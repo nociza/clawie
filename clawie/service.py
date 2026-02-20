@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from clawctl.store import StateStore
+from clawie.store import StateStore
 
 
 class SetupError(RuntimeError):
@@ -475,7 +475,7 @@ class ZeroClawService:
     def _require_setup(self) -> None:
         config = self.store.read_config()
         if not config.get("api_key"):
-            raise SetupError("setup is incomplete. Run 'clawctl setup init'.")
+            raise SetupError("setup is incomplete. Run 'clawie setup init'.")
 
     def _mint_channels(
         self,

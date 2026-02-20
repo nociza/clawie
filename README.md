@@ -1,15 +1,16 @@
 # clawie
 
-`clawie` installs the `clawctl` Linux CLI + terminal dashboard for ZeroClaw operations.
+`clawie` provides `clawie`, a local CLI + terminal dashboard for ZeroClaw-style
+setup, user provisioning, and channel operations.
 
 Core flows:
-- setup ZeroClaw API/subscription/workspace
-- one-click user spin-out from template or cloned user config
-- choose per-user channel strategy (`new` or `migrate`)
-- unified dashboard for all user agents
-- extra ops features: health checks, event feed, batch provisioning, state import/export
+- initialize local setup (`api_key`, subscription, workspace, API URL)
+- create or clone users with channel strategies (`new` or `migrate`)
+- bootstrap or migrate channels between users
+- inspect health, events, and dashboard snapshots
+- export/import local state snapshots
 
-## Install with uv
+## Install
 
 From package index:
 
@@ -17,7 +18,7 @@ From package index:
 uv tool install clawie
 ```
 
-From this repository during development:
+From this repository:
 
 ```bash
 uv tool install -e .
@@ -25,55 +26,96 @@ uv tool install -e .
 
 ## Quick Start
 
-Interactive setup:
+Initialize setup (interactive):
 
 ```bash
-clawctl setup init --interactive
+clawie setup init --interactive
 ```
 
-Non-interactive setup:
+Initialize setup (non-interactive):
 
 ```bash
-clawctl setup init \
+clawie setup init \
   --api-key zc_live_1234 \
   --subscription pro \
-  --workspace production
+  --workspace production \
+  --api-url https://api.zeroclaw.example/v1
 ```
 
-Create a user from template:
+Check setup:
 
 ```bash
-clawctl users create \
+clawie setup status
+```
+
+Create a user from a template:
+
+```bash
+clawie users create \
   --user-id alice \
   --display-name "Alice Kim" \
   --template baseline \
   --channel-strategy new
 ```
 
-One-click clone a user config:
+Clone an existing user (shorthand command):
 
 ```bash
-clawctl users clone \
+clawie users clone \
   --from-user alice \
   --user-id bob \
   --display-name "Bob Lee" \
   --channel-strategy migrate
 ```
 
+Launch the dashboard:
+
+```bash
+clawie dashboard
+```
+
+## Command Highlights
+
+User operations:
+
+```bash
+clawie users list
+clawie users show --user-id alice
+clawie users delete --user-id alice
+```
+
+Create/clone with explicit channels:
+
+```bash
+clawie users create --user-id sam --channel-strategy new --channel chat:ops --channel email:inbox
+clawie users clone --from-user alice --user-id bob --channels-file channels.json
+```
+
 Channel operations:
 
 ```bash
-clawctl channels bootstrap --user-id alice --preset growth
-clawctl channels migrate --from-user alice --to-user bob
+clawie channels bootstrap --user-id alice --preset growth
+clawie channels bootstrap --user-id alice --preset enterprise --replace
+clawie channels migrate --from-user alice --to-user bob
+clawie channels migrate --from-user alice --to-user bob --replace
 ```
 
-Unified dashboard:
+Diagnostics and events:
 
 ```bash
-clawctl dashboard
+clawie doctor
+clawie events list --limit 50
 ```
 
-## Batch Provisioning Example
+State snapshots:
+
+```bash
+clawie state export --output backup.json
+clawie state import --input backup.json
+clawie state import --input backup.json --merge
+```
+
+## Batch Provisioning
 
 Create `users.json`:
 
@@ -97,30 +139,38 @@ Create `users.json`:
 Run:
 
 ```bash
-clawctl users batch-create --file users.json
+clawie users batch-create --file users.json
 ```
 
-## Other Useful Commands
+## Config and State
+
+Defaults:
+- config directory: `~/.config/clawie`
+- config file: `~/.config/clawie/config.json`
+- state file: `~/.config/clawie/state.json`
+
+You can override the config root for any command:
 
 ```bash
-clawctl setup status
-clawctl users list
-clawctl users show --user-id alice
-clawctl doctor
-clawctl events list --limit 50
-clawctl state export --output backup.json
-clawctl state import --input backup.json --merge
+clawie --config-dir /tmp/clawie-dev setup status
 ```
 
-## Config and State Paths
+## Development
 
-By default:
-- config directory: `~/.config/clawctl`
-- config file: `~/.config/clawctl/config.json`
-- state file: `~/.config/clawctl/state.json`
+Run from source:
 
-Override with `--config-dir` on any command.
+```bash
+uv run clawie --help
+uv run python -m clawie --help
+```
+
+Run tests:
+
+```bash
+uv run --with pytest pytest -q
+```
 
 ## Notes
 
-This scaffold stores data locally and is ready to wire into real ZeroClaw APIs. Integration point: `src/clawctl/service.py`.
+This project currently stores data locally. Integration point for service behavior:
+`clawie/service.py`.

@@ -41,7 +41,7 @@ class StateStore:
             base = Path(
                 os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
             )
-            self.root = base / "clawctl"
+            self.root = base / "clawie"
         else:
             self.root = Path(config_dir).expanduser()
         self.config_path = self.root / "config.json"

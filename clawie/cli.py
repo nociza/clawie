@@ -6,15 +6,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from clawctl.dashboard import run_dashboard
-from clawctl.service import (
+from clawie.dashboard import run_dashboard
+from clawie.service import (
     SetupError,
     UserExistsError,
     UserNotFoundError,
     ZeroClawService,
 )
-from clawctl.store import DEFAULT_CONFIG, StateStore
-from clawctl.ui import (
+from clawie.store import DEFAULT_CONFIG, StateStore
+from clawie.ui import (
     print_error,
     print_info,
     print_panel,
@@ -26,12 +26,12 @@ from clawctl.ui import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="clawctl",
+        prog="clawie",
         description="ZeroClaw Linux CLI + dashboard control plane",
     )
     parser.add_argument(
         "--config-dir",
-        help="Override config directory (default: ~/.config/clawctl)",
+        help="Override config directory (default: ~/.config/clawie)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -269,7 +269,7 @@ def cmd_setup_status(args: argparse.Namespace, service: ZeroClawService) -> int:
         ],
     )
     if not status.get("configured"):
-        print_warning("Setup is incomplete. Run `clawctl setup init`.")
+        print_warning("Setup is incomplete. Run `clawie setup init`.")
         return 1
     return 0
 

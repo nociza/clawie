@@ -13,13 +13,11 @@ authors = [{ name = "Clawie Team" }]
 dependencies = []
 
 [project.scripts]
-clawctl = "clawctl.cli:main"
-
-[tool.setuptools]
-package-dir = { "" = "src" }
+clawie = "clawie.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["clawie*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["."]

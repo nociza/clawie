@@ -5,8 +5,8 @@ from pathlib import Path
 
 from pytest import CaptureFixture
 
-from clawctl.cli import main
-from clawctl.store import StateStore
+from clawie.cli import main
+from clawie.store import StateStore
 
 
 def run_cli(config_dir: Path, *args: str) -> int:

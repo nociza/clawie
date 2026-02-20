@@ -5,7 +5,7 @@ import sys
 import time
 from typing import Any
 
-from clawctl.ui import print_info, print_table
+from clawie.ui import print_info, print_table
 
 
 def run_dashboard(

@@ -42,15 +42,15 @@ def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[s
     assert "configured: True" in status_output
 
 
-def test_create_user_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234", "--workspace", "prod") == 0
     capsys.readouterr()
     assert (
         run_cli(
             tmp_path,
-            "users",
+            "agents",
             "create",
-            "--user-id",
+            "--agent-id",
             "alice",
             "--template",
             "baseline",
@@ -72,7 +72,7 @@ def test_create_user_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture
 def test_spawn_requires_root(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
-    code = run_cli(tmp_path, "spawn", "--user-id", "sam")
+    code = run_cli(tmp_path, "spawn", "--agent-id", "sam")
     output = capsys.readouterr().out
     assert code == 1
     assert "requires root privileges" in output
@@ -106,7 +106,7 @@ def test_spawn_success_with_mocks(
     code = run_cli(
         tmp_path,
         "spawn",
-        "--user-id",
+        "--agent-id",
         "sam",
         "--linux-user",
         "sam",
@@ -119,8 +119,8 @@ def test_spawn_success_with_mocks(
     assert "Spawned linux user sam" in output
 
     state = StateStore(config_dir=tmp_path).read_state()
-    assert "sam" in state["users"]
-    assert state["users"]["sam"]["agent"]["linux_user"] == "sam"
+    assert "sam" in state["agents"]
+    assert state["agents"]["sam"]["agent"]["linux_user"] == "sam"
 
 
 def test_store_creates_sqlite_db(tmp_path: Path) -> None:
@@ -136,18 +136,18 @@ def test_batch_create_returns_nonzero_on_errors(
     assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
 
-    batch_file = tmp_path / "users.json"
+    batch_file = tmp_path / "agents.json"
     batch_file.write_text(
         json.dumps(
             [
-                {"user_id": "maria", "display_name": "Maria"},
+                {"agent_id": "maria", "display_name": "Maria"},
                 {"display_name": "MissingId"},
             ]
         ),
         encoding="utf-8",
     )
 
-    code = run_cli(tmp_path, "users", "batch-create", "--file", str(batch_file))
+    code = run_cli(tmp_path, "agents", "batch-create", "--file", str(batch_file))
     output = capsys.readouterr().out
     assert code == 1
     assert "created: 1" in output

@@ -16,11 +16,11 @@ class SetupError(RuntimeError):
     pass
 
 
-class UserExistsError(RuntimeError):
+class AgentExistsError(RuntimeError):
     pass
 
 
-class UserNotFoundError(RuntimeError):
+class AgentNotFoundError(RuntimeError):
     pass
 
 
@@ -100,9 +100,9 @@ class ZeroClawService:
             "updated_at": config.get("updated_at", ""),
         }
 
-    def create_user(
+    def create_agent(
         self,
-        user_id: str,
+        agent_id: str,
         display_name: str | None,
         template: str,
         clone_from: str | None,
@@ -112,25 +112,27 @@ class ZeroClawService:
     ) -> dict[str, Any]:
         self._require_setup()
 
-        user_id = user_id.strip()
-        if not user_id:
-            raise ValueError("user_id is required")
+        agent_id = agent_id.strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
 
         if channel_strategy not in {"new", "migrate"}:
             raise ValueError("channel_strategy must be one of: new, migrate")
 
         state = self.store.read_state()
-        if user_id in state["users"]:
-            raise UserExistsError(f"user already exists: {user_id}")
+        agents = state.setdefault("agents", state.get("users", {}))
+        state["users"] = agents
+        if agent_id in agents:
+            raise AgentExistsError(f"agent already exists: {agent_id}")
 
         base_channels: list[dict[str, str]] = []
         source_template = template
         source_agent_defaults: dict[str, Any] = {}
 
         if clone_from:
-            source = state["users"].get(clone_from)
+            source = agents.get(clone_from)
             if not source:
-                raise UserNotFoundError(f"clone source user not found: {clone_from}")
+                raise AgentNotFoundError(f"clone source agent not found: {clone_from}")
             base_channels = copy.deepcopy(source.get("channels", []))
             source_template = source.get("source_template") or template
             source_agent_defaults = copy.deepcopy(source.get("agent", {}))
@@ -145,7 +147,7 @@ class ZeroClawService:
             base_channels = copy.deepcopy(channels)
 
         if channel_strategy == "new":
-            final_channels = self._mint_channels(user_id, base_channels)
+            final_channels = self._mint_channels(agent_id, base_channels)
         else:
             if not clone_from:
                 raise ValueError(
@@ -155,7 +157,7 @@ class ZeroClawService:
             for channel in final_channels:
                 channel["migrated_from"] = clone_from
 
-        display = display_name.strip() if display_name else user_id
+        display = display_name.strip() if display_name else agent_id
         provider = str(self.store.read_config().get("provider", "zeroclaw"))
         default_runtime = "openclaw-agent" if provider == "openclaw" else "zeroclaw-agent"
         agent = {
@@ -168,8 +170,8 @@ class ZeroClawService:
             "pid": int(source_agent_defaults.get("pid", 0)),
         }
 
-        user = {
-            "user_id": user_id,
+        agent_state = {
+            "agent_id": agent_id,
             "display_name": display,
             "created_at": now_iso(),
             "source_template": source_template,
@@ -178,66 +180,73 @@ class ZeroClawService:
             "channels": final_channels,
             "agent": agent,
         }
-        state["users"][user_id] = user
+        agents[agent_id] = agent_state
 
         self._event(
             state,
-            "users.created",
-            f"Provisioned user {user_id}",
+            "agents.created",
+            f"Provisioned agent {agent_id}",
             {
-                "user_id": user_id,
+                "agent_id": agent_id,
                 "channel_strategy": channel_strategy,
                 "channel_count": len(final_channels),
                 "clone_from": clone_from or "",
             },
         )
         self.store.write_state(state)
-        return user
+        return agent_state
 
-    def list_users(self) -> list[dict[str, Any]]:
-        users = list(self.store.read_state()["users"].values())
-        return sorted(users, key=lambda row: (row.get("created_at", ""), row["user_id"]))
-
-    def get_user(self, user_id: str) -> dict[str, Any]:
+    def list_agents(self) -> list[dict[str, Any]]:
         state = self.store.read_state()
-        user = state["users"].get(user_id)
-        if not user:
-            raise UserNotFoundError(f"user not found: {user_id}")
-        return user
+        agents = list(state.setdefault("agents", state.get("users", {})).values())
+        return sorted(
+            agents,
+            key=lambda row: (row.get("created_at", ""), row.get("agent_id", row.get("user_id", ""))),
+        )
 
-    def delete_user(self, user_id: str) -> None:
+    def get_agent(self, agent_id: str) -> dict[str, Any]:
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        return agent
+
+    def delete_agent(self, agent_id: str) -> None:
         self._require_setup()
         state = self.store.read_state()
-        if user_id not in state["users"]:
-            raise UserNotFoundError(f"user not found: {user_id}")
-        del state["users"][user_id]
+        agents = state.setdefault("agents", state.get("users", {}))
+        if agent_id not in agents:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        del agents[agent_id]
         self._event(
             state,
-            "users.deleted",
-            f"Deleted user {user_id}",
-            {"user_id": user_id},
+            "agents.deleted",
+            f"Deleted agent {agent_id}",
+            {"agent_id": agent_id},
         )
         self.store.write_state(state)
 
     def migrate_channels(
         self,
-        from_user: str,
-        to_user: str,
+        from_agent: str,
+        to_agent: str,
         replace: bool = False,
     ) -> dict[str, Any]:
         self._require_setup()
         state = self.store.read_state()
 
-        source = state["users"].get(from_user)
-        target = state["users"].get(to_user)
+        agents = state.setdefault("agents", state.get("users", {}))
+        source = agents.get(from_agent)
+        target = agents.get(to_agent)
         if not source:
-            raise UserNotFoundError(f"source user not found: {from_user}")
+            raise AgentNotFoundError(f"source agent not found: {from_agent}")
         if not target:
-            raise UserNotFoundError(f"target user not found: {to_user}")
+            raise AgentNotFoundError(f"target agent not found: {to_agent}")
 
         source_channels = copy.deepcopy(source.get("channels", []))
         for channel in source_channels:
-            channel["migrated_from"] = from_user
+            channel["migrated_from"] = from_agent
 
         if replace:
             target_channels = source_channels
@@ -258,10 +267,10 @@ class ZeroClawService:
         self._event(
             state,
             "channels.migrated",
-            f"Migrated channels from {from_user} to {to_user}",
+            f"Migrated channels from {from_agent} to {to_agent}",
             {
-                "from_user": from_user,
-                "to_user": to_user,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
                 "replace": replace,
                 "channel_count": len(target_channels),
             },
@@ -271,7 +280,7 @@ class ZeroClawService:
 
     def bootstrap_channels(
         self,
-        user_id: str,
+        agent_id: str,
         preset: str,
         replace: bool = False,
     ) -> dict[str, Any]:
@@ -294,11 +303,12 @@ class ZeroClawService:
             raise ValueError("preset must be one of: minimal, growth, enterprise")
 
         state = self.store.read_state()
-        target = state["users"].get(user_id)
+        agents = state.setdefault("agents", state.get("users", {}))
+        target = agents.get(agent_id)
         if not target:
-            raise UserNotFoundError(f"user not found: {user_id}")
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
 
-        generated = self._mint_channels(user_id, presets[preset])
+        generated = self._mint_channels(agent_id, presets[preset])
         if replace:
             target_channels = generated
         else:
@@ -317,9 +327,9 @@ class ZeroClawService:
         self._event(
             state,
             "channels.bootstrapped",
-            f"Applied {preset} channel preset for {user_id}",
+            f"Applied {preset} channel preset for {agent_id}",
             {
-                "user_id": user_id,
+                "agent_id": agent_id,
                 "preset": preset,
                 "replace": replace,
                 "channel_count": len(target_channels),
@@ -365,17 +375,17 @@ class ZeroClawService:
             }
         )
 
-        users = state.get("users", {})
-        if users:
-            checks.append({"status": "pass", "message": f"{len(users)} user(s) provisioned"})
+        agents = state.setdefault("agents", state.get("users", {}))
+        if agents:
+            checks.append({"status": "pass", "message": f"{len(agents)} agent(s) provisioned"})
         else:
-            checks.append({"status": "warn", "message": "No users provisioned yet"})
+            checks.append({"status": "warn", "message": "No agents provisioned yet"})
 
-        no_channels = [uid for uid, row in users.items() if not row.get("channels")]
+        no_channels = [aid for aid, row in agents.items() if not row.get("channels")]
         if no_channels:
             checks.append({
                 "status": "warn",
-                "message": "Users without channels: " + ", ".join(no_channels),
+                "message": "Agents without channels: " + ", ".join(no_channels),
             })
 
         overall = "healthy"
@@ -391,20 +401,24 @@ class ZeroClawService:
         events = state.get("events", [])
         return list(reversed(events[-limit:]))
 
-    def dashboard_snapshot(self, user_id: str | None = None) -> dict[str, Any]:
-        return self.performance_snapshot(user_id=user_id, refresh=True)
+    def dashboard_snapshot(self, agent_id: str | None = None) -> dict[str, Any]:
+        return self.performance_snapshot(agent_id=agent_id, refresh=True)
 
     def performance_snapshot(
         self,
-        user_id: str | None = None,
+        agent_id: str | None = None,
         refresh: bool = False,
     ) -> dict[str, Any]:
         if refresh:
-            self.collect_metrics(user_id=user_id)
+            self.collect_metrics(agent_id=agent_id)
         state = self.store.read_state()
-        users = list(state["users"].values())
-        if user_id:
-            users = [row for row in users if row.get("user_id") == user_id]
+        agents = list(state.setdefault("agents", state.get("users", {})).values())
+        if agent_id:
+            agents = [
+                row
+                for row in agents
+                if row.get("agent_id", row.get("user_id", "")) == agent_id
+            ]
         latest_metrics = self.store.latest_metrics(limit_per_user=1)
 
         rows: list[dict[str, Any]] = []
@@ -412,29 +426,35 @@ class ZeroClawService:
         migrated_total = 0
         cpu_total = 0.0
         mem_total = 0.0
-        for user in sorted(users, key=lambda row: row["user_id"]):
-            channels = user.get("channels", [])
+        for agent_state in sorted(
+            agents,
+            key=lambda row: row.get("agent_id", row.get("user_id", "")),
+        ):
+            channels = agent_state.get("channels", [])
             migrated_count = sum(1 for row in channels if row.get("migrated_from"))
             channel_total += len(channels)
             migrated_total += migrated_count
-            metric = (latest_metrics.get(user.get("user_id", ""), [{}]) or [{}])[0]
+            current_id = str(agent_state.get("agent_id", agent_state.get("user_id", "")))
+            metric = (latest_metrics.get(current_id, [{}]) or [{}])[0]
             cpu = float(metric.get("cpu_percent", 0.0))
             mem = float(metric.get("mem_percent", 0.0))
             rss = int(metric.get("rss_kb", 0))
-            sampled_status = str(metric.get("status", user.get("agent", {}).get("status", "unknown")))
+            sampled_status = str(
+                metric.get("status", agent_state.get("agent", {}).get("status", "unknown"))
+            )
             cpu_total += cpu
             mem_total += mem
             rows.append(
                 {
-                    "user_id": user.get("user_id", ""),
-                    "display_name": user.get("display_name", ""),
+                    "agent_id": current_id,
+                    "display_name": agent_state.get("display_name", ""),
                     "status": sampled_status,
-                    "version": user.get("agent", {}).get("version", ""),
-                    "strategy": user.get("channel_strategy", ""),
+                    "version": agent_state.get("agent", {}).get("version", ""),
+                    "strategy": agent_state.get("channel_strategy", ""),
                     "channels": len(channels),
                     "migrated": migrated_count,
-                    "last_sync": user.get("agent", {}).get("last_sync", ""),
-                    "pid": int(user.get("agent", {}).get("pid") or 0),
+                    "last_sync": agent_state.get("agent", {}).get("last_sync", ""),
+                    "pid": int(agent_state.get("agent", {}).get("pid") or 0),
                     "cpu_percent": cpu,
                     "mem_percent": mem,
                     "rss_kb": rss,
@@ -447,7 +467,7 @@ class ZeroClawService:
             "workspace": config.get("workspace", ""),
             "provider": config.get("provider", "zeroclaw"),
             "totals": {
-                "users": len(rows),
+                "agents": len(rows),
                 "channels": channel_total,
                 "migrated_channels": migrated_total,
                 "cpu_percent": round(cpu_total, 2),
@@ -457,14 +477,14 @@ class ZeroClawService:
             "events": self.list_events(limit=8),
         }
 
-    def collect_metrics(self, user_id: str | None = None) -> dict[str, Any]:
+    def collect_metrics(self, agent_id: str | None = None) -> dict[str, Any]:
         state = self.store.read_state()
-        users = state.get("users", {})
+        agents = state.setdefault("agents", state.get("users", {}))
         sampled = 0
-        for uid, user in users.items():
-            if user_id and uid != user_id:
+        for aid, agent_state in agents.items():
+            if agent_id and aid != agent_id:
                 continue
-            agent = user.setdefault("agent", {})
+            agent = agent_state.setdefault("agent", {})
             pid = int(agent.get("pid") or 0)
             status = "offline"
             cpu_percent = 0.0
@@ -484,7 +504,7 @@ class ZeroClawService:
             agent["last_sync"] = now_iso()
             self.store.write_metric(
                 timestamp=now_iso(),
-                user_id=uid,
+                user_id=aid,
                 cpu_percent=cpu_percent,
                 mem_percent=mem_percent,
                 rss_kb=rss_kb,
@@ -496,7 +516,7 @@ class ZeroClawService:
 
     def spawn_linux_user(
         self,
-        user_id: str,
+        agent_id: str,
         linux_user: str | None = None,
         copy_configs: bool = True,
         source_home: str | Path | None = None,
@@ -504,17 +524,18 @@ class ZeroClawService:
         agent_version: str = "1.0.0",
     ) -> dict[str, Any]:
         self._require_setup()
-        user_id = user_id.strip()
-        if not user_id:
-            raise ValueError("user_id is required")
+        agent_id = agent_id.strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
 
         state = self.store.read_state()
-        if user_id in state.get("users", {}):
-            raise UserExistsError(f"user already exists: {user_id}")
+        agents = state.setdefault("agents", state.get("users", {}))
+        if agent_id in agents:
+            raise AgentExistsError(f"agent already exists: {agent_id}")
         if template not in state.get("templates", {}):
             raise ValueError(f"template not found: {template}")
 
-        target_user = (linux_user or user_id).strip()
+        target_user = (linux_user or agent_id).strip()
         self._validate_linux_username(target_user)
         if os.geteuid() != 0:
             raise SetupError(
@@ -523,7 +544,7 @@ class ZeroClawService:
 
         target_home = Path("/home") / target_user
         if self._linux_user_exists(target_user):
-            raise UserExistsError(f"linux user already exists: {target_user}")
+            raise AgentExistsError(f"linux user already exists: {target_user}")
 
         subprocess.run(["useradd", "-m", "-s", "/bin/bash", target_user], check=True)
 
@@ -536,40 +557,41 @@ class ZeroClawService:
             else:
                 src_home = Path.home()
         copied = self._copy_user_configs(src_home, target_home, target_user, enabled=copy_configs)
-        user = self.create_user(
-            user_id=user_id,
-            display_name=user_id,
+        agent_state = self.create_agent(
+            agent_id=agent_id,
+            display_name=agent_id,
             template=template,
             clone_from=None,
             channel_strategy="new",
             channels=None,
             agent_version=agent_version,
         )
-        user["agent"]["linux_user"] = target_user
+        agent_state["agent"]["linux_user"] = target_user
         state = self.store.read_state()
         self._event(
             state,
-            "users.spawned",
-            f"Spawned linux user {target_user} for {user_id}",
-            {"user_id": user_id, "linux_user": target_user, "copied": copied},
+            "agents.spawned",
+            f"Spawned linux user {target_user} for {agent_id}",
+            {"agent_id": agent_id, "linux_user": target_user, "copied": copied},
         )
-        state["users"][user_id] = user
+        agents = state.setdefault("agents", state.get("users", {}))
+        agents[agent_id] = agent_state
         self.store.write_state(state)
-        return {"user": user, "linux_user": target_user, "copied_paths": copied}
+        return {"agent": agent_state, "linux_user": target_user, "copied_paths": copied}
 
-    def batch_create_users(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+    def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         results = {"created": [], "errors": []}
         for entry in entries:
-            user_id = str(entry.get("user_id", "")).strip()
-            if not user_id:
+            agent_id = str(entry.get("agent_id", entry.get("user_id", ""))).strip()
+            if not agent_id:
                 results["errors"].append({
-                    "user_id": "",
-                    "error": "entry missing user_id",
+                    "agent_id": "",
+                    "error": "entry missing agent_id",
                 })
                 continue
             try:
-                user = self.create_user(
-                    user_id=user_id,
+                agent_state = self.create_agent(
+                    agent_id=agent_id,
                     display_name=entry.get("display_name"),
                     template=str(entry.get("template", "baseline")),
                     clone_from=entry.get("clone_from"),
@@ -577,9 +599,9 @@ class ZeroClawService:
                     channels=entry.get("channels"),
                     agent_version=str(entry.get("agent_version", "1.0.0")),
                 )
-                results["created"].append(user["user_id"])
+                results["created"].append(agent_state["agent_id"])
             except Exception as exc:  # noqa: BLE001
-                results["errors"].append({"user_id": user_id, "error": str(exc)})
+                results["errors"].append({"agent_id": agent_id, "error": str(exc)})
         return results
 
     def export_state(self, output_path: str | Path) -> Path:
@@ -616,10 +638,10 @@ class ZeroClawService:
 
             merged_state = copy.deepcopy(current_state)
             merged_state.setdefault("templates", {})
-            merged_state.setdefault("users", {})
+            merged_state.setdefault("agents", merged_state.get("users", {}))
             merged_state.setdefault("events", [])
             merged_state["templates"].update(state.get("templates", {}))
-            merged_state["users"].update(state.get("users", {}))
+            merged_state["agents"].update(state.get("agents", state.get("users", {})))
             merged_state["events"] = (
                 merged_state["events"] + state.get("events", [])
             )[-self.EVENT_LIMIT :]
@@ -639,7 +661,7 @@ class ZeroClawService:
 
     def _mint_channels(
         self,
-        user_id: str,
+        agent_id: str,
         base_channels: list[dict[str, str]],
     ) -> list[dict[str, str]]:
         items = base_channels or [{"kind": "chat", "name": "primary"}]
@@ -647,18 +669,42 @@ class ZeroClawService:
         for idx, channel in enumerate(items, start=1):
             kind = str(channel.get("kind", "chat"))
             raw_name = str(channel.get("name", f"channel-{idx}"))
-            if raw_name.startswith(f"{user_id}-"):
+            if raw_name.startswith(f"{agent_id}-"):
                 full_name = raw_name
             else:
-                full_name = f"{user_id}-{raw_name}"
+                full_name = f"{agent_id}-{raw_name}"
             minted.append(
                 {
                     "kind": kind,
                     "name": full_name,
-                    "external_id": f"{user_id}:{kind}:{idx}",
+                    "external_id": f"{agent_id}:{kind}:{idx}",
                 }
             )
         return minted
+
+    # Backward-compatible aliases.
+    def create_user(self, **kwargs: Any) -> dict[str, Any]:
+        return self.create_agent(
+            agent_id=str(kwargs.get("user_id", kwargs.get("agent_id", ""))),
+            display_name=kwargs.get("display_name"),
+            template=str(kwargs.get("template", "baseline")),
+            clone_from=kwargs.get("clone_from"),
+            channel_strategy=str(kwargs.get("channel_strategy", "new")),
+            channels=kwargs.get("channels"),
+            agent_version=str(kwargs.get("agent_version", "1.0.0")),
+        )
+
+    def list_users(self) -> list[dict[str, Any]]:
+        return self.list_agents()
+
+    def get_user(self, user_id: str) -> dict[str, Any]:
+        return self.get_agent(user_id)
+
+    def delete_user(self, user_id: str) -> None:
+        self.delete_agent(user_id)
+
+    def batch_create_users(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.batch_create_agents(entries)
 
     def _event(
         self,

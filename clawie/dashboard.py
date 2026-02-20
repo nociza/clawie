@@ -10,27 +10,27 @@ from clawie.ui import print_info, print_table
 
 def run_dashboard(
     service: Any,
-    user_id: str | None = None,
+    agent_id: str | None = None,
     refresh_seconds: int = 2,
 ) -> None:
     if not sys.stdout.isatty():
-        _print_static(service.performance_snapshot(user_id=user_id, refresh=True))
+        _print_static(service.performance_snapshot(agent_id=agent_id, refresh=True))
         return
 
     try:
-        curses.wrapper(_loop, service, user_id, refresh_seconds)
+        curses.wrapper(_loop, service, agent_id, refresh_seconds)
     except curses.error:
-        _print_static(service.performance_snapshot(user_id=user_id, refresh=True))
+        _print_static(service.performance_snapshot(agent_id=agent_id, refresh=True))
 
 
-def _loop(stdscr: Any, service: Any, user_id: str | None, refresh_seconds: int) -> None:
+def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int) -> None:
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(refresh_seconds * 1000)
 
     while True:
-        snapshot = service.performance_snapshot(user_id=user_id, refresh=True)
-        _draw(stdscr, snapshot, user_id)
+        snapshot = service.performance_snapshot(agent_id=agent_id, refresh=True)
+        _draw(stdscr, snapshot, agent_id)
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             return
@@ -39,7 +39,7 @@ def _loop(stdscr: Any, service: Any, user_id: str | None, refresh_seconds: int) 
         time.sleep(0.05)
 
 
-def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
+def _draw(stdscr: Any, snapshot: dict[str, Any], agent_id: str | None) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
     line = 0
@@ -53,15 +53,15 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
 
     totals = snapshot["totals"]
     summary = (
-        f"users={totals['users']} channels={totals['channels']} "
+        f"agents={totals['agents']} channels={totals['channels']} "
         f"migrated={totals['migrated_channels']} cpu={totals.get('cpu_percent', 0)}% "
-        f"mem={totals.get('mem_percent', 0)}% filter={user_id or 'all'}"
+        f"mem={totals.get('mem_percent', 0)}% filter={agent_id or 'all'}"
     )
     stdscr.addstr(line, 0, _fit(summary, width))
     line += 2
 
     columns = [
-        ("USER", 14),
+        ("AGENT", 14),
         ("DISPLAY", 18),
         ("STATUS", 8),
         ("PID", 7),
@@ -84,7 +84,7 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
             break
         text = _row(
             [
-                row.get("user_id", ""),
+                row.get("agent_id", row.get("user_id", "")),
                 row.get("display_name", ""),
                 row.get("status", ""),
                 str(row.get("pid", 0)),
@@ -141,7 +141,7 @@ def _print_static(snapshot: dict[str, Any]) -> None:
     totals = snapshot["totals"]
     print_info(
         "Clawie Monitor "
-        f"provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} users={totals['users']} "
+        f"provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} agents={totals['agents']} "
         f"channels={totals['channels']} migrated={totals['migrated_channels']} "
         f"cpu={totals.get('cpu_percent', 0)}% mem={totals.get('mem_percent', 0)}%"
     )
@@ -150,7 +150,7 @@ def _print_static(snapshot: dict[str, Any]) -> None:
     for row in snapshot["rows"]:
         rows.append(
             [
-                row.get("user_id", ""),
+                row.get("agent_id", row.get("user_id", "")),
                 row.get("display_name", ""),
                 row.get("status", ""),
                 str(row.get("pid", 0)),
@@ -165,7 +165,7 @@ def _print_static(snapshot: dict[str, Any]) -> None:
 
     if rows:
         print_table(
-            ["user", "display", "status", "pid", "cpu%", "mem%", "rss_kb", "strategy", "channels", "migrated"],
+            ["agent", "display", "status", "pid", "cpu%", "mem%", "rss_kb", "strategy", "channels", "migrated"],
             rows,
         )
 

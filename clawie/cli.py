@@ -10,8 +10,8 @@ from typing import Any
 from clawie.dashboard import run_dashboard
 from clawie.service import (
     SetupError,
-    UserExistsError,
-    UserNotFoundError,
+    AgentExistsError,
+    AgentNotFoundError,
     ZeroClawService,
 )
 from clawie.store import DEFAULT_CONFIG, StateStore
@@ -64,87 +64,90 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--status", action="store_true", help="Show setup status only")
     setup.set_defaults(func=cmd_setup)
 
-    users = subparsers.add_parser("users", help="Provision and manage users")
-    users_sub = users.add_subparsers(dest="users_command", required=True)
+    agents = subparsers.add_parser("agents", help="Provision and manage agents")
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
 
-    users_create = users_sub.add_parser("create", help="Create a user")
-    users_create.add_argument("--user-id", required=True, help="Unique user ID")
-    users_create.add_argument("--display-name", help="Display name")
-    users_create.add_argument("--template", default="baseline", help="Template name")
-    users_create.add_argument("--clone-from", help="Clone channels/defaults from user ID")
-    users_create.add_argument(
+    agents_create = agents_sub.add_parser("create", help="Create an agent")
+    agents_create.add_argument("--agent-id", required=True, help="Unique agent ID")
+    agents_create.add_argument("--display-name", help="Display name")
+    agents_create.add_argument("--template", default="baseline", help="Template name")
+    agents_create.add_argument(
+        "--clone-from",
+        help="Clone channels/defaults from source agent ID",
+    )
+    agents_create.add_argument(
         "--channel-strategy",
         choices=["new", "migrate"],
         default="new",
         help="Use minted channel names or migrated channel names",
     )
-    users_create.add_argument(
+    agents_create.add_argument(
         "--channel",
         action="append",
         default=[],
         metavar="KIND:NAME",
         help="Add a channel definition (repeatable)",
     )
-    users_create.add_argument(
+    agents_create.add_argument(
         "--channels-file",
         help="JSON file with channel definitions: [{\"kind\": ..., \"name\": ...}]",
     )
-    users_create.add_argument("--agent-version", default="1.0.0", help="Agent version")
-    users_create.set_defaults(func=cmd_users_create)
+    agents_create.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    agents_create.set_defaults(func=cmd_agents_create)
 
-    users_clone = users_sub.add_parser(
+    agents_clone = agents_sub.add_parser(
         "clone",
-        help="One-click user clone from an existing user config",
+        help="One-click agent clone from an existing agent config",
     )
-    users_clone.add_argument("--from-user", required=True, help="Existing source user")
-    users_clone.add_argument("--user-id", required=True, help="New user ID")
-    users_clone.add_argument("--display-name", help="Display name")
-    users_clone.add_argument(
+    agents_clone.add_argument("--from-agent", required=True, help="Existing source agent")
+    agents_clone.add_argument("--agent-id", required=True, help="New agent ID")
+    agents_clone.add_argument("--display-name", help="Display name")
+    agents_clone.add_argument(
         "--channel-strategy",
         choices=["new", "migrate"],
         default="migrate",
         help="Use copied channels as-is (migrate) or mint new names (new)",
     )
-    users_clone.add_argument(
+    agents_clone.add_argument(
         "--channel",
         action="append",
         default=[],
         metavar="KIND:NAME",
         help="Override cloned channels with explicit definitions (repeatable)",
     )
-    users_clone.add_argument(
+    agents_clone.add_argument(
         "--channels-file",
         help="JSON file with channel definitions to override clone channels",
     )
-    users_clone.add_argument("--agent-version", default="1.0.0", help="Agent version")
-    users_clone.set_defaults(func=cmd_users_clone)
+    agents_clone.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    agents_clone.set_defaults(func=cmd_agents_clone)
 
-    users_list = users_sub.add_parser("list", help="List users")
-    users_list.set_defaults(func=cmd_users_list)
+    agents_list = agents_sub.add_parser("list", help="List agents")
+    agents_list.set_defaults(func=cmd_agents_list)
 
-    users_show = users_sub.add_parser("show", help="Show one user")
-    users_show.add_argument("--user-id", required=True)
-    users_show.set_defaults(func=cmd_users_show)
+    agents_show = agents_sub.add_parser("show", help="Show one agent")
+    agents_show.add_argument("--agent-id", required=True)
+    agents_show.set_defaults(func=cmd_agents_show)
 
-    users_delete = users_sub.add_parser("delete", help="Delete one user")
-    users_delete.add_argument("--user-id", required=True)
-    users_delete.set_defaults(func=cmd_users_delete)
+    agents_delete = agents_sub.add_parser("delete", help="Delete one agent")
+    agents_delete.add_argument("--agent-id", required=True)
+    agents_delete.set_defaults(func=cmd_agents_delete)
 
-    users_batch = users_sub.add_parser(
+    agents_batch = agents_sub.add_parser(
         "batch-create",
-        help="Create users from JSON array entries",
+        help="Create agents from JSON array entries",
     )
-    users_batch.add_argument("--file", required=True, help="Input JSON file")
-    users_batch.set_defaults(func=cmd_users_batch_create)
+    agents_batch.add_argument("--file", required=True, help="Input JSON file")
+    agents_batch.set_defaults(func=cmd_agents_batch_create)
 
     channels = subparsers.add_parser("channels", help="Channel operations")
     channels_sub = channels.add_subparsers(dest="channels_command", required=True)
 
     channels_bootstrap = channels_sub.add_parser(
         "bootstrap",
-        help="Apply a channel preset to a user",
+        help="Apply a channel preset to an agent",
     )
-    channels_bootstrap.add_argument("--user-id", required=True)
+    channels_bootstrap.add_argument("--agent-id", required=True)
     channels_bootstrap.add_argument(
         "--preset",
         choices=["minimal", "growth", "enterprise"],
@@ -159,10 +162,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     channels_migrate = channels_sub.add_parser(
         "migrate",
-        help="Copy channels from one user to another",
+        help="Copy channels from one agent to another",
     )
-    channels_migrate.add_argument("--from-user", required=True)
-    channels_migrate.add_argument("--to-user", required=True)
+    channels_migrate.add_argument("--from-agent", required=True)
+    channels_migrate.add_argument("--to-agent", required=True)
     channels_migrate.add_argument(
         "--replace",
         action="store_true",
@@ -172,12 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     spawn = subparsers.add_parser(
         "spawn",
-        help="Create a Linux user and provision a matching Clawie user",
+        help="Create a Linux user and provision a matching Clawie agent",
     )
-    spawn.add_argument("--user-id", required=True, help="Clawie user ID")
+    spawn.add_argument("--agent-id", required=True, help="Clawie agent ID")
     spawn.add_argument(
         "--linux-user",
-        help="Linux username (defaults to user-id)",
+        help="Linux username (defaults to agent-id)",
     )
     spawn.add_argument("--template", default="baseline", help="Template name")
     spawn.add_argument("--agent-version", default="1.0.0", help="Agent version")
@@ -188,17 +191,17 @@ def build_parser() -> argparse.ArgumentParser:
     spawn.add_argument(
         "--skip-config-copy",
         action="store_true",
-        help="Do not copy user config files to the new Linux user",
+        help="Do not copy current user config files to the new Linux user",
     )
     spawn.set_defaults(func=cmd_spawn)
 
     monitor = subparsers.add_parser("monitor", help="htop-like agent performance monitor")
-    monitor.add_argument("--user-id", help="Filter monitor to one user")
+    monitor.add_argument("--agent-id", help="Filter monitor to one agent")
     monitor.add_argument("--refresh-seconds", type=int, default=2)
     monitor.set_defaults(func=cmd_monitor)
 
     dashboard = subparsers.add_parser("dashboard", help="Unified agent dashboard")
-    dashboard.add_argument("--user-id", help="Filter dashboard to one user")
+    dashboard.add_argument("--agent-id", help="Filter dashboard to one agent")
     dashboard.add_argument("--refresh-seconds", type=int, default=2)
     dashboard.set_defaults(func=cmd_monitor)
 
@@ -239,8 +242,8 @@ def main(argv: list[str] | None = None) -> int:
         return int(handler(args, service) or 0)
     except (
         SetupError,
-        UserExistsError,
-        UserNotFoundError,
+        AgentExistsError,
+        AgentNotFoundError,
         ValueError,
         FileNotFoundError,
         json.JSONDecodeError,
@@ -326,10 +329,10 @@ def _print_setup_status(service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_users_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int:
     channels = _resolve_channels(args.channel, args.channels_file)
-    user = service.create_user(
-        user_id=args.user_id,
+    agent = service.create_agent(
+        agent_id=args.agent_id,
         display_name=args.display_name,
         template=args.template,
         clone_from=args.clone_from,
@@ -337,43 +340,43 @@ def cmd_users_create(args: argparse.Namespace, service: ZeroClawService) -> int:
         channels=channels,
         agent_version=args.agent_version,
     )
-    print_success(f"Provisioned user {user['user_id']}")
-    _print_user(user)
+    print_success(f"Provisioned agent {agent['agent_id']}")
+    _print_agent(agent)
     return 0
 
 
-def cmd_users_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
     channels = _resolve_channels(args.channel, args.channels_file)
-    user = service.create_user(
-        user_id=args.user_id,
+    agent = service.create_agent(
+        agent_id=args.agent_id,
         display_name=args.display_name,
         template="baseline",
-        clone_from=args.from_user,
+        clone_from=args.from_agent,
         channel_strategy=args.channel_strategy,
         channels=channels,
         agent_version=args.agent_version,
     )
-    print_success(f"Cloned user config from {args.from_user} to {user['user_id']}")
-    _print_user(user)
+    print_success(f"Cloned agent config from {args.from_agent} to {agent['agent_id']}")
+    _print_agent(agent)
     return 0
 
 
-def cmd_users_list(args: argparse.Namespace, service: ZeroClawService) -> int:
-    users = service.list_users()
-    if not users:
-        print_info("No users provisioned yet.")
+def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agents = service.list_agents()
+    if not agents:
+        print_info("No agents provisioned yet.")
         return 0
 
     rows: list[list[str]] = []
-    for user in users:
-        agent = user.get("agent", {})
-        channels = user.get("channels", [])
+    for row in agents:
+        agent = row.get("agent", {})
+        channels = row.get("channels", [])
         migrated = sum(1 for channel in channels if channel.get("migrated_from"))
         rows.append(
             [
-                str(user.get("user_id", "")),
-                str(user.get("display_name", "")),
-                str(user.get("channel_strategy", "")),
+                str(row.get("agent_id", row.get("user_id", ""))),
+                str(row.get("display_name", "")),
+                str(row.get("channel_strategy", "")),
                 str(len(channels)),
                 str(migrated),
                 str(agent.get("status", "")),
@@ -381,25 +384,25 @@ def cmd_users_list(args: argparse.Namespace, service: ZeroClawService) -> int:
             ]
         )
     print_table(
-        ["user_id", "display_name", "strategy", "channels", "migrated", "status", "agent"],
+        ["agent_id", "display_name", "strategy", "channels", "migrated", "status", "agent"],
         rows,
     )
     return 0
 
 
-def cmd_users_show(args: argparse.Namespace, service: ZeroClawService) -> int:
-    user = service.get_user(args.user_id)
-    _print_user(user)
+def cmd_agents_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent = service.get_agent(args.agent_id)
+    _print_agent(agent)
     return 0
 
 
-def cmd_users_delete(args: argparse.Namespace, service: ZeroClawService) -> int:
-    service.delete_user(args.user_id)
-    print_success(f"Deleted user {args.user_id}")
+def cmd_agents_delete(args: argparse.Namespace, service: ZeroClawService) -> int:
+    service.delete_agent(args.agent_id)
+    print_success(f"Deleted agent {args.agent_id}")
     return 0
 
 
-def cmd_users_batch_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) -> int:
     payload = _read_json_file(args.file)
     if not isinstance(payload, list):
         raise ValueError("batch file must be a JSON array")
@@ -410,7 +413,7 @@ def cmd_users_batch_create(args: argparse.Namespace, service: ZeroClawService) -
             raise ValueError(f"batch entry at index {idx} must be an object")
         entries.append(row)
 
-    result = service.batch_create_users(entries)
+    result = service.batch_create_agents(entries)
     print_panel(
         "Batch Create",
         [
@@ -421,43 +424,43 @@ def cmd_users_batch_create(args: argparse.Namespace, service: ZeroClawService) -
 
     created = result.get("created", [])
     if created:
-        print_info("Created users: " + ", ".join(str(row) for row in created))
+        print_info("Created agents: " + ", ".join(str(row) for row in created))
 
     errors = result.get("errors", [])
     if errors:
-        rows = [[str(row.get("user_id", "")), str(row.get("error", ""))] for row in errors]
-        print_table(["user_id", "error"], rows)
+        rows = [[str(row.get("agent_id", "")), str(row.get("error", ""))] for row in errors]
+        print_table(["agent_id", "error"], rows)
         return 1
     return 0
 
 
 def cmd_channels_bootstrap(args: argparse.Namespace, service: ZeroClawService) -> int:
-    user = service.bootstrap_channels(
-        user_id=args.user_id,
+    agent = service.bootstrap_channels(
+        agent_id=args.agent_id,
         preset=args.preset,
         replace=args.replace,
     )
     print_success(
-        f"Applied {args.preset} preset for {args.user_id} ({len(user.get('channels', []))} channels)"
+        f"Applied {args.preset} preset for {args.agent_id} ({len(agent.get('channels', []))} channels)"
     )
     return 0
 
 
 def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> int:
-    user = service.migrate_channels(
-        from_user=args.from_user,
-        to_user=args.to_user,
+    agent = service.migrate_channels(
+        from_agent=args.from_agent,
+        to_agent=args.to_agent,
         replace=args.replace,
     )
     print_success(
-        f"Migrated channels {args.from_user} -> {args.to_user} ({len(user.get('channels', []))} channels)"
+        f"Migrated channels {args.from_agent} -> {args.to_agent} ({len(agent.get('channels', []))} channels)"
     )
     return 0
 
 
 def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
     result = service.spawn_linux_user(
-        user_id=args.user_id,
+        agent_id=args.agent_id,
         linux_user=args.linux_user,
         copy_configs=not bool(args.skip_config_copy),
         source_home=args.source_home,
@@ -465,20 +468,20 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
         agent_version=args.agent_version,
     )
     print_success(
-        f"Spawned linux user {result['linux_user']} and provisioned {result['user']['user_id']}"
+        f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
     )
     copied = result.get("copied_paths", [])
     if copied:
         print_info("Copied config paths:")
         for path in copied:
             print(f"- {path}")
-    _print_user(result["user"])
+    _print_agent(result["agent"])
     return 0
 
 
 def cmd_monitor(args: argparse.Namespace, service: ZeroClawService) -> int:
     refresh = max(1, int(args.refresh_seconds))
-    run_dashboard(service, user_id=args.user_id, refresh_seconds=refresh)
+    run_dashboard(service, agent_id=args.agent_id, refresh_seconds=refresh)
     return 0
 
 
@@ -542,21 +545,21 @@ def cmd_state_import(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def _print_user(user: dict[str, Any]) -> None:
-    channels = user.get("channels", [])
+def _print_agent(agent: dict[str, Any]) -> None:
+    channels = agent.get("channels", [])
     migrated = sum(1 for row in channels if row.get("migrated_from"))
     print_panel(
-        "User",
+        "Agent",
         [
-            f"user_id: {user.get('user_id', '')}",
-            f"display_name: {user.get('display_name', '')}",
-            f"template: {user.get('source_template', '')}",
-            f"clone_from: {user.get('clone_from', '')}",
-            f"channel_strategy: {user.get('channel_strategy', '')}",
+            f"agent_id: {agent.get('agent_id', agent.get('user_id', ''))}",
+            f"display_name: {agent.get('display_name', '')}",
+            f"template: {agent.get('source_template', '')}",
+            f"clone_from: {agent.get('clone_from', '')}",
+            f"channel_strategy: {agent.get('channel_strategy', '')}",
             f"channels: {len(channels)}",
             f"migrated_channels: {migrated}",
-            f"agent_status: {user.get('agent', {}).get('status', '')}",
-            f"agent_version: {user.get('agent', {}).get('version', '')}",
+            f"agent_status: {agent.get('agent', {}).get('status', '')}",
+            f"agent_version: {agent.get('agent', {}).get('version', '')}",
         ],
     )
 

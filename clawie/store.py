@@ -32,7 +32,7 @@ DEFAULT_STATE: dict[str, Any] = {
             },
         }
     },
-    "users": {},
+    "agents": {},
     "events": [],
 }
 
@@ -125,9 +125,10 @@ class StateStore:
         if not state["templates"]:
             state["templates"] = copy.deepcopy(DEFAULT_STATE["templates"])
 
-        state["users"] = {}
+        state["agents"] = {}
         for row in user_rows:
-            state["users"][str(row["user_id"])] = self._decode_json_obj(str(row["payload"]))
+            state["agents"][str(row["user_id"])] = self._decode_json_obj(str(row["payload"]))
+        state["users"] = state["agents"]
 
         state["events"] = []
         for row in event_rows:
@@ -145,10 +146,10 @@ class StateStore:
     def write_state(self, payload: dict[str, Any]) -> None:
         self.ensure()
         templates = payload.get("templates", {})
-        users = payload.get("users", {})
+        agents = payload.get("agents", payload.get("users", {}))
         events = payload.get("events", [])
-        if not isinstance(templates, dict) or not isinstance(users, dict) or not isinstance(events, list):
-            raise ValueError("state payload must include templates/users/events")
+        if not isinstance(templates, dict) or not isinstance(agents, dict) or not isinstance(events, list):
+            raise ValueError("state payload must include templates/agents/events")
 
         with self._connect() as conn:
             conn.execute("DELETE FROM templates")
@@ -161,10 +162,10 @@ class StateStore:
                     (str(name), json.dumps(template, sort_keys=True)),
                 )
 
-            for user_id, user in users.items():
+            for agent_id, agent in agents.items():
                 conn.execute(
                     "INSERT INTO users(user_id, payload) VALUES (?, ?)",
-                    (str(user_id), json.dumps(user, sort_keys=True)),
+                    (str(agent_id), json.dumps(agent, sort_keys=True)),
                 )
 
             for event in events:

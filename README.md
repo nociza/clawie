@@ -1,14 +1,14 @@
 # clawie
 
 `clawie` provides `clawie`, a local CLI + terminal dashboard for provider setup,
-Linux user spawning, user provisioning, and channel operations.
+Linux user spawning, agent provisioning, and channel operations.
 
 Core flows:
 - initialize local setup (`provider`, optional API key, subscription, workspace, API URL)
 - choose/install provider runtime (`zeroclaw` default, or `openclaw`)
 - spawn Linux users and copy current user configs
-- create or clone users with channel strategies (`new` or `migrate`)
-- bootstrap or migrate channels between users
+- create or clone agents with channel strategies (`new` or `migrate`)
+- bootstrap or migrate channels between agents
 - inspect health, events, and htop-like monitor snapshots
 - export/import local state snapshots
 
@@ -56,22 +56,22 @@ Check setup:
 clawie setup --status
 ```
 
-Create a user from a template:
+Create an agent from a template:
 
 ```bash
-clawie users create \
-  --user-id alice \
+clawie agents create \
+  --agent-id alice \
   --display-name "Alice Kim" \
   --template baseline \
   --channel-strategy new
 ```
 
-Clone an existing user (shorthand command):
+Clone an existing agent (shorthand command):
 
 ```bash
-clawie users clone \
-  --from-user alice \
-  --user-id bob \
+clawie agents clone \
+  --from-agent alice \
+  --agent-id bob \
   --display-name "Bob Lee" \
   --channel-strategy migrate
 ```
@@ -85,33 +85,33 @@ clawie monitor
 Spawn a Linux user and copy current configs:
 
 ```bash
-sudo clawie spawn --user-id alice --linux-user alice
+sudo clawie spawn --agent-id alice --linux-user alice
 ```
 
 ## Command Highlights
 
-User operations:
+Agent operations:
 
 ```bash
-clawie users list
-clawie users show --user-id alice
-clawie users delete --user-id alice
+clawie agents list
+clawie agents show --agent-id alice
+clawie agents delete --agent-id alice
 ```
 
 Create/clone with explicit channels:
 
 ```bash
-clawie users create --user-id sam --channel-strategy new --channel chat:ops --channel email:inbox
-clawie users clone --from-user alice --user-id bob --channels-file channels.json
+clawie agents create --agent-id sam --channel-strategy new --channel chat:ops --channel email:inbox
+clawie agents clone --from-agent alice --agent-id bob --channels-file channels.json
 ```
 
 Channel operations:
 
 ```bash
-clawie channels bootstrap --user-id alice --preset growth
-clawie channels bootstrap --user-id alice --preset enterprise --replace
-clawie channels migrate --from-user alice --to-user bob
-clawie channels migrate --from-user alice --to-user bob --replace
+clawie channels bootstrap --agent-id alice --preset growth
+clawie channels bootstrap --agent-id alice --preset enterprise --replace
+clawie channels migrate --from-agent alice --to-agent bob
+clawie channels migrate --from-agent alice --to-agent bob --replace
 ```
 
 Diagnostics and events:
@@ -131,8 +131,8 @@ clawie dashboard
 Linux user spawning:
 
 ```bash
-sudo clawie spawn --user-id sam --linux-user sam
-sudo clawie spawn --user-id sam --linux-user sam --skip-config-copy
+sudo clawie spawn --agent-id sam --linux-user sam
+sudo clawie spawn --agent-id sam --linux-user sam --skip-config-copy
 ```
 
 State snapshots:
@@ -145,18 +145,18 @@ clawie state import --input backup.json --merge
 
 ## Batch Provisioning
 
-Create `users.json`:
+Create `agents.json`:
 
 ```json
 [
   {
-    "user_id": "maria",
+    "agent_id": "maria",
     "display_name": "Maria",
     "template": "baseline",
     "channel_strategy": "new"
   },
   {
-    "user_id": "dan",
+    "agent_id": "dan",
     "display_name": "Dan",
     "clone_from": "maria",
     "channel_strategy": "migrate"
@@ -167,7 +167,7 @@ Create `users.json`:
 Run:
 
 ```bash
-clawie users batch-create --file users.json
+clawie agents batch-create --file agents.json
 ```
 
 ## Config and State

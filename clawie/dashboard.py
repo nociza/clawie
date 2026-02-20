@@ -14,13 +14,13 @@ def run_dashboard(
     refresh_seconds: int = 2,
 ) -> None:
     if not sys.stdout.isatty():
-        _print_static(service.dashboard_snapshot(user_id=user_id))
+        _print_static(service.performance_snapshot(user_id=user_id, refresh=True))
         return
 
     try:
         curses.wrapper(_loop, service, user_id, refresh_seconds)
     except curses.error:
-        _print_static(service.dashboard_snapshot(user_id=user_id))
+        _print_static(service.performance_snapshot(user_id=user_id, refresh=True))
 
 
 def _loop(stdscr: Any, service: Any, user_id: str | None, refresh_seconds: int) -> None:
@@ -29,7 +29,7 @@ def _loop(stdscr: Any, service: Any, user_id: str | None, refresh_seconds: int) 
     stdscr.timeout(refresh_seconds * 1000)
 
     while True:
-        snapshot = service.dashboard_snapshot(user_id=user_id)
+        snapshot = service.performance_snapshot(user_id=user_id, refresh=True)
         _draw(stdscr, snapshot, user_id)
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
@@ -45,7 +45,7 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
     line = 0
 
     header = (
-        f"ZeroClaw Unified Dashboard | workspace={snapshot['workspace']} "
+        f"Clawie Monitor | provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} "
         f"| generated={snapshot['generated_at']}"
     )
     stdscr.addstr(line, 0, _fit(header, width))
@@ -54,7 +54,8 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
     totals = snapshot["totals"]
     summary = (
         f"users={totals['users']} channels={totals['channels']} "
-        f"migrated={totals['migrated_channels']} filter={user_id or 'all'}"
+        f"migrated={totals['migrated_channels']} cpu={totals.get('cpu_percent', 0)}% "
+        f"mem={totals.get('mem_percent', 0)}% filter={user_id or 'all'}"
     )
     stdscr.addstr(line, 0, _fit(summary, width))
     line += 2
@@ -62,12 +63,16 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
     columns = [
         ("USER", 14),
         ("DISPLAY", 18),
-        ("STATUS", 10),
+        ("STATUS", 8),
+        ("PID", 7),
+        ("CPU%", 6),
+        ("MEM%", 6),
+        ("RSSKB", 8),
         ("VER", 8),
         ("STRATEGY", 10),
         ("CH", 4),
         ("MIG", 5),
-        ("LAST_SYNC", 22),
+        ("LAST_SYNC", 20),
     ]
     stdscr.addstr(line, 0, _fit(_row([name for name, _ in columns], columns), width))
     line += 1
@@ -82,6 +87,10 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], user_id: str | None) -> None:
                 row.get("user_id", ""),
                 row.get("display_name", ""),
                 row.get("status", ""),
+                str(row.get("pid", 0)),
+                f"{float(row.get('cpu_percent', 0.0)):.1f}",
+                f"{float(row.get('mem_percent', 0.0)):.1f}",
+                str(row.get("rss_kb", 0)),
                 row.get("version", ""),
                 row.get("strategy", ""),
                 str(row.get("channels", 0)),
@@ -131,9 +140,10 @@ def _fit(text: str, width: int) -> str:
 def _print_static(snapshot: dict[str, Any]) -> None:
     totals = snapshot["totals"]
     print_info(
-        "ZeroClaw Dashboard "
-        f"workspace={snapshot['workspace']} users={totals['users']} "
-        f"channels={totals['channels']} migrated={totals['migrated_channels']}"
+        "Clawie Monitor "
+        f"provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} users={totals['users']} "
+        f"channels={totals['channels']} migrated={totals['migrated_channels']} "
+        f"cpu={totals.get('cpu_percent', 0)}% mem={totals.get('mem_percent', 0)}%"
     )
 
     rows = []
@@ -143,6 +153,10 @@ def _print_static(snapshot: dict[str, Any]) -> None:
                 row.get("user_id", ""),
                 row.get("display_name", ""),
                 row.get("status", ""),
+                str(row.get("pid", 0)),
+                f"{float(row.get('cpu_percent', 0.0)):.1f}",
+                f"{float(row.get('mem_percent', 0.0)):.1f}",
+                str(row.get("rss_kb", 0)),
                 row.get("strategy", ""),
                 str(row.get("channels", 0)),
                 str(row.get("migrated", 0)),
@@ -150,7 +164,10 @@ def _print_static(snapshot: dict[str, Any]) -> None:
         )
 
     if rows:
-        print_table(["user", "display", "status", "strategy", "channels", "migrated"], rows)
+        print_table(
+            ["user", "display", "status", "pid", "cpu%", "mem%", "rss_kb", "strategy", "channels", "migrated"],
+            rows,
+        )
 
     events = snapshot.get("events", [])
     if events:

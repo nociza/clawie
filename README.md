@@ -1,13 +1,15 @@
 # clawie
 
-`clawie` provides `clawie`, a local CLI + terminal dashboard for ZeroClaw-style
-setup, user provisioning, and channel operations.
+`clawie` provides `clawie`, a local CLI + terminal dashboard for provider setup,
+Linux user spawning, user provisioning, and channel operations.
 
 Core flows:
-- initialize local setup (`api_key`, subscription, workspace, API URL)
+- initialize local setup (`provider`, optional API key, subscription, workspace, API URL)
+- choose/install provider runtime (`zeroclaw` default, or `openclaw`)
+- spawn Linux users and copy current user configs
 - create or clone users with channel strategies (`new` or `migrate`)
 - bootstrap or migrate channels between users
-- inspect health, events, and dashboard snapshots
+- inspect health, events, and htop-like monitor snapshots
 - export/import local state snapshots
 
 ## Install
@@ -29,23 +31,29 @@ uv tool install -e .
 Initialize setup (interactive):
 
 ```bash
-clawie setup init --interactive
+clawie setup --interactive
 ```
 
-Initialize setup (non-interactive):
+Initialize setup (non-interactive, default provider `zeroclaw`):
 
 ```bash
-clawie setup init \
+clawie setup \
   --api-key zc_live_1234 \
   --subscription pro \
   --workspace production \
   --api-url https://api.zeroclaw.example/v1
 ```
 
+Initialize with `openclaw` (no API key required):
+
+```bash
+clawie setup --provider openclaw --install-runtime
+```
+
 Check setup:
 
 ```bash
-clawie setup status
+clawie setup --status
 ```
 
 Create a user from a template:
@@ -68,10 +76,16 @@ clawie users clone \
   --channel-strategy migrate
 ```
 
-Launch the dashboard:
+Launch the htop-like monitor:
 
 ```bash
-clawie dashboard
+clawie monitor
+```
+
+Spawn a Linux user and copy current configs:
+
+```bash
+sudo clawie spawn --user-id alice --linux-user alice
 ```
 
 ## Command Highlights
@@ -105,6 +119,20 @@ Diagnostics and events:
 ```bash
 clawie doctor
 clawie events list --limit 50
+```
+
+Monitor and dashboard:
+
+```bash
+clawie monitor
+clawie dashboard
+```
+
+Linux user spawning:
+
+```bash
+sudo clawie spawn --user-id sam --linux-user sam
+sudo clawie spawn --user-id sam --linux-user sam --skip-config-copy
 ```
 
 State snapshots:
@@ -145,14 +173,13 @@ clawie users batch-create --file users.json
 ## Config and State
 
 Defaults:
-- config directory: `~/.config/clawie`
-- config file: `~/.config/clawie/config.json`
-- state file: `~/.config/clawie/state.json`
+- state directory: `~/.clawie`
+- SQLite DB: `~/.clawie/clawie.db`
 
 You can override the config root for any command:
 
 ```bash
-clawie --config-dir /tmp/clawie-dev setup status
+clawie --config-dir /tmp/clawie-dev setup --status
 ```
 
 ## Development

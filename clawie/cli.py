@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,35 +28,41 @@ from clawie.ui import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clawie",
-        description="ZeroClaw Linux CLI + dashboard control plane",
+        description="Clawie Linux CLI + dashboard control plane",
     )
     parser.add_argument(
         "--config-dir",
-        help="Override config directory (default: ~/.config/clawie)",
+        help="Override state directory (default: ~/.clawie)",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    setup = subparsers.add_parser("setup", help="Configure ZeroClaw API/workspace")
-    setup_sub = setup.add_subparsers(dest="setup_command", required=True)
-
-    setup_init = setup_sub.add_parser("init", help="Initialize configuration")
-    setup_init.add_argument("--api-key", help="ZeroClaw API key")
-    setup_init.add_argument("--subscription", default="starter", help="Plan name")
-    setup_init.add_argument("--workspace", default="default", help="Workspace slug")
-    setup_init.add_argument(
+    setup = subparsers.add_parser("setup", help="Configure provider/workspace")
+    setup.add_argument(
+        "--provider",
+        choices=["zeroclaw", "openclaw"],
+        default="zeroclaw",
+        help="Agent provider",
+    )
+    setup.add_argument("--api-key", help="Provider API key (required for zeroclaw)")
+    setup.add_argument("--subscription", default="starter", help="Plan name")
+    setup.add_argument("--workspace", default="default", help="Workspace slug")
+    setup.add_argument(
         "--api-url",
         default=str(DEFAULT_CONFIG["api_url"]),
-        help="ZeroClaw API base URL",
+        help="API base URL",
     )
-    setup_init.add_argument(
+    setup.add_argument(
+        "--install-runtime",
+        action="store_true",
+        help="Record local runtime as installed",
+    )
+    setup.add_argument(
         "--interactive",
         action="store_true",
         help="Prompt for values interactively",
     )
-    setup_init.set_defaults(func=cmd_setup_init)
-
-    setup_status = setup_sub.add_parser("status", help="Show setup status")
-    setup_status.set_defaults(func=cmd_setup_status)
+    setup.add_argument("--status", action="store_true", help="Show setup status only")
+    setup.set_defaults(func=cmd_setup)
 
     users = subparsers.add_parser("users", help="Provision and manage users")
     users_sub = users.add_subparsers(dest="users_command", required=True)
@@ -163,10 +170,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     channels_migrate.set_defaults(func=cmd_channels_migrate)
 
+    spawn = subparsers.add_parser(
+        "spawn",
+        help="Create a Linux user and provision a matching Clawie user",
+    )
+    spawn.add_argument("--user-id", required=True, help="Clawie user ID")
+    spawn.add_argument(
+        "--linux-user",
+        help="Linux username (defaults to user-id)",
+    )
+    spawn.add_argument("--template", default="baseline", help="Template name")
+    spawn.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    spawn.add_argument(
+        "--source-home",
+        help="Source home directory to copy configs from (default: current home)",
+    )
+    spawn.add_argument(
+        "--skip-config-copy",
+        action="store_true",
+        help="Do not copy user config files to the new Linux user",
+    )
+    spawn.set_defaults(func=cmd_spawn)
+
+    monitor = subparsers.add_parser("monitor", help="htop-like agent performance monitor")
+    monitor.add_argument("--user-id", help="Filter monitor to one user")
+    monitor.add_argument("--refresh-seconds", type=int, default=2)
+    monitor.set_defaults(func=cmd_monitor)
+
     dashboard = subparsers.add_parser("dashboard", help="Unified agent dashboard")
     dashboard.add_argument("--user-id", help="Filter dashboard to one user")
     dashboard.add_argument("--refresh-seconds", type=int, default=2)
-    dashboard.set_defaults(func=cmd_dashboard)
+    dashboard.set_defaults(func=cmd_monitor)
 
     doctor = subparsers.add_parser("doctor", help="Run health checks")
     doctor.set_defaults(func=cmd_doctor)
@@ -210,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
         ValueError,
         FileNotFoundError,
         json.JSONDecodeError,
+        PermissionError,
+        subprocess.CalledProcessError,
     ) as exc:
         print_error(str(exc))
         return 1
@@ -218,7 +254,11 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-def cmd_setup_init(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
+    if args.status:
+        return _print_setup_status(service)
+
+    provider = str(args.provider).strip().lower() or "zeroclaw"
     api_key = str(args.api_key or "").strip()
     subscription = str(args.subscription).strip()
     workspace = str(args.workspace).strip()
@@ -226,50 +266,62 @@ def cmd_setup_init(args: argparse.Namespace, service: ZeroClawService) -> int:
 
     if args.interactive:
         print_info("Interactive setup mode")
-        api_key = api_key or _prompt_required("ZeroClaw API key")
+        provider = _prompt_with_default("Provider (zeroclaw/openclaw)", provider).lower()
+        if provider not in {"zeroclaw", "openclaw"}:
+            raise ValueError("provider must be one of: zeroclaw, openclaw")
+        if provider == "zeroclaw":
+            api_key = api_key or _prompt_required("ZeroClaw API key")
         subscription = _prompt_with_default("Subscription", subscription)
         workspace = _prompt_with_default("Workspace", workspace)
         api_url = _prompt_with_default("API URL", api_url)
 
-    if not api_key:
-        raise ValueError("API key is required. Use --api-key or --interactive.")
+    if provider == "zeroclaw" and not api_key:
+        raise ValueError(
+            "API key is required for zeroclaw. Use --api-key, choose openclaw, or --interactive."
+        )
 
     config = service.setup(
+        provider=provider,
         api_key=api_key,
         subscription=subscription or "starter",
         workspace=workspace or "default",
         api_url=api_url or str(DEFAULT_CONFIG["api_url"]),
+        install_runtime=bool(args.install_runtime),
     )
     status = service.setup_status()
 
-    print_success("ZeroClaw setup initialized")
+    print_success("Clawie setup initialized")
     print_panel(
         "Setup",
         [
+            f"provider: {config.get('provider', '')}",
             f"workspace: {config.get('workspace', '')}",
             f"subscription: {config.get('subscription', '')}",
             f"api_url: {config.get('api_url', '')}",
+            f"runtime_installed: {bool(config.get('runtime_installed', False))}",
             f"api_key: {status.get('api_key', '')}",
         ],
     )
     return 0
 
 
-def cmd_setup_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def _print_setup_status(service: ZeroClawService) -> int:
     status = service.setup_status()
     print_panel(
         "Setup Status",
         [
             f"configured: {status.get('configured', False)}",
+            f"provider: {status.get('provider', '')}",
             f"workspace: {status.get('workspace', '')}",
             f"subscription: {status.get('subscription', '')}",
             f"api_url: {status.get('api_url', '')}",
             f"api_key: {status.get('api_key', '')}",
+            f"runtime_installed: {status.get('runtime_installed', False)}",
             f"updated_at: {status.get('updated_at', '')}",
         ],
     )
     if not status.get("configured"):
-        print_warning("Setup is incomplete. Run `clawie setup init`.")
+        print_warning("Setup is incomplete. Run `clawie setup`.")
         return 1
     return 0
 
@@ -403,7 +455,28 @@ def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_dashboard(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.spawn_linux_user(
+        user_id=args.user_id,
+        linux_user=args.linux_user,
+        copy_configs=not bool(args.skip_config_copy),
+        source_home=args.source_home,
+        template=args.template,
+        agent_version=args.agent_version,
+    )
+    print_success(
+        f"Spawned linux user {result['linux_user']} and provisioned {result['user']['user_id']}"
+    )
+    copied = result.get("copied_paths", [])
+    if copied:
+        print_info("Copied config paths:")
+        for path in copied:
+            print(f"- {path}")
+    _print_user(result["user"])
+    return 0
+
+
+def cmd_monitor(args: argparse.Namespace, service: ZeroClawService) -> int:
     refresh = max(1, int(args.refresh_seconds))
     run_dashboard(service, user_id=args.user_id, refresh_seconds=refresh)
     return 0

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,16 +45,24 @@ class ZeroClawService:
 
     def setup(
         self,
+        provider: str,
         api_key: str,
         subscription: str,
         workspace: str,
         api_url: str,
+        install_runtime: bool = False,
     ) -> dict[str, Any]:
+        provider = provider.strip().lower() or "zeroclaw"
+        if provider not in {"zeroclaw", "openclaw"}:
+            raise ValueError("provider must be one of: zeroclaw, openclaw")
         config = self.store.read_config()
+        config["provider"] = provider
         config["api_key"] = api_key.strip()
         config["subscription"] = subscription.strip()
         config["workspace"] = workspace.strip()
         config["api_url"] = api_url.strip()
+        if install_runtime:
+            config["runtime_installed"] = True
         created = config.get("created_at") or now_iso()
         config["created_at"] = created
         config["updated_at"] = now_iso()
@@ -61,10 +72,12 @@ class ZeroClawService:
         self._event(
             state,
             "setup.initialized",
-            "ZeroClaw configuration initialized",
+            "Clawie configuration initialized",
             {
+                "provider": config["provider"],
                 "workspace": config["workspace"],
                 "subscription": config["subscription"],
+                "runtime_installed": bool(config.get("runtime_installed", False)),
             },
         )
         self.store.write_state(state)
@@ -73,12 +86,17 @@ class ZeroClawService:
     def setup_status(self) -> dict[str, Any]:
         config = self.store.read_config()
         configured = bool(config.get("api_key"))
+        provider = str(config.get("provider", "zeroclaw"))
+        if provider == "openclaw":
+            configured = True
         return {
             "configured": configured,
+            "provider": provider,
             "api_url": config.get("api_url", ""),
             "workspace": config.get("workspace", ""),
             "subscription": config.get("subscription", ""),
             "api_key": redact(config.get("api_key", "")),
+            "runtime_installed": bool(config.get("runtime_installed", False)),
             "updated_at": config.get("updated_at", ""),
         }
 
@@ -138,13 +156,16 @@ class ZeroClawService:
                 channel["migrated_from"] = clone_from
 
         display = display_name.strip() if display_name else user_id
+        provider = str(self.store.read_config().get("provider", "zeroclaw"))
+        default_runtime = "openclaw-agent" if provider == "openclaw" else "zeroclaw-agent"
         agent = {
             "status": "ready",
             "version": agent_version,
             "last_sync": now_iso(),
-            "runtime": source_agent_defaults.get("runtime", "zeroclaw-agent"),
+            "runtime": source_agent_defaults.get("runtime", default_runtime),
             "autostart": bool(source_agent_defaults.get("autostart", True)),
             "heartbeat_seconds": int(source_agent_defaults.get("heartbeat_seconds", 30)),
+            "pid": int(source_agent_defaults.get("pid", 0)),
         }
 
         user = {
@@ -312,13 +333,18 @@ class ZeroClawService:
         config = self.store.read_config()
         state = self.store.read_state()
 
-        if config.get("api_key"):
+        provider = str(config.get("provider", "zeroclaw"))
+        if provider == "openclaw":
+            checks.append({"status": "pass", "message": "Provider is openclaw (API key optional)"})
+        elif config.get("api_key"):
             checks.append({"status": "pass", "message": "API key is configured"})
         else:
-            checks.append({
-                "status": "fail",
-                "message": "API key is missing. Run setup init.",
-            })
+            checks.append(
+                {
+                    "status": "fail",
+                    "message": "API key is missing. Run setup.",
+                }
+            )
 
         if config.get("workspace"):
             checks.append({"status": "pass", "message": "Workspace is configured"})
@@ -332,6 +358,12 @@ class ZeroClawService:
             checks.append({"status": "pass", "message": "At least one template exists"})
         else:
             checks.append({"status": "fail", "message": "No templates available"})
+        checks.append(
+            {
+                "status": "pass",
+                "message": f"Local database: {self.store.db_path}",
+            }
+        )
 
         users = state.get("users", {})
         if users:
@@ -360,43 +392,170 @@ class ZeroClawService:
         return list(reversed(events[-limit:]))
 
     def dashboard_snapshot(self, user_id: str | None = None) -> dict[str, Any]:
+        return self.performance_snapshot(user_id=user_id, refresh=True)
+
+    def performance_snapshot(
+        self,
+        user_id: str | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        if refresh:
+            self.collect_metrics(user_id=user_id)
         state = self.store.read_state()
         users = list(state["users"].values())
         if user_id:
             users = [row for row in users if row.get("user_id") == user_id]
+        latest_metrics = self.store.latest_metrics(limit_per_user=1)
 
         rows: list[dict[str, Any]] = []
         channel_total = 0
         migrated_total = 0
+        cpu_total = 0.0
+        mem_total = 0.0
         for user in sorted(users, key=lambda row: row["user_id"]):
             channels = user.get("channels", [])
             migrated_count = sum(1 for row in channels if row.get("migrated_from"))
             channel_total += len(channels)
             migrated_total += migrated_count
+            metric = (latest_metrics.get(user.get("user_id", ""), [{}]) or [{}])[0]
+            cpu = float(metric.get("cpu_percent", 0.0))
+            mem = float(metric.get("mem_percent", 0.0))
+            rss = int(metric.get("rss_kb", 0))
+            sampled_status = str(metric.get("status", user.get("agent", {}).get("status", "unknown")))
+            cpu_total += cpu
+            mem_total += mem
             rows.append(
                 {
                     "user_id": user.get("user_id", ""),
                     "display_name": user.get("display_name", ""),
-                    "status": user.get("agent", {}).get("status", "unknown"),
+                    "status": sampled_status,
                     "version": user.get("agent", {}).get("version", ""),
                     "strategy": user.get("channel_strategy", ""),
                     "channels": len(channels),
                     "migrated": migrated_count,
                     "last_sync": user.get("agent", {}).get("last_sync", ""),
+                    "pid": int(user.get("agent", {}).get("pid") or 0),
+                    "cpu_percent": cpu,
+                    "mem_percent": mem,
+                    "rss_kb": rss,
                 }
             )
 
+        config = self.store.read_config()
         return {
             "generated_at": now_iso(),
-            "workspace": self.store.read_config().get("workspace", ""),
+            "workspace": config.get("workspace", ""),
+            "provider": config.get("provider", "zeroclaw"),
             "totals": {
                 "users": len(rows),
                 "channels": channel_total,
                 "migrated_channels": migrated_total,
+                "cpu_percent": round(cpu_total, 2),
+                "mem_percent": round(mem_total, 2),
             },
             "rows": rows,
             "events": self.list_events(limit=8),
         }
+
+    def collect_metrics(self, user_id: str | None = None) -> dict[str, Any]:
+        state = self.store.read_state()
+        users = state.get("users", {})
+        sampled = 0
+        for uid, user in users.items():
+            if user_id and uid != user_id:
+                continue
+            agent = user.setdefault("agent", {})
+            pid = int(agent.get("pid") or 0)
+            status = "offline"
+            cpu_percent = 0.0
+            mem_percent = 0.0
+            rss_kb = 0
+            if pid > 0:
+                probe = self._probe_process(pid)
+                if probe is not None:
+                    cpu_percent = float(probe["cpu_percent"])
+                    mem_percent = float(probe["mem_percent"])
+                    rss_kb = int(probe["rss_kb"])
+                    status = "running"
+                else:
+                    agent["pid"] = 0
+
+            agent["status"] = status
+            agent["last_sync"] = now_iso()
+            self.store.write_metric(
+                timestamp=now_iso(),
+                user_id=uid,
+                cpu_percent=cpu_percent,
+                mem_percent=mem_percent,
+                rss_kb=rss_kb,
+                status=status,
+            )
+            sampled += 1
+        self.store.write_state(state)
+        return {"sampled": sampled}
+
+    def spawn_linux_user(
+        self,
+        user_id: str,
+        linux_user: str | None = None,
+        copy_configs: bool = True,
+        source_home: str | Path | None = None,
+        template: str = "baseline",
+        agent_version: str = "1.0.0",
+    ) -> dict[str, Any]:
+        self._require_setup()
+        user_id = user_id.strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+
+        state = self.store.read_state()
+        if user_id in state.get("users", {}):
+            raise UserExistsError(f"user already exists: {user_id}")
+        if template not in state.get("templates", {}):
+            raise ValueError(f"template not found: {template}")
+
+        target_user = (linux_user or user_id).strip()
+        self._validate_linux_username(target_user)
+        if os.geteuid() != 0:
+            raise SetupError(
+                "spawn requires root privileges. Re-run with sudo/root to create Linux users."
+            )
+
+        target_home = Path("/home") / target_user
+        if self._linux_user_exists(target_user):
+            raise UserExistsError(f"linux user already exists: {target_user}")
+
+        subprocess.run(["useradd", "-m", "-s", "/bin/bash", target_user], check=True)
+
+        if source_home:
+            src_home = Path(source_home).expanduser()
+        else:
+            sudo_user = os.environ.get("SUDO_USER", "").strip()
+            if sudo_user:
+                src_home = Path("/home") / sudo_user
+            else:
+                src_home = Path.home()
+        copied = self._copy_user_configs(src_home, target_home, target_user, enabled=copy_configs)
+        user = self.create_user(
+            user_id=user_id,
+            display_name=user_id,
+            template=template,
+            clone_from=None,
+            channel_strategy="new",
+            channels=None,
+            agent_version=agent_version,
+        )
+        user["agent"]["linux_user"] = target_user
+        state = self.store.read_state()
+        self._event(
+            state,
+            "users.spawned",
+            f"Spawned linux user {target_user} for {user_id}",
+            {"user_id": user_id, "linux_user": target_user, "copied": copied},
+        )
+        state["users"][user_id] = user
+        self.store.write_state(state)
+        return {"user": user, "linux_user": target_user, "copied_paths": copied}
 
     def batch_create_users(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         results = {"created": [], "errors": []}
@@ -474,8 +633,9 @@ class ZeroClawService:
 
     def _require_setup(self) -> None:
         config = self.store.read_config()
-        if not config.get("api_key"):
-            raise SetupError("setup is incomplete. Run 'clawie setup init'.")
+        provider = str(config.get("provider", "zeroclaw"))
+        if provider == "zeroclaw" and not config.get("api_key"):
+            raise SetupError("setup is incomplete. Run 'clawie setup'.")
 
     def _mint_channels(
         self,
@@ -518,3 +678,75 @@ class ZeroClawService:
         )
         if len(events) > self.EVENT_LIMIT:
             state["events"] = events[-self.EVENT_LIMIT :]
+
+    def _probe_process(self, pid: int) -> dict[str, Any] | None:
+        if pid <= 0:
+            return None
+        cmd = ["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss="]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        parts = result.stdout.strip().split()
+        if len(parts) < 3:
+            return None
+        try:
+            return {
+                "cpu_percent": float(parts[0]),
+                "mem_percent": float(parts[1]),
+                "rss_kb": int(parts[2]),
+            }
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _validate_linux_username(username: str) -> None:
+        if not username:
+            raise ValueError("linux username is required")
+        if len(username) > 32:
+            raise ValueError("linux username must be <= 32 chars")
+        allowed = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+        if username[0] == "-" or any(ch not in allowed for ch in username):
+            raise ValueError("linux username can only contain a-z, 0-9, _ and -")
+
+    @staticmethod
+    def _linux_user_exists(username: str) -> bool:
+        result = subprocess.run(
+            ["id", "-u", username],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def _copy_user_configs(
+        self,
+        source_home: Path,
+        target_home: Path,
+        username: str,
+        enabled: bool,
+    ) -> list[str]:
+        if not enabled:
+            return []
+        candidates = [
+            ".bashrc",
+            ".profile",
+            ".gitconfig",
+            ".config/clawie",
+            ".clawie",
+        ]
+        copied: list[str] = []
+        for rel in candidates:
+            src = source_home / rel
+            dst = target_home / rel
+            if not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.is_dir():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            subprocess.run(["chown", "-R", f"{username}:{username}", str(dst)], check=True)
+            copied.append(str(dst))
+        return copied

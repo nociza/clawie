@@ -639,6 +639,7 @@ class ZeroClawService:
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
         rows: list[dict[str, Any]] = []
+        assigned_keys: set[tuple[str, str]] = set()
         for aid, payload in sorted(agents.items()):
             self._hydrate_agent_controls(payload)
             provider = str(payload.get("agent", {}).get("provider", "")).strip().lower()
@@ -649,6 +650,7 @@ class ZeroClawService:
                 name = str(channel.get("name", "")).strip()
                 if not kind or not name:
                     continue
+                assigned_keys.add((kind, name))
                 rows.append(
                     {
                         "source": "agent",
@@ -660,7 +662,26 @@ class ZeroClawService:
                     }
                 )
 
+        for channel in self._read_channel_pool():
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or not name or (kind, name) in assigned_keys:
+                continue
+            rows.append(
+                {
+                    "source": "pool",
+                    "owner_agent_id": "@pool",
+                    "provider": str(channel.get("provider", "")).strip().lower(),
+                    "kind": kind,
+                    "name": name,
+                    "enabled": False,
+                }
+            )
+
         for item in self._local_channel_inventory():
+            key = (str(item.get("kind", "")).strip().lower(), str(item.get("name", "")).strip())
+            if key in assigned_keys:
+                continue
             rows.append(item)
 
         kinds = {str(row.get("kind", "")) for row in rows if str(row.get("kind", "")).strip()}
@@ -672,6 +693,7 @@ class ZeroClawService:
                 "kinds": len(kinds),
                 "assigned": sum(1 for row in rows if str(row.get("source", "")) == "agent"),
                 "local": sum(1 for row in rows if str(row.get("source", "")) == "local"),
+                "pool": sum(1 for row in rows if str(row.get("source", "")) == "pool"),
             },
         }
 
@@ -703,6 +725,7 @@ class ZeroClawService:
             target_channels = []
             target["channels"] = target_channels
 
+        self._remove_pool_channel(channel_kind, channel_name)
         if self._find_channel(target_channels, channel_kind, channel_name) is None:
             target_channels.append(
                 {
@@ -745,6 +768,70 @@ class ZeroClawService:
             "kind": channel_kind,
             "name": channel_name,
             "moved": moved,
+        }
+
+    def unassign_channel_from_agent(
+        self,
+        agent_id: str,
+        kind: str,
+        name: str,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        src = str(agent_id).strip()
+        channel_kind = str(kind).strip().lower()
+        channel_name = str(name).strip()
+        if not src:
+            raise ValueError("agent_id is required")
+        if src.startswith("@local:"):
+            raise ValueError("cannot unassign local-user channel")
+        if not channel_kind or not channel_name:
+            raise ValueError("kind and name are required")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        source = agents.get(src)
+        if not source:
+            raise AgentNotFoundError(f"agent not found: {src}")
+        self._hydrate_agent_controls(source)
+        channels = source.setdefault("channels", [])
+        if not isinstance(channels, list):
+            channels = []
+            source["channels"] = channels
+
+        found_idx = self._find_channel(channels, channel_kind, channel_name)
+        if found_idx is None:
+            raise ValueError(f"channel not found on {src}: {channel_kind}:{channel_name}")
+        removed = channels.pop(found_idx)
+        source.setdefault("agent", {})["last_sync"] = now_iso()
+
+        pool = self._read_channel_pool()
+        if self._find_channel(pool, channel_kind, channel_name) is None:
+            pool.append(
+                {
+                    "kind": channel_kind,
+                    "name": channel_name,
+                    "provider": str(source.get("agent", {}).get("provider", "")).strip().lower(),
+                    "external_id": str(removed.get("external_id", "")),
+                }
+            )
+            self._write_channel_pool(pool)
+
+        self._event(
+            state,
+            "channels.unassigned",
+            f"Unassigned channel {channel_kind}:{channel_name} from {src}",
+            {
+                "source_agent_id": src,
+                "kind": channel_kind,
+                "name": channel_name,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "source_agent_id": src,
+            "kind": channel_kind,
+            "name": channel_name,
+            "status": "unassigned",
         }
 
     def connect_agent_channel(
@@ -898,6 +985,17 @@ class ZeroClawService:
                     root = Path(pwd.getpwnam(sudo_user).pw_dir)
                 except KeyError:
                     root = Path.home()
+            elif os.geteuid() == 0:
+                discovered: list[dict[str, Any]] = []
+                home_root = Path("/home")
+                if home_root.exists():
+                    for entry in sorted(home_root.iterdir()):
+                        if not entry.is_dir():
+                            continue
+                        discovered.extend(detect_installed_providers(str(entry)))
+                if discovered:
+                    return discovered
+                root = Path.home()
             else:
                 root = Path.home()
         return detect_installed_providers(str(root))
@@ -921,11 +1019,56 @@ class ZeroClawService:
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)
         local_info = local_state.setdefault(name, {})
-        linux_user = self._local_target_user()
-        cmd = self._service_command(name, command, linux_user=linux_user)
-        env = self._service_env(linux_user)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
-        output = (result.stdout or result.stderr or "").strip()
+        linux_user = self._local_linux_user_hint(name, self._local_target_user())
+        if command == "status":
+            unit_status = self._systemd_user_service_status(name, linux_user)
+            if unit_status != "unknown":
+                local_info["service_status"] = unit_status
+                local_info["service_mode"] = "systemd"
+                config["local_service_state"] = local_state
+                self.store.write_config(config)
+                return {
+                    "provider": name,
+                    "action": command,
+                    "service_status": unit_status,
+                    "service_mode": "systemd",
+                    "output": f"systemctl user unit state: {unit_status}",
+                }
+        else:
+            managed = self._systemd_user_service_manage(name, command, linux_user)
+            if managed.get("ok", False):
+                status = "running" if command in {"start", "restart"} else "stopped"
+                local_info["service_status"] = status
+                local_info["service_mode"] = "systemd"
+                config["local_service_state"] = local_state
+                self.store.write_config(config)
+                return {
+                    "provider": name,
+                    "action": command,
+                    "service_status": status,
+                    "service_mode": "systemd",
+                    "output": str(managed.get("output", "")),
+                }
+        try:
+            probe = self._run_local_provider_command(name, command, linux_user)
+            cmd = probe["command"]
+            result = probe["result"]
+            output = probe["output"]
+        except Exception as exc:
+            if command != "status":
+                raise
+            status = self._best_effort_local_status(local_info, linux_user)
+            local_info["service_status"] = status
+            local_info["service_mode"] = "fallback"
+            config["local_service_state"] = local_state
+            self.store.write_config(config)
+            return {
+                "provider": name,
+                "action": command,
+                "service_status": status,
+                "service_mode": "fallback",
+                "output": str(exc),
+            }
 
         if result.returncode != 0 and "failed to connect to bus" in output.lower():
             fallback = self._fallback_service_action(
@@ -947,6 +1090,20 @@ class ZeroClawService:
                 "output": str(fallback.get("output", "")),
             }
 
+        if result.returncode != 0 and command == "status":
+            status = self._best_effort_local_status(local_info, linux_user)
+            local_info["service_status"] = status
+            local_info["service_mode"] = "fallback"
+            config["local_service_state"] = local_state
+            self.store.write_config(config)
+            return {
+                "provider": name,
+                "action": command,
+                "service_status": status,
+                "service_mode": "fallback",
+                "output": output,
+            }
+
         if result.returncode != 0:
             raise SetupError(
                 f"{name} service {command} failed: " + (output or f"exit {result.returncode}")
@@ -954,21 +1111,30 @@ class ZeroClawService:
 
         if command == "start":
             status = "running"
+            mode = "systemd"
         elif command == "stop":
             status = "stopped"
+            mode = "systemd"
         elif command == "restart":
             status = "running"
+            mode = "systemd"
         else:
-            status = self._infer_service_status(output)
+            inferred = self._infer_service_status(output)
+            if inferred == "unknown":
+                status = self._best_effort_local_status(local_info, linux_user)
+                mode = "fallback"
+            else:
+                status = inferred
+                mode = "systemd"
         local_info["service_status"] = status
-        local_info["service_mode"] = "systemd"
+        local_info["service_mode"] = mode
         config["local_service_state"] = local_state
         self.store.write_config(config)
         return {
             "provider": name,
             "action": command,
             "service_status": status,
-            "service_mode": "systemd",
+            "service_mode": local_info["service_mode"],
             "output": output,
         }
 
@@ -1770,17 +1936,76 @@ class ZeroClawService:
             normalized[str(key).strip().lower()] = dict(value)
         return normalized
 
+    @staticmethod
+    def _normalized_channel_pool(config: dict[str, Any]) -> list[dict[str, str]]:
+        raw = config.get("channel_pool", [])
+        if not isinstance(raw, list):
+            return []
+        rows: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")).strip().lower()
+            name = str(item.get("name", "")).strip()
+            if not kind or not name:
+                continue
+            key = (kind, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "provider": str(item.get("provider", "")).strip().lower(),
+                    "external_id": str(item.get("external_id", "")).strip(),
+                }
+            )
+        return rows
+
+    def _read_channel_pool(self) -> list[dict[str, str]]:
+        config = self.store.read_config()
+        return self._normalized_channel_pool(config)
+
+    def _write_channel_pool(self, channels: list[dict[str, str]]) -> None:
+        config = self.store.read_config()
+        config["channel_pool"] = self._normalized_channel_pool({"channel_pool": channels})
+        config["updated_at"] = now_iso()
+        self.store.write_config(config)
+
+    def _remove_pool_channel(self, kind: str, name: str) -> None:
+        current = self._read_channel_pool()
+        remaining = [
+            row
+            for row in current
+            if not (
+                str(row.get("kind", "")).strip().lower() == kind
+                and str(row.get("name", "")).strip() == name
+            )
+        ]
+        if len(remaining) != len(current):
+            self._write_channel_pool(remaining)
+
     def _local_dashboard_rows(self, refresh: bool = False) -> list[dict[str, Any]]:
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)
         installed = self.list_installed_claws()
+        user_hints: dict[str, str] = {}
+        for claw in installed:
+            provider = str(claw.get("provider", "")).strip().lower()
+            if not provider:
+                continue
+            hint = self._linux_user_from_provider_root(Path(str(claw.get("root", "")).strip()))
+            if hint:
+                user_hints[provider] = hint
         providers = [
             str(row.get("provider", "")).strip().lower()
             for row in installed
             if str(row.get("provider", "")).strip()
         ]
         if refresh and providers:
-            local_state = self._refresh_local_service_statuses(providers, local_state)
+            local_state = self._refresh_local_service_statuses(providers, local_state, user_hints=user_hints)
             config = self.store.read_config()
         rows: list[dict[str, Any]] = []
         # Use the same home-resolution logic as list_installed_claws() so
@@ -1793,7 +2018,7 @@ class ZeroClawService:
             rows.append(
                 {
                     "agent_id": f"@local:{provider}",
-                    "display_name": f"{provider} (current-user)",
+                    "display_name": "local-user",
                     "status": str(local_info.get("service_status", "unknown")),
                     "version": "local",
                     "provider": provider,
@@ -1844,17 +2069,39 @@ class ZeroClawService:
         self,
         providers: list[str],
         local_state: dict[str, dict[str, Any]],
+        user_hints: dict[str, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         config = self.store.read_config()
-        linux_user = self._local_target_user()
+        default_user = self._local_target_user()
         dirty = False
         for provider in providers:
             info = local_state.setdefault(provider, {})
+            hint_user = str((user_hints or {}).get(provider, "")).strip()
+            cached_user = str(info.get("linux_user", "")).strip()
+            linux_user = self._preferred_local_linux_user(
+                default_user=default_user,
+                hint_user=hint_user,
+                cached_user=cached_user,
+            )
+            if linux_user and linux_user != str(info.get("linux_user", "")).strip():
+                info["linux_user"] = linux_user
+                dirty = True
+            unit_status = self._systemd_user_service_status(provider, linux_user)
+            if unit_status != "unknown":
+                status = unit_status
+                mode = "systemd"
+                if status != str(info.get("service_status", "unknown")):
+                    info["service_status"] = status
+                    dirty = True
+                if mode != str(info.get("service_mode", "unknown")):
+                    info["service_mode"] = mode
+                    dirty = True
+                continue
             try:
-                cmd = self._service_command(provider, "status", linux_user=linux_user)
-                env = self._service_env(linux_user)
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
-                output = (result.stdout or result.stderr or "").strip()
+                probe = self._run_local_provider_command(provider, "status", linux_user)
+                cmd = probe["command"]
+                result = probe["result"]
+                output = probe["output"]
                 lowered = output.lower()
                 if result.returncode != 0 and "failed to connect to bus" in lowered:
                     fallback = self._fallback_service_action(
@@ -1868,15 +2115,18 @@ class ZeroClawService:
                     mode = "fallback"
                 else:
                     inferred = self._infer_service_status(output)
-                    if inferred == "unknown" and result.returncode != 0:
-                        status = self._normalize_status_text(str(info.get("service_status", "unknown")))
-                        mode = str(info.get("service_mode", "unknown"))
+                    if inferred == "unknown":
+                        status = self._best_effort_local_status(info, linux_user)
+                        mode = "fallback"
+                    elif result.returncode != 0:
+                        status = self._best_effort_local_status(info, linux_user)
+                        mode = "fallback"
                     else:
                         status = inferred
                         mode = "systemd"
             except Exception:
-                status = self._normalize_status_text(str(info.get("service_status", "unknown")))
-                mode = str(info.get("service_mode", "unknown"))
+                status = self._best_effort_local_status(info, linux_user)
+                mode = "fallback"
             if status != str(info.get("service_status", "unknown")):
                 info["service_status"] = status
                 dirty = True
@@ -1888,6 +2138,225 @@ class ZeroClawService:
             config["local_service_state"] = local_state
             self.store.write_config(config)
         return local_state
+
+    def _systemd_user_service_status(self, provider: str, linux_user: str) -> str:
+        service = f"{provider}.service"
+        candidates: list[str] = []
+        for token in (
+            str(linux_user).strip(),
+            str(self._local_target_user()).strip(),
+            str(self._local_linux_user_hint(provider, "")).strip(),
+        ):
+            if token and token not in candidates:
+                candidates.append(token)
+        home_root = Path("/home")
+        if home_root.exists():
+            for entry in sorted(home_root.iterdir(), key=lambda row: str(getattr(row, "name", ""))):
+                if not entry.is_dir():
+                    continue
+                token = entry.name.strip()
+                if token and token not in candidates:
+                    candidates.append(token)
+
+        saw_stopped = False
+        for candidate in candidates:
+            if candidate == "root":
+                continue
+            cmd = ["systemctl", "--machine", f"{candidate}@", "--user", "is-active", service]
+            env = self._systemctl_env()
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+            except Exception:
+                continue
+            parsed = self._parse_systemctl_status(result.stdout, result.stderr)
+            if parsed == "running":
+                return "running"
+            if parsed == "stopped":
+                saw_stopped = True
+
+        fallback_env_user = candidates[0] if candidates else str(linux_user).strip()
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", service],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(fallback_env_user),
+            )
+        except Exception:
+            return "stopped" if saw_stopped else "unknown"
+        parsed = self._parse_systemctl_status(result.stdout, result.stderr)
+        if parsed == "running":
+            return parsed
+        if parsed == "stopped":
+            return "stopped"
+        return "stopped" if saw_stopped else "unknown"
+
+    def _systemd_user_service_manage(self, provider: str, action: str, linux_user: str) -> dict[str, Any]:
+        service = f"{provider}.service"
+        candidates: list[str] = []
+        for token in (
+            str(linux_user).strip(),
+            str(self._local_target_user()).strip(),
+            str(self._local_linux_user_hint(provider, "")).strip(),
+        ):
+            if token and token not in candidates:
+                candidates.append(token)
+        home_root = Path("/home")
+        if home_root.exists():
+            for entry in sorted(home_root.iterdir(), key=lambda row: str(getattr(row, "name", ""))):
+                if not entry.is_dir():
+                    continue
+                token = entry.name.strip()
+                if token and token not in candidates:
+                    candidates.append(token)
+
+        last_output = ""
+        for candidate in candidates:
+            if candidate == "root":
+                continue
+            cmd = ["systemctl", "--machine", f"{candidate}@", "--user", action, service]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._systemctl_env(),
+                )
+            except Exception as exc:
+                last_output = str(exc)
+                continue
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                return {"ok": True, "output": output, "command": cmd}
+            last_output = output or f"exit {result.returncode}"
+
+        fallback_user = candidates[0] if candidates else str(linux_user).strip()
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", action, service],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(fallback_user),
+            )
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                return {"ok": True, "output": output, "command": ["systemctl", "--user", action, service]}
+            last_output = output or f"exit {result.returncode}"
+        except Exception as exc:
+            last_output = str(exc)
+        return {"ok": False, "output": last_output}
+
+    @staticmethod
+    def _systemctl_env() -> dict[str, str]:
+        env = dict(os.environ)
+        current_path = env.get("PATH", "")
+        required_paths = ["/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        merged = [segment for segment in current_path.split(":") if segment]
+        for segment in required_paths:
+            if segment not in merged:
+                merged.append(segment)
+        env["PATH"] = ":".join(merged)
+        return env
+
+    @staticmethod
+    def _parse_systemctl_status(stdout: str, stderr: str) -> str:
+        text = (stdout or "").strip().lower()
+        err = (stderr or "").strip().lower()
+        token = text or err
+        if not token:
+            return "unknown"
+        if "connect to bus" in token:
+            return "unknown"
+        if token in {"active", "activating", "reloading"} or token.startswith("active"):
+            return "running"
+        if token in {"inactive", "failed", "deactivating", "dead"} or token.startswith("inactive"):
+            return "stopped"
+        return "unknown"
+
+    def _local_linux_user_hint(self, provider: str, fallback: str) -> str:
+        fallback_user = str(fallback).strip()
+        if fallback_user and fallback_user != "root":
+            return fallback_user
+        name = str(provider).strip().lower()
+        for claw in self.list_installed_claws():
+            if str(claw.get("provider", "")).strip().lower() != name:
+                continue
+            hint = self._linux_user_from_provider_root(Path(str(claw.get("root", "")).strip()))
+            if hint:
+                return hint
+        return fallback_user
+
+    @staticmethod
+    def _preferred_local_linux_user(
+        default_user: str,
+        hint_user: str,
+        cached_user: str,
+    ) -> str:
+        default_token = str(default_user).strip()
+        hint_token = str(hint_user).strip()
+        cached_token = str(cached_user).strip()
+        # Always prefer the current invoking user (e.g. SUDO_USER) over stale cache.
+        for candidate in (default_token, hint_token, cached_token):
+            if candidate and candidate != "root":
+                return candidate
+        return default_token or hint_token or cached_token
+
+    @staticmethod
+    def _linux_user_from_provider_root(root: Path) -> str:
+        parts = root.parts
+        if len(parts) >= 3 and parts[1] == "home":
+            return str(parts[2]).strip()
+        if len(parts) >= 2 and parts[1] == "root":
+            return "root"
+        return ""
+
+    def _run_local_provider_command(
+        self,
+        provider: str,
+        action: str,
+        linux_user: str,
+    ) -> dict[str, Any]:
+        attempts: list[tuple[list[str], dict[str, str]]] = []
+        if os.geteuid() == 0 and linux_user and linux_user != "root":
+            attempts.append(
+                (self._service_command(provider, action, linux_user=linux_user), self._service_env(linux_user))
+            )
+        attempts.append((self._service_command(provider, action, linux_user=""), self._service_env(linux_user)))
+
+        last: dict[str, Any] | None = None
+        for idx, (cmd, env) in enumerate(attempts):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+            except Exception:
+                if idx + 1 < len(attempts):
+                    continue
+                raise
+
+            output = (result.stdout or result.stderr or "").strip()
+            last = {"command": cmd, "result": result, "output": output}
+
+            retry_allowed = idx + 1 < len(attempts)
+            unparseable_status = action == "status" and self._infer_service_status(output) == "unknown"
+            failed = result.returncode != 0
+            if retry_allowed and (failed or unparseable_status):
+                continue
+            return last
+
+        if last is not None:
+            return last
+        raise SetupError(f"{provider} service {action} failed before process launch")
+
+    def _best_effort_local_status(self, info: dict[str, Any], linux_user: str) -> str:
+        status = self._normalize_status_text(str(info.get("service_status", "unknown")))
+        if status != "unknown":
+            return status
+        pid = int(info.get("fallback_pid", 0) or 0)
+        if pid > 0:
+            return "running" if self._is_pid_running(pid, linux_user) else "stopped"
+        return "stopped"
 
     @staticmethod
     def _local_target_user() -> str:
@@ -1903,10 +2372,13 @@ class ZeroClawService:
     def _local_agent_view(self, provider: str) -> dict[str, Any]:
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)
+        local_state = self._refresh_local_service_statuses([provider], local_state)
+        config = self.store.read_config()
+        local_state = self._normalized_local_service_state(config)
         info = dict(local_state.get(provider, {}))
         return {
             "agent_id": f"@local:{provider}",
-            "display_name": f"{provider} (current-user)",
+            "display_name": "local-user",
             "source_template": "local-user",
             "clone_from": "",
             "channel_strategy": "local-user",

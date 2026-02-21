@@ -16,6 +16,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auth_mode": "linked",
     "provider_credentials": {},
     "local_service_state": {},
+    "channel_pool": [],
     "spawn_password_hash": "",
     "subscription": "starter",
     "workspace": "default",

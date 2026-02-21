@@ -8,6 +8,7 @@ from pathlib import Path
 from pytest import CaptureFixture, MonkeyPatch
 
 from clawie.cli import main
+from clawie.dashboard import DashboardState, _handle_detail_key
 from clawie.providers import credential_paths_for_providers
 from clawie.service import ZeroClawService
 from clawie.store import StateStore
@@ -768,7 +769,63 @@ def test_dashboard_refresh_local_status_uses_sudo_user_context(
     snapshot = service.performance_snapshot(refresh=True)
     row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
     assert row["status"] == "running"
-    assert any(cmd[:3] == ["sudo", "-u", "alice"] for cmd in calls)
+    assert any(cmd[:4] == ["systemctl", "--machine", "alice@", "--user"] for cmd in calls)
+
+
+def test_local_agent_view_refreshes_service_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        class Result:
+            returncode = 0
+            stdout = "active (running)"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    payload = service.get_dashboard_agent("@local:zeroclaw")
+    agent = payload.get("agent", {})
+    assert payload.get("display_name") == "local-user"
+    assert agent.get("service_status") == "running"
+    assert agent.get("status") == "running"
+
+
+def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None:
+    class FakeService:
+        def get_dashboard_agent(self, _: str) -> dict[str, object]:
+            return {
+                "channels": [],
+                "agent": {
+                    "plugins": {},
+                    "provider": "zeroclaw",
+                    "status": "running",
+                    "version": "local",
+                    "autostart": False,
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "heartbeat_seconds": 30,
+                    "auth_mode": "linked",
+                    "local_user": True,
+                },
+            }
+
+    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=2, setting_idx=2)
+    _handle_detail_key(ord("j"), state, FakeService())
+    _handle_detail_key(ord("j"), state, FakeService())
+    _handle_detail_key(ord("j"), state, FakeService())
+    assert state.setting_idx > 2
 
 
 def test_service_action_requires_root_for_other_linux_user(
@@ -928,6 +985,400 @@ def test_local_claw_service_action_updates_local_state(
     assert str(local_state.get("zeroclaw", {}).get("service_status", "")) == "running"
 
 
+def test_local_claw_service_status_falls_back_to_stopped_on_command_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["/usr/bin/zeroclaw", "service"]:
+            return Result(1, stderr="random status failure")
+        return Result(0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = service.local_claw_service_action("zeroclaw", "status")
+    assert result["service_status"] == "stopped"
+    assert result["service_mode"] == "fallback"
+
+
+def test_local_claw_service_status_empty_success_output_uses_best_effort(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result(0, stdout=""))
+    result = service.local_claw_service_action("zeroclaw", "status")
+    assert result["service_status"] == "stopped"
+    assert result["service_mode"] == "fallback"
+
+
+def test_local_claw_service_stop_prefers_systemd_machine_control(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class AliceInfo:
+        pw_uid = 1001
+        pw_dir = "/home/alice"
+        pw_name = "alice"
+
+    class RootInfo:
+        pw_uid = 0
+        pw_dir = "/root"
+        pw_name = "root"
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("pwd.getpwnam", lambda _: AliceInfo())
+    monkeypatch.setattr("pwd.getpwuid", lambda _uid: RootInfo())
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/home/alice/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        if cmd[:4] == ["systemctl", "--machine", "alice@", "--user"] and "stop" in cmd:
+            return Result(0, stdout="")
+        return Result(1, stderr="unexpected")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = service.local_claw_service_action("zeroclaw", "stop")
+    assert result["service_status"] == "stopped"
+    assert result["service_mode"] == "systemd"
+    assert any(cmd[:4] == ["systemctl", "--machine", "alice@", "--user"] and "stop" in cmd for cmd in calls)
+
+
+def test_dashboard_refresh_local_status_non_bus_error_uses_best_effort(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/home/alice/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["/usr/bin/zeroclaw", "service"]:
+            return Result(1, stderr="unexpected failure")
+        return Result(0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    snapshot = service.performance_snapshot(refresh=True)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
+    assert row["status"] == "stopped"
+
+
+def test_dashboard_refresh_local_status_empty_success_output_uses_best_effort(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/home/alice/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result(0, stdout=""))
+    snapshot = service.performance_snapshot(refresh=True)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
+    assert row["status"] == "stopped"
+
+
+def test_dashboard_refresh_local_status_retries_as_sudo_user_for_parseable_output(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class AliceInfo:
+        pw_uid = 1001
+        pw_dir = "/home/alice"
+        pw_name = "alice"
+
+    class RootInfo:
+        pw_uid = 0
+        pw_dir = "/root"
+        pw_name = "root"
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("pwd.getpwnam", lambda _: AliceInfo())
+    monkeypatch.setattr("pwd.getpwuid", lambda uid: RootInfo() if int(uid) == 0 else AliceInfo())
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/home/alice/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        if cmd[:2] == ["/usr/bin/zeroclaw", "service"]:
+            return Result(0, stdout="")
+        if cmd[:3] == ["sudo", "-u", "alice"]:
+            return Result(0, stdout="Service state: active")
+        return Result(1, stderr="unexpected")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    snapshot = service.performance_snapshot(refresh=True)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
+    assert row["status"] == "running"
+    assert any(cmd[:3] == ["sudo", "-u", "alice"] for cmd in calls)
+
+
+def test_dashboard_refresh_uses_user_hint_from_provider_root_when_sudo_user_missing(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class RootInfo:
+        pw_uid = 0
+        pw_dir = "/root"
+        pw_name = "root"
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("pwd.getpwuid", lambda _uid: RootInfo())
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/home/alice/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        if cmd[:2] == ["/usr/bin/zeroclaw", "service"]:
+            return Result(0, stdout="")
+        if cmd[:3] == ["sudo", "-u", "alice"]:
+            return Result(0, stdout="Service state: active")
+        return Result(1, stderr="unexpected")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    snapshot = service.performance_snapshot(refresh=True)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
+    assert row["status"] == "running"
+    assert any(cmd[:3] == ["sudo", "-u", "alice"] for cmd in calls)
+
+
+def test_dashboard_refresh_prefers_sudo_user_over_root_hint(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    class AliceInfo:
+        pw_uid = 1001
+        pw_dir = "/home/alice"
+        pw_name = "alice"
+
+    class RootInfo:
+        pw_uid = 0
+        pw_dir = "/root"
+        pw_name = "root"
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setenv("SUDO_USER", "alice")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("pwd.getpwnam", lambda _: AliceInfo())
+    monkeypatch.setattr("pwd.getpwuid", lambda _uid: RootInfo())
+    monkeypatch.setattr(
+        "clawie.service.detect_installed_providers",
+        lambda _: [{"provider": "zeroclaw", "root": "/root/.zeroclaw", "markers": []}],
+    )
+    monkeypatch.setattr("clawie.service.shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        if cmd[:4] == ["systemctl", "--machine", "alice@", "--user"]:
+            return Result(0, stdout="active")
+        return Result(1, stderr="failed")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    snapshot = service.performance_snapshot(refresh=True)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
+    assert row["status"] == "running"
+    assert any(cmd[:4] == ["systemctl", "--machine", "alice@", "--user"] for cmd in calls)
+
+
+def test_preferred_local_linux_user_prioritizes_default_over_cached() -> None:
+    selected = ZeroClawService._preferred_local_linux_user(
+        default_user="azicon",
+        hint_user="teleclaw",
+        cached_user="teleclaw",
+    )
+    assert selected == "azicon"
+
+
+def test_parse_systemctl_status_ignores_bus_errors() -> None:
+    assert ZeroClawService._parse_systemctl_status("", "Failed to connect to bus: No medium found") == "unknown"
+    assert ZeroClawService._parse_systemctl_status("active\n", "") == "running"
+    assert ZeroClawService._parse_systemctl_status("inactive\n", "") == "stopped"
+
+
+def test_systemd_status_prefers_any_running_candidate_over_stopped(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(service, "_local_target_user", lambda: "root")
+    monkeypatch.setattr(service, "_local_linux_user_hint", lambda _provider, _fallback: "root")
+
+    class FakeEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def is_dir(self) -> bool:
+            return True
+
+    class FakeHomePath:
+        def __init__(self, raw: str) -> None:
+            self.raw = raw
+
+        def exists(self) -> bool:
+            return self.raw == "/home"
+
+        def iterdir(self) -> list[FakeEntry]:
+            return [FakeEntry("root"), FakeEntry("azicon")]
+
+    monkeypatch.setattr("clawie.service.Path", FakeHomePath)
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:4] == ["systemctl", "--machine", "root@", "--user"]:
+            return Result(3, stdout="inactive")
+        if cmd[:4] == ["systemctl", "--machine", "azicon@", "--user"]:
+            return Result(0, stdout="active")
+        return Result(1, stderr="Failed to connect to bus")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    status = service._systemd_user_service_status("zeroclaw", linux_user="root")
+    assert status == "running"
+
+
 def test_channel_inventory_includes_agent_and_local_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1003,6 +1454,83 @@ def test_assign_channel_moves_between_agents(tmp_path: Path) -> None:
     alice = service.get_agent("alice")
     bob = service.get_agent("bob")
     assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))
+    assert any(c.get("name") == "alice-support" for c in bob.get("channels", []))
+
+
+def test_unassign_channel_moves_to_pool_and_stays_visible(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+
+    service.unassign_channel_from_agent("alice", "chat", "alice-support")
+    alice = service.get_agent("alice")
+    assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))
+
+    inventory = service.channel_inventory()
+    assert any(
+        row.get("source") == "pool"
+        and row.get("owner_agent_id") == "@pool"
+        and row.get("kind") == "chat"
+        and row.get("name") == "alice-support"
+        for row in inventory.get("rows", [])
+    )
+
+
+def test_assign_from_pool_removes_pool_entry(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.create_agent(
+        agent_id="bob",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.unassign_channel_from_agent("alice", "chat", "alice-support")
+    service.assign_channel_to_agent("@pool", "chat", "alice-support", "bob")
+
+    inventory = service.channel_inventory()
+    assert not any(
+        row.get("source") == "pool"
+        and row.get("kind") == "chat"
+        and row.get("name") == "alice-support"
+        for row in inventory.get("rows", [])
+    )
+    bob = service.get_agent("bob")
     assert any(c.get("name") == "alice-support" for c in bob.get("channels", []))
 
 

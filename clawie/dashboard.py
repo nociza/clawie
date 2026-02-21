@@ -14,7 +14,8 @@ class DashboardState:
     overview_mode: str = "agents"
     overview_focus_idx: int = 0
     selected_row: int = 0
-    selected_channel_row: int = 0
+    selected_available_row: int = 0
+    selected_assigned_row: int = 0
     selected_target_row: int = 0
     selected_agent_id: str = ""
     focus_idx: int = 0
@@ -106,50 +107,83 @@ def _handle_channels_overview_key(
     service: Any,
 ) -> None:
     inventory = service.channel_inventory()
-    channels = inventory.get("rows", [])
     agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
-    state.selected_channel_row = min(state.selected_channel_row, max(0, len(channels) - 1))
     state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
+    if not agent_rows:
+        return
+    target_agent_id = str(agent_rows[state.selected_target_row].get("agent_id", ""))
+    rows = list(inventory.get("rows", []))
+    available = [row for row in rows if str(row.get("source", "")) in {"local", "pool"}]
+    assigned = [row for row in rows if str(row.get("owner_agent_id", "")).strip() == target_agent_id]
+    state.selected_available_row = min(state.selected_available_row, max(0, len(available) - 1))
+    state.selected_assigned_row = min(state.selected_assigned_row, max(0, len(assigned) - 1))
 
     if key == 9:  # TAB
-        state.overview_focus_idx = (state.overview_focus_idx + 1) % 2
+        state.overview_focus_idx = (state.overview_focus_idx + 1) % 3
         return
 
     if key in (curses.KEY_DOWN, ord("j")):
-        if state.overview_focus_idx == 0 and channels:
-            state.selected_channel_row = min(len(channels) - 1, state.selected_channel_row + 1)
-        elif state.overview_focus_idx == 1 and agent_rows:
+        if state.overview_focus_idx == 0 and agent_rows:
             state.selected_target_row = min(len(agent_rows) - 1, state.selected_target_row + 1)
+        elif state.overview_focus_idx == 1 and available:
+            state.selected_available_row = min(len(available) - 1, state.selected_available_row + 1)
+        elif state.overview_focus_idx == 2 and assigned:
+            state.selected_assigned_row = min(len(assigned) - 1, state.selected_assigned_row + 1)
         return
     if key in (curses.KEY_UP, ord("k")):
-        if state.overview_focus_idx == 0 and channels:
-            state.selected_channel_row = max(0, state.selected_channel_row - 1)
-        elif state.overview_focus_idx == 1 and agent_rows:
+        if state.overview_focus_idx == 0 and agent_rows:
             state.selected_target_row = max(0, state.selected_target_row - 1)
+        elif state.overview_focus_idx == 1 and available:
+            state.selected_available_row = max(0, state.selected_available_row - 1)
+        elif state.overview_focus_idx == 2 and assigned:
+            state.selected_assigned_row = max(0, state.selected_assigned_row - 1)
         return
 
-    if not channels or not agent_rows:
-        return
-    selected_channel = channels[state.selected_channel_row]
-    target_agent_id = str(agent_rows[state.selected_target_row].get("agent_id", ""))
-    source_agent_id = str(selected_channel.get("owner_agent_id", ""))
-    kind = str(selected_channel.get("kind", ""))
-    name = str(selected_channel.get("name", ""))
+    selected_available = available[state.selected_available_row] if available else {}
+    selected_assigned = assigned[state.selected_assigned_row] if assigned else {}
+    source_agent_id = str(selected_available.get("owner_agent_id", ""))
+    available_kind = str(selected_available.get("kind", ""))
+    available_name = str(selected_available.get("name", ""))
+    assigned_kind = str(selected_assigned.get("kind", ""))
+    assigned_name = str(selected_assigned.get("name", ""))
 
     if key in (ord("a"), ord("A")):
+        if not available_kind or not available_name:
+            return
         try:
-            service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
-            state.notice = f"assigned {kind}:{name} -> {target_agent_id}"
+            service.assign_channel_to_agent(source_agent_id, available_kind, available_name, target_agent_id)
+            state.notice = f"assigned {available_kind}:{available_name} -> {target_agent_id}"
             state.notice_error = False
         except Exception as exc:  # noqa: BLE001
             state.notice = str(exc)
             state.notice_error = True
         return
     if key in (ord("c"), ord("C")):
+        kind = ""
+        name = ""
         try:
-            service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
+            if state.overview_focus_idx == 1:
+                kind, name = available_kind, available_name
+                if not kind or not name:
+                    return
+                service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
+            else:
+                kind, name = assigned_kind, assigned_name
+                if not kind or not name:
+                    return
             service.connect_agent_channel(target_agent_id, kind, name)
             state.notice = f"connected {kind}:{name} for {target_agent_id}"
+            state.notice_error = False
+        except Exception as exc:  # noqa: BLE001
+            state.notice = str(exc)
+            state.notice_error = True
+        return
+    if key in (ord("u"), ord("U")):
+        if not assigned_kind or not assigned_name:
+            return
+        try:
+            service.unassign_channel_from_agent(target_agent_id, assigned_kind, assigned_name)
+            state.notice = f"unassigned {assigned_kind}:{assigned_name}"
             state.notice_error = False
         except Exception as exc:  # noqa: BLE001
             state.notice = str(exc)
@@ -208,7 +242,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
         elif focus == "plugins":
             state.plugin_idx = min(max(0, len(plugins) - 1), state.plugin_idx + 1)
         else:
-            state.setting_idx = min(2, state.setting_idx + 1)
+            state.setting_idx = min(max(0, len(settings) - 1), state.setting_idx + 1)
         return
 
     if key in (curses.KEY_UP, ord("k")):
@@ -294,7 +328,7 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
         if state.overview_mode == "agents":
             footer = "q quit | v channels view | Enter details | j/k move | r refresh"
         else:
-            footer = "q quit | v agents view | Tab pane | j/k move | a assign | c connect | Enter details | r refresh"
+            footer = "q quit | v agents view | Tab pane | j/k move | a assign | u unassign | c connect | Enter details | r refresh"
     else:
         _draw_detail(stdscr, service, state, height, width)
         if state.purge_confirm:
@@ -324,6 +358,7 @@ def _draw_stats(stdscr: Any, snapshot: dict[str, Any], width: int) -> None:
     )
     _add(stdscr, 1, 0, _fit(line, width), _color(0))
     _add(stdscr, 2, 0, "=" * max(0, width - 1), _color(4))
+    _add(stdscr, 3, 0, _fit("Legend: @<provider> = local claw for current Linux user", width), _color(3))
 
 
 def _draw_overview(
@@ -347,16 +382,16 @@ def _draw_overview_agents(stdscr: Any, snapshot: dict[str, Any], state: Dashboar
     table_bottom = height - 4
 
     headers = ["agent", "status", "cpu", "mem", "channels", "provider"]
-    _add(stdscr, 3, 0, _fit(" ".join(h.ljust(12) for h in headers), split), _color(4))
+    _add(stdscr, 4, 0, _fit(" ".join(h.ljust(12) for h in headers), split), _color(4))
 
-    line = 4
+    line = 5
     for idx, row in enumerate(rows):
         if line >= table_bottom:
             break
         channels_text = f"{row.get('channels', 0)}/{row.get('channels_total', 0)}"
         text = " ".join(
             [
-                str(row.get("agent_id", ""))[:12].ljust(12),
+                _display_agent_id(str(row.get("agent_id", "")))[:12].ljust(12),
                 str(row.get("status", ""))[:12].ljust(12),
                 f"{float(row.get('cpu_percent', 0.0)):.1f}".ljust(12),
                 f"{float(row.get('mem_percent', 0.0)):.1f}".ljust(12),
@@ -368,23 +403,23 @@ def _draw_overview_agents(stdscr: Any, snapshot: dict[str, Any], state: Dashboar
         _add(stdscr, line, 0, _fit(text, split), color)
         line += 1
 
-    for y in range(3, height - 1):
+    for y in range(4, height - 1):
         _add(stdscr, y, split, "|", _color(4))
 
     pane_x = split + 2
     if rows:
         selected = rows[state.selected_row]
-        _add(stdscr, 3, pane_x, "Selected Agent", _color(1))
-        _add(stdscr, 4, pane_x, f"id: {selected.get('agent_id', '')}", _color(0))
-        _add(stdscr, 5, pane_x, f"display: {selected.get('display_name', '')}", _color(0))
-        _add(stdscr, 6, pane_x, f"provider: {selected.get('provider', '')}", _color(0))
-        _add(stdscr, 7, pane_x, f"status: {selected.get('status', '')}", _color(0))
-        _add(stdscr, 8, pane_x, f"version: {selected.get('version', '')}", _color(0))
-        _add(stdscr, 9, pane_x, f"strategy: {selected.get('strategy', '')}", _color(0))
+        _add(stdscr, 4, pane_x, "Selected Agent", _color(1))
+        _add(stdscr, 5, pane_x, f"id: {_display_agent_id(str(selected.get('agent_id', '')))}", _color(0))
+        _add(stdscr, 6, pane_x, f"display: {selected.get('display_name', '')}", _color(0))
+        _add(stdscr, 7, pane_x, f"provider: {selected.get('provider', '')}", _color(0))
+        _add(stdscr, 8, pane_x, f"status: {selected.get('status', '')}", _color(0))
+        _add(stdscr, 9, pane_x, f"version: {selected.get('version', '')}", _color(0))
+        _add(stdscr, 10, pane_x, f"strategy: {selected.get('strategy', '')}", _color(0))
 
     events = snapshot.get("events", [])
-    _add(stdscr, 11, pane_x, "Recent Events", _color(1))
-    ev_line = 12
+    _add(stdscr, 12, pane_x, "Recent Events", _color(1))
+    ev_line = 13
     for event in events[: max(0, height - 15)]:
         text = f"{event.get('timestamp', '')} | {event.get('type', '')}"
         _add(stdscr, ev_line, pane_x, _fit(text, width - pane_x), _color(0))
@@ -400,9 +435,10 @@ def _draw_overview_channels(
     width: int,
 ) -> None:
     _ = snapshot
-    split = max(50, int(width * 0.62))
-    split = min(split, width - 20)
-    left_bottom = height - 4
+    col_w = max(24, int((width - 4) / 3))
+    col2_x = col_w + 2
+    col3_x = (col_w * 2) + 3
+    rows_max = max(0, height - 10)
 
     channels: list[dict[str, Any]] = []
     try:
@@ -411,37 +447,53 @@ def _draw_overview_channels(
     except Exception:
         channels = []
     agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
-    _add(stdscr, 3, 0, "Channels View", _color(1))
-    _add(stdscr, 4, 0, "Press 'a' to assign, 'c' to connect selected channel to selected agent.", _color(0))
+    state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
+    selected_agent_id = str(agent_rows[state.selected_target_row].get("agent_id", "")) if agent_rows else ""
+    available = [row for row in channels if str(row.get("source", "")) in {"local", "pool"}]
+    assigned = [row for row in channels if str(row.get("owner_agent_id", "")).strip() == selected_agent_id]
+    state.selected_available_row = min(state.selected_available_row, max(0, len(available) - 1))
+    state.selected_assigned_row = min(state.selected_assigned_row, max(0, len(assigned) - 1))
 
-    # Render empty shell if runtime did not fill channel data.
-    _add(stdscr, 6, 0, f"Channels [{'ACTIVE' if state.overview_focus_idx == 0 else '      '}]", _color(4))
-    _add(stdscr, 6, split + 2, f"Target Agents [{'ACTIVE' if state.overview_focus_idx == 1 else '      '}]", _color(4))
+    _add(stdscr, 4, 0, "Channels View", _color(1))
+    _add(stdscr, 5, 0, "Select an agent, assign from Available, unassign from Assigned, then connect.", _color(0))
 
-    for y in range(5, height - 1):
-        _add(stdscr, y, split, "|", _color(4))
+    _add(stdscr, 7, 0, f"Target Agents [{'ACTIVE' if state.overview_focus_idx == 0 else '      '}]", _color(4))
+    _add(stdscr, 7, col2_x, f"Available Channels [{'ACTIVE' if state.overview_focus_idx == 1 else '      '}]", _color(4))
+    _add(stdscr, 7, col3_x, f"Assigned Channels [{'ACTIVE' if state.overview_focus_idx == 2 else '      '}]", _color(4))
 
-    if not channels:
-        _add(stdscr, 8, 0, "no channels discovered yet", _color(3))
-    state.selected_channel_row = min(state.selected_channel_row, max(0, len(channels) - 1))
-    line = 7
-    for idx, channel in enumerate(channels[: max(0, left_bottom - 7)]):
-        marker = "[x]" if bool(channel.get("enabled", True)) else "[ ]"
-        kind = str(channel.get("kind", ""))
-        name = str(channel.get("name", ""))
-        owner = str(channel.get("owner_agent_id", ""))
-        provider = str(channel.get("provider", ""))
-        text = f"{marker} {kind}:{name}  owner={owner}  via={provider}"
-        color = _color(5) if state.overview_focus_idx == 0 and idx == state.selected_channel_row else _color(0)
-        _add(stdscr, line, 0, _fit(text, split - 1), color)
+    for y in range(6, height - 1):
+        _add(stdscr, y, col_w, "|", _color(4))
+        _add(stdscr, y, col3_x - 2, "|", _color(4))
+
+    line = 8
+    if not agent_rows:
+        _add(stdscr, 9, 0, "no managed agents", _color(3))
+    for idx, row in enumerate(agent_rows[:rows_max]):
+        prefix = "> " if idx == state.selected_target_row else "  "
+        text = f"{prefix}{_display_agent_id(str(row.get('agent_id', '')))} [{row.get('status', '')}] {row.get('provider', '')}"
+        color = _color(5) if state.overview_focus_idx == 0 and idx == state.selected_target_row else _color(0)
+        _add(stdscr, line, 0, _fit(text, col_w - 1), color)
         line += 1
 
-    line = 7
-    state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
-    for idx, row in enumerate(agent_rows[: max(0, left_bottom - 7)]):
-        text = f"{row.get('agent_id', '')}  provider={row.get('provider', '')}  status={row.get('status', '')}"
-        color = _color(5) if state.overview_focus_idx == 1 and idx == state.selected_target_row else _color(0)
-        _add(stdscr, line, split + 2, _fit(text, width - split - 2), color)
+    line = 8
+    if not available:
+        _add(stdscr, 9, col2_x, "no available channels", _color(3))
+    for idx, channel in enumerate(available[:rows_max]):
+        source = str(channel.get("source", ""))
+        badge = "pool" if source == "pool" else "local"
+        text = f"{channel.get('kind', '')}:{channel.get('name', '')} [{badge}]"
+        color = _color(5) if state.overview_focus_idx == 1 and idx == state.selected_available_row else _color(0)
+        _add(stdscr, line, col2_x, _fit(text, col_w - 1), color)
+        line += 1
+
+    line = 8
+    if not assigned:
+        _add(stdscr, 9, col3_x, "no channels assigned", _color(3))
+    for idx, channel in enumerate(assigned[:rows_max]):
+        enabled = "on" if bool(channel.get("enabled", True)) else "off"
+        text = f"{channel.get('kind', '')}:{channel.get('name', '')} [{enabled}]"
+        color = _color(5) if state.overview_focus_idx == 2 and idx == state.selected_assigned_row else _color(0)
+        _add(stdscr, line, col3_x, _fit(text, width - col3_x), color)
         line += 1
 
     if state.notice:
@@ -462,7 +514,7 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     focus_names = ["channels", "plugins", "settings"]
     focus = focus_names[state.focus_idx]
 
-    _add(stdscr, 3, 0, f"Agent Detail: {state.selected_agent_id}", _color(1))
+    _add(stdscr, 3, 0, f"Agent Detail: {_display_agent_id(state.selected_agent_id)}", _color(1))
     _add(stdscr, 4, 0, f"provider={agent_info.get('provider', '')}  status={agent_info.get('status', '')}  version={agent_info.get('version', '')}", _color(0))
     if state.purge_confirm:
         _add(stdscr, 5, 0, "Purge requested: press 'y' to permanently delete agent + Linux user, or 'n' to cancel.", _color(2))
@@ -544,6 +596,14 @@ def _fit(text: str, width: int) -> str:
     return text[: max(0, width - 4)] + "..."
 
 
+def _display_agent_id(agent_id: str) -> str:
+    token = str(agent_id).strip()
+    if token.startswith("@local:"):
+        provider = token.split(":", 1)[1]
+        return f"@{provider}" if provider else "@"
+    return token
+
+
 def _print_static(snapshot: dict[str, Any]) -> None:
     totals = snapshot["totals"]
     print_info(
@@ -557,7 +617,7 @@ def _print_static(snapshot: dict[str, Any]) -> None:
     for row in snapshot["rows"]:
         rows.append(
             [
-                row.get("agent_id", row.get("user_id", "")),
+                _display_agent_id(str(row.get("agent_id", row.get("user_id", "")))),
                 row.get("display_name", ""),
                 row.get("provider", ""),
                 row.get("status", ""),

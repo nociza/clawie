@@ -926,3 +926,123 @@ def test_local_claw_service_action_updates_local_state(
     local_state = cfg.get("local_service_state", {})
     assert isinstance(local_state, dict)
     assert str(local_state.get("zeroclaw", {}).get("service_status", "")) == "running"
+
+
+def test_channel_inventory_includes_agent_and_local_channels(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "ops"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    monkeypatch.setattr(
+        service,
+        "_local_channel_inventory",
+        lambda: [
+            {
+                "source": "local",
+                "owner_agent_id": "@local:zeroclaw",
+                "provider": "zeroclaw",
+                "kind": "telegram",
+                "name": "primary",
+                "enabled": True,
+            }
+        ],
+    )
+    snapshot = service.channel_inventory()
+    rows = snapshot["rows"]
+    assert any(row["owner_agent_id"] == "alice" and row["kind"] == "chat" for row in rows)
+    assert any(row["owner_agent_id"] == "@local:zeroclaw" and row["kind"] == "telegram" for row in rows)
+
+
+def test_assign_channel_moves_between_agents(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.create_agent(
+        agent_id="bob",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.assign_channel_to_agent("alice", "chat", "alice-support", "bob")
+    alice = service.get_agent("alice")
+    bob = service.get_agent("bob")
+    assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))
+    assert any(c.get("name") == "alice-support" for c in bob.get("channels", []))
+
+
+def test_connect_agent_channel_runs_provider_command(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        return Result(0, stdout="connected")
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/openclaw")
+    monkeypatch.setattr("subprocess.run", fake_run)
+    result = service.connect_agent_channel("alice", "telegram", "team")
+    assert result["status"] == "connected"
+    assert any(cmd[:3] == ["/usr/bin/openclaw", "channels", "add"] for cmd in calls)

@@ -95,6 +95,25 @@ clawie state export --output backup.json
 clawie state import --input backup.json
 ```
 
+## Dashboard Controls
+
+- Local claws found in current user home (for example `~/.zeroclaw`) are shown
+  in the same list as agents, marked as `(current-user)`.
+- `v`: switch overview between `Agents` and `Channels` mode
+- `j` / `k` or arrow keys: move selection
+- `Enter`: open selected agent detail page
+- `Tab`: switch detail section (channels/plugins/settings)
+- `Space` / `Enter`: run action for selected row
+- In `Channels` overview mode:
+  - `Tab`: switch focus between channel list and target agent list
+  - `a`: assign selected channel to selected agent
+  - `c`: assign + run provider channel connect command for selected agent
+- `a`: toggle selected agent autostart
+- In Settings, use service rows to run `<provider> service start|stop|restart|status`
+- `d`: purge selected agent (requires confirmation)
+- `b` or `Esc`: back to overview
+- `r`: refresh, `q`: quit
+
 ## Isolation and Credential Reuse
 
 `spawn` is built around the Linux `user` model. Each claw can get an isolated

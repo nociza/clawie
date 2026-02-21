@@ -5,6 +5,7 @@ import crypt
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -638,6 +639,191 @@ class ZeroClawService:
         )
         self.store.write_state(state)
         return target
+
+    def channel_inventory(self) -> dict[str, Any]:
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        rows: list[dict[str, Any]] = []
+        for aid, payload in sorted(agents.items()):
+            self._hydrate_agent_controls(payload)
+            provider = str(payload.get("agent", {}).get("provider", "")).strip().lower()
+            for channel in payload.get("channels", []):
+                if not isinstance(channel, dict):
+                    continue
+                kind = str(channel.get("kind", "")).strip().lower()
+                name = str(channel.get("name", "")).strip()
+                if not kind or not name:
+                    continue
+                rows.append(
+                    {
+                        "source": "agent",
+                        "owner_agent_id": str(aid),
+                        "provider": provider,
+                        "kind": kind,
+                        "name": name,
+                        "enabled": bool(channel.get("enabled", True)),
+                    }
+                )
+
+        for item in self._local_channel_inventory():
+            rows.append(item)
+
+        kinds = {str(row.get("kind", "")) for row in rows if str(row.get("kind", "")).strip()}
+        return {
+            "generated_at": now_iso(),
+            "rows": rows,
+            "totals": {
+                "channels": len(rows),
+                "kinds": len(kinds),
+                "assigned": sum(1 for row in rows if str(row.get("source", "")) == "agent"),
+                "local": sum(1 for row in rows if str(row.get("source", "")) == "local"),
+            },
+        }
+
+    def assign_channel_to_agent(
+        self,
+        source_agent_id: str,
+        kind: str,
+        name: str,
+        target_agent_id: str,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        src = str(source_agent_id).strip()
+        dst = str(target_agent_id).strip()
+        channel_kind = str(kind).strip().lower()
+        channel_name = str(name).strip()
+        if not channel_kind or not channel_name:
+            raise ValueError("kind and name are required")
+        if not dst:
+            raise ValueError("target_agent_id is required")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        target = agents.get(dst)
+        if not target:
+            raise AgentNotFoundError(f"target agent not found: {dst}")
+        self._hydrate_agent_controls(target)
+        target_channels = target.setdefault("channels", [])
+        if not isinstance(target_channels, list):
+            target_channels = []
+            target["channels"] = target_channels
+
+        if self._find_channel(target_channels, channel_kind, channel_name) is None:
+            target_channels.append(
+                {
+                    "kind": channel_kind,
+                    "name": channel_name,
+                    "enabled": True,
+                    "external_id": f"{dst}:{channel_kind}:{len(target_channels) + 1}",
+                }
+            )
+
+        moved = False
+        if src and not src.startswith("@local:") and src in agents and src != dst:
+            source = agents[src]
+            self._hydrate_agent_controls(source)
+            source_channels = source.setdefault("channels", [])
+            if isinstance(source_channels, list):
+                found_idx = self._find_channel(source_channels, channel_kind, channel_name)
+                if found_idx is not None:
+                    source_channels.pop(found_idx)
+                    moved = True
+                    source.setdefault("agent", {})["last_sync"] = now_iso()
+
+        target.setdefault("agent", {})["last_sync"] = now_iso()
+        self._event(
+            state,
+            "channels.assigned",
+            f"Assigned channel {channel_kind}:{channel_name} to {dst}",
+            {
+                "source_agent_id": src,
+                "target_agent_id": dst,
+                "kind": channel_kind,
+                "name": channel_name,
+                "moved": moved,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "source_agent_id": src,
+            "target_agent_id": dst,
+            "kind": channel_kind,
+            "name": channel_name,
+            "moved": moved,
+        }
+
+    def connect_agent_channel(
+        self,
+        agent_id: str,
+        kind: str,
+        name: str,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        target = str(agent_id).strip()
+        channel_kind = str(kind).strip().lower()
+        channel_name = str(name).strip()
+        if not target:
+            raise ValueError("agent_id is required")
+        if not channel_kind or not channel_name:
+            raise ValueError("kind and name are required")
+        if target.startswith("@local:"):
+            raise ValueError("connect is only supported for managed agents")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(target)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {target}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{target}' has no provider configured")
+        linux_user = str(info.get("linux_user", "")).strip()
+        self.assign_channel_to_agent("", channel_kind, channel_name, target)
+
+        commands = self._channel_connect_commands(provider, channel_kind, channel_name, linux_user)
+        last_error = ""
+        chosen: list[str] = []
+        for cmd in commands:
+            chosen = cmd
+            env = self._service_env(linux_user)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                state = self.store.read_state()
+                agents = state.setdefault("agents", state.get("users", {}))
+                refreshed = agents.get(target, {})
+                refreshed_info = refreshed.setdefault("agent", {})
+                refreshed_info["last_sync"] = now_iso()
+                self._event(
+                    state,
+                    "channels.connected",
+                    f"Connected channel {channel_kind}:{channel_name} for {target}",
+                    {
+                        "agent_id": target,
+                        "provider": provider,
+                        "kind": channel_kind,
+                        "name": channel_name,
+                        "command": " ".join(cmd),
+                    },
+                )
+                self.store.write_state(state)
+                return {
+                    "agent_id": target,
+                    "provider": provider,
+                    "kind": channel_kind,
+                    "name": channel_name,
+                    "command": cmd,
+                    "output": output,
+                    "status": "connected",
+                }
+            last_error = output or f"exit {result.returncode}"
+
+        raise SetupError(
+            f"channel connect failed for {target} ({provider}): {last_error}. "
+            + ("attempted: " + " || ".join(" ".join(cmd) for cmd in commands) if commands else "")
+        )
 
     def doctor(self) -> dict[str, Any]:
         checks: list[dict[str, str]] = []
@@ -1345,6 +1531,17 @@ class ZeroClawService:
             copied.append(str(dst))
         return copied
 
+    @staticmethod
+    def _find_channel(channels: list[dict[str, Any]], kind: str, name: str) -> int | None:
+        for idx, channel in enumerate(channels):
+            if not isinstance(channel, dict):
+                continue
+            row_kind = str(channel.get("kind", "")).strip().lower()
+            row_name = str(channel.get("name", "")).strip()
+            if row_kind == kind and row_name == name:
+                return idx
+        return None
+
     def _apply_spawn_password(
         self,
         username: str,
@@ -1413,6 +1610,47 @@ class ZeroClawService:
         if os.geteuid() != 0:
             raise SetupError(
                 "service control requires root when agent linux_user differs from current user. Re-run with sudo/root."
+            )
+        return ["sudo", "-u", linux_user, "-H", "--", *base]
+
+    def _channel_connect_commands(
+        self,
+        provider: str,
+        kind: str,
+        name: str,
+        linux_user: str,
+    ) -> list[list[str]]:
+        executable = self._resolve_provider_executable(provider)
+        commands: list[list[str]] = []
+        if provider == "openclaw":
+            commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
+            commands.append([executable, "channels", "login", kind])
+            commands.append([executable, "channels", "login"])
+        else:
+            commands.append([executable, "channel", "add", kind, name])
+            commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
+            commands.append([executable, "channel", "login", kind])
+            commands.append([executable, "channels", "login", kind])
+
+        wrapped: list[list[str]] = []
+        for raw in commands:
+            if linux_user:
+                wrapped.append(self._sudo_wrap(raw, linux_user))
+            else:
+                wrapped.append(raw)
+        return wrapped
+
+    def _sudo_wrap(self, base: list[str], linux_user: str) -> list[str]:
+        current_user = ""
+        try:
+            current_user = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError:
+            current_user = ""
+        if not linux_user or linux_user == current_user:
+            return base
+        if os.geteuid() != 0:
+            raise SetupError(
+                "channel connect requires root when agent linux_user differs from current user. Re-run with sudo/root."
             )
         return ["sudo", "-u", linux_user, "-H", "--", *base]
 
@@ -1586,6 +1824,41 @@ class ZeroClawService:
             )
         return rows
 
+    def _local_channel_inventory(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for claw in self.list_installed_claws():
+            provider = str(claw.get("provider", "")).strip().lower()
+            root = Path(str(claw.get("root", "")).strip())
+            if not provider or not root:
+                continue
+            discovered = self._discover_channels_for_provider_root(provider, root)
+            for channel in discovered:
+                kind = str(channel.get("kind", "")).strip().lower()
+                name = str(channel.get("name", "")).strip()
+                if not kind or not name:
+                    continue
+                rows.append(
+                    {
+                        "source": "local",
+                        "owner_agent_id": f"@local:{provider}",
+                        "provider": provider,
+                        "kind": kind,
+                        "name": name,
+                        "enabled": bool(channel.get("enabled", True)),
+                    }
+                )
+        return rows
+
+    def _discover_channels_for_provider_root(self, provider: str, root: Path) -> list[dict[str, str]]:
+        name = str(provider).strip().lower()
+        if name == "zeroclaw":
+            return self._channels_from_zeroclaw_config(root / "config.toml")
+        if name == "picoclaw":
+            return self._channels_from_picoclaw_config(root / "config.json")
+        if name == "openclaw":
+            return self._channels_from_openclaw_config(root / "openclaw.json")
+        return []
+
     def _refresh_local_service_statuses(
         self,
         providers: list[str],
@@ -1758,6 +2031,10 @@ class ZeroClawService:
         for provider in providers:
             if provider == "zeroclaw":
                 channels.extend(self._channels_from_zeroclaw_config(source_home / ".zeroclaw" / "config.toml"))
+            elif provider == "picoclaw":
+                channels.extend(self._channels_from_picoclaw_config(source_home / ".picoclaw" / "config.json"))
+            elif provider == "openclaw":
+                channels.extend(self._channels_from_openclaw_config(source_home / ".openclaw" / "openclaw.json"))
         return self._dedupe_channels(channels)
 
     def _channels_from_zeroclaw_config(self, config_path: Path) -> list[dict[str, str]]:
@@ -1793,6 +2070,70 @@ class ZeroClawService:
             name = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
             channels.append({"kind": kind, "name": name})
         return channels
+
+    def _channels_from_picoclaw_config(self, config_path: Path) -> list[dict[str, str]]:
+        if not config_path.exists():
+            return []
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        channels_cfg = payload.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return []
+        channels: list[dict[str, str]] = []
+        for key, value in channels_cfg.items():
+            kind = str(key).strip().lower()
+            if not kind:
+                continue
+            enabled = True
+            if isinstance(value, dict):
+                enabled = bool(value.get("enabled", True))
+                display = str(value.get("name", kind)).strip().lower()
+            else:
+                display = kind
+            if not enabled:
+                continue
+            channels.append({"kind": kind, "name": display or kind})
+        return channels
+
+    def _channels_from_openclaw_config(self, config_path: Path) -> list[dict[str, str]]:
+        if not config_path.exists():
+            return []
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        channels: list[dict[str, str]] = []
+        channels_cfg = payload.get("channels", {})
+        if isinstance(channels_cfg, dict):
+            for key, value in channels_cfg.items():
+                kind = str(key).strip().lower()
+                if not kind:
+                    continue
+                if isinstance(value, dict):
+                    if not bool(value.get("enabled", True)):
+                        continue
+                    display = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
+                else:
+                    display = kind
+                channels.append({"kind": kind, "name": display})
+
+        bindings = payload.get("bindings", [])
+        if isinstance(bindings, list):
+            for binding in bindings:
+                if not isinstance(binding, dict):
+                    continue
+                match = binding.get("match", {})
+                if not isinstance(match, dict):
+                    continue
+                kind = str(match.get("channel", "")).strip().lower()
+                account = str(match.get("accountId", "")).strip()
+                if not kind or not account:
+                    continue
+                cleaned = re.sub(r"[^a-z0-9._-]+", "-", account.lower()).strip("-")
+                channels.append({"kind": kind, "name": cleaned or kind})
+        return self._dedupe_channels(channels)
 
     @staticmethod
     def _dedupe_channels(channels: list[dict[str, str]]) -> list[dict[str, str]]:

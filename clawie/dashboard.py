@@ -11,7 +11,11 @@ from clawie.ui import print_info, print_table
 @dataclass
 class DashboardState:
     view: str = "overview"
+    overview_mode: str = "agents"
+    overview_focus_idx: int = 0
     selected_row: int = 0
+    selected_channel_row: int = 0
+    selected_target_row: int = 0
     selected_agent_id: str = ""
     focus_idx: int = 0
     channel_idx: int = 0
@@ -62,12 +66,25 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
             continue
 
         if state.view == "overview":
-            _handle_overview_key(key, state, snapshot)
+            _handle_overview_key(key, state, snapshot, service)
         else:
             _handle_detail_key(key, state, service)
 
 
-def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any]) -> None:
+def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any], service: Any) -> None:
+    if key in (ord("v"), ord("V")):
+        if state.overview_mode == "agents":
+            state.overview_mode = "channels"
+            state.overview_focus_idx = 0
+        else:
+            state.overview_mode = "agents"
+            state.overview_focus_idx = 0
+        return
+
+    if state.overview_mode == "channels":
+        _handle_channels_overview_key(key, state, snapshot, service)
+        return
+
     rows = snapshot.get("rows", [])
     if key in (curses.KEY_DOWN, ord("j")):
         if rows:
@@ -80,6 +97,67 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
     elif key in (curses.KEY_ENTER, 10, 13):
         if rows:
             state.view = "detail"
+
+
+def _handle_channels_overview_key(
+    key: int,
+    state: DashboardState,
+    snapshot: dict[str, Any],
+    service: Any,
+) -> None:
+    inventory = service.channel_inventory()
+    channels = inventory.get("rows", [])
+    agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
+    state.selected_channel_row = min(state.selected_channel_row, max(0, len(channels) - 1))
+    state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
+
+    if key == 9:  # TAB
+        state.overview_focus_idx = (state.overview_focus_idx + 1) % 2
+        return
+
+    if key in (curses.KEY_DOWN, ord("j")):
+        if state.overview_focus_idx == 0 and channels:
+            state.selected_channel_row = min(len(channels) - 1, state.selected_channel_row + 1)
+        elif state.overview_focus_idx == 1 and agent_rows:
+            state.selected_target_row = min(len(agent_rows) - 1, state.selected_target_row + 1)
+        return
+    if key in (curses.KEY_UP, ord("k")):
+        if state.overview_focus_idx == 0 and channels:
+            state.selected_channel_row = max(0, state.selected_channel_row - 1)
+        elif state.overview_focus_idx == 1 and agent_rows:
+            state.selected_target_row = max(0, state.selected_target_row - 1)
+        return
+
+    if not channels or not agent_rows:
+        return
+    selected_channel = channels[state.selected_channel_row]
+    target_agent_id = str(agent_rows[state.selected_target_row].get("agent_id", ""))
+    source_agent_id = str(selected_channel.get("owner_agent_id", ""))
+    kind = str(selected_channel.get("kind", ""))
+    name = str(selected_channel.get("name", ""))
+
+    if key in (ord("a"), ord("A")):
+        try:
+            service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
+            state.notice = f"assigned {kind}:{name} -> {target_agent_id}"
+            state.notice_error = False
+        except Exception as exc:  # noqa: BLE001
+            state.notice = str(exc)
+            state.notice_error = True
+        return
+    if key in (ord("c"), ord("C")):
+        try:
+            service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
+            service.connect_agent_channel(target_agent_id, kind, name)
+            state.notice = f"connected {kind}:{name} for {target_agent_id}"
+            state.notice_error = False
+        except Exception as exc:  # noqa: BLE001
+            state.notice = str(exc)
+            state.notice_error = True
+        return
+    if key in (curses.KEY_ENTER, 10, 13):
+        state.selected_agent_id = target_agent_id
+        state.view = "detail"
 
 
 def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
@@ -212,8 +290,11 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
     _draw_stats(stdscr, snapshot, width)
 
     if state.view == "overview":
-        _draw_overview(stdscr, snapshot, state, height, width)
-        footer = "q quit | Enter details | j/k move | r refresh"
+        _draw_overview(stdscr, snapshot, state, service, height, width)
+        if state.overview_mode == "agents":
+            footer = "q quit | v channels view | Enter details | j/k move | r refresh"
+        else:
+            footer = "q quit | v agents view | Tab pane | j/k move | a assign | c connect | Enter details | r refresh"
     else:
         _draw_detail(stdscr, service, state, height, width)
         if state.purge_confirm:
@@ -245,7 +326,21 @@ def _draw_stats(stdscr: Any, snapshot: dict[str, Any], width: int) -> None:
     _add(stdscr, 2, 0, "=" * max(0, width - 1), _color(4))
 
 
-def _draw_overview(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, height: int, width: int) -> None:
+def _draw_overview(
+    stdscr: Any,
+    snapshot: dict[str, Any],
+    state: DashboardState,
+    service: Any,
+    height: int,
+    width: int,
+) -> None:
+    if state.overview_mode == "channels":
+        _draw_overview_channels(stdscr, snapshot, state, service, height, width)
+        return
+    _draw_overview_agents(stdscr, snapshot, state, height, width)
+
+
+def _draw_overview_agents(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, height: int, width: int) -> None:
     rows = snapshot.get("rows", [])
     split = max(40, int(width * 0.68))
     split = min(split, width - 20)
@@ -294,6 +389,64 @@ def _draw_overview(stdscr: Any, snapshot: dict[str, Any], state: DashboardState,
         text = f"{event.get('timestamp', '')} | {event.get('type', '')}"
         _add(stdscr, ev_line, pane_x, _fit(text, width - pane_x), _color(0))
         ev_line += 1
+
+
+def _draw_overview_channels(
+    stdscr: Any,
+    snapshot: dict[str, Any],
+    state: DashboardState,
+    service: Any,
+    height: int,
+    width: int,
+) -> None:
+    _ = snapshot
+    split = max(50, int(width * 0.62))
+    split = min(split, width - 20)
+    left_bottom = height - 4
+
+    channels: list[dict[str, Any]] = []
+    try:
+        inventory = service.channel_inventory()
+        channels = list(inventory.get("rows", []))
+    except Exception:
+        channels = []
+    agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
+    _add(stdscr, 3, 0, "Channels View", _color(1))
+    _add(stdscr, 4, 0, "Press 'a' to assign, 'c' to connect selected channel to selected agent.", _color(0))
+
+    # Render empty shell if runtime did not fill channel data.
+    _add(stdscr, 6, 0, f"Channels [{'ACTIVE' if state.overview_focus_idx == 0 else '      '}]", _color(4))
+    _add(stdscr, 6, split + 2, f"Target Agents [{'ACTIVE' if state.overview_focus_idx == 1 else '      '}]", _color(4))
+
+    for y in range(5, height - 1):
+        _add(stdscr, y, split, "|", _color(4))
+
+    if not channels:
+        _add(stdscr, 8, 0, "no channels discovered yet", _color(3))
+    state.selected_channel_row = min(state.selected_channel_row, max(0, len(channels) - 1))
+    line = 7
+    for idx, channel in enumerate(channels[: max(0, left_bottom - 7)]):
+        marker = "[x]" if bool(channel.get("enabled", True)) else "[ ]"
+        kind = str(channel.get("kind", ""))
+        name = str(channel.get("name", ""))
+        owner = str(channel.get("owner_agent_id", ""))
+        provider = str(channel.get("provider", ""))
+        text = f"{marker} {kind}:{name}  owner={owner}  via={provider}"
+        color = _color(5) if state.overview_focus_idx == 0 and idx == state.selected_channel_row else _color(0)
+        _add(stdscr, line, 0, _fit(text, split - 1), color)
+        line += 1
+
+    line = 7
+    state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
+    for idx, row in enumerate(agent_rows[: max(0, left_bottom - 7)]):
+        text = f"{row.get('agent_id', '')}  provider={row.get('provider', '')}  status={row.get('status', '')}"
+        color = _color(5) if state.overview_focus_idx == 1 and idx == state.selected_target_row else _color(0)
+        _add(stdscr, line, split + 2, _fit(text, width - split - 2), color)
+        line += 1
+
+    if state.notice:
+        color = _color(2) if state.notice_error else _color(1)
+        _add(stdscr, height - 3, 0, _fit(f"notice: {state.notice}", width), color)
 
 
 def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, width: int) -> None:

@@ -5,18 +5,13 @@ import crypt
 import json
 import os
 import pwd
-import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
-
+from clawie.provider_channels import dedupe_channels, get_channel_adapter
 from clawie.providers import (
     credential_paths_for_providers,
     detect_installed_providers,
@@ -1621,27 +1616,8 @@ class ZeroClawService:
         linux_user: str,
     ) -> list[list[str]]:
         executable = self._resolve_provider_executable(provider)
-        commands: list[list[str]] = []
-        if provider == "openclaw":
-            commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
-            commands.append([executable, "channels", "login", kind])
-            commands.append([executable, "channels", "login"])
-        elif provider == "zeroclaw":
-            # ZeroClaw channel management is centered around channel doctor/onboard,
-            # plus Telegram allowlist binding for direct identity linking.
-            if kind == "telegram" and self._looks_like_sender_identity(name):
-                commands.append([executable, "channel", "bind-telegram", name])
-            commands.append([executable, "channel", "doctor"])
-            commands.append([executable, "onboard", "--channels-only"])
-        elif provider == "picoclaw":
-            # PicoClaw uses onboarding + config-driven channels in ~/.picoclaw/config.json.
-            commands.append([executable, "onboard"])
-            commands.append([executable, "status"])
-        else:
-            commands.append([executable, "channel", "add", kind, name])
-            commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
-            commands.append([executable, "channel", "login", kind])
-            commands.append([executable, "channels", "login", kind])
+        adapter = get_channel_adapter(provider)
+        commands = adapter.connect_commands(executable=executable, kind=kind, name=name)
 
         wrapped: list[list[str]] = []
         for raw in commands:
@@ -1650,17 +1626,6 @@ class ZeroClawService:
             else:
                 wrapped.append(raw)
         return wrapped
-
-    @staticmethod
-    def _looks_like_sender_identity(value: str) -> bool:
-        token = str(value).strip()
-        if not token:
-            return False
-        if token in {"telegram", "default", "primary"}:
-            return False
-        if token.startswith("@") and len(token) > 1:
-            return True
-        return token.isdigit()
 
     def _sudo_wrap(self, base: list[str], linux_user: str) -> list[str]:
         current_user = ""
@@ -1872,14 +1837,8 @@ class ZeroClawService:
         return rows
 
     def _discover_channels_for_provider_root(self, provider: str, root: Path) -> list[dict[str, str]]:
-        name = str(provider).strip().lower()
-        if name == "zeroclaw":
-            return self._channels_from_zeroclaw_config(root / "config.toml")
-        if name == "picoclaw":
-            return self._channels_from_picoclaw_config(root / "config.json")
-        if name == "openclaw":
-            return self._channels_from_openclaw_config(root / "openclaw.json")
-        return []
+        adapter = get_channel_adapter(provider)
+        return adapter.discover_channels(root)
 
     def _refresh_local_service_statuses(
         self,
@@ -2051,124 +2010,10 @@ class ZeroClawService:
 
         channels: list[dict[str, str]] = []
         for provider in providers:
-            if provider == "zeroclaw":
-                channels.extend(self._channels_from_zeroclaw_config(source_home / ".zeroclaw" / "config.toml"))
-            elif provider == "picoclaw":
-                channels.extend(self._channels_from_picoclaw_config(source_home / ".picoclaw" / "config.json"))
-            elif provider == "openclaw":
-                channels.extend(self._channels_from_openclaw_config(source_home / ".openclaw" / "openclaw.json"))
-        return self._dedupe_channels(channels)
-
-    def _channels_from_zeroclaw_config(self, config_path: Path) -> list[dict[str, str]]:
-        if tomllib is None or not config_path.exists():
-            return []
-        try:
-            payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-
-        channels_cfg = payload.get("channels_config", {})
-        if not isinstance(channels_cfg, dict):
-            return []
-
-        channels: list[dict[str, str]] = []
-        if bool(channels_cfg.get("cli")):
-            channels.append({"kind": "cli", "name": "local"})
-
-        for key, value in channels_cfg.items():
-            kind = str(key).strip().lower()
-            if kind == "cli" or not kind:
+            try:
+                state_dir = get_provider(provider).state_dir
+            except ValueError:
                 continue
-            if not isinstance(value, dict):
-                continue
-            if not bool(value.get("enabled", True)):
-                continue
-
-            token_keys = ("bot_token", "token", "api_key", "webhook_url")
-            has_secret = any(str(value.get(token, "")).strip() for token in token_keys)
-            has_config = bool(value.get("allowed_users")) or bool(value.get("channels"))
-            if not has_secret and not has_config:
-                continue
-            name = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
-            channels.append({"kind": kind, "name": name})
-        return channels
-
-    def _channels_from_picoclaw_config(self, config_path: Path) -> list[dict[str, str]]:
-        if not config_path.exists():
-            return []
-        try:
-            payload = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        channels_cfg = payload.get("channels", {})
-        if not isinstance(channels_cfg, dict):
-            return []
-        channels: list[dict[str, str]] = []
-        for key, value in channels_cfg.items():
-            kind = str(key).strip().lower()
-            if not kind:
-                continue
-            enabled = True
-            if isinstance(value, dict):
-                enabled = bool(value.get("enabled", True))
-                display = str(value.get("name", kind)).strip().lower()
-            else:
-                display = kind
-            if not enabled:
-                continue
-            channels.append({"kind": kind, "name": display or kind})
-        return channels
-
-    def _channels_from_openclaw_config(self, config_path: Path) -> list[dict[str, str]]:
-        if not config_path.exists():
-            return []
-        try:
-            payload = json.loads(config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        channels: list[dict[str, str]] = []
-        channels_cfg = payload.get("channels", {})
-        if isinstance(channels_cfg, dict):
-            for key, value in channels_cfg.items():
-                kind = str(key).strip().lower()
-                if not kind:
-                    continue
-                if isinstance(value, dict):
-                    if not bool(value.get("enabled", True)):
-                        continue
-                    display = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
-                else:
-                    display = kind
-                channels.append({"kind": kind, "name": display})
-
-        bindings = payload.get("bindings", [])
-        if isinstance(bindings, list):
-            for binding in bindings:
-                if not isinstance(binding, dict):
-                    continue
-                match = binding.get("match", {})
-                if not isinstance(match, dict):
-                    continue
-                kind = str(match.get("channel", "")).strip().lower()
-                account = str(match.get("accountId", "")).strip()
-                if not kind or not account:
-                    continue
-                cleaned = re.sub(r"[^a-z0-9._-]+", "-", account.lower()).strip("-")
-                channels.append({"kind": kind, "name": cleaned or kind})
-        return self._dedupe_channels(channels)
-
-    @staticmethod
-    def _dedupe_channels(channels: list[dict[str, str]]) -> list[dict[str, str]]:
-        deduped: list[dict[str, str]] = []
-        seen: set[tuple[str, str]] = set()
-        for channel in channels:
-            kind = str(channel.get("kind", "")).strip().lower()
-            name = str(channel.get("name", "")).strip()
-            if not kind or not name:
-                continue
-            key = (kind, name)
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append({"kind": kind, "name": name})
-        return deduped
+            adapter = get_channel_adapter(provider)
+            channels.extend(adapter.discover_channels(source_home / state_dir))
+        return dedupe_channels(channels)

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from clawie.dashboard import run_dashboard
+from clawie.providers import get_provider, provider_names
 from clawie.service import (
     SetupError,
     AgentExistsError,
@@ -39,13 +40,27 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("setup", help="Configure provider/workspace")
     setup.add_argument(
         "--provider",
-        choices=["zeroclaw", "openclaw"],
+        choices=provider_names(),
         default="zeroclaw",
         help="Agent provider",
     )
-    setup.add_argument("--api-key", help="Provider API key (required for zeroclaw)")
+    setup.add_argument("--api-key", help="Provider API key (if using api_key auth)")
+    setup.add_argument(
+        "--auth-mode",
+        choices=["linked", "api_key", "none"],
+        help="Provider auth mode (default is provider-specific)",
+    )
     setup.add_argument("--subscription", default="starter", help="Plan name")
     setup.add_argument("--workspace", default="default", help="Workspace slug")
+    setup.add_argument(
+        "--spawn-password",
+        help="Set a global default Linux password for future spawned users",
+    )
+    setup.add_argument(
+        "--clear-spawn-password",
+        action="store_true",
+        help="Clear the global default spawn password",
+    )
     setup.add_argument(
         "--api-url",
         default=str(DEFAULT_CONFIG["api_url"]),
@@ -93,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON file with channel definitions: [{\"kind\": ..., \"name\": ...}]",
     )
     agents_create.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    agents_create.add_argument(
+        "--provider",
+        choices=provider_names(),
+        help="Override provider for this agent",
+    )
     agents_create.set_defaults(func=cmd_agents_create)
 
     agents_clone = agents_sub.add_parser(
@@ -120,6 +140,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON file with channel definitions to override clone channels",
     )
     agents_clone.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    agents_clone.add_argument(
+        "--provider",
+        choices=provider_names(),
+        help="Override provider for this cloned agent",
+    )
     agents_clone.set_defaults(func=cmd_agents_clone)
 
     agents_list = agents_sub.add_parser("list", help="List agents")
@@ -139,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agents_batch.add_argument("--file", required=True, help="Input JSON file")
     agents_batch.set_defaults(func=cmd_agents_batch_create)
+
+    list_alias = subparsers.add_parser("list", help="List agents (alias for `agents list`)")
+    list_alias.set_defaults(func=cmd_list_alias)
 
     channels = subparsers.add_parser("channels", help="Channel operations")
     channels_sub = channels.add_subparsers(dest="channels_command", required=True)
@@ -185,8 +213,26 @@ def build_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--template", default="baseline", help="Template name")
     spawn.add_argument("--agent-version", default="1.0.0", help="Agent version")
     spawn.add_argument(
+        "--provider",
+        choices=provider_names(),
+        help="Provider for the spawned agent (defaults to current setup provider)",
+    )
+    spawn.add_argument(
         "--source-home",
         help="Source home directory to copy configs from (default: current home)",
+    )
+    spawn.add_argument(
+        "--password",
+        help="Set plaintext Linux password for this spawned user only",
+    )
+    spawn.add_argument(
+        "--password-hash",
+        help="Set pre-hashed Linux password for this spawned user only (shadow-compatible)",
+    )
+    spawn.add_argument(
+        "--no-global-password",
+        action="store_true",
+        help="Do not apply global default spawn password",
     )
     spawn.add_argument(
         "--skip-config-copy",
@@ -195,10 +241,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     spawn.set_defaults(func=cmd_spawn)
 
+    purge = subparsers.add_parser(
+        "purge",
+        help="Delete an agent and remove its spawned Linux user/home profile",
+    )
+    purge.add_argument("agent_id", nargs="?", help="Agent ID to purge")
+    purge.add_argument(
+        "--agent-id",
+        dest="agent_id_flag",
+        help="Agent ID to purge (backward-compatible flag form)",
+    )
+    purge.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation prompt",
+    )
+    purge.set_defaults(func=cmd_purge)
+
     monitor = subparsers.add_parser("monitor", help="htop-like agent performance monitor")
     monitor.add_argument("--agent-id", help="Filter monitor to one agent")
     monitor.add_argument("--refresh-seconds", type=int, default=2)
     monitor.set_defaults(func=cmd_monitor)
+
+    claws = subparsers.add_parser("claws", help="Discover and inspect installed claw runtimes")
+    claws_sub = claws.add_subparsers(dest="claws_command", required=True)
+    claws_detect = claws_sub.add_parser("detect", help="Detect installed claw runtimes")
+    claws_detect.add_argument(
+        "--source-home",
+        help="Home directory to inspect (default: current user home)",
+    )
+    claws_detect.set_defaults(func=cmd_claws_detect)
 
     dashboard = subparsers.add_parser("dashboard", help="Unified agent dashboard")
     dashboard.add_argument("--agent-id", help="Filter dashboard to one agent")
@@ -263,29 +335,38 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
 
     provider = str(args.provider).strip().lower() or "zeroclaw"
     api_key = str(args.api_key or "").strip()
+    auth_mode = str(args.auth_mode or "").strip().lower() or None
+    spawn_password = args.spawn_password
     subscription = str(args.subscription).strip()
     workspace = str(args.workspace).strip()
     api_url = str(args.api_url).strip()
 
     if args.interactive:
         print_info("Interactive setup mode")
-        provider = _prompt_with_default("Provider (zeroclaw/openclaw)", provider).lower()
-        if provider not in {"zeroclaw", "openclaw"}:
-            raise ValueError("provider must be one of: zeroclaw, openclaw")
-        if provider == "zeroclaw":
-            api_key = api_key or _prompt_required("ZeroClaw API key")
+        provider = _prompt_with_default(
+            f"Provider ({'/'.join(provider_names())})",
+            provider,
+        ).lower()
+        if provider not in set(provider_names()):
+            raise ValueError("provider must be one of: " + ", ".join(provider_names()))
+        spec = get_provider(provider)
+        auth_mode = auth_mode or spec.default_auth_mode
+        auth_mode = _prompt_with_default(
+            f"Auth mode ({'/'.join(spec.auth_modes)})",
+            auth_mode,
+        ).lower()
+        if auth_mode == "api_key":
+            api_key = api_key or _prompt_required(f"{provider} API key")
         subscription = _prompt_with_default("Subscription", subscription)
         workspace = _prompt_with_default("Workspace", workspace)
         api_url = _prompt_with_default("API URL", api_url)
 
-    if provider == "zeroclaw" and not api_key:
-        raise ValueError(
-            "API key is required for zeroclaw. Use --api-key, choose openclaw, or --interactive."
-        )
-
     config = service.setup(
         provider=provider,
         api_key=api_key,
+        auth_mode=auth_mode,
+        spawn_password=spawn_password,
+        clear_spawn_password=bool(args.clear_spawn_password),
         subscription=subscription or "starter",
         workspace=workspace or "default",
         api_url=api_url or str(DEFAULT_CONFIG["api_url"]),
@@ -301,6 +382,8 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
             f"workspace: {config.get('workspace', '')}",
             f"subscription: {config.get('subscription', '')}",
             f"api_url: {config.get('api_url', '')}",
+            f"auth_mode: {config.get('auth_mode', '')}",
+            f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
             f"runtime_installed: {bool(config.get('runtime_installed', False))}",
             f"api_key: {status.get('api_key', '')}",
         ],
@@ -318,7 +401,9 @@ def _print_setup_status(service: ZeroClawService) -> int:
             f"workspace: {status.get('workspace', '')}",
             f"subscription: {status.get('subscription', '')}",
             f"api_url: {status.get('api_url', '')}",
+            f"auth_mode: {status.get('auth_mode', '')}",
             f"api_key: {status.get('api_key', '')}",
+            f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
             f"runtime_installed: {status.get('runtime_installed', False)}",
             f"updated_at: {status.get('updated_at', '')}",
         ],
@@ -339,6 +424,7 @@ def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int
         channel_strategy=args.channel_strategy,
         channels=channels,
         agent_version=args.agent_version,
+        provider=args.provider,
     )
     print_success(f"Provisioned agent {agent['agent_id']}")
     _print_agent(agent)
@@ -355,6 +441,7 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
         channel_strategy=args.channel_strategy,
         channels=channels,
         agent_version=args.agent_version,
+        provider=args.provider,
     )
     print_success(f"Cloned agent config from {args.from_agent} to {agent['agent_id']}")
     _print_agent(agent)
@@ -371,23 +458,32 @@ def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     for row in agents:
         agent = row.get("agent", {})
         channels = row.get("channels", [])
+        active_channels = sum(1 for channel in channels if bool(channel.get("enabled", True)))
         migrated = sum(1 for channel in channels if channel.get("migrated_from"))
+        plugins = agent.get("plugins", {})
+        enabled_plugins = sum(1 for value in plugins.values() if bool(value))
         rows.append(
             [
                 str(row.get("agent_id", row.get("user_id", ""))),
                 str(row.get("display_name", "")),
+                str(agent.get("provider", "")),
                 str(row.get("channel_strategy", "")),
-                str(len(channels)),
+                f"{active_channels}/{len(channels)}",
+                f"{enabled_plugins}/{len(plugins)}",
                 str(migrated),
                 str(agent.get("status", "")),
                 str(agent.get("version", "")),
             ]
         )
     print_table(
-        ["agent_id", "display_name", "strategy", "channels", "migrated", "status", "agent"],
+        ["agent_id", "display_name", "provider", "strategy", "channels", "plugins", "migrated", "status", "agent"],
         rows,
     )
     return 0
+
+
+def cmd_list_alias(args: argparse.Namespace, service: ZeroClawService) -> int:
+    return cmd_agents_list(args, service)
 
 
 def cmd_agents_show(args: argparse.Namespace, service: ZeroClawService) -> int:
@@ -466,10 +562,16 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
         source_home=args.source_home,
         template=args.template,
         agent_version=args.agent_version,
+        provider=args.provider,
+        password=args.password,
+        password_hash=args.password_hash,
+        use_global_password=not bool(args.no_global_password),
     )
     print_success(
         f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
     )
+    source = str(result.get("password_source", "none"))
+    print_info(f"Password source: {source}")
     copied = result.get("copied_paths", [])
     if copied:
         print_info("Copied config paths:")
@@ -479,9 +581,47 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = str(args.agent_id or args.agent_id_flag or "").strip()
+    if not agent_id:
+        raise ValueError("agent_id is required")
+    if not args.yes:
+        print_warning(f"This will permanently purge agent '{agent_id}' and its Linux user profile.")
+        confirmation = input("Proceed? [y/N]: ").strip().lower()
+        if confirmation not in {"y", "yes"}:
+            raise ValueError("purge cancelled by user")
+    result = service.purge_agent(agent_id)
+    print_success(f"Purged agent {result.get('agent_id', '')}")
+    linux_user = str(result.get("linux_user", "")).strip()
+    if linux_user:
+        print_info(
+            f"linux_user={linux_user} removed={bool(result.get('linux_user_removed', False))} "
+            f"home_removed={bool(result.get('home_removed', False))}"
+        )
+    return 0
+
+
 def cmd_monitor(args: argparse.Namespace, service: ZeroClawService) -> int:
     refresh = max(1, int(args.refresh_seconds))
     run_dashboard(service, agent_id=args.agent_id, refresh_seconds=refresh)
+    return 0
+
+
+def cmd_claws_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
+    rows = service.list_installed_claws(source_home=args.source_home)
+    if not rows:
+        print_info("No installed claws detected.")
+        return 0
+    table: list[list[str]] = []
+    for row in rows:
+        table.append(
+            [
+                str(row.get("provider", "")),
+                str(row.get("root", "")),
+                ", ".join(str(item) for item in row.get("markers", [])),
+            ]
+        )
+    print_table(["provider", "root", "markers"], table)
     return 0
 
 
@@ -558,6 +698,10 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"channel_strategy: {agent.get('channel_strategy', '')}",
             f"channels: {len(channels)}",
             f"migrated_channels: {migrated}",
+            f"provider: {agent.get('agent', {}).get('provider', '')}",
+            f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
+            f"autostart: {agent.get('agent', {}).get('autostart', True)}",
+            f"service_status: {agent.get('agent', {}).get('service_status', 'unknown')}",
             f"agent_status: {agent.get('agent', {}).get('status', '')}",
             f"agent_version: {agent.get('agent', {}).get('version', '')}",
         ],
@@ -570,11 +714,18 @@ def _print_agent(agent: dict[str, Any]) -> None:
                 [
                     str(channel.get("kind", "")),
                     str(channel.get("name", "")),
+                    str(bool(channel.get("enabled", True))),
                     str(channel.get("external_id", "")),
                     str(channel.get("migrated_from", "")),
                 ]
             )
-        print_table(["kind", "name", "external_id", "migrated_from"], rows)
+        print_table(["kind", "name", "enabled", "external_id", "migrated_from"], rows)
+
+    plugins = agent.get("agent", {}).get("plugins", {})
+    if plugins:
+        plugin_rows = [[str(key), str(bool(value))] for key, value in sorted(plugins.items())]
+        print()
+        print_table(["plugin", "enabled"], plugin_rows)
 
 
 def _resolve_channels(

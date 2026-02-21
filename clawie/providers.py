@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    name: str
+    runtime: str
+    auth_modes: tuple[str, ...]
+    default_auth_mode: str
+    state_dir: str
+    marker_files: tuple[str, ...]
+    credential_paths: tuple[str, ...] = ()
+
+    def supports_auth_mode(self, mode: str) -> bool:
+        return mode in self.auth_modes
+
+
+PROVIDERS: dict[str, ProviderSpec] = {
+    "zeroclaw": ProviderSpec(
+        name="zeroclaw",
+        runtime="zeroclaw-agent",
+        auth_modes=("linked", "api_key"),
+        default_auth_mode="linked",
+        state_dir=".zeroclaw",
+        marker_files=("config.toml", "auth-profiles.json", ".secret_key"),
+        credential_paths=(
+            ".zeroclaw",
+            ".config/zeroclaw",
+            ".codex",
+            ".config/openai",
+            ".openai",
+        ),
+    ),
+    "picoclaw": ProviderSpec(
+        name="picoclaw",
+        runtime="picoclaw-agent",
+        auth_modes=("linked", "api_key"),
+        default_auth_mode="linked",
+        state_dir=".picoclaw",
+        marker_files=("config.json", "config.toml", "auth-profiles.json"),
+        credential_paths=(
+            ".picoclaw",
+            ".config/picoclaw",
+            ".codex",
+            ".config/openai",
+            ".openai",
+        ),
+    ),
+    "openclaw": ProviderSpec(
+        name="openclaw",
+        runtime="openclaw-agent",
+        auth_modes=("none", "linked", "api_key"),
+        default_auth_mode="none",
+        state_dir=".openclaw",
+        marker_files=(
+            "openclaw.json",
+            "auth-profiles.json",
+            "agents/*/agent/auth-profiles.json",
+        ),
+        credential_paths=(
+            ".openclaw",
+            ".config/openclaw",
+            ".codex",
+            ".config/openai",
+            ".openai",
+        ),
+    ),
+}
+
+
+def provider_names() -> list[str]:
+    return sorted(PROVIDERS)
+
+
+def get_provider(name: str) -> ProviderSpec:
+    normalized = (name or "").strip().lower()
+    if normalized not in PROVIDERS:
+        choices = ", ".join(provider_names())
+        raise ValueError(f"provider must be one of: {choices}")
+    return PROVIDERS[normalized]
+
+
+def credential_paths_for_providers(names: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        spec = get_provider(name)
+        for rel in spec.credential_paths:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            ordered.append(rel)
+    return ordered
+
+
+def detect_installed_providers(home_dir: str) -> list[dict[str, object]]:
+    from pathlib import Path
+
+    source = Path(home_dir).expanduser()
+    findings: list[dict[str, object]] = []
+    for name in provider_names():
+        spec = get_provider(name)
+        root = source / spec.state_dir
+        if not root.exists():
+            continue
+        markers = []
+        for marker in spec.marker_files:
+            rel = f"{spec.state_dir}/{marker}"
+            if "*" in marker:
+                matched = list(source.glob(rel))
+                for item in matched[:3]:
+                    markers.append(str(item.relative_to(source)))
+            elif (source / rel).exists():
+                markers.append(rel)
+        if not markers:
+            continue
+        findings.append(
+            {
+                "provider": spec.name,
+                "root": str(root),
+                "markers": markers,
+            }
+        )
+    return findings

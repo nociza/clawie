@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pwd
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_url": "https://api.zeroclaw.example/v1",
     "api_key": "",
     "provider": "zeroclaw",
+    "auth_mode": "linked",
+    "provider_credentials": {},
+    "local_service_state": {},
+    "spawn_password_hash": "",
     "subscription": "starter",
     "workspace": "default",
     "runtime_installed": False,
@@ -39,16 +45,15 @@ DEFAULT_STATE: dict[str, Any] = {
 
 class StateStore:
     def __init__(self, config_dir: str | Path | None = None) -> None:
+        self._allow_tmp_fallback = config_dir is None and "CLAWIE_HOME" not in os.environ
         if config_dir is None:
-            self.root = Path(os.environ.get("CLAWIE_HOME", str(Path.home() / ".clawie")))
+            root = self._default_root()
         else:
-            self.root = Path(config_dir).expanduser()
-        self.db_path = self.root / "clawie.db"
-        self.config_path = self.root / "config.json"  # legacy migration input
-        self.state_path = self.root / "state.json"  # legacy migration input
+            root = Path(config_dir).expanduser()
+        self._set_root(root)
 
     def ensure(self) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self._ensure_root_dir()
         with self._connect() as conn:
             conn.executescript(
                 """
@@ -299,7 +304,46 @@ class StateStore:
             self.write_state(state)
 
     def _connect(self) -> sqlite3.Connection:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self._ensure_root_dir()
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _set_root(self, root: Path) -> None:
+        self.root = root.expanduser()
+        self.db_path = self.root / "clawie.db"
+        self.config_path = self.root / "config.json"  # legacy migration input
+        self.state_path = self.root / "state.json"  # legacy migration input
+
+    def _ensure_root_dir(self) -> None:
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            if not self._allow_tmp_fallback:
+                raise
+            fallback = self._fallback_root()
+            self._set_root(fallback)
+            self.root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _fallback_root() -> Path:
+        uid_fn = getattr(os, "getuid", None)
+        if callable(uid_fn):
+            suffix = str(uid_fn())
+        else:
+            suffix = str(os.environ.get("USERNAME", "user"))
+        return Path(tempfile.gettempdir()) / f"clawie-{suffix}"
+
+    @staticmethod
+    def _default_root() -> Path:
+        explicit = str(os.environ.get("CLAWIE_HOME", "")).strip()
+        if explicit:
+            return Path(explicit).expanduser()
+        sudo_user = str(os.environ.get("SUDO_USER", "")).strip()
+        if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+            try:
+                home = Path(pwd.getpwnam(sudo_user).pw_dir)
+                return home / ".clawie"
+            except KeyError:
+                pass
+        return Path.home() / ".clawie"

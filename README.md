@@ -5,8 +5,9 @@ Linux user spawning, agent provisioning, and channel operations.
 
 Core flows:
 - initialize local setup (`provider`, optional API key, subscription, workspace, API URL)
-- choose/install provider runtime (`zeroclaw` default, or `openclaw`)
+- choose/install provider runtime (`zeroclaw`, `picoclaw`, or `openclaw`)
 - spawn Linux users and copy current user configs
+- auto-detect installed claws in source home and transfer credentials/state
 - create or clone agents with channel strategies (`new` or `migrate`)
 - bootstrap or migrate channels between agents
 - inspect health, events, and htop-like monitor snapshots
@@ -34,20 +35,31 @@ Initialize setup (interactive):
 clawie setup --interactive
 ```
 
-Initialize setup (non-interactive, default provider `zeroclaw`):
+Initialize setup (non-interactive, default provider `zeroclaw` with linked auth):
+
+```bash
+clawie setup --subscription pro --workspace production
+```
+
+Set a global default password for future spawned Linux users:
+
+```bash
+clawie setup --spawn-password 'ChangeMe123!'
+```
+
+Use explicit API key auth (any provider that supports it):
 
 ```bash
 clawie setup \
-  --api-key zc_live_1234 \
-  --subscription pro \
-  --workspace production \
-  --api-url https://api.zeroclaw.example/v1
+  --provider zeroclaw \
+  --auth-mode api_key \
+  --api-key zc_live_1234
 ```
 
 Initialize with `openclaw` (no API key required):
 
 ```bash
-clawie setup --provider openclaw --install-runtime
+clawie setup --provider openclaw --auth-mode none --install-runtime
 ```
 
 Check setup:
@@ -63,7 +75,8 @@ clawie agents create \
   --agent-id alice \
   --display-name "Alice Kim" \
   --template baseline \
-  --channel-strategy new
+  --channel-strategy new \
+  --provider zeroclaw
 ```
 
 Clone an existing agent (shorthand command):
@@ -73,7 +86,8 @@ clawie agents clone \
   --from-agent alice \
   --agent-id bob \
   --display-name "Bob Lee" \
-  --channel-strategy migrate
+  --channel-strategy migrate \
+  --provider picoclaw
 ```
 
 Launch the htop-like monitor:
@@ -93,9 +107,12 @@ sudo clawie spawn --agent-id alice --linux-user alice
 Agent operations:
 
 ```bash
+clawie list
 clawie agents list
 clawie agents show --agent-id alice
 clawie agents delete --agent-id alice
+sudo clawie purge alice
+sudo clawie purge alice --yes
 ```
 
 Create/clone with explicit channels:
@@ -128,12 +145,51 @@ clawie monitor
 clawie dashboard
 ```
 
+Dashboard controls:
+- Local claws found in current user home (for example `~/.zeroclaw`) are shown
+  in the same list as agents, marked as `(current-user)`.
+- `j` / `k` or arrow keys: move selection
+- `Enter`: open selected agent detail page
+- `Tab`: switch detail section (channels/plugins/settings)
+- `Space` / `Enter`: run action for selected row
+- `a`: toggle selected agent autostart
+- In Settings, use service rows to run `<provider> service start|stop|restart|status`
+  The dashboard sets per-user runtime bus env automatically and retries once
+  after bootstrapping user linger/service manager when running as root.
+  If user bus remains unavailable, Clawie falls back to provider `daemon` mode
+  and tracks `fallback_pid` for start/stop/status operations.
+- `d`: purge selected agent (requires confirmation)
+- `b` or `Esc`: back to overview
+- `r`: refresh, `q`: quit
+
+Discover installed claws:
+
+```bash
+clawie claws detect
+clawie claws detect --source-home /home/azicon
+```
+
 Linux user spawning:
 
 ```bash
 sudo clawie spawn --agent-id sam --linux-user sam
 sudo clawie spawn --agent-id sam --linux-user sam --skip-config-copy
+sudo clawie spawn --agent-id pico1 --linux-user pico1 --provider picoclaw
+sudo clawie spawn --agent-id sam --linux-user sam --password 'AgentSpecific123!'
+sudo clawie spawn --agent-id sam --linux-user sam --password-hash '$6$...'
+sudo clawie spawn --agent-id sam --linux-user sam --no-global-password
 ```
+
+`spawn` automatically ports common credential/config locations from the invoking
+user to the new Linux user, including Clawie config, provider config dirs, and
+Codex/OpenAI config dirs when present.
+It also auto-detects installed claw runtimes in the source home and includes
+their credential/state paths during transfer.
+When source claw config contains configured channels (for example
+`~/.zeroclaw/config.toml` with `channels_config.telegram`), spawn imports those
+channel kinds automatically instead of falling back to baseline-only channels.
+When run via `sudo`, Clawie reuses the invoking user's Clawie state by default
+instead of creating a separate `/root/.clawie` setup.
 
 State snapshots:
 

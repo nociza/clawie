@@ -1046,3 +1046,21 @@ def test_connect_agent_channel_runs_provider_command(
     result = service.connect_agent_channel("alice", "telegram", "team")
     assert result["status"] == "connected"
     assert any(cmd[:3] == ["/usr/bin/openclaw", "channels", "add"] for cmd in calls)
+
+
+def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/picoclaw")
+    commands = service._channel_connect_commands("picoclaw", "telegram", "team", linux_user="")
+    assert any(len(cmd) >= 2 and cmd[1] == "onboard" for cmd in commands)
+    assert not any(len(cmd) >= 2 and cmd[1] == "channel" for cmd in commands)

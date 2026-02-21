@@ -1626,6 +1626,17 @@ class ZeroClawService:
             commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
             commands.append([executable, "channels", "login", kind])
             commands.append([executable, "channels", "login"])
+        elif provider == "zeroclaw":
+            # ZeroClaw channel management is centered around channel doctor/onboard,
+            # plus Telegram allowlist binding for direct identity linking.
+            if kind == "telegram" and self._looks_like_sender_identity(name):
+                commands.append([executable, "channel", "bind-telegram", name])
+            commands.append([executable, "channel", "doctor"])
+            commands.append([executable, "onboard", "--channels-only"])
+        elif provider == "picoclaw":
+            # PicoClaw uses onboarding + config-driven channels in ~/.picoclaw/config.json.
+            commands.append([executable, "onboard"])
+            commands.append([executable, "status"])
         else:
             commands.append([executable, "channel", "add", kind, name])
             commands.append([executable, "channels", "add", "--channel", kind, "--name", name])
@@ -1639,6 +1650,17 @@ class ZeroClawService:
             else:
                 wrapped.append(raw)
         return wrapped
+
+    @staticmethod
+    def _looks_like_sender_identity(value: str) -> bool:
+        token = str(value).strip()
+        if not token:
+            return False
+        if token in {"telegram", "default", "primary"}:
+            return False
+        if token.startswith("@") and len(token) > 1:
+            return True
+        return token.isdigit()
 
     def _sudo_wrap(self, base: list[str], linux_user: str) -> list[str]:
         current_user = ""

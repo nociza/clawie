@@ -10,8 +10,10 @@ class ProviderSpec:
     auth_modes: tuple[str, ...]
     default_auth_mode: str
     state_dir: str
+    workspace_dir: str
     marker_files: tuple[str, ...]
     credential_paths: tuple[str, ...] = ()
+    core_prompt_files: tuple[str, ...] = ()
 
     def supports_auth_mode(self, mode: str) -> bool:
         return mode in self.auth_modes
@@ -24,6 +26,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
         state_dir=".zeroclaw",
+        workspace_dir="workspace",
         marker_files=("config.toml", "auth-profiles.json", ".secret_key"),
         credential_paths=(
             ".zeroclaw",
@@ -32,6 +35,16 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".config/openai",
             ".openai",
         ),
+        core_prompt_files=(
+            "SOUL.md",
+            "IDENTITY.md",
+            "AGENTS.md",
+            "TOOLS.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "USER.md",
+        ),
     ),
     "picoclaw": ProviderSpec(
         name="picoclaw",
@@ -39,6 +52,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
         state_dir=".picoclaw",
+        workspace_dir="workspace",
         marker_files=("config.json", "config.toml", "auth-profiles.json"),
         credential_paths=(
             ".picoclaw",
@@ -47,6 +61,16 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".config/openai",
             ".openai",
         ),
+        core_prompt_files=(
+            "SOUL.md",
+            "IDENTITY.md",
+            "AGENTS.md",
+            "TOOLS.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "USER.md",
+        ),
     ),
     "openclaw": ProviderSpec(
         name="openclaw",
@@ -54,6 +78,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_modes=("none", "linked", "api_key"),
         default_auth_mode="none",
         state_dir=".openclaw",
+        workspace_dir="workspace",
         marker_files=(
             "openclaw.json",
             "auth-profiles.json",
@@ -65,6 +90,16 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".codex",
             ".config/openai",
             ".openai",
+        ),
+        core_prompt_files=(
+            "SOUL.md",
+            "IDENTITY.md",
+            "AGENTS.md",
+            "TOOLS.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "USER.md",
         ),
     ),
 }

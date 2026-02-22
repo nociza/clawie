@@ -145,6 +145,7 @@ class ZeroClawService:
         channels: list[dict[str, str]] | None,
         agent_version: str,
         provider: str | None = None,
+        core_prompts: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         self._require_setup()
 
@@ -185,13 +186,13 @@ class ZeroClawService:
         if channel_strategy == "new":
             final_channels = self._mint_channels(agent_id, base_channels)
         else:
-            if not clone_from:
+            if not clone_from and not channels:
                 raise ValueError(
-                    "channel strategy 'migrate' requires --clone-from to copy channels"
+                    "channel strategy 'migrate' requires --clone-from or explicit channels"
                 )
             final_channels = copy.deepcopy(base_channels)
             for channel in final_channels:
-                channel["migrated_from"] = clone_from
+                channel["migrated_from"] = clone_from or "local-source"
         for channel in final_channels:
             channel["enabled"] = bool(channel.get("enabled", True))
 
@@ -228,6 +229,9 @@ class ZeroClawService:
             "pid": int(source_agent_defaults.get("pid", 0)),
             "plugins": plugins,
         }
+        if clone_from and not core_prompts:
+            core_prompts = copy.deepcopy(agents.get(clone_from, {}).get("core_prompts", {}))
+        normalized_prompts = self._normalize_core_prompts(provider_spec.name, core_prompts or {})
 
         agent_state = {
             "agent_id": agent_id,
@@ -237,6 +241,7 @@ class ZeroClawService:
             "clone_from": clone_from,
             "channel_strategy": channel_strategy,
             "channels": final_channels,
+            "core_prompts": normalized_prompts,
             "agent": agent,
         }
         agents[agent_id] = agent_state
@@ -1007,6 +1012,150 @@ class ZeroClawService:
             return self._local_agent_view(provider)
         return self.get_agent(token)
 
+    def list_agent_core_prompts(self, agent_id: str) -> list[dict[str, Any]]:
+        payload = self.get_dashboard_agent(agent_id)
+        info = payload.get("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        prompts = self._normalize_core_prompts(provider, payload.get("core_prompts", {}))
+        rows: list[dict[str, Any]] = []
+        for name in self._provider_core_prompt_names(provider):
+            content = str(prompts.get(name, ""))
+            rows.append(
+                {
+                    "name": name,
+                    "chars": len(content),
+                    "configured": bool(content.strip()),
+                }
+            )
+        return rows
+
+    def get_agent_core_prompt(self, agent_id: str, prompt_name: str) -> dict[str, str]:
+        payload = self.get_dashboard_agent(agent_id)
+        info = payload.get("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        name = self._canonical_core_prompt_name(provider, prompt_name)
+        prompts = self._normalize_core_prompts(provider, payload.get("core_prompts", {}))
+        return {"name": name, "content": str(prompts.get(name, ""))}
+
+    def set_agent_core_prompt(
+        self,
+        agent_id: str,
+        prompt_name: str,
+        content: str,
+        sync_to_disk: bool = True,
+    ) -> dict[str, Any]:
+        token = str(agent_id).strip()
+        body = str(content)
+        if token.startswith("@local:"):
+            provider = token.split(":", 1)[1]
+            name = self._canonical_core_prompt_name(provider, prompt_name)
+            home = self._local_agent_home(provider)
+            if not home:
+                raise SetupError(f"could not resolve local home for provider '{provider}'")
+            self._write_core_prompt_file(provider, home, name, body)
+            return self._local_agent_view(provider)
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        name = self._canonical_core_prompt_name(provider, prompt_name)
+        prompts = self._normalize_core_prompts(provider, agent.get("core_prompts", {}))
+        prompts[name] = body
+        agent["core_prompts"] = prompts
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.prompt_updated",
+            f"Updated {name} for {token}",
+            {"agent_id": token, "prompt": name, "chars": len(body)},
+        )
+        self.store.write_state(state)
+        if sync_to_disk:
+            self.write_agent_core_prompts_to_disk(token)
+        return agent
+
+    def clone_agent_prompts(
+        self,
+        from_agent: str,
+        to_agent: str,
+        apply_to_disk: bool = True,
+    ) -> dict[str, Any]:
+        source = self.get_dashboard_agent(from_agent)
+        target = self.get_dashboard_agent(to_agent)
+        source_info = source.get("agent", {})
+        target_info = target.get("agent", {})
+        source_provider = str(source_info.get("provider", "")).strip().lower()
+        target_provider = str(target_info.get("provider", "")).strip().lower()
+        if source_provider != target_provider:
+            raise ValueError("source and target providers must match to clone core prompts")
+        prompt_payload = self._normalize_core_prompts(source_provider, source.get("core_prompts", {}))
+        for name, content in prompt_payload.items():
+            self.set_agent_core_prompt(to_agent, name, content, sync_to_disk=False)
+        if apply_to_disk:
+            self.write_agent_core_prompts_to_disk(to_agent)
+        return self.get_dashboard_agent(to_agent)
+
+    def sync_agent_core_prompts_from_disk(self, agent_id: str) -> dict[str, Any]:
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            provider = token.split(":", 1)[1]
+            return self._local_agent_view(provider)
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        home = self._agent_linux_home(agent)
+        if not home:
+            raise SetupError(f"agent '{token}' has no linux_user home to read prompts from")
+        disk_prompts = self._read_core_prompts_from_home(provider, home)
+        agent["core_prompts"] = self._normalize_core_prompts(provider, disk_prompts)
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.prompt_synced",
+            f"Synced core prompts from disk for {token}",
+            {"agent_id": token, "source": str(home)},
+        )
+        self.store.write_state(state)
+        return agent
+
+    def write_agent_core_prompts_to_disk(self, agent_id: str) -> dict[str, Any]:
+        payload = self.get_dashboard_agent(agent_id)
+        info = payload.get("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        prompts = self._normalize_core_prompts(provider, payload.get("core_prompts", {}))
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            home = self._local_agent_home(provider)
+            if not home:
+                raise SetupError(f"could not resolve local home for provider '{provider}'")
+            for name, content in prompts.items():
+                self._write_core_prompt_file(provider, home, name, content)
+            return self._local_agent_view(provider)
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        home = self._agent_linux_home(agent)
+        if not home:
+            raise SetupError(f"agent '{token}' has no linux_user home to write prompts to")
+        linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
+        for name, content in prompts.items():
+            self._write_core_prompt_file(provider, home, name, content)
+            if linux_user and os.geteuid() == 0:
+                target = self._core_prompt_path(provider, home, name)
+                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
+        return agent
+
     def local_claw_service_action(self, provider: str, action: str) -> dict[str, Any]:
         self._require_setup()
         name = str(provider).strip().lower()
@@ -1271,6 +1420,7 @@ class ZeroClawService:
         password: str | None = None,
         password_hash: str | None = None,
         use_global_password: bool = True,
+        clone_from_agent: str | None = None,
     ) -> dict[str, Any]:
         self._require_setup()
         agent_id = agent_id.strip()
@@ -1311,26 +1461,65 @@ class ZeroClawService:
                 src_home = Path("/home") / sudo_user
             else:
                 src_home = Path.home()
-        imported_channels = self._discover_channels_from_source_home(src_home, provider)
+
+        config = self.store.read_config()
+        resolved_provider = str(provider or config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
+        clone_token = str(clone_from_agent or "").strip()
+        cloned_prompts: dict[str, str] = {}
+        cloned_channels: list[dict[str, str]] = []
+        clone_source_agent: str | None = None
+        if clone_token:
+            source_payload = self.get_dashboard_agent(clone_token)
+            source_provider = str(source_payload.get("agent", {}).get("provider", "")).strip().lower()
+            if source_provider != resolved_provider:
+                raise ValueError("spawn clone source provider must match target provider")
+            clone_source_agent = clone_token if not clone_token.startswith("@local:") else None
+            cloned_channels = copy.deepcopy(source_payload.get("channels", []))
+            cloned_prompts = self._normalize_core_prompts(
+                resolved_provider,
+                source_payload.get("core_prompts", {}),
+            )
+        else:
+            cloned_channels = self._discover_channels_from_source_home(src_home, resolved_provider)
+            cloned_prompts = self._normalize_core_prompts(
+                resolved_provider,
+                self._read_core_prompts_from_home(resolved_provider, src_home),
+            )
+
         copied = self._copy_user_configs(src_home, target_home, target_user, enabled=copy_configs)
         copied += self._copy_provider_credentials(
             source_home=src_home,
             target_home=target_home,
             username=target_user,
-            requested_provider=provider,
+            requested_provider=resolved_provider,
             enabled=copy_configs,
         )
         agent_state = self.create_agent(
             agent_id=agent_id,
             display_name=agent_id,
             template=template,
-            clone_from=None,
-            channel_strategy="new",
-            channels=imported_channels or None,
+            clone_from=clone_source_agent,
+            channel_strategy="migrate" if cloned_channels else "new",
+            channels=cloned_channels or None,
             agent_version=agent_version,
-            provider=provider,
+            provider=resolved_provider,
+            core_prompts=cloned_prompts,
         )
         agent_state["agent"]["linux_user"] = target_user
+        if copy_configs:
+            for name, content in cloned_prompts.items():
+                try:
+                    self._write_core_prompt_file(resolved_provider, target_home, name, content)
+                    subprocess.run(
+                        [
+                            "chown",
+                            f"{target_user}:{target_user}",
+                            str(self._core_prompt_path(resolved_provider, target_home, name)),
+                        ],
+                        check=False,
+                    )
+                except PermissionError:
+                    pass
         state = self.store.read_state()
         self._event(
             state,
@@ -1343,7 +1532,8 @@ class ZeroClawService:
                 "detected_providers": [
                     row["provider"] for row in self.list_installed_claws(source_home=src_home)
                 ],
-                "imported_channels": len(imported_channels),
+                "imported_channels": len(cloned_channels),
+                "clone_from_agent": clone_from_agent or "",
                 "password_source": password_source,
             },
         )
@@ -1377,6 +1567,7 @@ class ZeroClawService:
                     channels=entry.get("channels"),
                     agent_version=str(entry.get("agent_version", "1.0.0")),
                     provider=entry.get("provider"),
+                    core_prompts=entry.get("core_prompts"),
                 )
                 results["created"].append(agent_state["agent_id"])
             except Exception as exc:  # noqa: BLE001
@@ -1526,6 +1717,7 @@ class ZeroClawService:
             channels=kwargs.get("channels"),
             agent_version=str(kwargs.get("agent_version", "1.0.0")),
             provider=kwargs.get("provider"),
+            core_prompts=kwargs.get("core_prompts"),
         )
 
     def list_users(self) -> list[dict[str, Any]]:
@@ -2065,6 +2257,84 @@ class ZeroClawService:
         adapter = get_channel_adapter(provider)
         return adapter.discover_channels(root)
 
+    @staticmethod
+    def _provider_core_prompt_names(provider: str) -> tuple[str, ...]:
+        try:
+            names = get_provider(provider).core_prompt_files
+        except ValueError:
+            names = ()
+        if names:
+            return names
+        return (
+            "SOUL.md",
+            "IDENTITY.md",
+            "AGENTS.md",
+            "TOOLS.md",
+            "MEMORY.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "USER.md",
+        )
+
+    def _canonical_core_prompt_name(self, provider: str, prompt_name: str) -> str:
+        token = str(prompt_name).strip().upper()
+        if token and not token.endswith(".MD"):
+            token = f"{token}.MD"
+        for item in self._provider_core_prompt_names(provider):
+            if item.upper() == token:
+                return item
+        raise ValueError(
+            f"unknown core prompt '{prompt_name}'. supported: {', '.join(self._provider_core_prompt_names(provider))}"
+        )
+
+    def _normalize_core_prompts(self, provider: str, payload: dict[str, Any]) -> dict[str, str]:
+        rows: dict[str, str] = {}
+        data = payload if isinstance(payload, dict) else {}
+        for name in self._provider_core_prompt_names(provider):
+            value = data.get(name, "")
+            rows[name] = str(value) if value is not None else ""
+        return rows
+
+    def _core_prompt_path(self, provider: str, home: Path, prompt_name: str) -> Path:
+        spec = get_provider(provider)
+        name = self._canonical_core_prompt_name(provider, prompt_name)
+        return home / spec.state_dir / spec.workspace_dir / name
+
+    def _read_core_prompts_from_home(self, provider: str, home: Path) -> dict[str, str]:
+        rows: dict[str, str] = {}
+        for name in self._provider_core_prompt_names(provider):
+            path = self._core_prompt_path(provider, home, name)
+            if path.exists():
+                rows[name] = path.read_text(encoding="utf-8")
+            else:
+                rows[name] = ""
+        return rows
+
+    def _write_core_prompt_file(self, provider: str, home: Path, prompt_name: str, content: str) -> Path:
+        path = self._core_prompt_path(provider, home, prompt_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(content), encoding="utf-8")
+        return path
+
+    def _agent_linux_home(self, agent: dict[str, Any]) -> Path | None:
+        linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
+        if not linux_user:
+            return None
+        return Path("/home") / linux_user
+
+    def _local_agent_home(self, provider: str) -> Path | None:
+        for claw in self.list_installed_claws():
+            if str(claw.get("provider", "")).strip().lower() != provider:
+                continue
+            root = Path(str(claw.get("root", "")).strip())
+            hint = self._linux_user_from_provider_root(root)
+            if hint and hint != "root":
+                return Path("/home") / hint
+        target = self._local_target_user()
+        if target and target != "root":
+            return Path("/home") / target
+        return None
+
     def _refresh_local_service_statuses(
         self,
         providers: list[str],
@@ -2376,6 +2646,10 @@ class ZeroClawService:
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)
         info = dict(local_state.get(provider, {}))
+        home = self._local_agent_home(provider)
+        prompts = self._normalize_core_prompts(provider, {})
+        if home:
+            prompts = self._normalize_core_prompts(provider, self._read_core_prompts_from_home(provider, home))
         return {
             "agent_id": f"@local:{provider}",
             "display_name": "local-user",
@@ -2383,6 +2657,7 @@ class ZeroClawService:
             "clone_from": "",
             "channel_strategy": "local-user",
             "channels": [],
+            "core_prompts": prompts,
             "agent": {
                 "provider": provider,
                 "auth_mode": str(self._provider_auth(provider).get("auth_mode", "")),
@@ -2464,10 +2739,12 @@ class ZeroClawService:
                 if isinstance(channel, dict):
                     channel["enabled"] = bool(channel.get("enabled", True))
         agent = agent_state.setdefault("agent", {})
+        provider = str(agent.get("provider", "")).strip().lower()
         raw_plugins = agent.get("plugins", self._default_plugins_for_provider(str(agent.get("provider", ""))))
         if not isinstance(raw_plugins, dict):
             raw_plugins = self._default_plugins_for_provider(str(agent.get("provider", "")))
         agent["plugins"] = self._normalize_plugins(raw_plugins)
+        agent_state["core_prompts"] = self._normalize_core_prompts(provider, agent_state.get("core_prompts", {}))
 
     def _discover_channels_from_source_home(
         self,

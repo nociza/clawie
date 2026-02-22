@@ -416,6 +416,91 @@ allowed_users = ["*"]
     agent = StateStore(config_dir=tmp_path).read_state()["agents"]["teleclaw"]
     kinds = {str(row.get("kind", "")) for row in agent.get("channels", [])}
     assert "telegram" in kinds
+    assert str(agent.get("channel_strategy", "")) == "migrate"
+
+
+def test_spawn_clones_core_prompts_from_local_source_home(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "setup", "--provider", "zeroclaw") == 0
+    capsys.readouterr()
+
+    source_home = tmp_path / "source-home"
+    workspace = source_home / ".zeroclaw" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "SOUL.md").write_text("You are teleclaw.\n", encoding="utf-8")
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        class Result:
+            returncode = 1
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    code = run_cli(
+        tmp_path,
+        "spawn",
+        "--agent-id",
+        "teleclaw2",
+        "--linux-user",
+        "teleclaw2",
+        "--source-home",
+        str(source_home),
+        "--skip-config-copy",
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Spawned linux user teleclaw2" in output
+
+    agent = StateStore(config_dir=tmp_path).read_state()["agents"]["teleclaw2"]
+    prompts = agent.get("core_prompts", {})
+    assert str(prompts.get("SOUL.md", "")) == "You are teleclaw.\n"
+
+
+def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "setup", "--provider", "zeroclaw") == 0
+    capsys.readouterr()
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.create_agent(
+        agent_id="src",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    service.create_agent(
+        agent_id="dst",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    service.set_agent_core_prompt("src", "SOUL.md", "source soul", sync_to_disk=False)
+
+    code = run_cli(
+        tmp_path,
+        "agents",
+        "clone-prompts",
+        "--from-agent",
+        "src",
+        "--to-agent",
+        "dst",
+        "--no-apply-to-disk",
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Cloned core prompts src -> dst" in output
+    dst = StateStore(config_dir=tmp_path).read_state()["agents"]["dst"]
+    assert str(dst.get("core_prompts", {}).get("SOUL.md", "")) == "source soul"
 
 
 def test_store_creates_sqlite_db(tmp_path: Path) -> None:
@@ -821,7 +906,7 @@ def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None
                 },
             }
 
-    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=2, setting_idx=2)
+    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=3, setting_idx=2)
     _handle_detail_key(ord("j"), state, FakeService())
     _handle_detail_key(ord("j"), state, FakeService())
     _handle_detail_key(ord("j"), state, FakeService())

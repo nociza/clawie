@@ -147,6 +147,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agents_clone.set_defaults(func=cmd_agents_clone)
 
+    agents_clone_prompts = agents_sub.add_parser(
+        "clone-prompts",
+        help="Clone core prompt files (SOUL.md, etc.) from one agent to another",
+    )
+    agents_clone_prompts.add_argument("--from-agent", required=True, help="Source agent ID")
+    agents_clone_prompts.add_argument("--to-agent", required=True, help="Target agent ID")
+    agents_clone_prompts.add_argument(
+        "--no-apply-to-disk",
+        action="store_true",
+        help="Only update clawiestate; do not write prompt files to target Linux home",
+    )
+    agents_clone_prompts.set_defaults(func=cmd_agents_clone_prompts)
+
     agents_list = agents_sub.add_parser("list", help="List agents")
     agents_list.set_defaults(func=cmd_agents_list)
 
@@ -238,6 +251,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-config-copy",
         action="store_true",
         help="Do not copy current user config files to the new Linux user",
+    )
+    spawn.add_argument(
+        "--clone-from-agent",
+        help="Clone full state from this source agent (defaults to current local claw state)",
     )
     spawn.set_defaults(func=cmd_spawn)
 
@@ -448,6 +465,17 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_agents_clone_prompts(args: argparse.Namespace, service: ZeroClawService) -> int:
+    updated = service.clone_agent_prompts(
+        from_agent=args.from_agent,
+        to_agent=args.to_agent,
+        apply_to_disk=not bool(args.no_apply_to_disk),
+    )
+    print_success(f"Cloned core prompts {args.from_agent} -> {args.to_agent}")
+    _print_agent(updated)
+    return 0
+
+
 def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     agents = service.list_agents()
     if not agents:
@@ -566,6 +594,7 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
         password=args.password,
         password_hash=args.password_hash,
         use_global_password=not bool(args.no_global_password),
+        clone_from_agent=args.clone_from_agent,
     )
     print_success(
         f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
@@ -700,6 +729,7 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"migrated_channels: {migrated}",
             f"provider: {agent.get('agent', {}).get('provider', '')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
+            f"core_prompts: {len(agent.get('core_prompts', {}))}",
             f"autostart: {agent.get('agent', {}).get('autostart', True)}",
             f"service_status: {agent.get('agent', {}).get('service_status', 'unknown')}",
             f"agent_status: {agent.get('agent', {}).get('status', '')}",

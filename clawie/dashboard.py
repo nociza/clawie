@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import curses
+import os
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from clawie.ui import print_info, print_table
@@ -21,6 +25,7 @@ class DashboardState:
     focus_idx: int = 0
     channel_idx: int = 0
     plugin_idx: int = 0
+    prompt_idx: int = 0
     setting_idx: int = 0
     purge_confirm: bool = False
     notice: str = ""
@@ -217,7 +222,8 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
         state.notice_error = False
         return
 
-    focus_names = ["channels", "plugins", "settings"]
+    focus_names = ["channels", "plugins", "prompts", "settings"]
+    state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
     focus = focus_names[state.focus_idx]
 
     try:
@@ -227,8 +233,10 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
 
     channels = agent.get("channels", [])
     plugins = sorted(agent.get("agent", {}).get("plugins", {}).items())
+    prompts = _prompt_items(agent)
     state.channel_idx = min(state.channel_idx, max(0, len(channels) - 1))
     state.plugin_idx = min(state.plugin_idx, max(0, len(plugins) - 1))
+    state.prompt_idx = min(state.prompt_idx, max(0, len(prompts) - 1))
     settings = _settings_items(agent)
     state.setting_idx = min(state.setting_idx, max(0, len(settings) - 1))
 
@@ -241,6 +249,8 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = min(max(0, len(channels) - 1), state.channel_idx + 1)
         elif focus == "plugins":
             state.plugin_idx = min(max(0, len(plugins) - 1), state.plugin_idx + 1)
+        elif focus == "prompts":
+            state.prompt_idx = min(max(0, len(prompts) - 1), state.prompt_idx + 1)
         else:
             state.setting_idx = min(max(0, len(settings) - 1), state.setting_idx + 1)
         return
@@ -250,6 +260,8 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = max(0, state.channel_idx - 1)
         elif focus == "plugins":
             state.plugin_idx = max(0, state.plugin_idx - 1)
+        elif focus == "prompts":
+            state.prompt_idx = max(0, state.prompt_idx - 1)
         else:
             state.setting_idx = max(0, state.setting_idx - 1)
         return
@@ -289,6 +301,9 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
+        elif focus == "prompts" and prompts:
+            item = prompts[state.prompt_idx]
+            _run_prompt_action(service, state, item)
         elif focus == "settings":
             item = settings[state.setting_idx] if settings else None
             if item:
@@ -334,7 +349,7 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
         if state.purge_confirm:
             footer = "CONFIRM PURGE: y confirm | n cancel"
         else:
-            footer = "q quit | b back | Tab section | j/k move | Space/Enter action | a autostart | d purge | r refresh"
+            footer = "q quit | b back | Tab section | j/k move | Space/Enter action | prompts: edit/sync/write | a autostart | d purge | r refresh"
 
     _add(stdscr, height - 1, 0, _fit(footer, width), _color(3))
     stdscr.refresh()
@@ -511,33 +526,36 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     agent_info = agent.get("agent", {})
     channels = agent.get("channels", [])
     plugins = sorted(agent_info.get("plugins", {}).items())
-    focus_names = ["channels", "plugins", "settings"]
+    prompts = _prompt_items(agent)
+    focus_names = ["channels", "plugins", "prompts", "settings"]
+    state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
     focus = focus_names[state.focus_idx]
 
     _add(stdscr, 3, 0, f"Agent Detail: {_display_agent_id(state.selected_agent_id)}", _color(1))
     _add(stdscr, 4, 0, f"provider={agent_info.get('provider', '')}  status={agent_info.get('status', '')}  version={agent_info.get('version', '')}", _color(0))
+    _add(stdscr, 5, 0, f"sections: {' | '.join(focus_names)}", _color(3))
     if state.purge_confirm:
-        _add(stdscr, 5, 0, "Purge requested: press 'y' to permanently delete agent + Linux user, or 'n' to cancel.", _color(2))
+        _add(stdscr, 6, 0, "Purge requested: press 'y' to permanently delete agent + Linux user, or 'n' to cancel.", _color(2))
 
     left_w = max(36, int(width * 0.45))
     mid_w = max(28, int(width * 0.30))
     right_x = left_w + mid_w + 2
 
-    _add(stdscr, 6, 0, f"Channels [{'ACTIVE' if focus == 'channels' else '      '}]")
-    line = 7
-    for idx, channel in enumerate(channels[: max(0, height - 10)]):
+    _add(stdscr, 7, 0, f"Channels [{'ACTIVE' if focus == 'channels' else '      '}]")
+    line = 8
+    for idx, channel in enumerate(channels[: max(0, height - 11)]):
         marker = "[x]" if bool(channel.get("enabled", True)) else "[ ]"
         text = f"{marker} {channel.get('kind', '')}:{channel.get('name', '')}"
         color = _color(5) if focus == "channels" and idx == state.channel_idx else _color(0)
         _add(stdscr, line, 0, _fit(text, left_w - 1), color)
         line += 1
 
-    for y in range(6, height - 1):
+    for y in range(7, height - 1):
         _add(stdscr, y, left_w, "|", _color(4))
 
-    _add(stdscr, 6, left_w + 2, f"Plugins [{'ACTIVE' if focus == 'plugins' else '      '}]")
-    line = 7
-    for idx, item in enumerate(plugins[: max(0, height - 10)]):
+    _add(stdscr, 7, left_w + 2, f"Plugins [{'ACTIVE' if focus == 'plugins' else '      '}]")
+    line = 8
+    for idx, item in enumerate(plugins[: max(0, height - 11)]):
         key, enabled = item
         marker = "[x]" if bool(enabled) else "[ ]"
         text = f"{marker} {key}"
@@ -545,15 +563,20 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         _add(stdscr, line, left_w + 2, _fit(text, mid_w - 2), color)
         line += 1
 
-    for y in range(6, height - 1):
+    for y in range(7, height - 1):
         _add(stdscr, y, left_w + mid_w + 1, "|", _color(4))
 
-    _add(stdscr, 6, right_x, f"Settings [{'ACTIVE' if focus == 'settings' else '      '}]")
-    setting_rows = _settings_items(agent)
-    line = 7
-    for idx, item in enumerate(setting_rows):
-        text = str(item["label"])
-        color = _color(5) if focus == "settings" and idx == state.setting_idx else _color(0)
+    if focus == "prompts":
+        _add(stdscr, 7, right_x, "Prompts [ACTIVE]", _color(1))
+        right_rows = prompts
+    else:
+        _add(stdscr, 7, right_x, f"Settings [{'ACTIVE' if focus == 'settings' else '      '}]")
+        right_rows = _settings_items(agent)
+    line = 8
+    for idx, item in enumerate(right_rows):
+        text = str(item.get("label", ""))
+        selected = (focus == "prompts" and idx == state.prompt_idx) or (focus == "settings" and idx == state.setting_idx)
+        color = _color(5) if selected else _color(0)
         _add(stdscr, line, right_x, _fit(text, width - right_x), color)
         line += 1
     if state.notice:
@@ -641,6 +664,24 @@ def _print_static(snapshot: dict[str, Any]) -> None:
             print(f"- {event.get('timestamp', '')} {event.get('type', '')} {event.get('message', '')}")
 
 
+def _prompt_items(agent: dict[str, Any]) -> list[dict[str, str]]:
+    prompt_rows: list[dict[str, str]] = []
+    prompts = agent.get("core_prompts", {})
+    if isinstance(prompts, dict):
+        for name in sorted(prompts):
+            content = str(prompts.get(name, ""))
+            prompt_rows.append(
+                {
+                    "kind": "prompt_edit",
+                    "prompt": str(name),
+                    "label": f"edit {name} ({len(content)} chars)",
+                }
+            )
+    prompt_rows.append({"kind": "prompt_sync_from_disk", "label": "sync prompts from disk"})
+    prompt_rows.append({"kind": "prompt_write_to_disk", "label": "write prompts to disk"})
+    return prompt_rows
+
+
 def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
     info = agent.get("agent", {})
     is_local = bool(info.get("local_user", False))
@@ -664,6 +705,56 @@ def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
         },
         {"kind": "auth_mode", "label": f"{prefix}auth_mode: {info.get('auth_mode', '')}"},
     ]
+
+
+def _run_prompt_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
+    kind = str(item.get("kind", ""))
+    try:
+        if kind == "prompt_sync_from_disk":
+            service.sync_agent_core_prompts_from_disk(state.selected_agent_id)
+            state.notice = "prompts synced from disk"
+        elif kind == "prompt_write_to_disk":
+            service.write_agent_core_prompts_to_disk(state.selected_agent_id)
+            state.notice = "prompts written to disk"
+        elif kind == "prompt_edit":
+            prompt = str(item.get("prompt", ""))
+            payload = service.get_agent_core_prompt(state.selected_agent_id, prompt)
+            updated = _edit_text_in_editor(
+                initial=str(payload.get("content", "")),
+                suffix=Path(prompt).suffix or ".md",
+            )
+            if updated is None:
+                state.notice = "prompt edit cancelled"
+            else:
+                service.set_agent_core_prompt(state.selected_agent_id, prompt, updated, sync_to_disk=True)
+                state.notice = f"updated {prompt}"
+        else:
+            state.notice = "unknown prompt action"
+        state.notice_error = False
+    except Exception as exc:  # noqa: BLE001
+        state.notice = str(exc)
+        state.notice_error = True
+
+
+def _edit_text_in_editor(initial: str, suffix: str = ".md") -> str | None:
+    editor = str(os.environ.get("EDITOR", "")).strip() or "vi"
+    fd, path = tempfile.mkstemp(prefix="clawie-prompt-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(initial)
+        curses.def_prog_mode()
+        curses.endwin()
+        result = subprocess.run([editor, path], check=False)
+        curses.reset_prog_mode()
+        curses.curs_set(0)
+        if result.returncode != 0:
+            return None
+        return Path(path).read_text(encoding="utf-8")
+    finally:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:

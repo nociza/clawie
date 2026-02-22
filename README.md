@@ -1,8 +1,10 @@
 # clawie
+<img width="2466" height="1536" alt="clawie" src="https://github.com/user-attachments/assets/e458bb38-b506-4fd6-a43e-53cd49649592" />
 
 `clawie` is the central command center for your claw army.
 It gives you one local CLI + terminal dashboard to provision, isolate, and run
 many claws from one place.
+
 
 ## Philosophy
 

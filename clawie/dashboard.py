@@ -11,6 +11,55 @@ from typing import Any
 
 from clawie.ui import print_info, print_table
 
+# ── Box Drawing ──────────────────────────────────────────────────────
+H = "\u2500"  # ─
+V = "\u2502"  # │
+TL = "\u250c"  # ┌
+TR = "\u2510"  # ┐
+BL = "\u2514"  # └
+BR = "\u2518"  # ┘
+LT = "\u251c"  # ├
+RT = "\u2524"  # ┤
+TT = "\u252c"  # ┬
+BT = "\u2534"  # ┴
+XX = "\u253c"  # ┼
+
+# ── Icons ────────────────────────────────────────────────────────────
+ICON_RUN = "\u25cf"  # ●
+ICON_STOP = "\u25cb"  # ○
+ICON_ON = "\u25c9"  # ◉
+ICON_OFF = "\u25cb"  # ○
+ICON_PTR = "\u25b8"  # ▸
+ICON_DOT = "\u00b7"  # ·
+ICON_BRAND = "\u25c8"  # ◈
+ICON_BACK = "\u25c2"  # ◂
+ICON_WARN = "\u25b2"  # ▲
+BAR_FILL = "\u25b0"  # ▰
+BAR_EMPTY = "\u25b1"  # ▱
+
+# ── Color Pair IDs ───────────────────────────────────────────────────
+C_DEFAULT = 0
+C_TITLE = 1  # Cyan – branding, titles, info
+C_ERROR = 2  # Red – errors, critical
+C_HELP = 3  # Yellow – footer help, legend
+C_BORDER = 4  # Blue – borders, structural
+C_SELECT = 5  # Black on Cyan – selection highlight
+C_OK = 6  # Green – running, success, enabled
+C_HEAD = 7  # White bold – section headers
+C_ACCENT = 8  # Magenta – badges, accents
+C_NOTICE_OK = 9  # Black on Green – success notice bar
+C_NOTICE_ERR = 10  # White on Red – error notice bar
+
+# ── Status Abbreviations ────────────────────────────────────────────
+_STATUS_SHORT: dict[str, str] = {
+    "running": "run",
+    "stopped": "stop",
+    "starting": "init",
+    "active": "run",
+    "inactive": "stop",
+    "dead": "dead",
+}
+
 
 @dataclass
 class DashboardState:
@@ -30,6 +79,11 @@ class DashboardState:
     purge_confirm: bool = False
     notice: str = ""
     notice_error: bool = False
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Entry Points
+# ═════════════════════════════════════════════════════════════════════
 
 
 def run_dashboard(
@@ -59,7 +113,10 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
         state.view = "detail"
 
     while True:
-        snapshot = service.performance_snapshot(agent_id=None if state.view == "detail" else agent_id, refresh=True)
+        snapshot = service.performance_snapshot(
+            agent_id=None if state.view == "detail" else agent_id,
+            refresh=True,
+        )
         _sync_selection(state, snapshot)
         _draw(stdscr, snapshot, state, service)
 
@@ -77,8 +134,15 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
             _handle_detail_key(key, state, service)
 
 
+# ═════════════════════════════════════════════════════════════════════
+#  Key Handlers
+# ═════════════════════════════════════════════════════════════════════
+
+
 def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any], service: Any) -> None:
     if key in (ord("v"), ord("V")):
+        state.notice = ""
+        state.notice_error = False
         if state.overview_mode == "agents":
             state.overview_mode = "channels"
             state.overview_focus_idx = 0
@@ -102,6 +166,8 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
             state.selected_agent_id = str(rows[state.selected_row].get("agent_id", ""))
     elif key in (curses.KEY_ENTER, 10, 13):
         if rows:
+            state.notice = ""
+            state.notice_error = False
             state.view = "detail"
 
 
@@ -195,6 +261,8 @@ def _handle_channels_overview_key(
             state.notice_error = True
         return
     if key in (curses.KEY_ENTER, 10, 13):
+        state.notice = ""
+        state.notice_error = False
         state.selected_agent_id = target_agent_id
         state.view = "detail"
 
@@ -204,7 +272,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
         if key in (ord("y"), ord("Y")):
             try:
                 service.purge_agent(state.selected_agent_id)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 state.purge_confirm = False
                 return
             state.purge_confirm = False
@@ -228,7 +296,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
 
     try:
         agent = service.get_dashboard_agent(state.selected_agent_id)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return
 
     channels = agent.get("channels", [])
@@ -310,6 +378,11 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
                 _run_setting_action(service, state, item)
 
 
+# ═════════════════════════════════════════════════════════════════════
+#  Selection Sync
+# ═════════════════════════════════════════════════════════════════════
+
+
 def _sync_selection(state: DashboardState, snapshot: dict[str, Any]) -> None:
     rows = snapshot.get("rows", [])
     if not rows:
@@ -331,49 +404,87 @@ def _sync_selection(state: DashboardState, snapshot: dict[str, Any]) -> None:
         state.selected_agent_id = str(rows[state.selected_row].get("agent_id", ""))
 
 
+# ═════════════════════════════════════════════════════════════════════
+#  Main Draw Orchestrator
+# ═════════════════════════════════════════════════════════════════════
+
+
 def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service: Any) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
+    if height < 8 or width < 40:
+        _add(stdscr, 0, 0, _fit("terminal too small (min 40x8)", width), _color(C_ERROR))
+        stdscr.refresh()
+        return
+
     _draw_header(stdscr, snapshot, width)
-    _draw_stats(stdscr, snapshot, width)
 
     if state.view == "overview":
+        _draw_stats(stdscr, snapshot, width)
         _draw_overview(stdscr, snapshot, state, service, height, width)
         if state.overview_mode == "agents":
-            footer = "q quit | v channels view | Enter details | j/k move | r refresh"
+            footer = f"q quit {ICON_DOT} v channels {ICON_DOT} Enter details {ICON_DOT} j/k move {ICON_DOT} r refresh"
         else:
-            footer = "q quit | v agents view | Tab pane | j/k move | a assign | u unassign | c connect | Enter details | r refresh"
+            footer = f"q quit {ICON_DOT} v agents {ICON_DOT} Tab pane {ICON_DOT} j/k move {ICON_DOT} a assign {ICON_DOT} u unassign {ICON_DOT} c connect {ICON_DOT} r refresh"
     else:
         _draw_detail(stdscr, service, state, height, width)
         if state.purge_confirm:
-            footer = "CONFIRM PURGE: y confirm | n cancel"
+            footer = f"{ICON_WARN} CONFIRM PURGE: y confirm {ICON_DOT} n cancel"
         else:
-            footer = "q quit | b back | Tab section | j/k move | Space/Enter action | prompts: edit/sync/write | a autostart | d purge | r refresh"
+            footer = (
+                f"q quit {ICON_DOT} b back {ICON_DOT} Tab section {ICON_DOT} j/k move {ICON_DOT} "
+                f"Space toggle {ICON_DOT} prompts: edit/sync/write {ICON_DOT} a autostart {ICON_DOT} d purge"
+            )
 
-    _add(stdscr, height - 1, 0, _fit(footer, width), _color(3))
+    # ── Notice bar ───────────────────────────────────────────────────
+    if state.notice:
+        ncolor = _color(C_NOTICE_ERR) if state.notice_error else _color(C_NOTICE_OK)
+        notice_text = f" {state.notice} "
+        _add(stdscr, height - 2, 0, notice_text.ljust(width - 1), ncolor)
+
+    # ── Footer ───────────────────────────────────────────────────────
+    _add(stdscr, height - 1, 0, _fit(f" {footer}", width), _color(C_HELP))
     stdscr.refresh()
 
 
+# ═════════════════════════════════════════════════════════════════════
+#  Header & Stats
+# ═════════════════════════════════════════════════════════════════════
+
+
 def _draw_header(stdscr: Any, snapshot: dict[str, Any], width: int) -> None:
-    title = "CLAWIE DASHBOARD"
-    meta = f"provider={snapshot.get('provider', '')} workspace={snapshot.get('workspace', '')}"
-    line = f"{title}  |  {meta}"
-    _add(stdscr, 0, 0, _fit(line, width), _color(1))
+    provider = snapshot.get("provider", "")
+    workspace = snapshot.get("workspace", "")
+    generated = snapshot.get("generated_at", "")
+
+    left = f" {ICON_BRAND} CLAWIE"
+    right = f"{provider} {ICON_DOT} {workspace} {ICON_DOT} {generated} "
+
+    _add(stdscr, 0, 0, left, _color(C_TITLE, bold=True))
+    right_x = max(len(left) + 2, width - len(right))
+    _add(stdscr, 0, right_x, _fit(right, width - right_x), _color(C_TITLE, dim=True))
 
 
 def _draw_stats(stdscr: Any, snapshot: dict[str, Any], width: int) -> None:
     totals = snapshot.get("totals", {})
-    line = (
-        f"agents {totals.get('agents', 0)}  "
-        f"channels {totals.get('channels', 0)}  "
-        f"migrated {totals.get('migrated_channels', 0)}  "
-        f"cpu {totals.get('cpu_percent', 0)}%  mem {totals.get('mem_percent', 0)}%  "
-        f"generated {snapshot.get('generated_at', '')}"
-    )
-    _add(stdscr, 1, 0, _fit(line, width), _color(0))
-    _add(stdscr, 2, 0, "=" * max(0, width - 1), _color(4))
-    _add(stdscr, 3, 0, _fit("Legend: @<provider> = local claw for current Linux user", width), _color(3))
+    agents = totals.get("agents", 0)
+    channels = totals.get("channels", 0)
+    migrated = totals.get("migrated_channels", 0)
+    cpu = float(totals.get("cpu_percent", 0))
+    mem = float(totals.get("mem_percent", 0))
+
+    left = f" {agents} agents  {channels} channels  {migrated} migrated"
+    right = f"cpu {_bar(cpu)} {cpu:4.1f}%  mem {_bar(mem)} {mem:4.1f}% "
+
+    _add(stdscr, 1, 0, left, _color(C_DEFAULT))
+    right_x = max(len(left) + 2, width - len(right))
+    _add(stdscr, 1, right_x, _fit(right, width - right_x), _color(C_DEFAULT))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Overview Router
+# ═════════════════════════════════════════════════════════════════════
 
 
 def _draw_overview(
@@ -390,55 +501,111 @@ def _draw_overview(
     _draw_overview_agents(stdscr, snapshot, state, height, width)
 
 
-def _draw_overview_agents(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, height: int, width: int) -> None:
+# ═════════════════════════════════════════════════════════════════════
+#  Overview – Agents
+# ═════════════════════════════════════════════════════════════════════
+
+
+def _draw_overview_agents(
+    stdscr: Any,
+    snapshot: dict[str, Any],
+    state: DashboardState,
+    height: int,
+    width: int,
+) -> None:
     rows = snapshot.get("rows", [])
-    split = max(40, int(width * 0.68))
-    split = min(split, width - 20)
-    table_bottom = height - 4
+    split = max(40, int(width * 0.65))
+    split = min(split, width - 22)
+    content_bottom = height - 3  # leave room for notice + footer
+    right_x = split + 2
+    right_w = max(0, width - right_x)
 
-    headers = ["agent", "status", "cpu", "mem", "channels", "provider"]
-    _add(stdscr, 4, 0, _fit(" ".join(h.ljust(12) for h in headers), split), _color(4))
+    # ── Top separator ────────────────────────────────────────────────
+    _hline(stdscr, 2, width, junctions={split: TT})
 
-    line = 5
+    # ── Column headers ───────────────────────────────────────────────
+    aw, pw = _agent_col_widths(split - 2)
+    header = (
+        f"   {'AGENT':<{aw}}  {'STATUS':<7}  {'CPU':>5}  {'MEM':>5}  {'CH':>5}  {'PROVIDER':<{pw}}"
+    )
+    _add(stdscr, 3, 0, _fit(header, split), _color(C_HEAD, bold=True))
+    _add(stdscr, 3, right_x, "SELECTED AGENT", _color(C_HEAD, bold=True))
+
+    # ── Vertical divider ─────────────────────────────────────────────
+    for y in range(2, content_bottom + 1):
+        _add(stdscr, y, split, V, _color(C_BORDER))
+
+    # ── Bottom separator ─────────────────────────────────────────────
+    if content_bottom > 4:
+        _hline(stdscr, content_bottom, width, junctions={split: BT})
+
+    # ── Agent rows ───────────────────────────────────────────────────
+    line = 4
     for idx, row in enumerate(rows):
-        if line >= table_bottom:
+        if line >= content_bottom:
             break
-        channels_text = f"{row.get('channels', 0)}/{row.get('channels_total', 0)}"
-        text = " ".join(
-            [
-                _display_agent_id(str(row.get("agent_id", "")))[:12].ljust(12),
-                str(row.get("status", ""))[:12].ljust(12),
-                f"{float(row.get('cpu_percent', 0.0)):.1f}".ljust(12),
-                f"{float(row.get('mem_percent', 0.0)):.1f}".ljust(12),
-                channels_text.ljust(12),
-                str(row.get("provider", ""))[:12].ljust(12),
-            ]
+        agent_id = _display_agent_id(str(row.get("agent_id", "")))
+        status = str(row.get("status", ""))
+        icon = _status_icon(status)
+        cpu = f"{float(row.get('cpu_percent', 0.0)):.1f}"
+        mem = f"{float(row.get('mem_percent', 0.0)):.1f}"
+        ch = f"{row.get('channels', 0)}/{row.get('channels_total', 0)}"
+        prov = str(row.get("provider", ""))
+        is_sel = idx == state.selected_row
+        ptr = ICON_PTR if is_sel else " "
+
+        text = (
+            f" {ptr} {agent_id:<{aw}.{aw}}  {icon} {_status_short(status):<4}  "
+            f"{cpu:>5}  {mem:>5}  {ch:>5}  {prov:<{pw}.{pw}}"
         )
-        color = _color(5) if idx == state.selected_row else _color(0)
-        _add(stdscr, line, 0, _fit(text, split), color)
+        attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, 0, _fit(text, split), attr)
+
+        # status icon color on non-selected rows
+        if not is_sel:
+            icon_attr = _color(C_OK) if _is_running(status) else _color(C_HELP, dim=True)
+            icon_x = 4 + aw + 2
+            if icon_x < split:
+                _add(stdscr, line, icon_x, icon, icon_attr)
+
         line += 1
 
-    for y in range(4, height - 1):
-        _add(stdscr, y, split, "|", _color(4))
+    if not rows:
+        _add(stdscr, 4, 2, "no agents found", _color(C_HELP, dim=True))
 
-    pane_x = split + 2
-    if rows:
-        selected = rows[state.selected_row]
-        _add(stdscr, 4, pane_x, "Selected Agent", _color(1))
-        _add(stdscr, 5, pane_x, f"id: {_display_agent_id(str(selected.get('agent_id', '')))}", _color(0))
-        _add(stdscr, 6, pane_x, f"display: {selected.get('display_name', '')}", _color(0))
-        _add(stdscr, 7, pane_x, f"provider: {selected.get('provider', '')}", _color(0))
-        _add(stdscr, 8, pane_x, f"status: {selected.get('status', '')}", _color(0))
-        _add(stdscr, 9, pane_x, f"version: {selected.get('version', '')}", _color(0))
-        _add(stdscr, 10, pane_x, f"strategy: {selected.get('strategy', '')}", _color(0))
+    # ── Right panel: selected agent ──────────────────────────────────
+    if rows and state.selected_row < len(rows):
+        sel = rows[state.selected_row]
+        info_lines = [
+            (_display_agent_id(str(sel.get("agent_id", ""))), _color(C_TITLE, bold=True)),
+            (f"display  {sel.get('display_name', '')}", _color(C_DEFAULT)),
+            (f"provider {sel.get('provider', '')}", _color(C_DEFAULT)),
+            (f"status   {_status_icon(str(sel.get('status', '')))} {sel.get('status', '')}", _color(C_DEFAULT)),
+            (f"version  {sel.get('version', '')}", _color(C_DEFAULT)),
+            (f"strategy {sel.get('strategy', '')}", _color(C_DEFAULT)),
+        ]
+        for i, (text, attr) in enumerate(info_lines):
+            y = 4 + i
+            if y >= content_bottom:
+                break
+            _add(stdscr, y, right_x, _fit(text, right_w), attr)
 
+    # ── Right panel: recent events ───────────────────────────────────
     events = snapshot.get("events", [])
-    _add(stdscr, 12, pane_x, "Recent Events", _color(1))
-    ev_line = 13
-    for event in events[: max(0, height - 15)]:
-        text = f"{event.get('timestamp', '')} | {event.get('type', '')}"
-        _add(stdscr, ev_line, pane_x, _fit(text, width - pane_x), _color(0))
-        ev_line += 1
+    events_start = 11
+    if events and events_start < content_bottom:
+        _add(stdscr, events_start, right_x, "RECENT EVENTS", _color(C_HEAD, bold=True))
+        ev_line = events_start + 1
+        for event in events[: max(0, content_bottom - ev_line)]:
+            ts = str(event.get("timestamp", ""))
+            etype = str(event.get("type", ""))
+            _add(stdscr, ev_line, right_x, _fit(f"{ts} {etype}", right_w), _color(C_DEFAULT, dim=True))
+            ev_line += 1
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Overview – Channels
+# ═════════════════════════════════════════════════════════════════════
 
 
 def _draw_overview_channels(
@@ -449,17 +616,17 @@ def _draw_overview_channels(
     height: int,
     width: int,
 ) -> None:
-    _ = snapshot
-    col_w = max(24, int((width - 4) / 3))
-    col2_x = col_w + 2
-    col3_x = (col_w * 2) + 3
-    rows_max = max(0, height - 10)
+    col_w = max(22, int((width - 4) / 3))
+    col2_x = col_w + 1
+    col3_x = (col_w * 2) + 2
+    content_bottom = height - 3
+    rows_max = max(0, content_bottom - 6)
 
     channels: list[dict[str, Any]] = []
     try:
         inventory = service.channel_inventory()
         channels = list(inventory.get("rows", []))
-    except Exception:
+    except Exception:  # noqa: BLE001
         channels = []
     agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
     state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
@@ -469,58 +636,90 @@ def _draw_overview_channels(
     state.selected_available_row = min(state.selected_available_row, max(0, len(available) - 1))
     state.selected_assigned_row = min(state.selected_assigned_row, max(0, len(assigned) - 1))
 
-    _add(stdscr, 4, 0, "Channels View", _color(1))
-    _add(stdscr, 5, 0, "Select an agent, assign from Available, unassign from Assigned, then connect.", _color(0))
+    # ── Top separator ────────────────────────────────────────────────
+    _hline(stdscr, 2, width, junctions={col_w: TT, col3_x - 1: TT})
 
-    _add(stdscr, 7, 0, f"Target Agents [{'ACTIVE' if state.overview_focus_idx == 0 else '      '}]", _color(4))
-    _add(stdscr, 7, col2_x, f"Available Channels [{'ACTIVE' if state.overview_focus_idx == 1 else '      '}]", _color(4))
-    _add(stdscr, 7, col3_x, f"Assigned Channels [{'ACTIVE' if state.overview_focus_idx == 2 else '      '}]", _color(4))
+    # ── Section headers ──────────────────────────────────────────────
+    hdr_attrs = [_color(C_HELP, dim=True)] * 3
+    hdr_attrs[state.overview_focus_idx] = _color(C_TITLE, bold=True)
 
-    for y in range(6, height - 1):
-        _add(stdscr, y, col_w, "|", _color(4))
-        _add(stdscr, y, col3_x - 2, "|", _color(4))
+    _add(stdscr, 3, 1, "TARGET AGENTS", hdr_attrs[0])
+    _add(stdscr, 3, col2_x + 1, "AVAILABLE", hdr_attrs[1])
+    _add(stdscr, 3, col3_x + 1, "ASSIGNED", hdr_attrs[2])
 
-    line = 8
+    # ── Sub-header description ───────────────────────────────────────
+    _add(stdscr, 4, 1, _fit("select agent, assign/connect channels", col_w - 2), _color(C_HELP, dim=True))
+
+    # ── Vertical dividers ────────────────────────────────────────────
+    for y in range(2, content_bottom + 1):
+        _add(stdscr, y, col_w, V, _color(C_BORDER))
+        _add(stdscr, y, col3_x - 1, V, _color(C_BORDER))
+
+    # ── Bottom separator ─────────────────────────────────────────────
+    if content_bottom > 5:
+        _hline(stdscr, content_bottom, width, junctions={col_w: BT, col3_x - 1: BT})
+
+    # ── Column 1: Target agents ──────────────────────────────────────
+    line = 5
     if not agent_rows:
-        _add(stdscr, 9, 0, "no managed agents", _color(3))
+        _add(stdscr, line, 1, "no managed agents", _color(C_HELP, dim=True))
     for idx, row in enumerate(agent_rows[:rows_max]):
-        prefix = "> " if idx == state.selected_target_row else "  "
-        text = f"{prefix}{_display_agent_id(str(row.get('agent_id', '')))} [{row.get('status', '')}] {row.get('provider', '')}"
-        color = _color(5) if state.overview_focus_idx == 0 and idx == state.selected_target_row else _color(0)
-        _add(stdscr, line, 0, _fit(text, col_w - 1), color)
+        if line >= content_bottom:
+            break
+        is_sel = idx == state.selected_target_row
+        ptr = ICON_PTR if is_sel else " "
+        status = str(row.get("status", ""))
+        icon = _status_icon(status)
+        agent_id = _display_agent_id(str(row.get("agent_id", "")))
+        text = f" {ptr} {agent_id} {icon} {_status_short(status)}"
+        focused = state.overview_focus_idx == 0
+        attr = _color(C_SELECT) if focused and is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, 0, _fit(text, col_w), attr)
         line += 1
 
-    line = 8
+    # ── Column 2: Available channels ─────────────────────────────────
+    line = 5
     if not available:
-        _add(stdscr, 9, col2_x, "no available channels", _color(3))
+        _add(stdscr, line, col2_x + 1, "none", _color(C_HELP, dim=True))
     for idx, channel in enumerate(available[:rows_max]):
+        if line >= content_bottom:
+            break
         source = str(channel.get("source", ""))
         badge = "pool" if source == "pool" else "local"
-        text = f"{channel.get('kind', '')}:{channel.get('name', '')} [{badge}]"
-        color = _color(5) if state.overview_focus_idx == 1 and idx == state.selected_available_row else _color(0)
-        _add(stdscr, line, col2_x, _fit(text, col_w - 1), color)
+        text = f" {channel.get('kind', '')}:{channel.get('name', '')} [{badge}]"
+        focused = state.overview_focus_idx == 1
+        is_sel = idx == state.selected_available_row
+        attr = _color(C_SELECT) if focused and is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, col2_x, _fit(text, col_w - 1), attr)
         line += 1
 
-    line = 8
+    # ── Column 3: Assigned channels ──────────────────────────────────
+    line = 5
     if not assigned:
-        _add(stdscr, 9, col3_x, "no channels assigned", _color(3))
+        _add(stdscr, line, col3_x + 1, "none", _color(C_HELP, dim=True))
     for idx, channel in enumerate(assigned[:rows_max]):
-        enabled = "on" if bool(channel.get("enabled", True)) else "off"
-        text = f"{channel.get('kind', '')}:{channel.get('name', '')} [{enabled}]"
-        color = _color(5) if state.overview_focus_idx == 2 and idx == state.selected_assigned_row else _color(0)
-        _add(stdscr, line, col3_x, _fit(text, width - col3_x), color)
+        if line >= content_bottom:
+            break
+        enabled = bool(channel.get("enabled", True))
+        icon = ICON_ON if enabled else ICON_OFF
+        text = f" {icon} {channel.get('kind', '')}:{channel.get('name', '')}"
+        focused = state.overview_focus_idx == 2
+        is_sel = idx == state.selected_assigned_row
+        attr = _color(C_SELECT) if focused and is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, col3_x, _fit(text, width - col3_x), attr)
         line += 1
 
-    if state.notice:
-        color = _color(2) if state.notice_error else _color(1)
-        _add(stdscr, height - 3, 0, _fit(f"notice: {state.notice}", width), color)
+
+# ═════════════════════════════════════════════════════════════════════
+#  Detail View
+# ═════════════════════════════════════════════════════════════════════
 
 
 def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, width: int) -> None:
     try:
         agent = service.get_dashboard_agent(state.selected_agent_id)
     except Exception as exc:  # noqa: BLE001
-        _add(stdscr, 4, 0, f"Failed loading agent: {exc}", _color(2))
+        _add(stdscr, 2, 1, f"failed loading agent: {exc}", _color(C_ERROR))
         return
 
     agent_info = agent.get("agent", {})
@@ -530,58 +729,135 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     focus_names = ["channels", "plugins", "prompts", "settings"]
     state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
     focus = focus_names[state.focus_idx]
+    content_bottom = height - 3
 
-    _add(stdscr, 3, 0, f"Agent Detail: {_display_agent_id(state.selected_agent_id)}", _color(1))
-    _add(stdscr, 4, 0, f"provider={agent_info.get('provider', '')}  status={agent_info.get('status', '')}  version={agent_info.get('version', '')}", _color(0))
-    _add(stdscr, 5, 0, f"sections: {' | '.join(focus_names)}", _color(3))
+    # ── Agent info bar (line 1) ──────────────────────────────────────
+    status = str(agent_info.get("status", ""))
+    icon = _status_icon(status)
+    info_line = (
+        f" {ICON_BACK} {_display_agent_id(state.selected_agent_id)}"
+        f"   {agent_info.get('provider', '')}"
+        f" {ICON_DOT} {icon} {status}"
+        f" {ICON_DOT} v{agent_info.get('version', '')}"
+    )
+    _add(stdscr, 1, 0, _fit(info_line, width), _color(C_TITLE))
+
     if state.purge_confirm:
-        _add(stdscr, 6, 0, "Purge requested: press 'y' to permanently delete agent + Linux user, or 'n' to cancel.", _color(2))
+        warn_text = f" {ICON_WARN} permanently delete agent + Linux user? press y to confirm, n to cancel "
+        _add(stdscr, 1, 0, warn_text.ljust(width - 1), _color(C_NOTICE_ERR))
 
-    left_w = max(36, int(width * 0.45))
-    mid_w = max(28, int(width * 0.30))
-    right_x = left_w + mid_w + 2
+    # ── Layout: three visual columns ─────────────────────────────────
+    # Four logical sections (channels, plugins, prompts, settings) –
+    # prompts and settings share the right column, toggled by focus.
+    left_w = max(24, int(width * 0.38))
+    mid_w = max(20, int(width * 0.28))
+    col2_x = left_w + 1
+    col3_x = left_w + mid_w + 2
+    right_w = max(0, width - col3_x)
 
-    _add(stdscr, 7, 0, f"Channels [{'ACTIVE' if focus == 'channels' else '      '}]")
-    line = 8
-    for idx, channel in enumerate(channels[: max(0, height - 11)]):
-        marker = "[x]" if bool(channel.get("enabled", True)) else "[ ]"
-        text = f"{marker} {channel.get('kind', '')}:{channel.get('name', '')}"
-        color = _color(5) if focus == "channels" and idx == state.channel_idx else _color(0)
-        _add(stdscr, line, 0, _fit(text, left_w - 1), color)
-        line += 1
+    # ── Top separator ────────────────────────────────────────────────
+    _hline(stdscr, 2, width, junctions={left_w: TT, col3_x - 1: TT})
 
-    for y in range(7, height - 1):
-        _add(stdscr, y, left_w, "|", _color(4))
+    # ── Section headers ──────────────────────────────────────────────
+    ch_attr = _color(C_TITLE, bold=True) if focus == "channels" else _color(C_HELP, dim=True)
+    pl_attr = _color(C_TITLE, bold=True) if focus == "plugins" else _color(C_HELP, dim=True)
 
-    _add(stdscr, 7, left_w + 2, f"Plugins [{'ACTIVE' if focus == 'plugins' else '      '}]")
-    line = 8
-    for idx, item in enumerate(plugins[: max(0, height - 11)]):
-        key, enabled = item
-        marker = "[x]" if bool(enabled) else "[ ]"
-        text = f"{marker} {key}"
-        color = _color(5) if focus == "plugins" and idx == state.plugin_idx else _color(0)
-        _add(stdscr, line, left_w + 2, _fit(text, mid_w - 2), color)
-        line += 1
+    _add(stdscr, 3, 1, "CHANNELS", ch_attr)
+    _add(stdscr, 3, col2_x + 1, "PLUGINS", pl_attr)
 
-    for y in range(7, height - 1):
-        _add(stdscr, y, left_w + mid_w + 1, "|", _color(4))
-
+    # Right column header: show Prompts when focused, otherwise Settings
     if focus == "prompts":
-        _add(stdscr, 7, right_x, "Prompts [ACTIVE]", _color(1))
+        _add(stdscr, 3, col3_x + 1, "PROMPTS", _color(C_TITLE, bold=True))
+    else:
+        st_attr = _color(C_TITLE, bold=True) if focus == "settings" else _color(C_HELP, dim=True)
+        _add(stdscr, 3, col3_x + 1, "SETTINGS", st_attr)
+
+    # ── Vertical dividers ────────────────────────────────────────────
+    for y in range(2, content_bottom + 1):
+        _add(stdscr, y, left_w, V, _color(C_BORDER))
+        _add(stdscr, y, col3_x - 1, V, _color(C_BORDER))
+
+    # ── Bottom separator ─────────────────────────────────────────────
+    if content_bottom > 5:
+        _hline(stdscr, content_bottom, width, junctions={left_w: BT, col3_x - 1: BT})
+
+    # ── Column 1: Channels ───────────────────────────────────────────
+    line = 4
+    for idx, channel in enumerate(channels[: max(0, content_bottom - 4)]):
+        if line >= content_bottom:
+            break
+        enabled = bool(channel.get("enabled", True))
+        ch_icon = ICON_ON if enabled else ICON_OFF
+        text = f" {ch_icon} {channel.get('kind', '')}:{channel.get('name', '')}"
+        is_sel = focus == "channels" and idx == state.channel_idx
+        attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, 0, _fit(text, left_w), attr)
+        if not is_sel:
+            icon_attr = _color(C_OK) if enabled else _color(C_HELP, dim=True)
+            _add(stdscr, line, 1, ch_icon, icon_attr)
+        line += 1
+
+    if not channels:
+        _add(stdscr, 4, 1, "no channels", _color(C_HELP, dim=True))
+
+    # ── Column 2: Plugins ────────────────────────────────────────────
+    line = 4
+    for idx, (key, enabled) in enumerate(plugins[: max(0, content_bottom - 4)]):
+        if line >= content_bottom:
+            break
+        pl_icon = ICON_ON if bool(enabled) else ICON_OFF
+        text = f" {pl_icon} {key}"
+        is_sel = focus == "plugins" and idx == state.plugin_idx
+        attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, col2_x, _fit(text, mid_w), attr)
+        if not is_sel:
+            icon_attr = _color(C_OK) if bool(enabled) else _color(C_HELP, dim=True)
+            _add(stdscr, line, col2_x + 1, pl_icon, icon_attr)
+        line += 1
+
+    if not plugins:
+        _add(stdscr, 4, col2_x + 1, "no plugins", _color(C_HELP, dim=True))
+
+    # ── Column 3: Prompts (when focused) or Settings ─────────────────
+    if focus == "prompts":
         right_rows = prompts
     else:
-        _add(stdscr, 7, right_x, f"Settings [{'ACTIVE' if focus == 'settings' else '      '}]")
         right_rows = _settings_items(agent)
-    line = 8
+
+    line = 4
     for idx, item in enumerate(right_rows):
-        text = str(item.get("label", ""))
-        selected = (focus == "prompts" and idx == state.prompt_idx) or (focus == "settings" and idx == state.setting_idx)
-        color = _color(5) if selected else _color(0)
-        _add(stdscr, line, right_x, _fit(text, width - right_x), color)
+        if line >= content_bottom:
+            break
+        label = str(item.get("label", ""))
+        kind = str(item.get("kind", ""))
+
+        # Pick an icon based on item type
+        if kind == "autostart":
+            r_icon = ICON_ON if "on" in label else ICON_OFF
+            label = label.replace("autostart: on", f"autostart {ICON_DOT} on")
+            label = label.replace("autostart: off", f"autostart {ICON_DOT} off")
+        elif kind.startswith("service_") and kind not in ("service_status",):
+            r_icon = ICON_PTR
+        elif kind == "prompt_edit":
+            r_icon = ICON_PTR
+        elif kind.startswith("prompt_"):
+            r_icon = ICON_PTR
+        else:
+            r_icon = " "
+
+        text = f" {r_icon} {label}"
+        is_sel = (focus == "prompts" and idx == state.prompt_idx) or (focus == "settings" and idx == state.setting_idx)
+        attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
+        _add(stdscr, line, col3_x, _fit(text, right_w), attr)
         line += 1
-    if state.notice:
-        color = _color(2) if state.notice_error else _color(1)
-        _add(stdscr, min(height - 3, line + 1), 0, _fit(f"notice: {state.notice}", width), color)
+
+    if not right_rows:
+        _add(stdscr, 4, col3_x + 1, "none", _color(C_HELP, dim=True))
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Color & Drawing Utilities
+# ═════════════════════════════════════════════════════════════════════
 
 
 def _init_colors() -> None:
@@ -589,17 +865,32 @@ def _init_colors() -> None:
         return
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(2, curses.COLOR_RED, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
-    curses.init_pair(4, curses.COLOR_BLUE, -1)
-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(C_TITLE, curses.COLOR_CYAN, -1)
+    curses.init_pair(C_ERROR, curses.COLOR_RED, -1)
+    curses.init_pair(C_HELP, curses.COLOR_YELLOW, -1)
+    curses.init_pair(C_BORDER, curses.COLOR_BLUE, -1)
+    curses.init_pair(C_SELECT, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(C_OK, curses.COLOR_GREEN, -1)
+    curses.init_pair(C_HEAD, curses.COLOR_WHITE, -1)
+    curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(C_NOTICE_OK, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(C_NOTICE_ERR, curses.COLOR_WHITE, curses.COLOR_RED)
 
 
-def _color(idx: int) -> int:
+def _color(idx: int, bold: bool = False, dim: bool = False) -> int:
     if not curses.has_colors():
-        return curses.A_NORMAL
-    return curses.color_pair(idx)
+        attr = curses.A_NORMAL
+        if bold:
+            attr |= curses.A_BOLD
+        if dim:
+            attr |= curses.A_DIM
+        return attr
+    attr = curses.color_pair(idx)
+    if bold:
+        attr |= curses.A_BOLD
+    if dim:
+        attr |= curses.A_DIM
+    return attr
 
 
 def _add(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -616,7 +907,46 @@ def _fit(text: str, width: int) -> str:
         return ""
     if len(text) <= width - 1:
         return text
-    return text[: max(0, width - 4)] + "..."
+    if width <= 3:
+        return text[: max(0, width - 1)]
+    return text[: width - 4] + "..."
+
+
+def _hline(stdscr: Any, y: int, width: int, junctions: dict[int, str] | None = None) -> None:
+    """Draw a horizontal box-drawing line with optional junction characters."""
+    junctions = junctions or {}
+    chars = []
+    for x in range(max(0, width - 1)):
+        chars.append(junctions.get(x, H))
+    _add(stdscr, y, 0, "".join(chars), _color(C_BORDER))
+
+
+def _bar(value: float, max_val: float = 100.0, width: int = 6) -> str:
+    """Render a small resource usage bar: ▰▰▰▱▱▱"""
+    ratio = min(1.0, max(0.0, value / max_val)) if max_val > 0 else 0.0
+    filled = round(ratio * width)
+    return BAR_FILL * filled + BAR_EMPTY * (width - filled)
+
+
+def _status_icon(status: str) -> str:
+    return ICON_RUN if _is_running(status) else ICON_STOP
+
+
+def _status_short(status: str) -> str:
+    return _STATUS_SHORT.get(status.lower().strip(), status[:4])
+
+
+def _is_running(status: str) -> bool:
+    return status.lower().strip() in ("running", "active", "run")
+
+
+def _agent_col_widths(table_w: int) -> tuple[int, int]:
+    """Return (agent_name_width, provider_width) for the agent table."""
+    # fixed: status(7) + cpu(5) + mem(5) + ch(5) + 5 gaps of 2 = 32
+    remaining = max(0, table_w - 32)
+    aw = max(6, int(remaining * 0.6))
+    pw = max(4, remaining - aw)
+    return aw, pw
 
 
 def _display_agent_id(agent_id: str) -> str:
@@ -627,41 +957,9 @@ def _display_agent_id(agent_id: str) -> str:
     return token
 
 
-def _print_static(snapshot: dict[str, Any]) -> None:
-    totals = snapshot["totals"]
-    print_info(
-        "Clawie Monitor "
-        f"provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} agents={totals['agents']} "
-        f"channels={totals['channels']} migrated={totals['migrated_channels']} "
-        f"cpu={totals.get('cpu_percent', 0)}% mem={totals.get('mem_percent', 0)}%"
-    )
-
-    rows = []
-    for row in snapshot["rows"]:
-        rows.append(
-            [
-                _display_agent_id(str(row.get("agent_id", row.get("user_id", "")))),
-                row.get("display_name", ""),
-                row.get("provider", ""),
-                row.get("status", ""),
-                str(row.get("pid", 0)),
-                f"{float(row.get('cpu_percent', 0.0)):.1f}",
-                f"{float(row.get('mem_percent', 0.0)):.1f}",
-                f"{row.get('channels', 0)}/{row.get('channels_total', 0)}",
-            ]
-        )
-
-    if rows:
-        print_table(
-            ["agent", "display", "provider", "status", "pid", "cpu%", "mem%", "channels"],
-            rows,
-        )
-
-    events = snapshot.get("events", [])
-    if events:
-        print("\nRecent events:")
-        for event in events:
-            print(f"- {event.get('timestamp', '')} {event.get('type', '')} {event.get('message', '')}")
+# ═════════════════════════════════════════════════════════════════════
+#  Prompts
+# ═════════════════════════════════════════════════════════════════════
 
 
 def _prompt_items(agent: dict[str, Any]) -> list[dict[str, str]]:
@@ -680,31 +978,6 @@ def _prompt_items(agent: dict[str, Any]) -> list[dict[str, str]]:
     prompt_rows.append({"kind": "prompt_sync_from_disk", "label": "sync prompts from disk"})
     prompt_rows.append({"kind": "prompt_write_to_disk", "label": "write prompts to disk"})
     return prompt_rows
-
-
-def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
-    info = agent.get("agent", {})
-    is_local = bool(info.get("local_user", False))
-    prefix = "(local-user) " if is_local else ""
-    return [
-        {
-            "kind": "autostart",
-            "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'} (toggle)",
-        },
-        {
-            "kind": "service_status",
-            "label": f"{prefix}service_status: {info.get('service_status', 'unknown')} mode={info.get('service_mode', 'unknown')}",
-        },
-        {"kind": "service_start", "label": f"{prefix}service start"},
-        {"kind": "service_stop", "label": f"{prefix}service stop"},
-        {"kind": "service_restart", "label": f"{prefix}service restart"},
-        {"kind": "service_status_refresh", "label": f"{prefix}service status (refresh)"},
-        {
-            "kind": "heartbeat",
-            "label": f"{prefix}heartbeat_seconds: {int(info.get('heartbeat_seconds', 30))}",
-        },
-        {"kind": "auth_mode", "label": f"{prefix}auth_mode: {info.get('auth_mode', '')}"},
-    ]
 
 
 def _run_prompt_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
@@ -744,7 +1017,7 @@ def _edit_text_in_editor(initial: str, suffix: str = ".md") -> str | None:
             handle.write(initial)
         curses.def_prog_mode()
         curses.endwin()
-        result = subprocess.run([editor, path], check=False)
+        result = subprocess.run([editor, path], check=False)  # noqa: S603
         curses.reset_prog_mode()
         curses.curs_set(0)
         if result.returncode != 0:
@@ -753,8 +1026,38 @@ def _edit_text_in_editor(initial: str, suffix: str = ".md") -> str | None:
     finally:
         try:
             Path(path).unlink(missing_ok=True)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Settings & Actions
+# ═════════════════════════════════════════════════════════════════════
+
+
+def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
+    info = agent.get("agent", {})
+    is_local = bool(info.get("local_user", False))
+    prefix = "(local) " if is_local else ""
+    return [
+        {
+            "kind": "autostart",
+            "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
+        },
+        {
+            "kind": "service_status",
+            "label": f"{prefix}status: {info.get('service_status', 'unknown')} {ICON_DOT} {info.get('service_mode', 'unknown')}",
+        },
+        {"kind": "service_start", "label": f"{prefix}start service"},
+        {"kind": "service_stop", "label": f"{prefix}stop service"},
+        {"kind": "service_restart", "label": f"{prefix}restart service"},
+        {"kind": "service_status_refresh", "label": f"{prefix}refresh status"},
+        {
+            "kind": "heartbeat",
+            "label": f"{prefix}heartbeat: {int(info.get('heartbeat_seconds', 30))}s",
+        },
+        {"kind": "auth_mode", "label": f"{prefix}auth: {info.get('auth_mode', '')}"},
+    ]
 
 
 def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
@@ -798,3 +1101,46 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Static Fallback (non-TTY output)
+# ═════════════════════════════════════════════════════════════════════
+
+
+def _print_static(snapshot: dict[str, Any]) -> None:
+    totals = snapshot["totals"]
+    print_info(
+        f"Clawie Monitor  "
+        f"provider={snapshot.get('provider', '')} workspace={snapshot['workspace']} agents={totals['agents']} "
+        f"channels={totals['channels']} migrated={totals['migrated_channels']} "
+        f"cpu={totals.get('cpu_percent', 0)}% mem={totals.get('mem_percent', 0)}%"
+    )
+
+    rows = []
+    for row in snapshot["rows"]:
+        status = str(row.get("status", ""))
+        rows.append(
+            [
+                _display_agent_id(str(row.get("agent_id", row.get("user_id", "")))),
+                row.get("display_name", ""),
+                row.get("provider", ""),
+                f"{_status_icon(status)} {status}",
+                str(row.get("pid", 0)),
+                f"{float(row.get('cpu_percent', 0.0)):.1f}",
+                f"{float(row.get('mem_percent', 0.0)):.1f}",
+                f"{row.get('channels', 0)}/{row.get('channels_total', 0)}",
+            ]
+        )
+
+    if rows:
+        print_table(
+            ["agent", "display", "provider", "status", "pid", "cpu%", "mem%", "channels"],
+            rows,
+        )
+
+    events = snapshot.get("events", [])
+    if events:
+        print(f"\n  RECENT EVENTS")
+        for event in events:
+            print(f"  {ICON_DOT} {event.get('timestamp', '')} {event.get('type', '')} {event.get('message', '')}")

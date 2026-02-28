@@ -125,6 +125,8 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
             continue
         if key in (ord("q"), ord("Q")):
             return
+        if key == 27 and state.view == "overview" and state.overview_mode == "agents" and not state.purge_confirm:
+            return
         if key in (ord("r"), ord("R")):
             continue
 
@@ -140,6 +142,24 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
 
 
 def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any], service: Any) -> None:
+    # ── Purge confirmation intercept ─────────────────────────────────
+    if state.purge_confirm:
+        if key in (ord("y"), ord("Y")):
+            try:
+                service.purge_agent(state.selected_agent_id)
+                state.notice = f"purged {_display_agent_id(state.selected_agent_id)}"
+                state.notice_error = False
+            except Exception as exc:  # noqa: BLE001
+                state.notice = str(exc)
+                state.notice_error = True
+            state.purge_confirm = False
+            state.selected_agent_id = ""
+            return
+        if key in (ord("n"), ord("N"), 27):
+            state.purge_confirm = False
+            return
+        return  # swallow all other keys during confirm
+
     if key in (ord("v"), ord("V")):
         state.notice = ""
         state.notice_error = False
@@ -164,11 +184,22 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
         if rows:
             state.selected_row = max(0, state.selected_row - 1)
             state.selected_agent_id = str(rows[state.selected_row].get("agent_id", ""))
+    elif key in (ord("g"), curses.KEY_HOME):
+        if rows:
+            state.selected_row = 0
+            state.selected_agent_id = str(rows[0].get("agent_id", ""))
+    elif key in (ord("G"), curses.KEY_END):
+        if rows:
+            state.selected_row = len(rows) - 1
+            state.selected_agent_id = str(rows[-1].get("agent_id", ""))
     elif key in (curses.KEY_ENTER, 10, 13):
         if rows:
             state.notice = ""
             state.notice_error = False
             state.view = "detail"
+    elif key in (ord("d"), ord("D"), curses.KEY_DC):
+        if rows and state.selected_agent_id:
+            state.purge_confirm = True
 
 
 def _handle_channels_overview_key(
@@ -189,8 +220,24 @@ def _handle_channels_overview_key(
     state.selected_available_row = min(state.selected_available_row, max(0, len(available) - 1))
     state.selected_assigned_row = min(state.selected_assigned_row, max(0, len(assigned) - 1))
 
+    if key == 27:  # ESC – back to agents overview
+        state.overview_mode = "agents"
+        state.overview_focus_idx = 0
+        state.notice = ""
+        state.notice_error = False
+        return
+
     if key == 9:  # TAB
         state.overview_focus_idx = (state.overview_focus_idx + 1) % 3
+        return
+    if key == curses.KEY_BTAB:  # Shift-Tab
+        state.overview_focus_idx = (state.overview_focus_idx - 1) % 3
+        return
+    if key == curses.KEY_RIGHT:
+        state.overview_focus_idx = min(2, state.overview_focus_idx + 1)
+        return
+    if key == curses.KEY_LEFT:
+        state.overview_focus_idx = max(0, state.overview_focus_idx - 1)
         return
 
     if key in (curses.KEY_DOWN, ord("j")):
@@ -208,6 +255,22 @@ def _handle_channels_overview_key(
             state.selected_available_row = max(0, state.selected_available_row - 1)
         elif state.overview_focus_idx == 2 and assigned:
             state.selected_assigned_row = max(0, state.selected_assigned_row - 1)
+        return
+    if key in (ord("g"), curses.KEY_HOME):
+        if state.overview_focus_idx == 0:
+            state.selected_target_row = 0
+        elif state.overview_focus_idx == 1:
+            state.selected_available_row = 0
+        else:
+            state.selected_assigned_row = 0
+        return
+    if key in (ord("G"), curses.KEY_END):
+        if state.overview_focus_idx == 0:
+            state.selected_target_row = max(0, len(agent_rows) - 1)
+        elif state.overview_focus_idx == 1:
+            state.selected_available_row = max(0, len(available) - 1)
+        else:
+            state.selected_assigned_row = max(0, len(assigned) - 1)
         return
 
     selected_available = available[state.selected_available_row] if available else {}
@@ -311,6 +374,15 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
     if key == 9:  # TAB
         state.focus_idx = (state.focus_idx + 1) % len(focus_names)
         return
+    if key == curses.KEY_BTAB:  # Shift-Tab
+        state.focus_idx = (state.focus_idx - 1) % len(focus_names)
+        return
+    if key == curses.KEY_RIGHT:
+        state.focus_idx = min(len(focus_names) - 1, state.focus_idx + 1)
+        return
+    if key == curses.KEY_LEFT:
+        state.focus_idx = max(0, state.focus_idx - 1)
+        return
 
     if key in (curses.KEY_DOWN, ord("j")):
         if focus == "channels":
@@ -334,6 +406,27 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.setting_idx = max(0, state.setting_idx - 1)
         return
 
+    if key in (ord("g"), curses.KEY_HOME):
+        if focus == "channels":
+            state.channel_idx = 0
+        elif focus == "plugins":
+            state.plugin_idx = 0
+        elif focus == "prompts":
+            state.prompt_idx = 0
+        else:
+            state.setting_idx = 0
+        return
+    if key in (ord("G"), curses.KEY_END):
+        if focus == "channels":
+            state.channel_idx = max(0, len(channels) - 1)
+        elif focus == "plugins":
+            state.plugin_idx = max(0, len(plugins) - 1)
+        elif focus == "prompts":
+            state.prompt_idx = max(0, len(prompts) - 1)
+        else:
+            state.setting_idx = max(0, len(settings) - 1)
+        return
+
     if key == ord("a"):
         if state.selected_agent_id.startswith("@local:"):
             state.notice = "autostart not applicable for local-user claw"
@@ -347,7 +440,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
                 state.notice = str(exc)
                 state.notice_error = True
         return
-    if key in (ord("d"), ord("D")):
+    if key in (ord("d"), ord("D"), curses.KEY_DC):
         state.purge_confirm = True
         return
 
@@ -423,22 +516,37 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
     if state.view == "overview":
         _draw_stats(stdscr, snapshot, width)
         _draw_overview(stdscr, snapshot, state, service, height, width)
-        if state.overview_mode == "agents":
-            footer = f"q quit {ICON_DOT} v channels {ICON_DOT} Enter details {ICON_DOT} j/k move {ICON_DOT} r refresh"
+        if state.purge_confirm:
+            agent_display = _display_agent_id(state.selected_agent_id)
+            footer = f"{ICON_WARN} PURGE {agent_display}: y confirm {ICON_DOT} n cancel"
+        elif state.overview_mode == "agents":
+            footer = (
+                f"j/k navigate {ICON_DOT} Enter open {ICON_DOT} d purge {ICON_DOT} "
+                f"v channels {ICON_DOT} Esc/q quit"
+            )
         else:
-            footer = f"q quit {ICON_DOT} v agents {ICON_DOT} Tab pane {ICON_DOT} j/k move {ICON_DOT} a assign {ICON_DOT} u unassign {ICON_DOT} c connect {ICON_DOT} r refresh"
+            footer = (
+                f"j/k navigate {ICON_DOT} Tab/\u2190\u2192 pane {ICON_DOT} "
+                f"a assign {ICON_DOT} u unassign {ICON_DOT} c connect {ICON_DOT} "
+                f"Esc back {ICON_DOT} v agents {ICON_DOT} q quit"
+            )
     else:
         _draw_detail(stdscr, service, state, height, width)
         if state.purge_confirm:
             footer = f"{ICON_WARN} CONFIRM PURGE: y confirm {ICON_DOT} n cancel"
         else:
             footer = (
-                f"q quit {ICON_DOT} b back {ICON_DOT} Tab section {ICON_DOT} j/k move {ICON_DOT} "
-                f"Space toggle {ICON_DOT} prompts: edit/sync/write {ICON_DOT} a autostart {ICON_DOT} d purge"
+                f"j/k navigate {ICON_DOT} Tab/\u2190\u2192 section {ICON_DOT} "
+                f"Space action {ICON_DOT} a autostart {ICON_DOT} d purge {ICON_DOT} "
+                f"Esc/b back {ICON_DOT} q quit"
             )
 
     # ── Notice bar ───────────────────────────────────────────────────
-    if state.notice:
+    if state.purge_confirm and state.view == "overview":
+        agent_display = _display_agent_id(state.selected_agent_id)
+        warn = f" {ICON_WARN} purge {agent_display}? permanently deletes agent + Linux user "
+        _add(stdscr, height - 2, 0, warn.ljust(width - 1), _color(C_NOTICE_ERR))
+    elif state.notice:
         ncolor = _color(C_NOTICE_ERR) if state.notice_error else _color(C_NOTICE_OK)
         notice_text = f" {state.notice} "
         _add(stdscr, height - 2, 0, notice_text.ljust(width - 1), ncolor)

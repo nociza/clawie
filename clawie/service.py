@@ -48,12 +48,94 @@ def redact(secret: str) -> str:
 
 class ZeroClawService:
     EVENT_LIMIT = 2000
+    DEFAULT_SPAWN_PASSWORD = "clawie"
+    SSHD_DENY_USERS_FILE = Path("/etc/ssh/sshd_config.d/99-clawie-deny-users.conf")
+    HOMEBREW_PREFIX = Path("/home/linuxbrew/.linuxbrew")
+    GLOBAL_PROFILE_DIR = Path("/etc/profile.d")
+    GLOBAL_HOMEBREW_PROFILE_FILE = GLOBAL_PROFILE_DIR / "00-homebrew.sh"
+    GLOBAL_FNM_PROFILE_FILE = GLOBAL_PROFILE_DIR / "zz-fnm.sh"
+    GLOBAL_CLAUDE_PROFILE_FILE = GLOBAL_PROFILE_DIR / "20-claude-shared.sh"
+    SHARED_CLAUDE_DIR = Path("/var/lib/clawie/claude-shared")
+    SHARED_CLAUDE_SUBDIRS = ("backups", "cache", "debug")
+    GLOBAL_HOMEBREW_PROFILE_CONTENT = "\n".join(
+        [
+            "# Managed by clawie: shared runtime path for all users.",
+            'export HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"',
+            'export PNPM_HOME="$HOMEBREW_PREFIX/bin"',
+            'case ":$PATH:" in *":$HOMEBREW_PREFIX/bin:"*) ;; *) PATH="$HOMEBREW_PREFIX/bin:$PATH" ;; esac',
+            'case ":$PATH:" in *":$HOMEBREW_PREFIX/sbin:"*) ;; *) PATH="$HOMEBREW_PREFIX/sbin:$PATH" ;; esac',
+            'case ":$PATH:" in *":$PNPM_HOME:"*) ;; *) PATH="$PNPM_HOME:$PATH" ;; esac',
+            "export PATH",
+            "",
+        ]
+    )
+    GLOBAL_FNM_PROFILE_CONTENT = "\n".join(
+        [
+            "# Managed by clawie: fnm activation for interactive bash shells.",
+            'if [ -n "${BASH_VERSION:-}" ] && command -v fnm >/dev/null 2>&1; then',
+            "  # `su` can inherit another user's XDG_RUNTIME_DIR and break fnm.",
+            '  if [ -n "${XDG_RUNTIME_DIR:-}" ]; then',
+            '    if [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then',
+            "      unset XDG_RUNTIME_DIR",
+            "    fi",
+            "  fi",
+            '  export FNM_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fnm"',
+            '  eval "$(fnm env --use-on-cd --shell bash)"',
+            "fi",
+            "",
+        ]
+    )
+    GLOBAL_CLAUDE_PROFILE_CONTENT = "\n".join(
+        [
+            "# Managed by clawie: shared Claude Code auth/config directory.",
+            'export CLAUDE_CONFIG_DIR="/var/lib/clawie/claude-shared"',
+            "",
+        ]
+    )
     DEFAULT_AGENT_PLUGINS: dict[str, bool] = {
         "scheduler": True,
         "gateway": True,
         "memory": True,
         "web_search": True,
     }
+    SHARED_TOOLCHAIN_BEGIN = "# >>> clawie-shared-toolchain >>>"
+    SHARED_TOOLCHAIN_END = "# <<< clawie-shared-toolchain <<<"
+    SHARED_TOOLCHAIN_BLOCK = "\n".join(
+        [
+            SHARED_TOOLCHAIN_BEGIN,
+            "# Shared runtime tools for all spawned users (pnpm/fnm/uv/codex, etc.).",
+            'export HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"',
+            'if [ -d "$HOMEBREW_PREFIX/bin" ]; then',
+            '  case ":$PATH:" in',
+            '    *":$HOMEBREW_PREFIX/bin:"*) ;;',
+            '    *) export PATH="$HOMEBREW_PREFIX/bin:$PATH" ;;',
+            "  esac",
+            "fi",
+            'if [ -d "$HOMEBREW_PREFIX/sbin" ]; then',
+            '  case ":$PATH:" in',
+            '    *":$HOMEBREW_PREFIX/sbin:"*) ;;',
+            '    *) export PATH="$HOMEBREW_PREFIX/sbin:$PATH" ;;',
+            "  esac",
+            "fi",
+            'export PNPM_HOME="$HOMEBREW_PREFIX/bin"',
+            'export CLAUDE_CONFIG_DIR="/var/lib/clawie/claude-shared"',
+            'case ":$PATH:" in',
+            '  *":$PNPM_HOME:"*) ;;',
+            '  *) export PATH="$PNPM_HOME:$PATH" ;;',
+            "esac",
+            'if [ -n "${BASH_VERSION:-}" ] && command -v fnm >/dev/null 2>&1; then',
+            '  if [ -n "${XDG_RUNTIME_DIR:-}" ]; then',
+            '    if [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then',
+            "      unset XDG_RUNTIME_DIR",
+            "    fi",
+            "  fi",
+            '  export FNM_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/fnm"',
+            '  eval "$(fnm env --use-on-cd --shell bash)"',
+            "fi",
+            SHARED_TOOLCHAIN_END,
+            "",
+        ]
+    )
 
     def __init__(self, store: StateStore) -> None:
         self.store = store
@@ -195,6 +277,13 @@ class ZeroClawService:
                 channel["migrated_from"] = clone_from or "local-source"
         for channel in final_channels:
             channel["enabled"] = bool(channel.get("enabled", True))
+        transfer_from_clone = bool(clone_from and channel_strategy == "migrate")
+        self._assert_channels_unclaimed(
+            agents=agents,
+            owner_agent_id=agent_id,
+            channels=final_channels,
+            allow_owners={str(clone_from)} if transfer_from_clone else set(),
+        )
 
         config = self.store.read_config()
         default_provider = str(config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
@@ -245,6 +334,16 @@ class ZeroClawService:
             "agent": agent,
         }
         agents[agent_id] = agent_state
+        moved_from_clone = 0
+        if transfer_from_clone and clone_from:
+            source = agents.get(clone_from)
+            if source:
+                moved_from_clone = self._remove_channel_keys_from_agent(
+                    source=source,
+                    keys=self._channel_keys(final_channels),
+                )
+                if moved_from_clone:
+                    source.setdefault("agent", {})["last_sync"] = now_iso()
 
         self._event(
             state,
@@ -256,6 +355,7 @@ class ZeroClawService:
                 "channel_count": len(final_channels),
                 "clone_from": clone_from or "",
                 "provider": provider_spec.name,
+                "moved_from_clone": moved_from_clone,
             },
         )
         self.store.write_state(state)
@@ -536,6 +636,8 @@ class ZeroClawService:
         replace: bool = False,
     ) -> dict[str, Any]:
         self._require_setup()
+        if from_agent == to_agent:
+            raise ValueError("from_agent and to_agent must differ")
         state = self.store.read_state()
 
         agents = state.setdefault("agents", state.get("users", {}))
@@ -549,6 +651,13 @@ class ZeroClawService:
         source_channels = copy.deepcopy(source.get("channels", []))
         for channel in source_channels:
             channel["migrated_from"] = from_agent
+        source_keys = self._channel_keys(source_channels)
+        self._assert_channels_unclaimed(
+            agents=agents,
+            owner_agent_id=to_agent,
+            channels=source_channels,
+            allow_owners={from_agent, to_agent},
+        )
 
         if replace:
             target_channels = source_channels
@@ -562,6 +671,9 @@ class ZeroClawService:
                     existing.add(key)
 
         target["channels"] = target_channels
+        moved_from_source = self._remove_channel_keys_from_agent(source=source, keys=source_keys)
+        if moved_from_source:
+            source.setdefault("agent", {})["last_sync"] = now_iso()
         target["channel_strategy"] = "migrate"
         target["agent"]["status"] = "syncing"
         target["agent"]["last_sync"] = now_iso()
@@ -575,6 +687,7 @@ class ZeroClawService:
                 "to_agent": to_agent,
                 "replace": replace,
                 "channel_count": len(target_channels),
+                "moved_from_source": moved_from_source,
             },
         )
         self.store.write_state(state)
@@ -621,6 +734,11 @@ class ZeroClawService:
                 if key not in existing:
                     target_channels.append(channel)
                     existing.add(key)
+        self._assert_channels_unclaimed(
+            agents=agents,
+            owner_agent_id=agent_id,
+            channels=target_channels,
+        )
 
         target["channels"] = target_channels
         target["agent"]["status"] = "ready"
@@ -730,6 +848,12 @@ class ZeroClawService:
             target_channels = []
             target["channels"] = target_channels
 
+        moved_from_agents = self._remove_channel_from_other_agents(
+            agents=agents,
+            kind=channel_kind,
+            name=channel_name,
+            keep_agent_id=dst,
+        )
         self._remove_pool_channel(channel_kind, channel_name)
         if self._find_channel(target_channels, channel_kind, channel_name) is None:
             target_channels.append(
@@ -741,17 +865,7 @@ class ZeroClawService:
                 }
             )
 
-        moved = False
-        if src and not src.startswith("@local:") and src in agents and src != dst:
-            source = agents[src]
-            self._hydrate_agent_controls(source)
-            source_channels = source.setdefault("channels", [])
-            if isinstance(source_channels, list):
-                found_idx = self._find_channel(source_channels, channel_kind, channel_name)
-                if found_idx is not None:
-                    source_channels.pop(found_idx)
-                    moved = True
-                    source.setdefault("agent", {})["last_sync"] = now_iso()
+        moved = bool(moved_from_agents)
 
         target.setdefault("agent", {})["last_sync"] = now_iso()
         self._event(
@@ -764,6 +878,7 @@ class ZeroClawService:
                 "kind": channel_kind,
                 "name": channel_name,
                 "moved": moved,
+                "moved_from_agent_ids": moved_from_agents,
             },
         )
         self.store.write_state(state)
@@ -773,6 +888,7 @@ class ZeroClawService:
             "kind": channel_kind,
             "name": channel_name,
             "moved": moved,
+            "moved_from_agent_ids": moved_from_agents,
         }
 
     def unassign_channel_from_agent(
@@ -1445,13 +1561,15 @@ class ZeroClawService:
         if self._linux_user_exists(target_user):
             raise AgentExistsError(f"linux user already exists: {target_user}")
 
-        subprocess.run(["useradd", "-m", "-s", "/bin/bash", target_user], check=True)
-        password_source = self._apply_spawn_password(
+        spawn_shell = self._spawn_user_shell()
+        subprocess.run(["useradd", "-m", "-s", spawn_shell, target_user], check=True)
+        password_source, password_value = self._apply_spawn_password(
             username=target_user,
             password=password,
             password_hash=password_hash,
             use_global_password=use_global_password,
         )
+        ssh_login_disabled = self._disable_ssh_login_for_user(target_user)
 
         if source_home:
             src_home = Path(source_home).expanduser()
@@ -1461,6 +1579,7 @@ class ZeroClawService:
                 src_home = Path("/home") / sudo_user
             else:
                 src_home = Path.home()
+        system_prepared = self._ensure_system_shared_runtime(src_home)
 
         config = self.store.read_config()
         resolved_provider = str(provider or config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
@@ -1494,6 +1613,15 @@ class ZeroClawService:
             requested_provider=resolved_provider,
             enabled=copy_configs,
         )
+        for path in self._ensure_shared_toolchain_shell_init(target_home, target_user):
+            if path not in copied:
+                copied.append(path)
+        for path in self._ensure_shared_claude_links(target_home, target_user):
+            if path not in copied:
+                copied.append(path)
+        for path in system_prepared:
+            if path not in copied:
+                copied.append(path)
         agent_state = self.create_agent(
             agent_id=agent_id,
             display_name=agent_id,
@@ -1506,6 +1634,8 @@ class ZeroClawService:
             core_prompts=cloned_prompts,
         )
         agent_state["agent"]["linux_user"] = target_user
+        agent_state["agent"]["ssh_login_disabled"] = bool(ssh_login_disabled)
+        agent_state["agent"]["login_shell"] = spawn_shell
         if copy_configs:
             for name, content in cloned_prompts.items():
                 try:
@@ -1535,6 +1665,7 @@ class ZeroClawService:
                 "imported_channels": len(cloned_channels),
                 "clone_from_agent": clone_from_agent or "",
                 "password_source": password_source,
+                "ssh_login_disabled": bool(ssh_login_disabled),
             },
         )
         agents = state.setdefault("agents", state.get("users", {}))
@@ -1545,6 +1676,8 @@ class ZeroClawService:
             "linux_user": target_user,
             "copied_paths": copied,
             "password_source": password_source,
+            "password_value": password_value,
+            "ssh_login_disabled": bool(ssh_login_disabled),
         }
 
     def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1812,6 +1945,170 @@ class ZeroClawService:
             enabled=enabled,
         )
 
+    def _ensure_shared_toolchain_shell_init(self, target_home: Path, username: str) -> list[str]:
+        if not target_home.exists():
+            return []
+        if not os.access(target_home, os.W_OK | os.X_OK):
+            return []
+        updated: list[str] = []
+        for rel in [".profile", ".bashrc"]:
+            path = target_home / rel
+            current = ""
+            if path.exists():
+                current = path.read_text(encoding="utf-8")
+            if self.SHARED_TOOLCHAIN_BEGIN in current and self.SHARED_TOOLCHAIN_END in current:
+                continue
+            rendered = current
+            if rendered and not rendered.endswith("\n"):
+                rendered += "\n"
+            rendered += self.SHARED_TOOLCHAIN_BLOCK
+            path.write_text(rendered, encoding="utf-8")
+            subprocess.run(["chown", f"{username}:{username}", str(path)], check=True)
+            updated.append(str(path))
+        return updated
+
+    def _ensure_shared_claude_links(self, target_home: Path, username: str) -> list[str]:
+        if not target_home.exists():
+            return []
+        if not os.access(target_home, os.W_OK | os.X_OK):
+            return []
+        shared_dir = self.SHARED_CLAUDE_DIR
+        targets = [
+            (target_home / ".claude", shared_dir),
+            (target_home / ".claude.json", shared_dir / ".claude.json"),
+        ]
+        updated: list[str] = []
+        for dst, src in targets:
+            if dst.is_symlink():
+                try:
+                    if dst.resolve() == src.resolve():
+                        continue
+                except OSError:
+                    pass
+                dst.unlink(missing_ok=True)
+            elif dst.exists():
+                if dst.is_dir():
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+            dst.symlink_to(src, target_is_directory=src.is_dir())
+            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False)
+            updated.append(str(dst))
+        return updated
+
+    @staticmethod
+    def _write_managed_text(path: Path, content: str, mode: int) -> bool:
+        changed = not path.exists()
+        if path.exists():
+            try:
+                current = path.read_text(encoding="utf-8")
+            except OSError:
+                current = ""
+            if current != content:
+                changed = True
+        if changed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        current_mode = int(path.stat().st_mode) & 0o777
+        if current_mode != mode:
+            os.chmod(path, mode)
+            changed = True
+        return changed
+
+    def _patch_claude_cli_for_shared_permissions(self) -> str:
+        global_root = self.HOMEBREW_PREFIX / "bin" / "global"
+        if not global_root.exists():
+            return ""
+        candidates: list[Path] = []
+        for row in global_root.rglob("cli.js"):
+            token = str(row)
+            if "@anthropic-ai+claude-code@" not in token:
+                continue
+            if not token.endswith("/node_modules/@anthropic-ai/claude-code/cli.js"):
+                continue
+            candidates.append(row)
+        if not candidates:
+            return ""
+        target = sorted(candidates)[-1]
+        text = target.read_text(encoding="utf-8")
+        rendered = text.replace("mode:384", "mode:438").replace("bt9(K,384)", "bt9(K,438)")
+        changed = rendered != text
+        if changed:
+            target.write_text(rendered, encoding="utf-8")
+        current_mode = int(target.stat().st_mode) & 0o777
+        if current_mode != 0o644:
+            os.chmod(target, 0o644)
+            changed = True
+        return str(target) if changed else ""
+
+    def _seed_shared_claude_state(self, source_home: Path) -> list[str]:
+        shared = self.SHARED_CLAUDE_DIR
+        updated: list[str] = []
+        mapping = [
+            (source_home / ".claude" / ".credentials.json", shared / ".credentials.json"),
+            (source_home / ".claude.json", shared / ".claude.json"),
+        ]
+        for src, dst in mapping:
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+                updated.append(str(dst))
+            if dst.exists():
+                current_mode = int(dst.stat().st_mode) & 0o777
+                if current_mode != 0o666:
+                    os.chmod(dst, 0o666)
+                    if str(dst) not in updated:
+                        updated.append(str(dst))
+        return updated
+
+    def _ensure_system_shared_runtime(self, source_home: Path) -> list[str]:
+        if os.geteuid() != 0:
+            return []
+        profile_dir = self.GLOBAL_PROFILE_DIR
+        shared_parent = self.SHARED_CLAUDE_DIR.parent
+        if not profile_dir.exists() or not os.access(profile_dir, os.W_OK | os.X_OK):
+            return []
+        if not shared_parent.exists() or not os.access(shared_parent, os.W_OK | os.X_OK):
+            return []
+
+        updated: list[str] = []
+        managed_profiles = [
+            (
+                self.GLOBAL_HOMEBREW_PROFILE_FILE,
+                self.GLOBAL_HOMEBREW_PROFILE_CONTENT,
+            ),
+            (
+                self.GLOBAL_FNM_PROFILE_FILE,
+                self.GLOBAL_FNM_PROFILE_CONTENT,
+            ),
+            (
+                self.GLOBAL_CLAUDE_PROFILE_FILE,
+                self.GLOBAL_CLAUDE_PROFILE_CONTENT,
+            ),
+        ]
+        for path, content in managed_profiles:
+            if self._write_managed_text(path, content, 0o644):
+                updated.append(str(path))
+
+        shared_paths = [self.SHARED_CLAUDE_DIR]
+        for token in self.SHARED_CLAUDE_SUBDIRS:
+            shared_paths.append(self.SHARED_CLAUDE_DIR / token)
+        for path in shared_paths:
+            existed = path.exists()
+            path.mkdir(parents=True, exist_ok=True)
+            current_mode = int(path.stat().st_mode) & 0o777
+            if (not existed) or current_mode != 0o777:
+                os.chmod(path, 0o777)
+                updated.append(str(path))
+
+        for path in self._seed_shared_claude_state(source_home):
+            if path not in updated:
+                updated.append(path)
+
+        patched = self._patch_claude_cli_for_shared_permissions()
+        if patched and patched not in updated:
+            updated.append(patched)
+        return updated
+
     def _copy_provider_credentials(
         self,
         source_home: Path,
@@ -1895,13 +2192,113 @@ class ZeroClawService:
                 return idx
         return None
 
+    @staticmethod
+    def _channel_key(kind: str, name: str) -> tuple[str, str]:
+        return (str(kind).strip().lower(), str(name).strip())
+
+    def _channel_keys(self, channels: list[dict[str, Any]]) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            kind, name = self._channel_key(channel.get("kind", ""), channel.get("name", ""))
+            if not kind or not name:
+                continue
+            keys.add((kind, name))
+        return keys
+
+    def _assert_channels_unclaimed(
+        self,
+        agents: dict[str, Any],
+        owner_agent_id: str,
+        channels: list[dict[str, Any]],
+        allow_owners: set[str] | None = None,
+    ) -> None:
+        keys = self._channel_keys(channels)
+        if not keys:
+            return
+        allowed = {str(owner_agent_id).strip()}
+        if allow_owners:
+            for item in allow_owners:
+                token = str(item).strip()
+                if token:
+                    allowed.add(token)
+        conflicts: list[str] = []
+        for aid, payload in sorted(agents.items()):
+            token = str(aid).strip()
+            if token in allowed:
+                continue
+            rows = payload.get("channels", [])
+            if not isinstance(rows, list):
+                continue
+            claimed = [
+                f"{kind}:{name}" for (kind, name) in keys if self._find_channel(rows, kind, name) is not None
+            ]
+            if claimed:
+                conflicts.append(f"{token} owns {', '.join(claimed)}")
+        if conflicts:
+            raise ValueError("channel already assigned to another agent: " + "; ".join(conflicts))
+
+    def _remove_channel_keys_from_agent(
+        self,
+        source: dict[str, Any],
+        keys: set[tuple[str, str]],
+    ) -> int:
+        if not keys:
+            return 0
+        channels = source.setdefault("channels", [])
+        if not isinstance(channels, list):
+            source["channels"] = []
+            return 0
+        kept: list[Any] = []
+        removed = 0
+        for channel in channels:
+            if not isinstance(channel, dict):
+                kept.append(channel)
+                continue
+            kind, name = self._channel_key(channel.get("kind", ""), channel.get("name", ""))
+            if (kind, name) in keys:
+                removed += 1
+                continue
+            kept.append(channel)
+        source["channels"] = kept
+        return removed
+
+    def _remove_channel_from_other_agents(
+        self,
+        agents: dict[str, Any],
+        kind: str,
+        name: str,
+        keep_agent_id: str,
+    ) -> list[str]:
+        keep = str(keep_agent_id).strip()
+        moved_from: list[str] = []
+        for aid, payload in agents.items():
+            token = str(aid).strip()
+            if token == keep:
+                continue
+            rows = payload.setdefault("channels", [])
+            if not isinstance(rows, list):
+                continue
+            removed_any = False
+            while True:
+                found_idx = self._find_channel(rows, kind, name)
+                if found_idx is None:
+                    break
+                rows.pop(found_idx)
+                removed_any = True
+            if removed_any:
+                moved_from.append(token)
+                payload.setdefault("agent", {})["last_sync"] = now_iso()
+        return moved_from
+
     def _apply_spawn_password(
         self,
         username: str,
         password: str | None,
         password_hash: str | None,
         use_global_password: bool,
-    ) -> str:
+    ) -> tuple[str, str]:
         raw_password = str(password or "").strip()
         raw_hash = str(password_hash or "").strip()
         if raw_password and raw_hash:
@@ -1909,18 +2306,63 @@ class ZeroClawService:
 
         if raw_password:
             self._set_password_plaintext(username, raw_password)
-            return "spawn-password"
+            return ("spawn-password", raw_password)
         if raw_hash:
             self._set_password_hash(username, raw_hash)
-            return "spawn-password-hash"
+            return ("spawn-password-hash", "")
 
         if use_global_password:
             config = self.store.read_config()
             global_hash = str(config.get("spawn_password_hash", "")).strip()
             if global_hash:
                 self._set_password_hash(username, global_hash)
-                return "global-password-hash"
-        return "none"
+                return ("global-password-hash", "")
+
+        self._set_password_plaintext(username, self.DEFAULT_SPAWN_PASSWORD)
+        return ("default-password", self.DEFAULT_SPAWN_PASSWORD)
+
+    @staticmethod
+    def _spawn_user_shell() -> str:
+        return "/bin/bash"
+
+    def _disable_ssh_login_for_user(self, username: str) -> bool:
+        user = str(username).strip()
+        if not user:
+            raise ValueError("username is required")
+        path = self.SSHD_DENY_USERS_FILE
+        users: set[str] = set()
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    token = line.strip()
+                    if not token or token.startswith("#"):
+                        continue
+                    if token.lower().startswith("denyusers"):
+                        users.update(part.strip() for part in token.split()[1:] if part.strip())
+            except OSError as exc:
+                raise SetupError(f"failed reading ssh deny-users config: {exc}") from exc
+        users.add(user)
+        rendered = "# Managed by clawie. Spawned users are denied SSH login.\n"
+        rendered += f"DenyUsers {' '.join(sorted(users))}\n"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            raise SetupError(f"failed writing ssh deny-users config: {exc}") from exc
+
+        attempts = [
+            ["systemctl", "reload", "ssh"],
+            ["systemctl", "reload", "sshd"],
+            ["service", "ssh", "reload"],
+            ["service", "sshd", "reload"],
+        ]
+        last_error = ""
+        for cmd in attempts:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return True
+            last_error = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+        raise SetupError(f"updated ssh deny-users config but failed to reload ssh daemon: {last_error}")
 
     @staticmethod
     def _set_password_plaintext(username: str, password: str) -> None:

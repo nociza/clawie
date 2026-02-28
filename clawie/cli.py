@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     channels_migrate = channels_sub.add_parser(
         "migrate",
-        help="Copy channels from one agent to another",
+        help="Move channels from one agent to another",
     )
     channels_migrate.add_argument("--from-agent", required=True)
     channels_migrate.add_argument("--to-agent", required=True)
@@ -601,6 +601,13 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
     )
     source = str(result.get("password_source", "none"))
     print_info(f"Password source: {source}")
+    password_value = str(result.get("password_value", ""))
+    if password_value:
+        print_info(f"Password: {password_value}")
+    else:
+        print_info("Password: <not shown>")
+    if bool(result.get("ssh_login_disabled", False)):
+        print_info("SSH login: disabled for spawned Linux user")
     copied = result.get("copied_paths", [])
     if copied:
         print_info("Copied config paths:")

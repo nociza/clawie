@@ -164,6 +164,8 @@ def test_spawn_success_with_mocks(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(
         tmp_path,
@@ -230,6 +232,7 @@ def test_spawn_uses_global_password_hash(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(
         tmp_path,
@@ -244,6 +247,46 @@ def test_spawn_uses_global_password_hash(
     assert code == 0
     assert "Spawned linux user sam" in output
     assert any(cmd[:2] == ["usermod", "-p"] for cmd in calls)
+
+
+def test_spawn_uses_builtin_default_password_and_prints_it(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    calls: list[tuple[list[str], object]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append((cmd, kwargs.get("input")))
+
+        class Result:
+            returncode = 1
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+
+    code = run_cli(
+        tmp_path,
+        "spawn",
+        "--agent-id",
+        "sam-default",
+        "--linux-user",
+        "sam-default",
+        "--skip-config-copy",
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Password source: default-password" in output
+    assert "Password: clawie" in output
+    assert "SSH login: disabled for spawned Linux user" in output
+    assert any(cmd == ["chpasswd"] and input_data == "sam-default:clawie\n" for cmd, input_data in calls)
 
 
 def test_spawn_uses_per_agent_plaintext_password(
@@ -267,6 +310,7 @@ def test_spawn_uses_per_agent_plaintext_password(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(
         tmp_path,
@@ -282,7 +326,78 @@ def test_spawn_uses_per_agent_plaintext_password(
     output = capsys.readouterr().out
     assert code == 0
     assert "Spawned linux user sam2" in output
+    assert "Password source: spawn-password" in output
+    assert "Password: LocalPass123!" in output
     assert any(cmd == ["chpasswd"] and input_data == "sam2:LocalPass123!\n" for cmd, input_data in calls)
+
+
+def test_spawn_creates_linux_user_with_bash_shell(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+
+        class Result:
+            returncode = 1
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+
+    code = run_cli(
+        tmp_path,
+        "spawn",
+        "--agent-id",
+        "sam-shell",
+        "--linux-user",
+        "sam-shell",
+        "--skip-config-copy",
+    )
+    _ = capsys.readouterr().out
+    assert code == 0
+    useradd_cmd = next((cmd for cmd in calls if cmd[:2] == ["useradd", "-m"]), [])
+    assert useradd_cmd[:3] == ["useradd", "-m", "-s"]
+    assert useradd_cmd[3] == "/bin/bash"
+
+
+def test_disable_ssh_login_for_user_writes_denyusers_and_reloads(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    deny_file = tmp_path / "sshd_config.d" / "99-clawie-no-ssh.conf"
+    monkeypatch.setattr(ZeroClawService, "SSHD_DENY_USERS_FILE", deny_file)
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        return Result(0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    assert service._disable_ssh_login_for_user("alice") is True
+    assert service._disable_ssh_login_for_user("bob") is True
+
+    rendered = deny_file.read_text(encoding="utf-8")
+    assert "DenyUsers alice bob" in rendered
+    assert any(cmd[:3] == ["systemctl", "reload", "ssh"] for cmd in calls)
 
 
 def test_purge_removes_agent_and_linux_user_with_root(
@@ -315,6 +430,7 @@ def test_purge_removes_agent_and_linux_user_with_root(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(tmp_path, "purge", "--agent-id", "teleclaw", "--yes")
     output = capsys.readouterr().out
@@ -397,6 +513,7 @@ allowed_users = ["*"]
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(
         tmp_path,
@@ -441,6 +558,7 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(
         tmp_path,
@@ -650,6 +768,177 @@ def test_copy_selected_paths_deduplicates_and_copies(tmp_path: Path, monkeypatch
     assert (target_home / ".profile").exists()
     assert (target_home / ".codex" / "config.toml").exists()
     assert len(calls) == 2
+
+
+def test_ensure_shared_toolchain_shell_init_writes_profiles(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+    (target_home / ".profile").write_text("# existing\n", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+
+        class Result:
+            returncode = 0
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    updated = service._ensure_shared_toolchain_shell_init(target_home=target_home, username="sam")
+
+    assert str(target_home / ".profile") in updated
+    assert str(target_home / ".bashrc") in updated
+    profile_text = (target_home / ".profile").read_text(encoding="utf-8")
+    bashrc_text = (target_home / ".bashrc").read_text(encoding="utf-8")
+    assert "clawie-shared-toolchain" in profile_text
+    assert 'export PNPM_HOME="$HOMEBREW_PREFIX/bin"' in profile_text
+    assert "fnm env --use-on-cd --shell bash" in bashrc_text
+    assert calls == [
+        ["chown", "sam:sam", str(target_home / ".profile")],
+        ["chown", "sam:sam", str(target_home / ".bashrc")],
+    ]
+
+
+def test_ensure_shared_toolchain_shell_init_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+    (target_home / ".profile").write_text("", encoding="utf-8")
+    (target_home / ".bashrc").write_text("", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+
+        class Result:
+            returncode = 0
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    first = service._ensure_shared_toolchain_shell_init(target_home=target_home, username="sam")
+    assert len(first) == 2
+
+    calls.clear()
+    second = service._ensure_shared_toolchain_shell_init(target_home=target_home, username="sam")
+    assert second == []
+    assert calls == []
+
+
+def test_ensure_system_shared_runtime_seeds_claude_and_profiles(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    source_home = tmp_path / "source-home"
+    (source_home / ".claude").mkdir(parents=True)
+    (source_home / ".claude" / ".credentials.json").write_text('{"access_token":"abc"}\n', encoding="utf-8")
+    (source_home / ".claude.json").write_text('{"userID":"u1"}\n', encoding="utf-8")
+
+    profile_dir = tmp_path / "etc" / "profile.d"
+    profile_dir.mkdir(parents=True)
+    shared_dir = tmp_path / "var" / "lib" / "clawie" / "claude-shared"
+    shared_dir.parent.mkdir(parents=True)
+    brew_prefix = tmp_path / "homebrew"
+    claude_cli = (
+        brew_prefix
+        / "bin"
+        / "global"
+        / "5"
+        / ".pnpm"
+        / "@anthropic-ai+claude-code@2.1.62"
+        / "node_modules"
+        / "@anthropic-ai"
+        / "claude-code"
+        / "cli.js"
+    )
+    claude_cli.parent.mkdir(parents=True)
+    claude_cli.write_text("mode:384\nbt9(K,384)\n", encoding="utf-8")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ZeroClawService, "HOMEBREW_PREFIX", brew_prefix)
+    monkeypatch.setattr(ZeroClawService, "GLOBAL_PROFILE_DIR", profile_dir)
+    monkeypatch.setattr(ZeroClawService, "GLOBAL_HOMEBREW_PROFILE_FILE", profile_dir / "00-homebrew.sh")
+    monkeypatch.setattr(ZeroClawService, "GLOBAL_FNM_PROFILE_FILE", profile_dir / "zz-fnm.sh")
+    monkeypatch.setattr(ZeroClawService, "GLOBAL_CLAUDE_PROFILE_FILE", profile_dir / "20-claude-shared.sh")
+    monkeypatch.setattr(ZeroClawService, "SHARED_CLAUDE_DIR", shared_dir)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    updated = service._ensure_system_shared_runtime(source_home)
+
+    assert (profile_dir / "00-homebrew.sh").exists()
+    assert (profile_dir / "zz-fnm.sh").exists()
+    assert (profile_dir / "20-claude-shared.sh").exists()
+    assert "CLAUDE_CONFIG_DIR" in (profile_dir / "20-claude-shared.sh").read_text(encoding="utf-8")
+    assert "unset XDG_RUNTIME_DIR" in (profile_dir / "zz-fnm.sh").read_text(encoding="utf-8")
+
+    shared_credentials = shared_dir / ".credentials.json"
+    shared_state = shared_dir / ".claude.json"
+    assert shared_credentials.exists()
+    assert shared_state.exists()
+    assert (shared_credentials.stat().st_mode & 0o777) == 0o666
+    assert (shared_state.stat().st_mode & 0o777) == 0o666
+
+    patched_cli = claude_cli.read_text(encoding="utf-8")
+    assert "mode:438" in patched_cli
+    assert "bt9(K,438)" in patched_cli
+
+    assert str(shared_credentials) in updated
+    assert str(profile_dir / "20-claude-shared.sh") in updated
+
+
+def test_ensure_shared_claude_links_points_home_to_shared_store(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+    (target_home / ".claude").mkdir(parents=True)
+    (target_home / ".claude" / "old.txt").write_text("old\n", encoding="utf-8")
+    (target_home / ".claude.json").write_text("old\n", encoding="utf-8")
+
+    shared_dir = tmp_path / "var" / "lib" / "clawie" / "claude-shared"
+    shared_dir.mkdir(parents=True)
+    (shared_dir / ".claude.json").write_text('{"userID":"u1"}\n', encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+
+        class Result:
+            returncode = 0
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ZeroClawService, "SHARED_CLAUDE_DIR", shared_dir)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    updated = service._ensure_shared_claude_links(target_home=target_home, username="sam")
+
+    assert str(target_home / ".claude") in updated
+    assert str(target_home / ".claude.json") in updated
+    assert (target_home / ".claude").is_symlink()
+    assert (target_home / ".claude.json").is_symlink()
+    assert (target_home / ".claude").resolve() == shared_dir.resolve()
+    assert (target_home / ".claude.json").resolve() == (shared_dir / ".claude.json").resolve()
+    assert ["chown", "-h", "sam:sam", str(target_home / ".claude")] in calls
+    assert ["chown", "-h", "sam:sam", str(target_home / ".claude.json")] in calls
 
 
 def test_service_toggles_channel_plugin_and_autostart(tmp_path: Path) -> None:
@@ -1536,6 +1825,154 @@ def test_assign_channel_moves_between_agents(tmp_path: Path) -> None:
         provider="openclaw",
     )
     service.assign_channel_to_agent("alice", "chat", "alice-support", "bob")
+    alice = service.get_agent("alice")
+    bob = service.get_agent("bob")
+    assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))
+    assert any(c.get("name") == "alice-support" for c in bob.get("channels", []))
+
+
+def test_assign_channel_without_source_still_moves_existing_owner(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.create_agent(
+        agent_id="bob",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    result = service.assign_channel_to_agent("", "chat", "alice-support", "bob")
+    assert result["moved"] is True
+    assert "alice" in result.get("moved_from_agent_ids", [])
+
+    alice = service.get_agent("alice")
+    bob = service.get_agent("bob")
+    assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))
+    assert any(c.get("name") == "alice-support" for c in bob.get("channels", []))
+
+
+def test_create_agent_rejects_channel_already_owned_by_another_agent(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    try:
+        service.create_agent(
+            agent_id="bob",
+            display_name=None,
+            template="baseline",
+            clone_from=None,
+            channel_strategy="migrate",
+            channels=[{"kind": "chat", "name": "alice-support"}],
+            agent_version="1.0.0",
+            provider="openclaw",
+        )
+        assert False, "expected create_agent to reject duplicate channel ownership"
+    except Exception as exc:  # noqa: BLE001
+        assert "channel already assigned" in str(exc)
+
+
+def test_clone_with_migrate_transfers_channels_from_source_agent(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="src",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.create_agent(
+        agent_id="dst",
+        display_name=None,
+        template="baseline",
+        clone_from="src",
+        channel_strategy="migrate",
+        channels=None,
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    src = service.get_agent("src")
+    dst = service.get_agent("dst")
+    assert not any(c.get("name") == "src-support" for c in src.get("channels", []))
+    assert any(
+        c.get("name") == "src-support" and c.get("migrated_from") == "src"
+        for c in dst.get("channels", [])
+    )
+
+
+def test_migrate_channels_moves_ownership_instead_of_copying(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "chat", "name": "support"}],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.create_agent(
+        agent_id="bob",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    service.migrate_channels("alice", "bob")
     alice = service.get_agent("alice")
     bob = service.get_agent("bob")
     assert not any(c.get("name") == "alice-support" for c in alice.get("channels", []))

@@ -944,7 +944,11 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
             r_icon = ICON_ON if "on" in label else ICON_OFF
             label = label.replace("autostart: on", f"autostart {ICON_DOT} on")
             label = label.replace("autostart: off", f"autostart {ICON_DOT} off")
+        elif kind.startswith("cred_bundle:"):
+            r_icon = ICON_ON if "on" in label else ICON_OFF
         elif kind.startswith("service_") and kind not in ("service_status",):
+            r_icon = ICON_PTR
+        elif kind in {"cred_sync_now", "cred_revoke_now"}:
             r_icon = ICON_PTR
         elif kind == "prompt_edit":
             r_icon = ICON_PTR
@@ -1147,7 +1151,7 @@ def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
     info = agent.get("agent", {})
     is_local = bool(info.get("local_user", False))
     prefix = "(local) " if is_local else ""
-    return [
+    rows = [
         {
             "kind": "autostart",
             "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
@@ -1166,6 +1170,33 @@ def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
         },
         {"kind": "auth_mode", "label": f"{prefix}auth: {info.get('auth_mode', '')}"},
     ]
+    if is_local:
+        return rows
+    credential_sync = agent.get("credential_sync", {})
+    selected = {
+        str(item).strip().lower()
+        for item in credential_sync.get("bundles", [])
+        if str(item).strip()
+    }
+    rows.extend(
+        [
+            {
+                "kind": "cred_bundle:provider-auth",
+                "label": f"cred provider-auth: {'on' if 'provider-auth' in selected else 'off'}",
+            },
+            {
+                "kind": "cred_bundle:git",
+                "label": f"cred git: {'on' if 'git' in selected else 'off'}",
+            },
+            {"kind": "cred_sync_now", "label": "sync credentials now"},
+            {"kind": "cred_revoke_now", "label": "revoke selected credential access"},
+            {
+                "kind": "cred_last_sync",
+                "label": f"cred last_sync: {str(credential_sync.get('last_synced_at', '')) or 'never'}",
+            },
+        ]
+    )
+    return rows
 
 
 def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
@@ -1203,6 +1234,25 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
             else:
                 result = service.agent_service_action(state.selected_agent_id, "status")
             state.notice = f"service status: {result.get('service_status', 'unknown')}"
+        elif kind.startswith("cred_bundle:"):
+            if is_local:
+                state.notice = "credential bundle policy not applicable for local-user claw"
+            else:
+                bundle = kind.split(":", 1)[1]
+                service.toggle_agent_credential_bundle(state.selected_agent_id, bundle)
+                state.notice = f"credential bundle toggled: {bundle}"
+        elif kind == "cred_sync_now":
+            if is_local:
+                state.notice = "credential sync not applicable for local-user claw"
+            else:
+                result = service.sync_agent_credentials(state.selected_agent_id)
+                state.notice = f"credentials synced ({len(result.get('copied_paths', []))} paths)"
+        elif kind == "cred_revoke_now":
+            if is_local:
+                state.notice = "credential revoke not applicable for local-user claw"
+            else:
+                result = service.revoke_agent_credentials(state.selected_agent_id)
+                state.notice = f"credentials revoked ({len(result.get('removed_paths', []))} paths)"
         else:
             state.notice = "read-only setting"
         state.notice_error = False

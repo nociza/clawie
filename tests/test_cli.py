@@ -89,6 +89,43 @@ def test_create_agent_with_provider_override(tmp_path: Path, capsys: CaptureFixt
     assert "provider: picoclaw" in output
 
 
+def test_create_agent_uses_picoclaw_as_default_provider(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set") == 0
+    capsys.readouterr()
+
+    code = run_cli(tmp_path, "agent", "create", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "provider: picoclaw" in output
+
+
+def test_agent_provider_set_changes_provider(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "picoclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "agent", "create", "teleclaw", "--provider", "zeroclaw") == 1
+    output = capsys.readouterr().out
+    assert "provider 'zeroclaw' is not configured" in output
+
+    assert run_cli(tmp_path, "config", "set", "--provider", "zeroclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "agent", "create", "teleclaw", "--provider", "zeroclaw") == 0
+    capsys.readouterr()
+
+    assert run_cli(tmp_path, "config", "set", "--provider", "picoclaw") == 0
+    capsys.readouterr()
+    code = run_cli(tmp_path, "agent", "provider", "set", "teleclaw", "picoclaw")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Changed provider for teleclaw to picoclaw" in output
+    assert "provider: picoclaw" in output
+
+
 def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234", "--workspace", "prod") == 0
     capsys.readouterr()
@@ -137,6 +174,137 @@ def test_legacy_top_level_commands_are_rejected(tmp_path: Path) -> None:
     with raises(SystemExit) as list_exit:
         run_cli(tmp_path, "list")
     assert list_exit.value.code == 2
+
+
+def test_runtime_status_shows_auth_state(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "list_local_runtime_statuses",
+        lambda self, refresh=True: [
+            {
+                "provider": "zeroclaw",
+                "linux_user": "alice",
+                "service_status": "running",
+                "service_mode": "systemd",
+                "auth_mode": "linked",
+                "auth_status": "expired",
+                "auth_profile": "openai-codex:default",
+                "expires_at": "2026-03-02T05:47:04Z",
+                "root": "/home/alice/.zeroclaw",
+            }
+        ],
+    )
+
+    code = run_cli(tmp_path, "runtime", "status")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "provider" in output
+    assert "auth" in output
+    assert "zeroclaw" in output
+    assert "expired" in output
+
+
+def test_runtime_login_prints_auth_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "local_claw_auth_login",
+        lambda self, provider: {
+            "provider": provider,
+            "linux_user": "alice",
+            "home": "/home/alice",
+            "auth_mode": "linked",
+            "auth_status": "ready",
+            "auth_profile": "openai-codex:default",
+            "account": "acct-1",
+            "expires_at": "2026-03-22T05:47:04Z",
+            "last_refresh": "2026-03-08T01:02:03Z",
+            "source": "cli",
+            "detail": "oauth",
+            "login_required": False,
+            "action_performed": "login",
+        },
+    )
+
+    code = run_cli(tmp_path, "runtime", "login", "zeroclaw")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Completed linked login for zeroclaw" in output
+    assert "auth_status: ready" in output
+    assert "auth_profile: openai-codex:default" in output
+
+
+def test_agent_auth_show_prints_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "agent_auth_status",
+        lambda self, agent_id: {
+            "agent_id": agent_id,
+            "provider": "zeroclaw",
+            "linux_user": "alice",
+            "home": "/home/alice",
+            "auth_mode": "linked",
+            "auth_status": "expired",
+            "auth_profile": "openai-codex:default",
+            "account": "acct-1",
+            "expires_at": "2026-03-02T05:47:04Z",
+            "last_refresh": "2026-02-28T08:43:04Z",
+            "source": "file:auth-profiles.json",
+            "detail": "oauth",
+            "login_required": True,
+        },
+    )
+
+    code = run_cli(tmp_path, "agent", "auth", "show", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Agent Auth" in output
+    assert "auth_status: expired" in output
+    assert "login_required: True" in output
+
+
+def test_agent_auth_login_prints_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "agent_auth_login",
+        lambda self, agent_id: {
+            "agent_id": agent_id,
+            "provider": "zeroclaw",
+            "linux_user": "alice",
+            "home": "/home/alice",
+            "auth_mode": "linked",
+            "auth_status": "ready",
+            "auth_profile": "openai-codex:default",
+            "account": "acct-1",
+            "expires_at": "2026-03-22T05:47:04Z",
+            "last_refresh": "2026-03-08T01:02:03Z",
+            "source": "cli",
+            "detail": "oauth",
+            "login_required": False,
+            "action_performed": "refresh",
+        },
+    )
+
+    code = run_cli(tmp_path, "agent", "auth", "login", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Refreshed linked login for alice" in output
+    assert "auth_status: ready" in output
 
 
 def test_spawn_requires_root(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -1280,6 +1448,159 @@ def test_local_agent_view_refreshes_service_status(
     assert payload.get("display_name") == "local-user"
     assert agent.get("service_status") == "running"
     assert agent.get("status") == "running"
+
+
+def test_parse_provider_auth_status_output_marks_expired(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    parsed = service._parse_provider_auth_status_output(
+        "* openai-codex:default kind=OAuth account=acct-1 "
+        "expires=expired at 2026-03-02T05:47:04.775201553+00:00"
+    )
+
+    assert parsed["auth_status"] == "expired"
+    assert parsed["auth_profile"] == "openai-codex:default"
+    assert parsed["account"] == "acct-1"
+    assert parsed["expires_at"] == "2026-03-02T05:47:04.775201553+00:00"
+    assert parsed["detail"].lower() == "oauth"
+
+
+def test_auth_status_from_profiles_json_marks_expired(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    path = tmp_path / "auth-profiles.json"
+    path.write_text(
+        json.dumps(
+            {
+                "active_profiles": {"openai-codex": "openai-codex:default"},
+                "profiles": {
+                    "openai-codex:default": {
+                        "profile_name": "default",
+                        "provider": "openai-codex",
+                        "account_id": "acct-1",
+                        "kind": "oauth",
+                        "access_token": "tok",
+                        "refresh_token": "ref",
+                        "expires_at": "2026-03-02T05:47:04.775201553+00:00",
+                        "updated_at": "2026-02-28T08:43:04.625578501Z",
+                    }
+                },
+                "updated_at": "2026-02-28T08:43:04.625578501Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    parsed = service._auth_status_from_profiles_json(path)
+    assert parsed["auth_status"] == "expired"
+    assert parsed["auth_profile"] == "default"
+    assert parsed["account"] == "acct-1"
+    assert parsed["source"] == "file:auth-profiles.json"
+
+
+def test_local_claw_auth_login_refreshes_before_login(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+
+    states = iter(
+        [
+            {
+                "provider": "zeroclaw",
+                "auth_mode": "linked",
+                "auth_status": "expired",
+                "login_required": True,
+            },
+            {
+                "provider": "zeroclaw",
+                "auth_mode": "linked",
+                "auth_status": "missing",
+                "login_required": True,
+            },
+            {
+                "provider": "zeroclaw",
+                "auth_mode": "linked",
+                "auth_status": "ready",
+                "login_required": False,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(
+        ZeroClawService,
+        "_inspect_provider_auth_state",
+        lambda self, **kwargs: dict(next(states)),
+    )
+    monkeypatch.setattr(
+        ZeroClawService,
+        "_resolve_local_runtime_target",
+        lambda self, provider: {"linux_user": "", "home": str(tmp_path), "root": ""},
+    )
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/zeroclaw")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append(cmd)
+
+        class Result:
+            def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        if kwargs.get("capture_output"):
+            return Result(returncode=0, stdout="refreshed")
+        return Result(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    payload = service.local_claw_auth_login("zeroclaw")
+    assert payload["auth_status"] == "ready"
+    assert payload["action_performed"] == "login"
+    assert [cmd[-1] for cmd in calls] == ["refresh", "login"]
+
+
+def test_set_agent_provider_updates_runtime_and_auth_mode(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+
+    updated = service.set_agent_provider("teleclaw", "picoclaw")
+    info = updated["agent"]
+    assert info["provider"] == "picoclaw"
+    assert info["runtime"] == "picoclaw-agent"
+    assert info["auth_mode"] == "linked"
+    assert info["service_status"] == "unknown"
+    assert info["service_mode"] == "unknown"
 
 
 def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None:

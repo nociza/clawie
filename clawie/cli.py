@@ -148,7 +148,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     agent_sub = agent.add_subparsers(
         dest="agent_command",
         required=True,
-        metavar="{create,clone,prompt,credentials,list,show,delete,purge,create-batch}",
+        metavar="{create,clone,prompt,credentials,auth,provider,list,show,delete,purge,create-batch}",
     )
 
     create = agent_sub.add_parser("create", help="Create a new agent")
@@ -373,6 +373,68 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     )
     credentials_revoke.set_defaults(func=cmd_agents_credentials_revoke)
 
+    auth = agent_sub.add_parser(
+        "auth",
+        help="Inspect and refresh linked login sessions",
+    )
+    auth_sub = auth.add_subparsers(
+        dest="agent_auth_command",
+        required=True,
+        metavar="{show,login}",
+    )
+
+    auth_show = auth_sub.add_parser(
+        "show",
+        help="Show auth session status for an agent or local claw",
+    )
+    _add_positional_argument(
+        auth_show,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID or @local:PROVIDER",
+    )
+    auth_show.set_defaults(func=cmd_agents_auth_show)
+
+    auth_login = auth_sub.add_parser(
+        "login",
+        help="Refresh or re-run linked login for an agent or local claw",
+    )
+    _add_positional_argument(
+        auth_login,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID or @local:PROVIDER",
+    )
+    auth_login.set_defaults(func=cmd_agents_auth_login)
+
+    provider = agent_sub.add_parser(
+        "provider",
+        help="Inspect and change an agent provider",
+    )
+    provider_sub = provider.add_subparsers(
+        dest="agent_provider_command",
+        required=True,
+        metavar="{set}",
+    )
+
+    provider_set = provider_sub.add_parser(
+        "set",
+        help="Change the provider for an existing managed agent",
+    )
+    _add_positional_argument(
+        provider_set,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    _add_positional_argument(
+        provider_set,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Target provider name",
+    )
+    provider_set.set_defaults(func=cmd_agents_provider_set)
+
     agent_list = agent_sub.add_parser("list", help="List agents")
     agent_list.set_defaults(func=cmd_agents_list)
 
@@ -489,7 +551,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     runtime_sub = runtime.add_subparsers(
         dest="runtime_command",
         required=True,
-        metavar="{create,detect}",
+        metavar="{create,detect,status,login}",
     )
 
     create = runtime_sub.add_parser(
@@ -564,6 +626,24 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         help="Home directory to inspect (default: current user home)",
     )
     detect.set_defaults(func=cmd_claws_detect)
+
+    status = runtime_sub.add_parser(
+        "status",
+        help="Show local runtime service and auth status",
+    )
+    status.set_defaults(func=cmd_runtime_status)
+
+    login = runtime_sub.add_parser(
+        "login",
+        help="Refresh or re-run linked login for a local runtime",
+    )
+    _add_positional_argument(
+        login,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Installed local provider name",
+    )
+    login.set_defaults(func=cmd_runtime_login)
 
 
 def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
@@ -879,6 +959,36 @@ def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ZeroClawSer
     return 0
 
 
+def cmd_agents_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    payload = service.agent_auth_status(agent_id)
+    _print_auth_status(payload, title="Agent Auth")
+    return 0
+
+
+def cmd_agents_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    payload = service.agent_auth_login(agent_id)
+    action = str(payload.get("action_performed", "login"))
+    if action == "status":
+        print_info(f"Linked login already ready for {agent_id}")
+    elif action == "refresh":
+        print_success(f"Refreshed linked login for {agent_id}")
+    else:
+        print_success(f"Completed linked login for {agent_id}")
+    _print_auth_status(payload, title="Agent Auth")
+    return 0
+
+
+def cmd_agents_provider_set(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    agent = service.set_agent_provider(agent_id, provider)
+    print_success(f"Changed provider for {agent_id} to {agent.get('agent', {}).get('provider', '')}")
+    _print_agent(service.get_dashboard_agent(agent_id))
+    return 0
+
+
 def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     agents = service.list_agents()
     if not agents:
@@ -914,7 +1024,7 @@ def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
 
 def cmd_agents_show(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
-    agent = service.get_agent(agent_id)
+    agent = service.get_dashboard_agent(agent_id)
     _print_agent(agent)
     return 0
 
@@ -1067,6 +1177,49 @@ def cmd_claws_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_runtime_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+    _ = args
+    rows = service.list_local_runtime_statuses(refresh=True)
+    if not rows:
+        print_info("No local runtimes detected.")
+        return 0
+
+    table: list[list[str]] = []
+    for row in rows:
+        table.append(
+            [
+                str(row.get("provider", "")),
+                str(row.get("linux_user", "")),
+                str(row.get("service_status", "unknown")),
+                str(row.get("service_mode", "")),
+                str(row.get("auth_mode", "")),
+                str(row.get("auth_status", "unknown")),
+                str(row.get("auth_profile", "")),
+                str(row.get("expires_at", "")),
+                str(row.get("root", "")),
+            ]
+        )
+    print_table(
+        ["provider", "linux_user", "service", "service_mode", "auth_mode", "auth", "profile", "expires_at", "root"],
+        table,
+    )
+    return 0
+
+
+def cmd_runtime_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    payload = service.local_claw_auth_login(provider)
+    action = str(payload.get("action_performed", "login"))
+    if action == "status":
+        print_info(f"Linked login already ready for {provider}")
+    elif action == "refresh":
+        print_success(f"Refreshed linked login for {provider}")
+    else:
+        print_success(f"Completed linked login for {provider}")
+    _print_auth_status(payload, title="Runtime Auth")
+    return 0
+
+
 def cmd_doctor(args: argparse.Namespace, service: ZeroClawService) -> int:
     report = service.doctor()
     status = str(report.get("status", "unknown"))
@@ -1145,6 +1298,10 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"migrated_channels: {migrated}",
             f"provider: {agent.get('agent', {}).get('provider', '')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
+            f"auth_status: {agent.get('agent', {}).get('auth_status', 'unknown')}",
+            f"auth_profile: {agent.get('agent', {}).get('auth_profile', '')}",
+            f"auth_account: {agent.get('agent', {}).get('auth_account', '')}",
+            f"auth_expires_at: {agent.get('agent', {}).get('auth_expires_at', '')}",
             f"core_prompts: {len(agent.get('core_prompts', {}))}",
             f"credential_bundles: {selected_bundles}",
             f"autostart: {agent.get('agent', {}).get('autostart', True)}",
@@ -1173,6 +1330,27 @@ def _print_agent(agent: dict[str, Any]) -> None:
         plugin_rows = [[str(key), str(bool(value))] for key, value in sorted(plugins.items())]
         print()
         print_table(["plugin", "enabled"], plugin_rows)
+
+
+def _print_auth_status(payload: dict[str, Any], *, title: str) -> None:
+    print_panel(
+        title,
+        [
+            f"agent_id: {payload.get('agent_id', '')}",
+            f"provider: {payload.get('provider', '')}",
+            f"linux_user: {payload.get('linux_user', '')}",
+            f"home: {payload.get('home', '')}",
+            f"auth_mode: {payload.get('auth_mode', '')}",
+            f"auth_status: {payload.get('auth_status', 'unknown')}",
+            f"auth_profile: {payload.get('auth_profile', '')}",
+            f"account: {payload.get('account', '')}",
+            f"expires_at: {payload.get('expires_at', '')}",
+            f"last_refresh: {payload.get('last_refresh', '')}",
+            f"source: {payload.get('source', '')}",
+            f"detail: {payload.get('detail', '')}",
+            f"login_required: {payload.get('login_required', False)}",
+        ],
+    )
 
 
 def _resolve_channels(

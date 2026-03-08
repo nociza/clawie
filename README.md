@@ -74,9 +74,11 @@ clawie dashboard
 clawie config set|show
 clawie agent create|clone|list|show|delete|purge|create-batch
 clawie agent prompt copy
+clawie agent auth show|login
+clawie agent provider set
 clawie agent credentials list|show|set|sync|revoke
 clawie channel apply|move
-clawie runtime create|detect
+clawie runtime create|detect|status|login
 clawie dashboard
 clawie health
 clawie event list
@@ -94,6 +96,9 @@ clawie config set --provider picoclaw --auth-mode api_key --api-key pico_live_12
 # agents
 clawie agent list
 clawie agent show alice
+clawie agent auth show alice
+sudo clawie agent auth login alice
+clawie agent provider set alice picoclaw
 clawie agent clone alice bob --channel-strategy migrate
 clawie agent delete bob
 clawie agent prompt copy alice bob
@@ -110,6 +115,8 @@ clawie channel move alice bob
 # runtime + health
 sudo clawie runtime create alice --user alice
 clawie runtime detect
+clawie runtime status
+clawie runtime login zeroclaw
 clawie health
 clawie event list --limit 50
 

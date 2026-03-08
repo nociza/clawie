@@ -5,6 +5,7 @@ import crypt
 import json
 import os
 import pwd
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -98,6 +99,29 @@ class ZeroClawService:
         "memory": True,
         "web_search": True,
     }
+    CREDENTIAL_BUNDLE_SPECS: tuple[dict[str, Any], ...] = (
+        {
+            "id": "provider-auth",
+            "label": "provider auth (.codex/.openai/provider state)",
+            "default": True,
+            "kind": "provider",
+        },
+        {
+            "id": "git",
+            "label": "git auth (.gitconfig/.git-credentials/.config/gh/.ssh)",
+            "default": False,
+            "kind": "paths",
+            "paths": (".gitconfig", ".git-credentials", ".config/gh", ".ssh"),
+        },
+    )
+    CREDENTIAL_BUNDLE_ALIASES: dict[str, str] = {
+        "provider": "provider-auth",
+        "providers": "provider-auth",
+        "provider-auth": "provider-auth",
+        "provider_auth": "provider-auth",
+        "git": "git",
+    }
+    DEFAULT_CREDENTIAL_BUNDLES: tuple[str, ...] = ("provider-auth",)
     SHARED_TOOLCHAIN_BEGIN = "# >>> clawie-shared-toolchain >>>"
     SHARED_TOOLCHAIN_END = "# <<< clawie-shared-toolchain <<<"
     SHARED_TOOLCHAIN_BLOCK = "\n".join(
@@ -140,6 +164,143 @@ class ZeroClawService:
     def __init__(self, store: StateStore) -> None:
         self.store = store
 
+    @classmethod
+    def credential_bundle_options(cls) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for spec in cls.CREDENTIAL_BUNDLE_SPECS:
+            rows.append(
+                {
+                    "id": str(spec.get("id", "")),
+                    "label": str(spec.get("label", "")),
+                    "default": bool(spec.get("default", False)),
+                }
+            )
+        return rows
+
+    @classmethod
+    def _credential_bundle_spec_map(cls) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for spec in cls.CREDENTIAL_BUNDLE_SPECS:
+            token = str(spec.get("id", "")).strip().lower()
+            if token:
+                rows[token] = dict(spec)
+        return rows
+
+    def _canonical_credential_bundle(self, bundle: str) -> str:
+        token = str(bundle).strip().lower().replace("_", "-")
+        if not token:
+            return ""
+        return str(self.CREDENTIAL_BUNDLE_ALIASES.get(token, token))
+
+    def _normalize_credential_bundles(
+        self,
+        bundles: list[str] | tuple[str, ...] | None,
+        *,
+        include_defaults: bool,
+    ) -> list[str]:
+        allowed = self._credential_bundle_spec_map()
+        seeded: list[str] = []
+        if include_defaults:
+            seeded.extend(self.DEFAULT_CREDENTIAL_BUNDLES)
+        if bundles:
+            seeded.extend(str(item) for item in bundles)
+
+        selected: list[str] = []
+        seen: set[str] = set()
+        invalid: list[str] = []
+        for raw in seeded:
+            token = self._canonical_credential_bundle(raw)
+            if not token:
+                continue
+            if token not in allowed:
+                invalid.append(str(raw))
+                continue
+            if token in seen:
+                continue
+            seen.add(token)
+            selected.append(token)
+        if invalid:
+            choices = ", ".join(sorted(allowed))
+            raise ValueError(f"unknown credential bundle(s): {', '.join(invalid)} (supported: {choices})")
+        return selected
+
+    def _ordered_credential_bundles(self, bundles: list[str]) -> list[str]:
+        order = {
+            str(spec.get("id", "")).strip().lower(): idx
+            for idx, spec in enumerate(self.CREDENTIAL_BUNDLE_SPECS)
+        }
+        rows = self._normalize_credential_bundles(bundles, include_defaults=False)
+        return sorted(rows, key=lambda token: order.get(token, 10_000))
+
+    @staticmethod
+    def _normalized_string_list(payload: Any) -> list[str]:
+        rows: list[str] = []
+        if not isinstance(payload, list):
+            return rows
+        for item in payload:
+            token = str(item).strip()
+            if token:
+                rows.append(token)
+        return rows
+
+    def _normalize_credential_sync_state(self, payload: Any, *, default_when_missing: bool) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            payload = {}
+        raw_bundles = payload.get("bundles")
+        include_defaults = default_when_missing and not isinstance(raw_bundles, list)
+        try:
+            bundles = self._normalize_credential_bundles(
+                raw_bundles if isinstance(raw_bundles, list) else [],
+                include_defaults=include_defaults,
+            )
+        except ValueError:
+            bundles = self._normalize_credential_bundles([], include_defaults=default_when_missing)
+        return {
+            "bundles": self._ordered_credential_bundles(bundles),
+            "last_synced_at": str(payload.get("last_synced_at", "")),
+            "last_source_home": str(payload.get("last_source_home", "")),
+            "last_synced_paths": self._normalized_string_list(payload.get("last_synced_paths", [])),
+            "last_revoked_at": str(payload.get("last_revoked_at", "")),
+            "last_revoked_paths": self._normalized_string_list(payload.get("last_revoked_paths", [])),
+        }
+
+    @staticmethod
+    def _dedupe_paths(paths: list[str]) -> list[str]:
+        seen: set[str] = set()
+        rows: list[str] = []
+        for item in paths:
+            token = str(item).strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            rows.append(token)
+        return rows
+
+    @staticmethod
+    def _current_linux_user() -> str:
+        try:
+            return str(pwd.getpwuid(os.geteuid()).pw_name)
+        except KeyError:
+            return ""
+
+    def _assert_linux_user_manageable(self, linux_user: str, action: str) -> None:
+        token = str(linux_user).strip()
+        if not token:
+            raise SetupError(f"{action} requires an agent linux_user")
+        if os.geteuid() == 0:
+            return
+        if token != self._current_linux_user():
+            raise SetupError(
+                f"{action} requires root when agent linux_user differs from current user. Re-run with sudo/root."
+            )
+
+    @staticmethod
+    def _default_source_home() -> Path:
+        sudo_user = os.environ.get("SUDO_USER", "").strip()
+        if sudo_user:
+            return Path("/home") / sudo_user
+        return Path.home()
+
     def setup(
         self,
         provider: str,
@@ -152,7 +313,7 @@ class ZeroClawService:
         clear_spawn_password: bool = False,
         install_runtime: bool = False,
     ) -> dict[str, Any]:
-        provider = provider.strip().lower() or "zeroclaw"
+        provider = provider.strip().lower() or "picoclaw"
         provider_spec = get_provider(provider)
         api_key_value = api_key.strip()
         mode = self._resolve_auth_mode(provider_spec.name, api_key_value, auth_mode)
@@ -199,7 +360,7 @@ class ZeroClawService:
 
     def setup_status(self) -> dict[str, Any]:
         config = self.store.read_config()
-        provider = str(config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
+        provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
         provider_spec = get_provider(provider)
         credentials = self._provider_auth(provider)
         auth_mode = credentials.get("auth_mode", provider_spec.default_auth_mode)
@@ -286,7 +447,7 @@ class ZeroClawService:
         )
 
         config = self.store.read_config()
-        default_provider = str(config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
+        default_provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
         if provider:
             provider_spec = get_provider(provider)
         elif clone_from:
@@ -331,6 +492,7 @@ class ZeroClawService:
             "channel_strategy": channel_strategy,
             "channels": final_channels,
             "core_prompts": normalized_prompts,
+            "credential_sync": self._normalize_credential_sync_state({}, default_when_missing=True),
             "agent": agent,
         }
         agents[agent_id] = agent_state
@@ -379,6 +541,298 @@ class ZeroClawService:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
         self._hydrate_agent_controls(agent)
         return agent
+
+    def set_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+        if token.startswith("@local:"):
+            raise ValueError("provider switching is only supported for managed agents")
+
+        target_provider = str(provider).strip().lower()
+        if not target_provider:
+            raise ValueError("provider is required")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+
+        info = agent.setdefault("agent", {})
+        current_provider = str(info.get("provider", "")).strip().lower()
+        target_spec = get_provider(target_provider)
+        provider_auth = self._provider_auth(target_spec.name)
+        if not self._is_provider_configured(target_spec.name, provider_auth):
+            raise SetupError(f"provider '{target_spec.name}' is not configured. Run 'clawie config set'.")
+
+        if current_provider == target_spec.name:
+            return agent
+
+        info["provider"] = target_spec.name
+        info["runtime"] = target_spec.runtime
+        info["auth_mode"] = str(provider_auth.get("auth_mode", target_spec.default_auth_mode))
+        info["service_status"] = "unknown"
+        info["service_mode"] = "unknown"
+        info["pid"] = 0
+        if "fallback_pid" in info:
+            info["fallback_pid"] = 0
+        info["last_sync"] = now_iso()
+        agent["core_prompts"] = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+        self._event(
+            state,
+            "agents.provider_changed",
+            f"Changed provider for {token}",
+            {
+                "agent_id": token,
+                "from_provider": current_provider,
+                "to_provider": target_spec.name,
+            },
+        )
+        self.store.write_state(state)
+        return agent
+
+    def get_agent_credential_sync(self, agent_id: str) -> dict[str, Any]:
+        payload = self.get_dashboard_agent(agent_id)
+        info = payload.get("agent", {})
+        sync = self._normalize_credential_sync_state(payload.get("credential_sync"), default_when_missing=True)
+        selected = set(sync.get("bundles", []))
+        bundles: list[dict[str, Any]] = []
+        for option in self.credential_bundle_options():
+            bid = str(option.get("id", ""))
+            bundles.append(
+                {
+                    "id": bid,
+                    "label": str(option.get("label", "")),
+                    "default": bool(option.get("default", False)),
+                    "selected": bid in selected,
+                }
+            )
+        return {
+            "agent_id": str(payload.get("agent_id", payload.get("user_id", ""))),
+            "linux_user": str(info.get("linux_user", "")),
+            "local_user": bool(info.get("local_user", False)),
+            "selected_bundles": list(sync.get("bundles", [])),
+            "last_synced_at": str(sync.get("last_synced_at", "")),
+            "last_source_home": str(sync.get("last_source_home", "")),
+            "last_synced_paths": list(sync.get("last_synced_paths", [])),
+            "last_revoked_at": str(sync.get("last_revoked_at", "")),
+            "last_revoked_paths": list(sync.get("last_revoked_paths", [])),
+            "bundles": bundles,
+        }
+
+    def set_agent_credential_bundles(
+        self,
+        agent_id: str,
+        bundles: list[str],
+        *,
+        include_defaults: bool = False,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            raise ValueError("credential bundle policy is only supported for managed agents")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        selected = self._ordered_credential_bundles(
+            self._normalize_credential_bundles(bundles, include_defaults=include_defaults)
+        )
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        sync["bundles"] = selected
+        sync["last_synced_paths"] = []
+        sync["last_revoked_paths"] = []
+        agent["credential_sync"] = sync
+        agent.setdefault("agent", {})["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.credentials_policy_updated",
+            f"Updated credential policy for {token}",
+            {"agent_id": token, "bundles": selected},
+        )
+        self.store.write_state(state)
+        return agent
+
+    def toggle_agent_credential_bundle(self, agent_id: str, bundle: str) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            raise ValueError("credential bundle policy is only supported for managed agents")
+        selected_bundle = self._normalize_credential_bundles([bundle], include_defaults=False)
+        if not selected_bundle:
+            raise ValueError("bundle is required")
+        bundle_id = selected_bundle[0]
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        current = list(sync.get("bundles", []))
+        if bundle_id in current:
+            current = [item for item in current if item != bundle_id]
+        else:
+            current.append(bundle_id)
+        sync["bundles"] = self._ordered_credential_bundles(current)
+        sync["last_synced_paths"] = []
+        sync["last_revoked_paths"] = []
+        agent["credential_sync"] = sync
+        agent.setdefault("agent", {})["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.credentials_policy_toggled",
+            f"Toggled credential bundle {bundle_id} for {token}",
+            {
+                "agent_id": token,
+                "bundle": bundle_id,
+                "enabled": bundle_id in set(sync.get("bundles", [])),
+                "bundles": list(sync.get("bundles", [])),
+            },
+        )
+        self.store.write_state(state)
+        return agent
+
+    def sync_agent_credentials(
+        self,
+        agent_id: str,
+        *,
+        source_home: str | Path | None = None,
+        bundles: list[str] | None = None,
+        include_defaults: bool = False,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            raise ValueError("credential sync is only supported for managed agents")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        self._assert_linux_user_manageable(linux_user, "credential sync")
+        target_home = self._agent_linux_home(agent)
+        if not target_home:
+            raise SetupError(f"agent '{token}' has no linux_user home to sync credentials to")
+        if not target_home.exists():
+            raise SetupError(f"agent '{token}' home does not exist: {target_home}")
+        if source_home:
+            src_home = Path(source_home).expanduser()
+        else:
+            src_home = self._default_source_home()
+        if not src_home.exists():
+            raise FileNotFoundError(f"source home not found: {src_home}")
+
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        if bundles is None:
+            selected = self._ordered_credential_bundles(list(sync.get("bundles", [])))
+        else:
+            selected = self._ordered_credential_bundles(
+                self._normalize_credential_bundles(bundles, include_defaults=include_defaults)
+            )
+        copied = self._sync_selected_credential_bundles(
+            source_home=src_home,
+            target_home=target_home,
+            username=linux_user,
+            requested_provider=str(info.get("provider", "")),
+            bundles=selected,
+        )
+        sync["bundles"] = selected
+        sync["last_synced_at"] = now_iso()
+        sync["last_source_home"] = str(src_home)
+        sync["last_synced_paths"] = copied
+        sync["last_revoked_paths"] = []
+        agent["credential_sync"] = sync
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.credentials_synced",
+            f"Synced credentials for {token}",
+            {
+                "agent_id": token,
+                "linux_user": linux_user,
+                "source_home": str(src_home),
+                "bundles": selected,
+                "copied_paths": copied,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent_id": token,
+            "linux_user": linux_user,
+            "source_home": str(src_home),
+            "bundles": selected,
+            "copied_paths": copied,
+        }
+
+    def revoke_agent_credentials(
+        self,
+        agent_id: str,
+        *,
+        bundles: list[str] | None = None,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            raise ValueError("credential revoke is only supported for managed agents")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        self._assert_linux_user_manageable(linux_user, "credential revoke")
+        target_home = self._agent_linux_home(agent)
+        if not target_home:
+            raise SetupError(f"agent '{token}' has no linux_user home to revoke credentials from")
+        if not target_home.exists():
+            raise SetupError(f"agent '{token}' home does not exist: {target_home}")
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        selected = self._ordered_credential_bundles(list(sync.get("bundles", [])))
+        if bundles is None:
+            revoked_bundles = selected
+        else:
+            revoked_bundles = self._ordered_credential_bundles(
+                self._normalize_credential_bundles(bundles, include_defaults=False)
+            )
+        removed = self._revoke_selected_credential_bundles(target_home=target_home, bundles=revoked_bundles)
+        remaining = [item for item in selected if item not in set(revoked_bundles)]
+        sync["bundles"] = self._ordered_credential_bundles(remaining)
+        sync["last_revoked_at"] = now_iso()
+        sync["last_revoked_paths"] = removed
+        sync["last_synced_paths"] = []
+        agent["credential_sync"] = sync
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.credentials_revoked",
+            f"Revoked credentials for {token}",
+            {
+                "agent_id": token,
+                "linux_user": linux_user,
+                "bundles": revoked_bundles,
+                "removed_paths": removed,
+                "remaining_bundles": list(sync.get("bundles", [])),
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent_id": token,
+            "linux_user": linux_user,
+            "bundles": revoked_bundles,
+            "remaining_bundles": list(sync.get("bundles", [])),
+            "removed_paths": removed,
+        }
 
     def toggle_agent_channel(self, agent_id: str, channel_index: int) -> dict[str, Any]:
         self._require_setup()
@@ -1033,7 +1487,7 @@ class ZeroClawService:
         config = self.store.read_config()
         state = self.store.read_state()
 
-        provider = str(config.get("provider", "zeroclaw"))
+        provider = str(config.get("provider", "picoclaw"))
         provider_auth = self._provider_auth(provider)
         mode = provider_auth.get("auth_mode", get_provider(provider).default_auth_mode)
         if self._is_provider_configured(provider, provider_auth):
@@ -1125,8 +1579,10 @@ class ZeroClawService:
         token = str(agent_id).strip()
         if token.startswith("@local:"):
             provider = token.split(":", 1)[1]
-            return self._local_agent_view(provider)
-        return self.get_agent(token)
+            payload = self._local_agent_view(provider)
+        else:
+            payload = copy.deepcopy(self.get_agent(token))
+        return self._attach_agent_auth_status(payload)
 
     def list_agent_core_prompts(self, agent_id: str) -> list[dict[str, Any]]:
         payload = self.get_dashboard_agent(agent_id)
@@ -1403,6 +1859,171 @@ class ZeroClawService:
             "output": output,
         }
 
+    def list_local_runtime_statuses(self, refresh: bool = True) -> list[dict[str, Any]]:
+        config = self.store.read_config()
+        local_state = self._normalized_local_service_state(config)
+        installed = self.list_installed_claws()
+        user_hints: dict[str, str] = {}
+        providers: list[str] = []
+        for claw in installed:
+            provider = str(claw.get("provider", "")).strip().lower()
+            if not provider:
+                continue
+            providers.append(provider)
+            hint = self._linux_user_from_provider_root(Path(str(claw.get("root", "")).strip()))
+            if hint:
+                user_hints[provider] = hint
+        if refresh and providers:
+            local_state = self._refresh_local_service_statuses(providers, local_state, user_hints=user_hints)
+            config = self.store.read_config()
+            local_state = self._normalized_local_service_state(config)
+
+        rows: list[dict[str, Any]] = []
+        for claw in installed:
+            provider = str(claw.get("provider", "")).strip().lower()
+            if not provider:
+                continue
+            info = dict(local_state.get(provider, {}))
+            auth = self.local_claw_auth_status(provider)
+            rows.append(
+                {
+                    "provider": provider,
+                    "linux_user": str(info.get("linux_user", auth.get("linux_user", ""))),
+                    "service_status": str(info.get("service_status", "unknown")),
+                    "service_mode": str(info.get("service_mode", "unknown")),
+                    "root": str(claw.get("root", "")),
+                    "markers": list(claw.get("markers", [])),
+                    "auth_mode": str(auth.get("auth_mode", "")),
+                    "auth_status": str(auth.get("auth_status", "unknown")),
+                    "auth_profile": str(auth.get("auth_profile", "")),
+                    "account": str(auth.get("account", "")),
+                    "expires_at": str(auth.get("expires_at", "")),
+                    "login_required": bool(auth.get("login_required", False)),
+                    "source": str(auth.get("source", "")),
+                    "detail": str(auth.get("detail", "")),
+                }
+            )
+        return sorted(rows, key=lambda row: str(row.get("provider", "")))
+
+    def local_claw_auth_status(self, provider: str) -> dict[str, Any]:
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        spec = get_provider(name)
+        target = self._resolve_local_runtime_target(name)
+        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        payload = self._inspect_provider_auth_state(
+            provider=spec.name,
+            auth_mode=auth_mode,
+            linux_user=str(target.get("linux_user", "")),
+            home=self._path_or_none(target.get("home")),
+        )
+        payload.update(
+            {
+                "provider": spec.name,
+                "linux_user": str(target.get("linux_user", "")),
+                "home": str(target.get("home", "")),
+                "root": str(target.get("root", "")),
+                "local_user": True,
+            }
+        )
+        return payload
+
+    def local_claw_auth_login(self, provider: str) -> dict[str, Any]:
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        spec = get_provider(name)
+        target = self._resolve_local_runtime_target(name)
+        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        payload = self._refresh_or_login_linked_auth(
+            provider=spec.name,
+            auth_mode=auth_mode,
+            linux_user=str(target.get("linux_user", "")),
+            home=self._path_or_none(target.get("home")),
+        )
+        payload.update(
+            {
+                "provider": spec.name,
+                "linux_user": str(target.get("linux_user", "")),
+                "home": str(target.get("home", "")),
+                "root": str(target.get("root", "")),
+                "local_user": True,
+            }
+        )
+        return payload
+
+    def agent_auth_status(self, agent_id: str) -> dict[str, Any]:
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            payload = self.local_claw_auth_status(token.split(":", 1)[1])
+            payload["agent_id"] = token
+            return payload
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{token}' has no provider configured")
+        auth_mode = str(info.get("auth_mode", get_provider(provider).default_auth_mode))
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        payload = self._inspect_provider_auth_state(
+            provider=provider,
+            auth_mode=auth_mode,
+            linux_user=linux_user,
+            home=home,
+        )
+        payload.update(
+            {
+                "agent_id": token,
+                "linux_user": linux_user,
+                "home": str(home or ""),
+                "local_user": False,
+            }
+        )
+        return payload
+
+    def agent_auth_login(self, agent_id: str) -> dict[str, Any]:
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            payload = self.local_claw_auth_login(token.split(":", 1)[1])
+            payload["agent_id"] = token
+            return payload
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{token}' has no provider configured")
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        payload = self._refresh_or_login_linked_auth(
+            provider=provider,
+            auth_mode=str(info.get("auth_mode", get_provider(provider).default_auth_mode)),
+            linux_user=linux_user,
+            home=home,
+        )
+        payload.update(
+            {
+                "agent_id": token,
+                "linux_user": linux_user,
+                "home": str(home or ""),
+                "local_user": False,
+            }
+        )
+        return payload
+
     def dashboard_snapshot(self, agent_id: str | None = None) -> dict[str, Any]:
         return self.performance_snapshot(agent_id=agent_id, refresh=True)
 
@@ -1475,7 +2096,7 @@ class ZeroClawService:
         return {
             "generated_at": now_iso(),
             "workspace": config.get("workspace", ""),
-            "provider": config.get("provider", "zeroclaw"),
+            "provider": config.get("provider", "picoclaw"),
             "totals": {
                 "agents": len(rows),
                 "channels": channel_total,
@@ -1537,6 +2158,8 @@ class ZeroClawService:
         password_hash: str | None = None,
         use_global_password: bool = True,
         clone_from_agent: str | None = None,
+        credential_bundles: list[str] | None = None,
+        include_default_credentials: bool = True,
     ) -> dict[str, Any]:
         self._require_setup()
         agent_id = agent_id.strip()
@@ -1574,15 +2197,17 @@ class ZeroClawService:
         if source_home:
             src_home = Path(source_home).expanduser()
         else:
-            sudo_user = os.environ.get("SUDO_USER", "").strip()
-            if sudo_user:
-                src_home = Path("/home") / sudo_user
-            else:
-                src_home = Path.home()
+            src_home = self._default_source_home()
         system_prepared = self._ensure_system_shared_runtime(src_home)
 
         config = self.store.read_config()
-        resolved_provider = str(provider or config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
+        resolved_provider = str(provider or config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        selected_credential_bundles = self._ordered_credential_bundles(
+            self._normalize_credential_bundles(
+                credential_bundles,
+                include_defaults=include_default_credentials,
+            )
+        )
         clone_token = str(clone_from_agent or "").strip()
         cloned_prompts: dict[str, str] = {}
         cloned_channels: list[dict[str, str]] = []
@@ -1606,13 +2231,14 @@ class ZeroClawService:
             )
 
         copied = self._copy_user_configs(src_home, target_home, target_user, enabled=copy_configs)
-        copied += self._copy_provider_credentials(
-            source_home=src_home,
-            target_home=target_home,
-            username=target_user,
-            requested_provider=resolved_provider,
-            enabled=copy_configs,
-        )
+        if copy_configs:
+            copied += self._sync_selected_credential_bundles(
+                source_home=src_home,
+                target_home=target_home,
+                username=target_user,
+                requested_provider=resolved_provider,
+                bundles=selected_credential_bundles,
+            )
         for path in self._ensure_shared_toolchain_shell_init(target_home, target_user):
             if path not in copied:
                 copied.append(path)
@@ -1636,6 +2262,13 @@ class ZeroClawService:
         agent_state["agent"]["linux_user"] = target_user
         agent_state["agent"]["ssh_login_disabled"] = bool(ssh_login_disabled)
         agent_state["agent"]["login_shell"] = spawn_shell
+        credential_sync = self._normalize_credential_sync_state({}, default_when_missing=False)
+        credential_sync["bundles"] = selected_credential_bundles
+        credential_sync["last_source_home"] = str(src_home)
+        if copy_configs:
+            credential_sync["last_synced_at"] = now_iso()
+            credential_sync["last_synced_paths"] = list(copied)
+        agent_state["credential_sync"] = credential_sync
         if copy_configs:
             for name, content in cloned_prompts.items():
                 try:
@@ -1664,6 +2297,7 @@ class ZeroClawService:
                 ],
                 "imported_channels": len(cloned_channels),
                 "clone_from_agent": clone_from_agent or "",
+                "credential_bundles": selected_credential_bundles,
                 "password_source": password_source,
                 "ssh_login_disabled": bool(ssh_login_disabled),
             },
@@ -1678,6 +2312,7 @@ class ZeroClawService:
             "password_source": password_source,
             "password_value": password_value,
             "ssh_login_disabled": bool(ssh_login_disabled),
+            "credential_bundles": selected_credential_bundles,
         }
 
     def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1758,7 +2393,7 @@ class ZeroClawService:
 
     def _require_setup(self) -> None:
         config = self.store.read_config()
-        provider = str(config.get("provider", "zeroclaw")).strip().lower() or "zeroclaw"
+        provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
         credentials = self._provider_auth(provider)
         if not self._is_provider_configured(provider, credentials):
             raise SetupError("setup is incomplete. Run 'clawie setup'.")
@@ -1933,7 +2568,6 @@ class ZeroClawService:
         candidates = [
             ".bashrc",
             ".profile",
-            ".gitconfig",
             ".config/clawie",
             ".clawie",
         ]
@@ -2109,6 +2743,72 @@ class ZeroClawService:
             updated.append(patched)
         return updated
 
+    def _credential_bundle_paths(self, bundle_id: str) -> list[str]:
+        token = self._canonical_credential_bundle(bundle_id)
+        spec = self._credential_bundle_spec_map().get(token, {})
+        kind = str(spec.get("kind", "")).strip().lower()
+        if kind == "paths":
+            raw = spec.get("paths", ())
+            if isinstance(raw, tuple):
+                return [str(item) for item in raw if str(item).strip()]
+            if isinstance(raw, list):
+                return [str(item) for item in raw if str(item).strip()]
+        if token == "provider-auth":
+            return credential_paths_for_providers(provider_names())
+        return []
+
+    def _sync_selected_credential_bundles(
+        self,
+        source_home: Path,
+        target_home: Path,
+        username: str,
+        requested_provider: str | None,
+        bundles: list[str],
+    ) -> list[str]:
+        copied: list[str] = []
+        for bundle in self._ordered_credential_bundles(bundles):
+            if bundle == "provider-auth":
+                copied.extend(
+                    self._copy_provider_credentials(
+                        source_home=source_home,
+                        target_home=target_home,
+                        username=username,
+                        requested_provider=requested_provider,
+                        enabled=True,
+                    )
+                )
+                continue
+            paths = self._credential_bundle_paths(bundle)
+            copied.extend(
+                self._copy_selected_paths(
+                    source_home=source_home,
+                    target_home=target_home,
+                    username=username,
+                    relative_paths=paths,
+                    enabled=True,
+                )
+            )
+        return self._dedupe_paths(copied)
+
+    def _revoke_selected_credential_bundles(self, target_home: Path, bundles: list[str]) -> list[str]:
+        removed: list[str] = []
+        seen_rel: set[str] = set()
+        for bundle in self._ordered_credential_bundles(bundles):
+            for rel in self._credential_bundle_paths(bundle):
+                token = str(rel).strip()
+                if not token or token in seen_rel:
+                    continue
+                seen_rel.add(token)
+                dst = target_home / token
+                if not dst.exists() and not dst.is_symlink():
+                    continue
+                if dst.is_symlink() or dst.is_file():
+                    dst.unlink(missing_ok=True)
+                elif dst.is_dir():
+                    shutil.rmtree(dst)
+                removed.append(str(dst))
+        return self._dedupe_paths(removed)
+
     def _copy_provider_credentials(
         self,
         source_home: Path,
@@ -2122,7 +2822,7 @@ class ZeroClawService:
 
         config = self.store.read_config()
         configured = list(self._normalized_provider_credentials(config).keys())
-        configured.append(str(config.get("provider", "zeroclaw")))
+        configured.append(str(config.get("provider", "picoclaw")))
         if requested_provider:
             configured.append(requested_provider)
         for row in self.list_installed_claws(source_home=source_home):
@@ -2475,6 +3175,422 @@ class ZeroClawService:
             except KeyError:
                 pass
         return env
+
+    def _auth_env(self, linux_user: str, home: Path | None) -> dict[str, str]:
+        env = self._service_env(linux_user)
+        if home:
+            env["HOME"] = str(home)
+        return env
+
+    def _provider_auth_command(self, provider: str, action: str, linux_user: str) -> list[str]:
+        executable = self._resolve_provider_executable(provider)
+        base = [executable, "auth", action]
+        return self._sudo_wrap(base, linux_user)
+
+    @staticmethod
+    def _path_or_none(value: Any) -> Path | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        return Path(token)
+
+    def _resolve_local_runtime_target(self, provider: str) -> dict[str, str]:
+        name = str(provider).strip().lower()
+        config = self.store.read_config()
+        local_state = self._normalized_local_service_state(config)
+        cached = dict(local_state.get(name, {}))
+        root_path: Path | None = None
+        hint_user = ""
+        for claw in self.list_installed_claws():
+            if str(claw.get("provider", "")).strip().lower() != name:
+                continue
+            root_path = Path(str(claw.get("root", "")).strip())
+            hint_user = self._linux_user_from_provider_root(root_path)
+            break
+
+        linux_user = self._preferred_local_linux_user(
+            default_user=self._local_target_user(),
+            hint_user=hint_user,
+            cached_user=str(cached.get("linux_user", "")),
+        )
+        if root_path:
+            home = root_path.parent
+        elif linux_user and linux_user != "root":
+            home = Path("/home") / linux_user
+        else:
+            home = Path.home()
+        return {
+            "linux_user": linux_user,
+            "home": str(home),
+            "root": str(root_path or ""),
+        }
+
+    def _inspect_provider_auth_state(
+        self,
+        *,
+        provider: str,
+        auth_mode: str,
+        linux_user: str,
+        home: Path | None,
+    ) -> dict[str, Any]:
+        spec = get_provider(provider)
+        mode = str(auth_mode or spec.default_auth_mode).strip().lower() or spec.default_auth_mode
+        configured = self._is_provider_configured(spec.name, {"auth_mode": mode, **self._provider_auth(spec.name)})
+        payload: dict[str, Any] = {
+            "provider": spec.name,
+            "auth_mode": mode,
+            "auth_status": "unknown",
+            "auth_profile": "",
+            "account": "",
+            "expires_at": "",
+            "last_refresh": "",
+            "login_required": False,
+            "can_login": mode == "linked",
+            "source": "config",
+            "detail": "",
+        }
+
+        if mode == "none":
+            payload.update(
+                {
+                    "auth_status": "not_required",
+                    "can_login": False,
+                    "detail": "login not required",
+                }
+            )
+            return payload
+
+        if mode == "api_key":
+            payload.update(
+                {
+                    "auth_status": "ready" if configured else "missing",
+                    "login_required": not configured,
+                    "can_login": False,
+                    "detail": "API key configured" if configured else "API key missing",
+                }
+            )
+            return payload
+
+        cli_status = self._run_provider_auth_status(provider=spec.name, linux_user=linux_user, home=home)
+        if cli_status:
+            payload.update(cli_status)
+            payload["source"] = str(cli_status.get("source", "cli"))
+            payload["login_required"] = str(payload.get("auth_status", "")).strip().lower() in {"expired", "missing"}
+            return payload
+
+        file_status = self._inspect_auth_files(provider=spec.name, home=home)
+        if file_status:
+            payload.update(file_status)
+            payload["source"] = str(file_status.get("source", "files"))
+            payload["login_required"] = str(payload.get("auth_status", "")).strip().lower() in {"expired", "missing"}
+            return payload
+
+        payload.update(
+            {
+                "auth_status": "missing",
+                "login_required": True,
+                "detail": "no linked auth session found",
+                "source": "none",
+            }
+        )
+        return payload
+
+    def _refresh_or_login_linked_auth(
+        self,
+        *,
+        provider: str,
+        auth_mode: str,
+        linux_user: str,
+        home: Path | None,
+    ) -> dict[str, Any]:
+        mode = str(auth_mode).strip().lower()
+        if mode != "linked":
+            raise ValueError(f"{provider} uses '{mode}' auth; linked login is not applicable")
+
+        initial = self._inspect_provider_auth_state(
+            provider=provider,
+            auth_mode=mode,
+            linux_user=linux_user,
+            home=home,
+        )
+        if str(initial.get("auth_status", "")).strip().lower() == "ready":
+            initial["action_performed"] = "status"
+            return initial
+
+        env = self._auth_env(linux_user, home)
+        refresh_cmd = self._provider_auth_command(provider, "refresh", linux_user)
+        refresh = subprocess.run(refresh_cmd, capture_output=True, text=True, check=False, env=env)
+        refreshed = self._inspect_provider_auth_state(
+            provider=provider,
+            auth_mode=mode,
+            linux_user=linux_user,
+            home=home,
+        )
+        refreshed["refresh_output"] = (refresh.stdout or refresh.stderr or "").strip()
+        if str(refreshed.get("auth_status", "")).strip().lower() == "ready":
+            refreshed["action_performed"] = "refresh"
+            return refreshed
+
+        login_cmd = self._provider_auth_command(provider, "login", linux_user)
+        login = subprocess.run(login_cmd, check=False, env=env)
+        if login.returncode != 0:
+            raise SetupError(f"{provider} auth login failed with exit code {login.returncode}")
+        logged_in = self._inspect_provider_auth_state(
+            provider=provider,
+            auth_mode=mode,
+            linux_user=linux_user,
+            home=home,
+        )
+        logged_in["action_performed"] = "login"
+        if str(logged_in.get("auth_status", "")).strip().lower() != "ready":
+            raise SetupError(
+                f"{provider} auth login completed but session is still {logged_in.get('auth_status', 'unknown')}"
+            )
+        return logged_in
+
+    def _run_provider_auth_status(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        home: Path | None,
+    ) -> dict[str, Any] | None:
+        try:
+            cmd = self._provider_auth_command(provider, "status", linux_user)
+        except Exception:
+            return None
+
+        env = self._auth_env(linux_user, home)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+        except Exception:
+            return None
+
+        output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+        if not output and result.returncode != 0:
+            return None
+        parsed = self._parse_provider_auth_status_output(output)
+        if not parsed:
+            return None
+        parsed["source"] = "cli"
+        return parsed
+
+    def _parse_provider_auth_status_output(self, output: str) -> dict[str, Any]:
+        text = str(output or "").strip()
+        if not text:
+            return {}
+        lowered = text.lower()
+        if any(
+            token in lowered
+            for token in (
+                "not logged in",
+                "login required",
+                "no auth profiles",
+                "no profiles found",
+                "no active profile",
+            )
+        ):
+            return {"auth_status": "missing", "detail": text.splitlines()[0].strip()}
+
+        candidate = ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if "kind=" in line or "expires=" in line or "account=" in line:
+                candidate = line
+                break
+        if not candidate:
+            if "expired" in lowered:
+                return {"auth_status": "expired", "detail": text.splitlines()[0].strip()}
+            return {}
+
+        profile_match = re.match(r"^\*?\s*([^\s]+)", candidate)
+        profile = profile_match.group(1) if profile_match else ""
+        kind_match = re.search(r"\bkind=([^\s]+)", candidate, flags=re.IGNORECASE)
+        account_match = re.search(r"\baccount=([^\s]+)", candidate)
+        expired_match = re.search(r"\bexpires=expired at ([^\s]+)", candidate, flags=re.IGNORECASE)
+        expires_match = re.search(r"\bexpires=([^\s]+)", candidate, flags=re.IGNORECASE)
+        expires_at = ""
+        auth_status = "ready"
+        if expired_match:
+            expires_at = expired_match.group(1).strip()
+            auth_status = "expired"
+        elif expires_match:
+            token = expires_match.group(1).strip()
+            if token.lower() == "never":
+                auth_status = "ready"
+            elif token.lower() == "expired":
+                auth_status = "expired"
+            else:
+                expires_at = token
+                auth_status = self._auth_status_from_expiry(token, has_token=True)
+        return {
+            "auth_status": auth_status,
+            "auth_profile": profile,
+            "account": account_match.group(1).strip() if account_match else "",
+            "expires_at": expires_at,
+            "detail": kind_match.group(1).strip() if kind_match else "",
+        }
+
+    def _inspect_auth_files(self, *, provider: str, home: Path | None) -> dict[str, Any]:
+        if not home:
+            return {}
+        spec = get_provider(provider)
+        profiles_path = home / spec.state_dir / "auth-profiles.json"
+        if profiles_path.exists():
+            parsed = self._auth_status_from_profiles_json(profiles_path)
+            if parsed:
+                return parsed
+        codex_path = home / ".codex" / "auth.json"
+        if codex_path.exists():
+            parsed = self._auth_status_from_codex_auth_json(codex_path)
+            if parsed:
+                return parsed
+        return {}
+
+    def _auth_status_from_profiles_json(self, path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        profiles = payload.get("profiles", {})
+        if not isinstance(profiles, dict) or not profiles:
+            return {"auth_status": "missing", "detail": "no auth profiles found", "source": f"file:{path.name}"}
+
+        active_profiles = payload.get("active_profiles", {})
+        ordered_keys: list[str] = []
+        if isinstance(active_profiles, dict):
+            for value in active_profiles.values():
+                token = str(value).strip()
+                if token and token in profiles and token not in ordered_keys:
+                    ordered_keys.append(token)
+        for key in profiles:
+            token = str(key).strip()
+            if token and token not in ordered_keys:
+                ordered_keys.append(token)
+
+        selected_key = ""
+        selected: dict[str, Any] = {}
+        for key in ordered_keys:
+            item = profiles.get(key)
+            if isinstance(item, dict):
+                selected_key = key
+                selected = item
+                break
+        if not selected:
+            return {}
+
+        expires_at = str(selected.get("expires_at", "")).strip()
+        has_token = any(
+            str(selected.get(name, "")).strip()
+            for name in ("access_token", "refresh_token", "token", "id_token")
+        )
+        detail = str(selected.get("kind", "")).strip()
+        return {
+            "auth_status": self._auth_status_from_expiry(expires_at, has_token=has_token),
+            "auth_profile": str(selected.get("profile_name", "")).strip() or selected_key,
+            "account": str(selected.get("account_id", "")).strip(),
+            "expires_at": expires_at,
+            "last_refresh": str(selected.get("updated_at", payload.get("updated_at", ""))).strip(),
+            "detail": detail,
+            "source": f"file:{path.name}",
+        }
+
+    def _auth_status_from_codex_auth_json(self, path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        tokens = payload.get("tokens", {})
+        token_map = tokens if isinstance(tokens, dict) else {}
+        has_token = any(
+            str(token_map.get(name, "")).strip()
+            for name in ("access_token", "refresh_token", "id_token")
+        )
+        auth_mode = str(payload.get("auth_mode", "")).strip().lower()
+        api_key = str(payload.get("OPENAI_API_KEY", "")).strip()
+        status = "missing"
+        if has_token:
+            status = "ready"
+        elif api_key and auth_mode not in {"chatgpt", "oauth", "linked"}:
+            status = "ready"
+        return {
+            "auth_status": status,
+            "auth_profile": "default",
+            "account": str(token_map.get("account_id", payload.get("account_id", ""))).strip(),
+            "expires_at": "",
+            "last_refresh": str(payload.get("last_refresh", "")).strip(),
+            "detail": auth_mode or "codex-auth",
+            "source": f"file:{path.name}",
+        }
+
+    def _attach_agent_auth_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        agent_id = str(payload.get("agent_id", payload.get("user_id", ""))).strip()
+        info = payload.setdefault("agent", {})
+        try:
+            auth = self.agent_auth_status(agent_id)
+        except Exception as exc:
+            info["auth_status"] = "unknown"
+            info["auth_profile"] = ""
+            info["auth_account"] = ""
+            info["auth_expires_at"] = ""
+            info["auth_last_refresh"] = ""
+            info["auth_source"] = "error"
+            info["auth_detail"] = str(exc)
+            info["login_required"] = False
+            info["can_login"] = False
+            return payload
+
+        info["auth_mode"] = str(auth.get("auth_mode", info.get("auth_mode", "")))
+        info["auth_status"] = str(auth.get("auth_status", "unknown"))
+        info["auth_profile"] = str(auth.get("auth_profile", ""))
+        info["auth_account"] = str(auth.get("account", ""))
+        info["auth_expires_at"] = str(auth.get("expires_at", ""))
+        info["auth_last_refresh"] = str(auth.get("last_refresh", ""))
+        info["auth_source"] = str(auth.get("source", ""))
+        info["auth_detail"] = str(auth.get("detail", ""))
+        info["login_required"] = bool(auth.get("login_required", False))
+        info["can_login"] = bool(auth.get("can_login", False))
+        return payload
+
+    @staticmethod
+    def _parse_iso_timestamp(value: str) -> datetime | None:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        match = re.match(r"^(?P<head>.+?)(?:\.(?P<frac>\d+))?(?P<tz>Z|[+-]\d\d:\d\d)?$", token)
+        if not match:
+            return None
+        head = str(match.group("head") or "")
+        frac = str(match.group("frac") or "")
+        zone = str(match.group("tz") or "")
+        if zone == "Z":
+            zone = "+00:00"
+        normalized = head
+        if frac:
+            normalized += "." + frac[:6]
+        if zone:
+            normalized += zone
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _auth_status_from_expiry(self, expires_at: str, *, has_token: bool) -> str:
+        token = str(expires_at).strip()
+        if not token:
+            return "ready" if has_token else "missing"
+        parsed = self._parse_iso_timestamp(token)
+        if parsed is None:
+            lowered = token.lower()
+            if lowered == "expired":
+                return "expired"
+            return "ready" if has_token else "unknown"
+        return "expired" if parsed <= datetime.now(timezone.utc) else "ready"
 
     def _bootstrap_user_bus(self, linux_user: str) -> None:
         if not linux_user or os.geteuid() != 0:
@@ -3100,6 +4216,7 @@ class ZeroClawService:
             "channel_strategy": "local-user",
             "channels": [],
             "core_prompts": prompts,
+            "credential_sync": self._normalize_credential_sync_state({}, default_when_missing=False),
             "agent": {
                 "provider": provider,
                 "auth_mode": str(self._provider_auth(provider).get("auth_mode", "")),
@@ -3187,6 +4304,10 @@ class ZeroClawService:
             raw_plugins = self._default_plugins_for_provider(str(agent.get("provider", "")))
         agent["plugins"] = self._normalize_plugins(raw_plugins)
         agent_state["core_prompts"] = self._normalize_core_prompts(provider, agent_state.get("core_prompts", {}))
+        agent_state["credential_sync"] = self._normalize_credential_sync_state(
+            agent_state.get("credential_sync"),
+            default_when_missing=True,
+        )
 
     def _discover_channels_from_source_home(
         self,
@@ -3197,7 +4318,7 @@ class ZeroClawService:
         if requested_provider:
             providers.append(str(requested_provider).strip().lower())
         config = self.store.read_config()
-        providers.append(str(config.get("provider", "zeroclaw")).strip().lower())
+        providers.append(str(config.get("provider", "picoclaw")).strip().lower())
 
         channels: list[dict[str, str]] = []
         for provider in providers:

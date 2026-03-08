@@ -470,13 +470,16 @@ class ZeroClawService:
         if not isinstance(raw_plugins, dict):
             raw_plugins = self._default_plugins_for_provider(provider_spec.name)
         plugins = self._normalize_plugins(raw_plugins)
+        runtime = provider_spec.runtime
+        if clone_from:
+            runtime = str(source_agent_defaults.get("runtime", provider_spec.runtime)).strip() or provider_spec.runtime
 
         display = display_name.strip() if display_name else agent_id
         agent = {
             "status": "ready",
             "version": agent_version,
             "last_sync": now_iso(),
-            "runtime": source_agent_defaults.get("runtime", provider_spec.runtime),
+            "runtime": runtime,
             "provider": provider_spec.name,
             "auth_mode": provider_auth.get("auth_mode", provider_spec.default_auth_mode),
             "autostart": bool(source_agent_defaults.get("autostart", True)),
@@ -2683,7 +2686,7 @@ class ZeroClawService:
         agent_id: str,
         base_channels: list[dict[str, str]],
     ) -> list[dict[str, str]]:
-        items = base_channels or [{"kind": "chat", "name": "primary"}]
+        items = list(base_channels or [])
         minted: list[dict[str, str]] = []
         for idx, channel in enumerate(items, start=1):
             kind = str(channel.get("kind", "chat"))

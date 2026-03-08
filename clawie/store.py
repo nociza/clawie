@@ -14,6 +14,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "",
     "provider": "picoclaw",
     "auth_mode": "linked",
+    "schema_version": 1,
     "provider_credentials": {},
     "local_service_state": {},
     "channel_pool": [],
@@ -28,10 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 DEFAULT_STATE: dict[str, Any] = {
     "templates": {
         "baseline": {
-            "channels": [
-                {"kind": "chat", "name": "support"},
-                {"kind": "email", "name": "inbox"},
-            ],
+            "channels": [],
             "agent_defaults": {
                 "runtime": "picoclaw-agent",
                 "autostart": True,
@@ -45,6 +43,12 @@ DEFAULT_STATE: dict[str, Any] = {
 
 
 class StateStore:
+    SCHEMA_VERSION = 1
+    LEGACY_DEFAULT_CHANNELS: tuple[tuple[str, str], ...] = (
+        ("chat", "support"),
+        ("email", "inbox"),
+    )
+
     def __init__(self, config_dir: str | Path | None = None) -> None:
         self._allow_tmp_fallback = config_dir is None and "CLAWIE_HOME" not in os.environ
         if config_dir is None:
@@ -91,6 +95,7 @@ class StateStore:
             conn.commit()
         self._seed_defaults()
         self._migrate_legacy_json()
+        self._migrate_schema()
 
     def read_config(self) -> dict[str, Any]:
         self.ensure()
@@ -303,6 +308,93 @@ class StateStore:
         if self.state_path.exists():
             state = self._read_json(self.state_path, copy.deepcopy(DEFAULT_STATE))
             self.write_state(state)
+
+    def _migrate_schema(self) -> None:
+        current = self._stored_schema_version()
+        if current >= self.SCHEMA_VERSION:
+            return
+        if current < 1:
+            self._migrate_remove_legacy_default_channels()
+            current = 1
+        if current != self._stored_schema_version():
+            self._write_schema_version(current)
+
+    def _stored_schema_version(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM config WHERE key = ?",
+                ("schema_version",),
+            ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return int(self._decode_value(str(row["value"])))
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_schema_version(self, version: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
+                ("schema_version", self._encode_value(int(version))),
+            )
+            conn.commit()
+
+    @classmethod
+    def _is_legacy_default_channel(cls, channel: dict[str, Any], agent_id: str = "") -> bool:
+        if not isinstance(channel, dict):
+            return False
+        kind = str(channel.get("kind", "")).strip().lower()
+        name = str(channel.get("name", "")).strip()
+        if not kind or not name:
+            return False
+        for expected_kind, base_name in cls.LEGACY_DEFAULT_CHANNELS:
+            if kind != expected_kind:
+                continue
+            if name == base_name:
+                return True
+            if agent_id and name == f"{agent_id}-{base_name}":
+                return True
+        return False
+
+    def _migrate_remove_legacy_default_channels(self) -> None:
+        with self._connect() as conn:
+            template_rows = conn.execute("SELECT name, payload FROM templates").fetchall()
+            user_rows = conn.execute("SELECT user_id, payload FROM users").fetchall()
+
+            for row in template_rows:
+                name = str(row["name"])
+                if name != "baseline":
+                    continue
+                payload = self._decode_json_obj(str(row["payload"]))
+                channels = payload.get("channels", [])
+                if not isinstance(channels, list):
+                    continue
+                filtered = [item for item in channels if not self._is_legacy_default_channel(item)]
+                if len(filtered) == len(channels):
+                    continue
+                payload["channels"] = filtered
+                conn.execute(
+                    "UPDATE templates SET payload = ? WHERE name = ?",
+                    (json.dumps(payload, sort_keys=True), name),
+                )
+
+            for row in user_rows:
+                agent_id = str(row["user_id"])
+                payload = self._decode_json_obj(str(row["payload"]))
+                channels = payload.get("channels", [])
+                if not isinstance(channels, list):
+                    continue
+                filtered = [item for item in channels if not self._is_legacy_default_channel(item, agent_id)]
+                if len(filtered) == len(channels):
+                    continue
+                payload["channels"] = filtered
+                conn.execute(
+                    "UPDATE users SET payload = ? WHERE user_id = ?",
+                    (json.dumps(payload, sort_keys=True), agent_id),
+                )
+
+            conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_root_dir()

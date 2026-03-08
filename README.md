@@ -111,6 +111,10 @@ clawie agent credentials set alice git --include-defaults
 sudo clawie agent credentials sync alice
 sudo clawie agent credentials revoke alice git
 
+# new agents start with no channels; add them explicitly
+clawie agent create alice --template baseline
+clawie channel apply alice --preset growth
+
 # channels
 clawie channel apply alice --preset growth
 clawie channel move alice bob

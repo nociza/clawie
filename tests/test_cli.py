@@ -856,6 +856,58 @@ def test_store_creates_sqlite_db(tmp_path: Path) -> None:
     assert store.db_path.exists()
 
 
+def test_store_migrates_legacy_default_channels_from_baseline_and_agents(tmp_path: Path) -> None:
+    store = StateStore(config_dir=tmp_path)
+    store.ensure()
+
+    legacy_baseline = {
+        "channels": [
+            {"kind": "chat", "name": "support"},
+            {"kind": "email", "name": "inbox"},
+        ],
+        "agent_defaults": {
+            "runtime": "picoclaw-agent",
+            "autostart": True,
+            "heartbeat_seconds": 30,
+        },
+    }
+    legacy_agent = {
+        "agent_id": "alice",
+        "display_name": "",
+        "source_template": "baseline",
+        "channel_strategy": "new",
+        "channels": [
+            {"kind": "chat", "name": "alice-support", "enabled": True},
+            {"kind": "email", "name": "alice-inbox", "enabled": True},
+            {"kind": "telegram", "name": "team", "enabled": True},
+        ],
+        "agent": {
+            "provider": "picoclaw",
+            "runtime": "picoclaw-agent",
+        },
+    }
+
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE templates SET payload = ? WHERE name = ?",
+            (json.dumps(legacy_baseline, sort_keys=True), "baseline"),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO users(user_id, payload) VALUES (?, ?)",
+            ("alice", json.dumps(legacy_agent, sort_keys=True)),
+        )
+        conn.execute("DELETE FROM config WHERE key = ?", ("schema_version",))
+        conn.commit()
+
+    store.ensure()
+    state = store.read_state()
+    baseline = state["templates"]["baseline"]
+    alice = state["agents"]["alice"]
+    assert baseline["channels"] == []
+    assert alice["channels"] == [{"kind": "telegram", "name": "team", "enabled": True}]
+    assert store.read_config()["schema_version"] == 1
+
+
 def test_store_falls_back_to_tmp_when_home_is_unwritable(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -999,7 +1051,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
         template="baseline",
         clone_from=None,
         channel_strategy="new",
-        channels=None,
+        channels=[{"kind": "telegram", "name": "team"}],
         agent_version="1.0.0",
     )
     agent["agent"]["linux_user"] = "alice"
@@ -1282,7 +1334,7 @@ def test_service_toggles_channel_plugin_and_autostart(tmp_path: Path) -> None:
         template="baseline",
         clone_from=None,
         channel_strategy="new",
-        channels=None,
+        channels=[{"kind": "telegram", "name": "team"}],
         agent_version="1.0.0",
     )
     assert agent["channels"][0]["enabled"] is True
@@ -2311,6 +2363,59 @@ def test_service_action_requires_root_for_other_linux_user(
         assert False, "expected SetupError"
     except Exception as exc:  # noqa: BLE001
         assert "requires root" in str(exc)
+
+
+def test_create_agent_defaults_to_no_channels(tmp_path: Path) -> None:
+    store = StateStore(config_dir=tmp_path)
+    service = ZeroClawService(store)
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+
+    assert agent["channels"] == []
+
+
+def test_create_agent_ignores_stale_template_runtime_for_new_agents(tmp_path: Path) -> None:
+    store = StateStore(config_dir=tmp_path)
+    service = ZeroClawService(store)
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+
+    state = store.read_state()
+    baseline = state["templates"]["baseline"]
+    baseline["agent_defaults"]["runtime"] = "zeroclaw-agent"
+    store.write_state(state)
+
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+
+    assert agent["agent"]["runtime"] == "picoclaw-agent"
 
 
 def test_service_action_falls_back_when_bus_unavailable(

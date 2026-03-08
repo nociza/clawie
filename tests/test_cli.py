@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pytest import CaptureFixture, MonkeyPatch, raises
 
+from clawie.provider_auth import auth_status_from_profiles_json, parse_provider_auth_status_output
 from clawie.cli import main
 from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
@@ -1451,8 +1452,8 @@ def test_local_agent_view_refreshes_service_status(
 
 
 def test_parse_provider_auth_status_output_marks_expired(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
-    parsed = service._parse_provider_auth_status_output(
+    _ = tmp_path
+    parsed = parse_provider_auth_status_output(
         "* openai-codex:default kind=OAuth account=acct-1 "
         "expires=expired at 2026-03-02T05:47:04.775201553+00:00"
     )
@@ -1465,7 +1466,6 @@ def test_parse_provider_auth_status_output_marks_expired(tmp_path: Path) -> None
 
 
 def test_auth_status_from_profiles_json_marks_expired(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
     path = tmp_path / "auth-profiles.json"
     path.write_text(
         json.dumps(
@@ -1489,7 +1489,7 @@ def test_auth_status_from_profiles_json_marks_expired(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    parsed = service._auth_status_from_profiles_json(path)
+    parsed = auth_status_from_profiles_json(path)
     assert parsed["auth_status"] == "expired"
     assert parsed["auth_profile"] == "default"
     assert parsed["account"] == "acct-1"

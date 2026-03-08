@@ -5,13 +5,18 @@ import crypt
 import json
 import os
 import pwd
-import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from clawie.provider_auth import (
+    empty_auth_payload,
+    inspect_auth_files,
+    login_required,
+    parse_provider_auth_status_output,
+)
 from clawie.provider_channels import dedupe_channels, get_channel_adapter
 from clawie.providers import (
     credential_paths_for_providers,
@@ -3236,19 +3241,7 @@ class ZeroClawService:
         spec = get_provider(provider)
         mode = str(auth_mode or spec.default_auth_mode).strip().lower() or spec.default_auth_mode
         configured = self._is_provider_configured(spec.name, {"auth_mode": mode, **self._provider_auth(spec.name)})
-        payload: dict[str, Any] = {
-            "provider": spec.name,
-            "auth_mode": mode,
-            "auth_status": "unknown",
-            "auth_profile": "",
-            "account": "",
-            "expires_at": "",
-            "last_refresh": "",
-            "login_required": False,
-            "can_login": mode == "linked",
-            "source": "config",
-            "detail": "",
-        }
+        payload = empty_auth_payload(spec.name, mode)
 
         if mode == "none":
             payload.update(
@@ -3275,14 +3268,14 @@ class ZeroClawService:
         if cli_status:
             payload.update(cli_status)
             payload["source"] = str(cli_status.get("source", "cli"))
-            payload["login_required"] = str(payload.get("auth_status", "")).strip().lower() in {"expired", "missing"}
+            payload["login_required"] = login_required(str(payload.get("auth_status", "")))
             return payload
 
-        file_status = self._inspect_auth_files(provider=spec.name, home=home)
+        file_status = inspect_auth_files(provider=spec.name, home=home)
         if file_status:
             payload.update(file_status)
             payload["source"] = str(file_status.get("source", "files"))
-            payload["login_required"] = str(payload.get("auth_status", "")).strip().lower() in {"expired", "missing"}
+            payload["login_required"] = login_required(str(payload.get("auth_status", "")))
             return payload
 
         payload.update(
@@ -3369,161 +3362,11 @@ class ZeroClawService:
         output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
         if not output and result.returncode != 0:
             return None
-        parsed = self._parse_provider_auth_status_output(output)
+        parsed = parse_provider_auth_status_output(output)
         if not parsed:
             return None
         parsed["source"] = "cli"
         return parsed
-
-    def _parse_provider_auth_status_output(self, output: str) -> dict[str, Any]:
-        text = str(output or "").strip()
-        if not text:
-            return {}
-        lowered = text.lower()
-        if any(
-            token in lowered
-            for token in (
-                "not logged in",
-                "login required",
-                "no auth profiles",
-                "no profiles found",
-                "no active profile",
-            )
-        ):
-            return {"auth_status": "missing", "detail": text.splitlines()[0].strip()}
-
-        candidate = ""
-        for raw in text.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if "kind=" in line or "expires=" in line or "account=" in line:
-                candidate = line
-                break
-        if not candidate:
-            if "expired" in lowered:
-                return {"auth_status": "expired", "detail": text.splitlines()[0].strip()}
-            return {}
-
-        profile_match = re.match(r"^\*?\s*([^\s]+)", candidate)
-        profile = profile_match.group(1) if profile_match else ""
-        kind_match = re.search(r"\bkind=([^\s]+)", candidate, flags=re.IGNORECASE)
-        account_match = re.search(r"\baccount=([^\s]+)", candidate)
-        expired_match = re.search(r"\bexpires=expired at ([^\s]+)", candidate, flags=re.IGNORECASE)
-        expires_match = re.search(r"\bexpires=([^\s]+)", candidate, flags=re.IGNORECASE)
-        expires_at = ""
-        auth_status = "ready"
-        if expired_match:
-            expires_at = expired_match.group(1).strip()
-            auth_status = "expired"
-        elif expires_match:
-            token = expires_match.group(1).strip()
-            if token.lower() == "never":
-                auth_status = "ready"
-            elif token.lower() == "expired":
-                auth_status = "expired"
-            else:
-                expires_at = token
-                auth_status = self._auth_status_from_expiry(token, has_token=True)
-        return {
-            "auth_status": auth_status,
-            "auth_profile": profile,
-            "account": account_match.group(1).strip() if account_match else "",
-            "expires_at": expires_at,
-            "detail": kind_match.group(1).strip() if kind_match else "",
-        }
-
-    def _inspect_auth_files(self, *, provider: str, home: Path | None) -> dict[str, Any]:
-        if not home:
-            return {}
-        spec = get_provider(provider)
-        profiles_path = home / spec.state_dir / "auth-profiles.json"
-        if profiles_path.exists():
-            parsed = self._auth_status_from_profiles_json(profiles_path)
-            if parsed:
-                return parsed
-        codex_path = home / ".codex" / "auth.json"
-        if codex_path.exists():
-            parsed = self._auth_status_from_codex_auth_json(codex_path)
-            if parsed:
-                return parsed
-        return {}
-
-    def _auth_status_from_profiles_json(self, path: Path) -> dict[str, Any]:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        profiles = payload.get("profiles", {})
-        if not isinstance(profiles, dict) or not profiles:
-            return {"auth_status": "missing", "detail": "no auth profiles found", "source": f"file:{path.name}"}
-
-        active_profiles = payload.get("active_profiles", {})
-        ordered_keys: list[str] = []
-        if isinstance(active_profiles, dict):
-            for value in active_profiles.values():
-                token = str(value).strip()
-                if token and token in profiles and token not in ordered_keys:
-                    ordered_keys.append(token)
-        for key in profiles:
-            token = str(key).strip()
-            if token and token not in ordered_keys:
-                ordered_keys.append(token)
-
-        selected_key = ""
-        selected: dict[str, Any] = {}
-        for key in ordered_keys:
-            item = profiles.get(key)
-            if isinstance(item, dict):
-                selected_key = key
-                selected = item
-                break
-        if not selected:
-            return {}
-
-        expires_at = str(selected.get("expires_at", "")).strip()
-        has_token = any(
-            str(selected.get(name, "")).strip()
-            for name in ("access_token", "refresh_token", "token", "id_token")
-        )
-        detail = str(selected.get("kind", "")).strip()
-        return {
-            "auth_status": self._auth_status_from_expiry(expires_at, has_token=has_token),
-            "auth_profile": str(selected.get("profile_name", "")).strip() or selected_key,
-            "account": str(selected.get("account_id", "")).strip(),
-            "expires_at": expires_at,
-            "last_refresh": str(selected.get("updated_at", payload.get("updated_at", ""))).strip(),
-            "detail": detail,
-            "source": f"file:{path.name}",
-        }
-
-    def _auth_status_from_codex_auth_json(self, path: Path) -> dict[str, Any]:
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        tokens = payload.get("tokens", {})
-        token_map = tokens if isinstance(tokens, dict) else {}
-        has_token = any(
-            str(token_map.get(name, "")).strip()
-            for name in ("access_token", "refresh_token", "id_token")
-        )
-        auth_mode = str(payload.get("auth_mode", "")).strip().lower()
-        api_key = str(payload.get("OPENAI_API_KEY", "")).strip()
-        status = "missing"
-        if has_token:
-            status = "ready"
-        elif api_key and auth_mode not in {"chatgpt", "oauth", "linked"}:
-            status = "ready"
-        return {
-            "auth_status": status,
-            "auth_profile": "default",
-            "account": str(token_map.get("account_id", payload.get("account_id", ""))).strip(),
-            "expires_at": "",
-            "last_refresh": str(payload.get("last_refresh", "")).strip(),
-            "detail": auth_mode or "codex-auth",
-            "source": f"file:{path.name}",
-        }
 
     def _attach_agent_auth_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = str(payload.get("agent_id", payload.get("user_id", ""))).strip()
@@ -3553,44 +3396,6 @@ class ZeroClawService:
         info["login_required"] = bool(auth.get("login_required", False))
         info["can_login"] = bool(auth.get("can_login", False))
         return payload
-
-    @staticmethod
-    def _parse_iso_timestamp(value: str) -> datetime | None:
-        token = str(value or "").strip()
-        if not token:
-            return None
-        match = re.match(r"^(?P<head>.+?)(?:\.(?P<frac>\d+))?(?P<tz>Z|[+-]\d\d:\d\d)?$", token)
-        if not match:
-            return None
-        head = str(match.group("head") or "")
-        frac = str(match.group("frac") or "")
-        zone = str(match.group("tz") or "")
-        if zone == "Z":
-            zone = "+00:00"
-        normalized = head
-        if frac:
-            normalized += "." + frac[:6]
-        if zone:
-            normalized += zone
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
-
-    def _auth_status_from_expiry(self, expires_at: str, *, has_token: bool) -> str:
-        token = str(expires_at).strip()
-        if not token:
-            return "ready" if has_token else "missing"
-        parsed = self._parse_iso_timestamp(token)
-        if parsed is None:
-            lowered = token.lower()
-            if lowered == "expired":
-                return "expired"
-            return "ready" if has_token else "unknown"
-        return "expired" if parsed <= datetime.now(timezone.utc) else "ready"
 
     def _bootstrap_user_bus(self, linux_user: str) -> None:
         if not linux_user or os.geteuid() != 0:

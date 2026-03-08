@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -29,293 +28,593 @@ from clawie.ui import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clawie",
-        description="Clawie Linux CLI + dashboard control plane",
+        description="Clawie control plane for config, agents, runtimes, and dashboard operations",
     )
     parser.add_argument(
         "--config-dir",
         help="Override state directory (default: ~/.clawie)",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{config,agent,channel,runtime,dashboard,health,event,backup}",
+    )
 
-    setup = subparsers.add_parser("setup", help="Configure provider/workspace")
-    setup.add_argument(
-        "--provider",
-        choices=provider_names(),
-        default="zeroclaw",
-        help="Agent provider",
-    )
-    setup.add_argument("--api-key", help="Provider API key (if using api_key auth)")
-    setup.add_argument(
-        "--auth-mode",
-        choices=["linked", "api_key", "none"],
-        help="Provider auth mode (default is provider-specific)",
-    )
-    setup.add_argument("--subscription", default="starter", help="Plan name")
-    setup.add_argument("--workspace", default="default", help="Workspace slug")
-    setup.add_argument(
-        "--spawn-password",
-        help="Set a global default Linux password for future spawned users",
-    )
-    setup.add_argument(
-        "--clear-spawn-password",
-        action="store_true",
-        help="Clear the global default spawn password",
-    )
-    setup.add_argument(
-        "--api-url",
-        default=str(DEFAULT_CONFIG["api_url"]),
-        help="API base URL",
-    )
-    setup.add_argument(
-        "--install-runtime",
-        action="store_true",
-        help="Record local runtime as installed",
-    )
-    setup.add_argument(
-        "--interactive",
-        action="store_true",
-        help="Prompt for values interactively",
-    )
-    setup.add_argument("--status", action="store_true", help="Show setup status only")
-    setup.set_defaults(func=cmd_setup)
+    _build_config_parser(subparsers)
+    _build_agent_parser(subparsers)
+    _build_channel_parser(subparsers)
+    _build_runtime_parser(subparsers)
 
-    agents = subparsers.add_parser("agents", help="Provision and manage agents")
-    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+    dashboard = subparsers.add_parser(
+        "dashboard",
+        help="Open the interactive dashboard",
+    )
+    _add_positional_argument(
+        dashboard,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Only show one agent",
+    )
+    dashboard.add_argument(
+        "--refresh",
+        dest="refresh_seconds",
+        type=int,
+        default=2,
+        help="Refresh interval in seconds",
+    )
+    dashboard.set_defaults(func=cmd_monitor)
 
-    agents_create = agents_sub.add_parser("create", help="Create an agent")
-    agents_create.add_argument("--agent-id", required=True, help="Unique agent ID")
-    agents_create.add_argument("--display-name", help="Display name")
-    agents_create.add_argument("--template", default="baseline", help="Template name")
-    agents_create.add_argument(
+    health = subparsers.add_parser(
+        "health",
+        help="Run health checks",
+    )
+    health.set_defaults(func=cmd_doctor)
+
+    event = subparsers.add_parser(
+        "event",
+        help="Inspect recorded events",
+    )
+    event_sub = event.add_subparsers(
+        dest="event_command",
+        required=True,
+        metavar="{list}",
+    )
+    event_list = event_sub.add_parser("list", help="List recent events")
+    event_list.add_argument("--limit", type=int, default=20)
+    event_list.set_defaults(func=cmd_events_list)
+
+    backup = subparsers.add_parser(
+        "backup",
+        help="Export and import config/state snapshots",
+    )
+    backup_sub = backup.add_subparsers(
+        dest="backup_command",
+        required=True,
+        metavar="{export,import}",
+    )
+
+    backup_export = backup_sub.add_parser("export", help="Write a snapshot to disk")
+    _add_positional_argument(
+        backup_export,
+        "output",
+        metavar="PATH",
+        help_text="Snapshot output file",
+    )
+    backup_export.set_defaults(func=cmd_state_export)
+
+    backup_import = backup_sub.add_parser("import", help="Load a snapshot from disk")
+    _add_positional_argument(
+        backup_import,
+        "input",
+        metavar="PATH",
+        help_text="Snapshot file to import",
+    )
+    backup_import.add_argument("--merge", action="store_true")
+    backup_import.set_defaults(func=cmd_state_import)
+
+    return parser
+
+
+def _build_config_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    config = subparsers.add_parser(
+        "config",
+        help="View and update Clawie configuration",
+    )
+    config_sub = config.add_subparsers(
+        dest="config_command",
+        required=True,
+        metavar="{set,show}",
+    )
+
+    config_set = config_sub.add_parser(
+        "set",
+        help="Write provider, auth, and workspace settings",
+    )
+    _add_setup_arguments(config_set)
+    config_set.set_defaults(func=cmd_setup)
+
+    config_show = config_sub.add_parser(
+        "show",
+        help="Show current configuration status",
+    )
+    config_show.set_defaults(func=cmd_config_show)
+
+
+def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    agent = subparsers.add_parser(
+        "agent",
+        help="Manage agents, prompts, and credential access",
+    )
+    agent_sub = agent.add_subparsers(
+        dest="agent_command",
+        required=True,
+        metavar="{create,clone,prompt,credentials,list,show,delete,purge,create-batch}",
+    )
+
+    create = agent_sub.add_parser("create", help="Create a new agent")
+    _add_positional_argument(
+        create,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="New agent ID",
+    )
+    create.add_argument("--display-name", help="Display name")
+    create.add_argument("--template", default="baseline", help="Template name")
+    create.add_argument(
         "--clone-from",
-        help="Clone channels/defaults from source agent ID",
+        help="Clone channels/defaults from another agent",
     )
-    agents_create.add_argument(
+    create.add_argument(
         "--channel-strategy",
         choices=["new", "migrate"],
         default="new",
-        help="Use minted channel names or migrated channel names",
+        help="Use new channel names or migrated channel names",
     )
-    agents_create.add_argument(
+    create.add_argument(
         "--channel",
         action="append",
         default=[],
         metavar="KIND:NAME",
         help="Add a channel definition (repeatable)",
     )
-    agents_create.add_argument(
+    create.add_argument(
         "--channels-file",
         help="JSON file with channel definitions: [{\"kind\": ..., \"name\": ...}]",
     )
-    agents_create.add_argument("--agent-version", default="1.0.0", help="Agent version")
-    agents_create.add_argument(
+    create.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    create.add_argument(
         "--provider",
         choices=provider_names(),
         help="Override provider for this agent",
     )
-    agents_create.set_defaults(func=cmd_agents_create)
+    create.set_defaults(func=cmd_agents_create)
 
-    agents_clone = agents_sub.add_parser(
-        "clone",
-        help="One-click agent clone from an existing agent config",
+    clone = agent_sub.add_parser("clone", help="Clone an existing agent into a new one")
+    _add_positional_argument(
+        clone,
+        "from_agent",
+        metavar="SOURCE_AGENT",
+        help_text="Source agent ID",
     )
-    agents_clone.add_argument("--from-agent", required=True, help="Existing source agent")
-    agents_clone.add_argument("--agent-id", required=True, help="New agent ID")
-    agents_clone.add_argument("--display-name", help="Display name")
-    agents_clone.add_argument(
+    _add_positional_argument(
+        clone,
+        "agent_id",
+        metavar="TARGET_AGENT",
+        help_text="New agent ID",
+    )
+    clone.add_argument("--display-name", help="Display name")
+    clone.add_argument(
         "--channel-strategy",
         choices=["new", "migrate"],
         default="migrate",
-        help="Use copied channels as-is (migrate) or mint new names (new)",
+        help="Keep copied channel names or mint new ones",
     )
-    agents_clone.add_argument(
+    clone.add_argument(
         "--channel",
         action="append",
         default=[],
         metavar="KIND:NAME",
         help="Override cloned channels with explicit definitions (repeatable)",
     )
-    agents_clone.add_argument(
+    clone.add_argument(
         "--channels-file",
         help="JSON file with channel definitions to override clone channels",
     )
-    agents_clone.add_argument("--agent-version", default="1.0.0", help="Agent version")
-    agents_clone.add_argument(
+    clone.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    clone.add_argument(
         "--provider",
         choices=provider_names(),
         help="Override provider for this cloned agent",
     )
-    agents_clone.set_defaults(func=cmd_agents_clone)
+    clone.set_defaults(func=cmd_agents_clone)
 
-    agents_clone_prompts = agents_sub.add_parser(
-        "clone-prompts",
-        help="Clone core prompt files (SOUL.md, etc.) from one agent to another",
+    prompt = agent_sub.add_parser(
+        "prompt",
+        help="Manage core prompt files",
     )
-    agents_clone_prompts.add_argument("--from-agent", required=True, help="Source agent ID")
-    agents_clone_prompts.add_argument("--to-agent", required=True, help="Target agent ID")
-    agents_clone_prompts.add_argument(
+    prompt_sub = prompt.add_subparsers(dest="agent_prompt_command", required=True, metavar="{copy}")
+    prompt_copy = prompt_sub.add_parser(
+        "copy",
+        help="Copy core prompt files from one agent to another",
+    )
+    _add_positional_argument(
+        prompt_copy,
+        "from_agent",
+        metavar="SOURCE_AGENT",
+        help_text="Source agent ID",
+    )
+    _add_positional_argument(
+        prompt_copy,
+        "to_agent",
+        metavar="TARGET_AGENT",
+        help_text="Target agent ID",
+    )
+    prompt_copy.add_argument(
         "--no-apply-to-disk",
         action="store_true",
-        help="Only update clawiestate; do not write prompt files to target Linux home",
+        help="Only update state; do not write prompt files to the target Linux home",
     )
-    agents_clone_prompts.set_defaults(func=cmd_agents_clone_prompts)
+    prompt_copy.set_defaults(func=cmd_agents_clone_prompts)
 
-    agents_list = agents_sub.add_parser("list", help="List agents")
-    agents_list.set_defaults(func=cmd_agents_list)
-
-    agents_show = agents_sub.add_parser("show", help="Show one agent")
-    agents_show.add_argument("--agent-id", required=True)
-    agents_show.set_defaults(func=cmd_agents_show)
-
-    agents_delete = agents_sub.add_parser("delete", help="Delete one agent")
-    agents_delete.add_argument("--agent-id", required=True)
-    agents_delete.set_defaults(func=cmd_agents_delete)
-
-    agents_batch = agents_sub.add_parser(
-        "batch-create",
-        help="Create agents from JSON array entries",
+    credentials = agent_sub.add_parser(
+        "credentials",
+        help="Manage credential bundle policy and sync",
     )
-    agents_batch.add_argument("--file", required=True, help="Input JSON file")
-    agents_batch.set_defaults(func=cmd_agents_batch_create)
-
-    list_alias = subparsers.add_parser("list", help="List agents (alias for `agents list`)")
-    list_alias.set_defaults(func=cmd_list_alias)
-
-    channels = subparsers.add_parser("channels", help="Channel operations")
-    channels_sub = channels.add_subparsers(dest="channels_command", required=True)
-
-    channels_bootstrap = channels_sub.add_parser(
-        "bootstrap",
-        help="Apply a channel preset to an agent",
+    credentials_sub = credentials.add_subparsers(
+        dest="agent_credentials_command",
+        required=True,
+        metavar="{list,show,set,sync,revoke}",
     )
-    channels_bootstrap.add_argument("--agent-id", required=True)
-    channels_bootstrap.add_argument(
-        "--preset",
-        choices=["minimal", "growth", "enterprise"],
-        default="growth",
+
+    credentials_list = credentials_sub.add_parser(
+        "list",
+        help="List available credential bundles",
     )
-    channels_bootstrap.add_argument(
-        "--replace",
+    credentials_list.set_defaults(func=cmd_agents_credentials_bundles)
+
+    credentials_show = credentials_sub.add_parser(
+        "show",
+        help="Show selected credential bundles for an agent",
+    )
+    _add_positional_argument(
+        credentials_show,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    credentials_show.set_defaults(func=cmd_agents_credentials_show)
+
+    credentials_set = credentials_sub.add_parser(
+        "set",
+        help="Set selected credential bundles for an agent",
+    )
+    _add_positional_argument(
+        credentials_set,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    credentials_set.add_argument(
+        "bundles",
+        nargs="*",
+        metavar="BUNDLE",
+        help="Credential bundle IDs",
+    )
+    credentials_set.add_argument(
+        "--bundle",
+        action="append",
+        default=[],
+        metavar="BUNDLE",
+        help="Credential bundle ID (repeatable)",
+    )
+    credentials_set.add_argument(
+        "--include-defaults",
         action="store_true",
-        help="Replace existing channels instead of merging",
+        help="Start from default bundles, then add explicit selections",
     )
-    channels_bootstrap.set_defaults(func=cmd_channels_bootstrap)
+    credentials_set.set_defaults(func=cmd_agents_credentials_set)
 
-    channels_migrate = channels_sub.add_parser(
-        "migrate",
-        help="Move channels from one agent to another",
+    credentials_sync = credentials_sub.add_parser(
+        "sync",
+        help="Sync selected credentials into the agent Linux home",
     )
-    channels_migrate.add_argument("--from-agent", required=True)
-    channels_migrate.add_argument("--to-agent", required=True)
-    channels_migrate.add_argument(
-        "--replace",
+    _add_positional_argument(
+        credentials_sync,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    credentials_sync.add_argument(
+        "bundles",
+        nargs="*",
+        metavar="BUNDLE",
+        help="Override bundle IDs for this sync run",
+    )
+    credentials_sync.add_argument(
+        "--bundle",
+        action="append",
+        default=[],
+        metavar="BUNDLE",
+        help="Override bundles for this sync run only (repeatable)",
+    )
+    credentials_sync.add_argument(
+        "--include-defaults",
         action="store_true",
-        help="Replace destination channels instead of merging",
+        help="When using --bundle, include default bundles too",
     )
-    channels_migrate.set_defaults(func=cmd_channels_migrate)
-
-    spawn = subparsers.add_parser(
-        "spawn",
-        help="Create a Linux user and provision a matching Clawie agent",
-    )
-    spawn.add_argument("--agent-id", required=True, help="Clawie agent ID")
-    spawn.add_argument(
-        "--linux-user",
-        help="Linux username (defaults to agent-id)",
-    )
-    spawn.add_argument("--template", default="baseline", help="Template name")
-    spawn.add_argument("--agent-version", default="1.0.0", help="Agent version")
-    spawn.add_argument(
-        "--provider",
-        choices=provider_names(),
-        help="Provider for the spawned agent (defaults to current setup provider)",
-    )
-    spawn.add_argument(
+    credentials_sync.add_argument(
         "--source-home",
-        help="Source home directory to copy configs from (default: current home)",
+        help="Source home directory to copy credentials from",
     )
-    spawn.add_argument(
-        "--password",
-        help="Set plaintext Linux password for this spawned user only",
-    )
-    spawn.add_argument(
-        "--password-hash",
-        help="Set pre-hashed Linux password for this spawned user only (shadow-compatible)",
-    )
-    spawn.add_argument(
-        "--no-global-password",
-        action="store_true",
-        help="Do not apply global default spawn password",
-    )
-    spawn.add_argument(
-        "--skip-config-copy",
-        action="store_true",
-        help="Do not copy current user config files to the new Linux user",
-    )
-    spawn.add_argument(
-        "--clone-from-agent",
-        help="Clone full state from this source agent (defaults to current local claw state)",
-    )
-    spawn.set_defaults(func=cmd_spawn)
+    credentials_sync.set_defaults(func=cmd_agents_credentials_sync)
 
-    purge = subparsers.add_parser(
+    credentials_revoke = credentials_sub.add_parser(
+        "revoke",
+        help="Remove credential access from an agent Linux home",
+    )
+    _add_positional_argument(
+        credentials_revoke,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    credentials_revoke.add_argument(
+        "bundles",
+        nargs="*",
+        metavar="BUNDLE",
+        help="Bundle IDs to revoke (default: all selected bundles)",
+    )
+    credentials_revoke.add_argument(
+        "--bundle",
+        action="append",
+        default=[],
+        metavar="BUNDLE",
+        help="Only revoke these bundles (repeatable)",
+    )
+    credentials_revoke.set_defaults(func=cmd_agents_credentials_revoke)
+
+    agent_list = agent_sub.add_parser("list", help="List agents")
+    agent_list.set_defaults(func=cmd_agents_list)
+
+    agent_show = agent_sub.add_parser("show", help="Show one agent")
+    _add_positional_argument(
+        agent_show,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID to inspect",
+    )
+    agent_show.set_defaults(func=cmd_agents_show)
+
+    agent_delete = agent_sub.add_parser("delete", help="Delete an agent record")
+    _add_positional_argument(
+        agent_delete,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID to delete",
+    )
+    agent_delete.set_defaults(func=cmd_agents_delete)
+
+    agent_purge = agent_sub.add_parser(
         "purge",
-        help="Delete an agent and remove its spawned Linux user/home profile",
+        help="Delete an agent and remove its Linux runtime",
     )
-    purge.add_argument("agent_id", nargs="?", help="Agent ID to purge")
-    purge.add_argument(
-        "--agent-id",
-        dest="agent_id_flag",
-        help="Agent ID to purge (backward-compatible flag form)",
+    _add_positional_argument(
+        agent_purge,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID to purge",
     )
-    purge.add_argument(
+    agent_purge.add_argument(
         "--yes",
         action="store_true",
         help="Skip interactive confirmation prompt",
     )
-    purge.set_defaults(func=cmd_purge)
+    agent_purge.set_defaults(func=cmd_purge)
 
-    monitor = subparsers.add_parser("monitor", help="htop-like agent performance monitor")
-    monitor.add_argument("--agent-id", help="Filter monitor to one agent")
-    monitor.add_argument("--refresh-seconds", type=int, default=2)
-    monitor.set_defaults(func=cmd_monitor)
+    create_batch = agent_sub.add_parser(
+        "create-batch",
+        help="Create many agents from a JSON file",
+    )
+    _add_positional_argument(
+        create_batch,
+        "file",
+        metavar="FILE",
+        help_text="Input JSON file",
+    )
+    create_batch.set_defaults(func=cmd_agents_batch_create)
 
-    claws = subparsers.add_parser("claws", help="Discover and inspect installed claw runtimes")
-    claws_sub = claws.add_subparsers(dest="claws_command", required=True)
-    claws_detect = claws_sub.add_parser("detect", help="Detect installed claw runtimes")
-    claws_detect.add_argument(
+
+def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    channel = subparsers.add_parser(
+        "channel",
+        help="Manage agent channels",
+    )
+    channel_sub = channel.add_subparsers(
+        dest="channel_command",
+        required=True,
+        metavar="{apply,move}",
+    )
+
+    apply_preset = channel_sub.add_parser(
+        "apply",
+        help="Apply a channel preset to an agent",
+    )
+    _add_positional_argument(
+        apply_preset,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    apply_preset.add_argument(
+        "--preset",
+        choices=["minimal", "growth", "enterprise"],
+        default="growth",
+    )
+    apply_preset.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace existing channels instead of merging",
+    )
+    apply_preset.set_defaults(func=cmd_channels_bootstrap)
+
+    move = channel_sub.add_parser(
+        "move",
+        help="Move channels from one agent to another",
+    )
+    _add_positional_argument(
+        move,
+        "from_agent",
+        metavar="SOURCE_AGENT",
+        help_text="Source agent ID",
+    )
+    _add_positional_argument(
+        move,
+        "to_agent",
+        metavar="TARGET_AGENT",
+        help_text="Target agent ID",
+    )
+    move.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace destination channels instead of merging",
+    )
+    move.set_defaults(func=cmd_channels_migrate)
+
+
+def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    runtime = subparsers.add_parser(
+        "runtime",
+        help="Manage isolated Linux runtimes",
+    )
+    runtime_sub = runtime.add_subparsers(
+        dest="runtime_command",
+        required=True,
+        metavar="{create,detect}",
+    )
+
+    create = runtime_sub.add_parser(
+        "create",
+        help="Create a Linux runtime and matching agent",
+    )
+    _add_positional_argument(
+        create,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID to create",
+    )
+    create.add_argument(
+        "--user",
+        dest="linux_user",
+        help="Linux username (defaults to agent ID)",
+    )
+    create.add_argument("--template", default="baseline", help="Template name")
+    create.add_argument("--agent-version", default="1.0.0", help="Agent version")
+    create.add_argument(
+        "--provider",
+        choices=provider_names(),
+        help="Provider for the spawned agent",
+    )
+    create.add_argument(
+        "--source-home",
+        help="Source home directory to copy configs from",
+    )
+    create.add_argument(
+        "--password",
+        help="Set a plaintext Linux password for this runtime only",
+    )
+    create.add_argument(
+        "--password-hash",
+        help="Set a pre-hashed Linux password for this runtime only",
+    )
+    create.add_argument(
+        "--no-global-password",
+        action="store_true",
+        help="Do not apply the global default spawn password",
+    )
+    create.add_argument(
+        "--skip-config-copy",
+        action="store_true",
+        help="Do not copy current user config files to the new Linux user",
+    )
+    create.add_argument(
+        "--from-agent",
+        dest="clone_from_agent",
+        help="Clone state from an existing agent",
+    )
+    create.add_argument(
+        "--credential-bundle",
+        action="append",
+        default=[],
+        metavar="BUNDLE",
+        help="Credential bundle to sync on create (repeatable)",
+    )
+    create.add_argument(
+        "--no-default-credentials",
+        action="store_true",
+        help="Do not include default credential bundles when syncing on create",
+    )
+    create.set_defaults(func=cmd_spawn)
+
+    detect = runtime_sub.add_parser(
+        "detect",
+        help="Detect installed runtimes in a home directory",
+    )
+    detect.add_argument(
         "--source-home",
         help="Home directory to inspect (default: current user home)",
     )
-    claws_detect.set_defaults(func=cmd_claws_detect)
+    detect.set_defaults(func=cmd_claws_detect)
 
-    dashboard = subparsers.add_parser("dashboard", help="Unified agent dashboard")
-    dashboard.add_argument("--agent-id", help="Filter dashboard to one agent")
-    dashboard.add_argument("--refresh-seconds", type=int, default=2)
-    dashboard.set_defaults(func=cmd_monitor)
 
-    doctor = subparsers.add_parser("doctor", help="Run health checks")
-    doctor.set_defaults(func=cmd_doctor)
+def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--provider",
+        choices=provider_names(),
+        default="picoclaw",
+        help="Agent provider",
+    )
+    parser.add_argument("--api-key", help="Provider API key (if using api_key auth)")
+    parser.add_argument(
+        "--auth-mode",
+        choices=["linked", "api_key", "none"],
+        help="Provider auth mode (default is provider-specific)",
+    )
+    parser.add_argument("--subscription", default="starter", help="Plan name")
+    parser.add_argument("--workspace", default="default", help="Workspace slug")
+    parser.add_argument(
+        "--spawn-password",
+        help="Set a global default Linux password for future spawned users",
+    )
+    parser.add_argument(
+        "--clear-spawn-password",
+        action="store_true",
+        help="Clear the global default spawn password",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=str(DEFAULT_CONFIG["api_url"]),
+        help="API base URL",
+    )
+    parser.add_argument(
+        "--install-runtime",
+        action="store_true",
+        help="Record local runtime as installed",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for values interactively",
+    )
 
-    events = subparsers.add_parser("events", help="Event stream")
-    events_sub = events.add_subparsers(dest="events_command", required=True)
-    events_list = events_sub.add_parser("list", help="List recent events")
-    events_list.add_argument("--limit", type=int, default=20)
-    events_list.set_defaults(func=cmd_events_list)
 
-    state = subparsers.add_parser("state", help="Export/import local state snapshots")
-    state_sub = state.add_subparsers(dest="state_command", required=True)
-
-    state_export = state_sub.add_parser("export", help="Export config + state JSON")
-    state_export.add_argument("--output", required=True)
-    state_export.set_defaults(func=cmd_state_export)
-
-    state_import = state_sub.add_parser("import", help="Import config + state JSON")
-    state_import.add_argument("--input", required=True)
-    state_import.add_argument("--merge", action="store_true")
-    state_import.set_defaults(func=cmd_state_import)
-
-    return parser
+def _add_positional_argument(
+    parser: argparse.ArgumentParser,
+    name: str,
+    *,
+    metavar: str,
+    help_text: str,
+) -> None:
+    parser.add_argument(name, nargs="?", metavar=metavar, help=help_text)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -347,10 +646,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
-    if args.status:
-        return _print_setup_status(service)
-
-    provider = str(args.provider).strip().lower() or "zeroclaw"
+    provider = str(args.provider).strip().lower() or "picoclaw"
     api_key = str(args.api_key or "").strip()
     auth_mode = str(args.auth_mode or "").strip().lower() or None
     spawn_password = args.spawn_password
@@ -391,9 +687,9 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
     )
     status = service.setup_status()
 
-    print_success("Clawie setup initialized")
+    print_success("Clawie config updated")
     print_panel(
-        "Setup",
+        "Config",
         [
             f"provider: {config.get('provider', '')}",
             f"workspace: {config.get('workspace', '')}",
@@ -408,10 +704,15 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_config_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    _ = args
+    return _print_setup_status(service)
+
+
 def _print_setup_status(service: ZeroClawService) -> int:
     status = service.setup_status()
     print_panel(
-        "Setup Status",
+        "Config",
         [
             f"configured: {status.get('configured', False)}",
             f"provider: {status.get('provider', '')}",
@@ -426,15 +727,16 @@ def _print_setup_status(service: ZeroClawService) -> int:
         ],
     )
     if not status.get("configured"):
-        print_warning("Setup is incomplete. Run `clawie setup`.")
+        print_warning("Config is incomplete. Run `clawie config set`.")
         return 1
     return 0
 
 
 def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
     agent = service.create_agent(
-        agent_id=args.agent_id,
+        agent_id=agent_id,
         display_name=args.display_name,
         template=args.template,
         clone_from=args.clone_from,
@@ -449,30 +751,131 @@ def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int
 
 
 def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
+    agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
     agent = service.create_agent(
-        agent_id=args.agent_id,
+        agent_id=agent_id,
         display_name=args.display_name,
         template="baseline",
-        clone_from=args.from_agent,
+        clone_from=from_agent,
         channel_strategy=args.channel_strategy,
         channels=channels,
         agent_version=args.agent_version,
         provider=args.provider,
     )
-    print_success(f"Cloned agent config from {args.from_agent} to {agent['agent_id']}")
+    print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
     _print_agent(agent)
     return 0
 
 
 def cmd_agents_clone_prompts(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
+    to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
     updated = service.clone_agent_prompts(
-        from_agent=args.from_agent,
-        to_agent=args.to_agent,
+        from_agent=from_agent,
+        to_agent=to_agent,
         apply_to_disk=not bool(args.no_apply_to_disk),
     )
-    print_success(f"Cloned core prompts {args.from_agent} -> {args.to_agent}")
+    print_success(f"Cloned core prompts {from_agent} -> {to_agent}")
     _print_agent(updated)
+    return 0
+
+
+def cmd_agents_credentials_bundles(args: argparse.Namespace, service: ZeroClawService) -> int:
+    _ = args
+    rows: list[list[str]] = []
+    for item in service.credential_bundle_options():
+        rows.append(
+            [
+                str(item.get("id", "")),
+                str(item.get("label", "")),
+                str(bool(item.get("default", False))),
+            ]
+        )
+    print_table(["bundle", "description", "default"], rows)
+    return 0
+
+
+def cmd_agents_credentials_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    payload = service.get_agent_credential_sync(agent_id)
+    selected = ", ".join(str(item) for item in payload.get("selected_bundles", [])) or "<none>"
+    print_panel(
+        "Credential Sync",
+        [
+            f"agent_id: {payload.get('agent_id', '')}",
+            f"linux_user: {payload.get('linux_user', '')}",
+            f"selected: {selected}",
+            f"last_synced_at: {payload.get('last_synced_at', '')}",
+            f"last_source_home: {payload.get('last_source_home', '')}",
+            f"last_revoked_at: {payload.get('last_revoked_at', '')}",
+        ],
+    )
+    rows = []
+    for item in payload.get("bundles", []):
+        rows.append(
+            [
+                str(item.get("id", "")),
+                str(item.get("label", "")),
+                str(bool(item.get("default", False))),
+                str(bool(item.get("selected", False))),
+            ]
+        )
+    if rows:
+        print_table(["bundle", "description", "default", "selected"], rows)
+    return 0
+
+
+def cmd_agents_credentials_set(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
+    agent = service.set_agent_credential_bundles(
+        agent_id,
+        bundles=bundles,
+        include_defaults=bool(args.include_defaults),
+    )
+    selected = ", ".join(agent.get("credential_sync", {}).get("bundles", [])) or "<none>"
+    print_success(f"Updated credential bundles for {agent_id}")
+    print_info(f"Selected bundles: {selected}")
+    return 0
+
+
+def cmd_agents_credentials_sync(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    override_bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
+    result = service.sync_agent_credentials(
+        agent_id,
+        source_home=args.source_home,
+        bundles=override_bundles or None,
+        include_defaults=bool(args.include_defaults),
+    )
+    print_success(f"Synced credentials for {agent_id}")
+    print_info(f"Source home: {result.get('source_home', '')}")
+    print_info("Bundles: " + (", ".join(result.get("bundles", [])) or "<none>"))
+    copied = result.get("copied_paths", [])
+    if copied:
+        print_info("Copied credential paths:")
+        for path in copied:
+            print(f"- {path}")
+    return 0
+
+
+def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
+    result = service.revoke_agent_credentials(
+        agent_id,
+        bundles=bundles or None,
+    )
+    print_success(f"Revoked credential access for {agent_id}")
+    print_info("Revoked bundles: " + (", ".join(result.get("bundles", [])) or "<none>"))
+    print_info("Remaining bundles: " + (", ".join(result.get("remaining_bundles", [])) or "<none>"))
+    removed = result.get("removed_paths", [])
+    if removed:
+        print_info("Removed credential paths:")
+        for path in removed:
+            print(f"- {path}")
     return 0
 
 
@@ -509,25 +912,23 @@ def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     )
     return 0
 
-
-def cmd_list_alias(args: argparse.Namespace, service: ZeroClawService) -> int:
-    return cmd_agents_list(args, service)
-
-
 def cmd_agents_show(args: argparse.Namespace, service: ZeroClawService) -> int:
-    agent = service.get_agent(args.agent_id)
+    agent_id = _resolve_agent_id(args.agent_id)
+    agent = service.get_agent(agent_id)
     _print_agent(agent)
     return 0
 
 
 def cmd_agents_delete(args: argparse.Namespace, service: ZeroClawService) -> int:
-    service.delete_agent(args.agent_id)
-    print_success(f"Deleted agent {args.agent_id}")
+    agent_id = _resolve_agent_id(args.agent_id)
+    service.delete_agent(agent_id)
+    print_success(f"Deleted agent {agent_id}")
     return 0
 
 
 def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) -> int:
-    payload = _read_json_file(args.file)
+    source = _resolve_required_value(args.file, field_name="file")
+    payload = _read_json_file(source)
     if not isinstance(payload, list):
         raise ValueError("batch file must be a JSON array")
 
@@ -559,32 +960,36 @@ def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) 
 
 
 def cmd_channels_bootstrap(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
     agent = service.bootstrap_channels(
-        agent_id=args.agent_id,
+        agent_id=agent_id,
         preset=args.preset,
         replace=args.replace,
     )
     print_success(
-        f"Applied {args.preset} preset for {args.agent_id} ({len(agent.get('channels', []))} channels)"
+        f"Applied {args.preset} preset for {agent_id} ({len(agent.get('channels', []))} channels)"
     )
     return 0
 
 
 def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
+    to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
     agent = service.migrate_channels(
-        from_agent=args.from_agent,
-        to_agent=args.to_agent,
+        from_agent=from_agent,
+        to_agent=to_agent,
         replace=args.replace,
     )
     print_success(
-        f"Migrated channels {args.from_agent} -> {args.to_agent} ({len(agent.get('channels', []))} channels)"
+        f"Migrated channels {from_agent} -> {to_agent} ({len(agent.get('channels', []))} channels)"
     )
     return 0
 
 
 def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
     result = service.spawn_linux_user(
-        agent_id=args.agent_id,
+        agent_id=agent_id,
         linux_user=args.linux_user,
         copy_configs=not bool(args.skip_config_copy),
         source_home=args.source_home,
@@ -595,10 +1000,13 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
         password_hash=args.password_hash,
         use_global_password=not bool(args.no_global_password),
         clone_from_agent=args.clone_from_agent,
+        credential_bundles=list(args.credential_bundle or []),
+        include_default_credentials=not bool(args.no_default_credentials),
     )
     print_success(
         f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
     )
+    print_info("Credential bundles: " + (", ".join(result.get("credential_bundles", [])) or "<none>"))
     source = str(result.get("password_source", "none"))
     print_info(f"Password source: {source}")
     password_value = str(result.get("password_value", ""))
@@ -618,9 +1026,7 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
 
 
 def cmd_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
-    agent_id = str(args.agent_id or args.agent_id_flag or "").strip()
-    if not agent_id:
-        raise ValueError("agent_id is required")
+    agent_id = _resolve_agent_id(args.agent_id)
     if not args.yes:
         print_warning(f"This will permanently purge agent '{agent_id}' and its Linux user profile.")
         confirmation = input("Proceed? [y/N]: ").strip().lower()
@@ -639,7 +1045,7 @@ def cmd_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
 
 def cmd_monitor(args: argparse.Namespace, service: ZeroClawService) -> int:
     refresh = max(1, int(args.refresh_seconds))
-    run_dashboard(service, agent_id=args.agent_id, refresh_seconds=refresh)
+    run_dashboard(service, agent_id=args.agent_id or None, refresh_seconds=refresh)
     return 0
 
 
@@ -707,23 +1113,26 @@ def cmd_events_list(args: argparse.Namespace, service: ZeroClawService) -> int:
 
 
 def cmd_state_export(args: argparse.Namespace, service: ZeroClawService) -> int:
-    target = service.export_state(args.output)
+    target = service.export_state(_resolve_required_value(args.output, field_name="output"))
     print_success(f"State exported to {target}")
     return 0
 
 
 def cmd_state_import(args: argparse.Namespace, service: ZeroClawService) -> int:
-    service.import_state(args.input, merge=bool(args.merge))
+    source = _resolve_required_value(args.input, field_name="input")
+    service.import_state(source, merge=bool(args.merge))
     if args.merge:
-        print_success(f"State merged from {args.input}")
+        print_success(f"State merged from {source}")
     else:
-        print_success(f"State imported from {args.input}")
+        print_success(f"State imported from {source}")
     return 0
 
 
 def _print_agent(agent: dict[str, Any]) -> None:
     channels = agent.get("channels", [])
     migrated = sum(1 for row in channels if row.get("migrated_from"))
+    credential_sync = agent.get("credential_sync", {})
+    selected_bundles = ", ".join(str(item) for item in credential_sync.get("bundles", [])) or "<none>"
     print_panel(
         "Agent",
         [
@@ -737,6 +1146,7 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"provider: {agent.get('agent', {}).get('provider', '')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
             f"core_prompts: {len(agent.get('core_prompts', {}))}",
+            f"credential_bundles: {selected_bundles}",
             f"autostart: {agent.get('agent', {}).get('autostart', True)}",
             f"service_status: {agent.get('agent', {}).get('service_status', 'unknown')}",
             f"agent_status: {agent.get('agent', {}).get('status', '')}",
@@ -809,6 +1219,31 @@ def _read_json_file(path: str) -> Any:
     source = Path(path).expanduser()
     with source.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _resolve_required_value(
+    value: str | None,
+    *,
+    field_name: str,
+) -> str:
+    token = str(value or "").strip()
+    if not token:
+        raise ValueError(f"{field_name} is required")
+    return token
+
+
+def _resolve_agent_id(agent_id: str | None) -> str:
+    return _resolve_required_value(agent_id, field_name="agent_id")
+
+
+def _resolve_bundles(positional: list[str] | None, flags: list[str] | None) -> list[str]:
+    bundles: list[str] = []
+    for source in (positional or [], flags or []):
+        for item in source:
+            token = str(item).strip()
+            if token:
+                bundles.append(token)
+    return bundles
 
 
 def _prompt_required(label: str) -> str:

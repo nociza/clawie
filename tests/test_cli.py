@@ -5,10 +5,10 @@ import os
 import tempfile
 from pathlib import Path
 
-from pytest import CaptureFixture, MonkeyPatch
+from pytest import CaptureFixture, MonkeyPatch, raises
 
 from clawie.cli import main
-from clawie.dashboard import DashboardState, _handle_detail_key
+from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
 from clawie.service import ZeroClawService
 from clawie.store import StateStore
@@ -18,20 +18,21 @@ def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
 
 
-def test_setup_defaults_to_linked_auth_for_zeroclaw(
+def test_setup_defaults_to_linked_auth_for_picoclaw(
     tmp_path: Path, capsys: CaptureFixture[str]
 ) -> None:
-    code = run_cli(tmp_path, "setup")
+    code = run_cli(tmp_path, "config", "set")
     output = capsys.readouterr().out
     assert code == 0
-    assert "provider: zeroclaw" in output
+    assert "provider: picoclaw" in output
     assert "auth_mode: linked" in output
 
 
 def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     code = run_cli(
         tmp_path,
-        "setup",
+        "config",
+        "set",
         "--provider",
         "openclaw",
         "--workspace",
@@ -45,27 +46,26 @@ def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[s
     assert "spawn_password_default: not set" in output
     assert "runtime_installed: True" in output
 
-    status = run_cli(tmp_path, "setup", "--status")
+    status = run_cli(tmp_path, "config", "show")
     status_output = capsys.readouterr().out
     assert status == 0
     assert "configured: True" in status_output
 
 
 def test_setup_api_key_mode_requires_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    code = run_cli(tmp_path, "setup", "--provider", "picoclaw", "--auth-mode", "api_key")
+    code = run_cli(tmp_path, "config", "set", "--provider", "picoclaw", "--auth-mode", "api_key")
     output = capsys.readouterr().out
     assert code == 1
     assert "API key is required when --auth-mode api_key is selected" in output
 
 
 def test_create_agent_with_provider_override(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
     code = run_cli(
         tmp_path,
-        "agents",
+        "agent",
         "create",
-        "--agent-id",
         "pico",
         "--provider",
         "picoclaw",
@@ -74,13 +74,12 @@ def test_create_agent_with_provider_override(tmp_path: Path, capsys: CaptureFixt
     assert code == 1
     assert "provider 'picoclaw' is not configured" in output
 
-    assert run_cli(tmp_path, "setup", "--provider", "picoclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "picoclaw") == 0
     capsys.readouterr()
     code = run_cli(
         tmp_path,
-        "agents",
+        "agent",
         "create",
-        "--agent-id",
         "pico",
         "--provider",
         "picoclaw",
@@ -91,14 +90,13 @@ def test_create_agent_with_provider_override(tmp_path: Path, capsys: CaptureFixt
 
 
 def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234", "--workspace", "prod") == 0
+    assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234", "--workspace", "prod") == 0
     capsys.readouterr()
     assert (
         run_cli(
             tmp_path,
-            "agents",
+            "agent",
             "create",
-            "--agent-id",
             "alice",
             "--template",
             "baseline",
@@ -109,7 +107,7 @@ def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixtur
     )
     capsys.readouterr()
 
-    code = run_cli(tmp_path, "monitor")
+    code = run_cli(tmp_path, "dashboard")
     output = capsys.readouterr().out
     assert code == 0
     assert "Clawie Monitor" in output
@@ -117,13 +115,13 @@ def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixtur
     assert "cpu%" in output
 
 
-def test_list_alias_matches_agents_list(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+def test_agent_list_shows_created_agents(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
-    assert run_cli(tmp_path, "agents", "create", "--agent-id", "alice") == 0
+    assert run_cli(tmp_path, "agent", "create", "alice") == 0
     capsys.readouterr()
 
-    code = run_cli(tmp_path, "list")
+    code = run_cli(tmp_path, "agent", "list")
     output = capsys.readouterr().out
     assert code == 0
     assert "agent_id" in output
@@ -131,10 +129,20 @@ def test_list_alias_matches_agents_list(tmp_path: Path, capsys: CaptureFixture[s
     assert "alice" in output
 
 
+def test_legacy_top_level_commands_are_rejected(tmp_path: Path) -> None:
+    with raises(SystemExit) as setup_exit:
+        run_cli(tmp_path, "setup")
+    assert setup_exit.value.code == 2
+
+    with raises(SystemExit) as list_exit:
+        run_cli(tmp_path, "list")
+    assert list_exit.value.code == 2
+
+
 def test_spawn_requires_root(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234") == 0
+    assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
-    code = run_cli(tmp_path, "spawn", "--agent-id", "sam")
+    code = run_cli(tmp_path, "runtime", "create", "sam")
     output = capsys.readouterr().out
     assert code == 1
     assert "requires root privileges" in output
@@ -145,7 +153,7 @@ def test_spawn_success_with_mocks(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234") == 0
+    assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
 
     src_home = tmp_path / "source-home"
@@ -169,10 +177,10 @@ def test_spawn_success_with_mocks(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "sam",
-        "--linux-user",
+        "--user",
         "sam",
         "--source-home",
         str(src_home),
@@ -190,7 +198,8 @@ def test_spawn_success_with_mocks(
 def test_setup_sets_global_spawn_password(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     code = run_cli(
         tmp_path,
-        "setup",
+        "config",
+        "set",
         "--provider",
         "openclaw",
         "--spawn-password",
@@ -211,7 +220,8 @@ def test_spawn_uses_global_password_hash(
 ) -> None:
     assert run_cli(
         tmp_path,
-        "setup",
+        "config",
+        "set",
         "--provider",
         "openclaw",
         "--spawn-password",
@@ -236,10 +246,10 @@ def test_spawn_uses_global_password_hash(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "sam",
-        "--linux-user",
+        "--user",
         "sam",
         "--skip-config-copy",
     )
@@ -254,7 +264,7 @@ def test_spawn_uses_builtin_default_password_and_prints_it(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
 
     calls: list[tuple[list[str], object]] = []
@@ -274,10 +284,10 @@ def test_spawn_uses_builtin_default_password_and_prints_it(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "sam-default",
-        "--linux-user",
+        "--user",
         "sam-default",
         "--skip-config-copy",
     )
@@ -294,7 +304,7 @@ def test_spawn_uses_per_agent_plaintext_password(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
 
     calls: list[tuple[list[str], object]] = []
@@ -314,10 +324,10 @@ def test_spawn_uses_per_agent_plaintext_password(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "sam2",
-        "--linux-user",
+        "--user",
         "sam2",
         "--skip-config-copy",
         "--password",
@@ -336,7 +346,7 @@ def test_spawn_creates_linux_user_with_bash_shell(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
 
     calls: list[list[str]] = []
@@ -356,10 +366,10 @@ def test_spawn_creates_linux_user_with_bash_shell(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "sam-shell",
-        "--linux-user",
+        "--user",
         "sam-shell",
         "--skip-config-copy",
     )
@@ -405,9 +415,9 @@ def test_purge_removes_agent_and_linux_user_with_root(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
-    assert run_cli(tmp_path, "agents", "create", "--agent-id", "teleclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "teleclaw") == 0
     capsys.readouterr()
 
     store = StateStore(config_dir=tmp_path)
@@ -432,7 +442,7 @@ def test_purge_removes_agent_and_linux_user_with_root(
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
-    code = run_cli(tmp_path, "purge", "--agent-id", "teleclaw", "--yes")
+    code = run_cli(tmp_path, "agent", "purge", "teleclaw", "--yes")
     output = capsys.readouterr().out
     assert code == 0
     assert "Purged agent teleclaw" in output
@@ -445,9 +455,9 @@ def test_purge_requires_root_for_spawned_linux_user(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
-    assert run_cli(tmp_path, "agents", "create", "--agent-id", "teleclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "teleclaw") == 0
     capsys.readouterr()
 
     store = StateStore(config_dir=tmp_path)
@@ -456,7 +466,7 @@ def test_purge_requires_root_for_spawned_linux_user(
     store.write_state(state)
 
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
-    code = run_cli(tmp_path, "purge", "--agent-id", "teleclaw", "--yes")
+    code = run_cli(tmp_path, "agent", "purge", "teleclaw", "--yes")
     output = capsys.readouterr().out
     assert code == 1
     assert "purge requires root privileges" in output
@@ -467,13 +477,13 @@ def test_purge_accepts_positional_agent_id(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
-    assert run_cli(tmp_path, "agents", "create", "--agent-id", "teleclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "teleclaw") == 0
     capsys.readouterr()
 
     monkeypatch.setattr("builtins.input", lambda _: "yes")
-    code = run_cli(tmp_path, "purge", "teleclaw")
+    code = run_cli(tmp_path, "agent", "purge", "teleclaw")
     output = capsys.readouterr().out
     assert code == 0
     assert "Purged agent teleclaw" in output
@@ -484,7 +494,7 @@ def test_spawn_imports_channels_from_zeroclaw_config(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "zeroclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "zeroclaw") == 0
     capsys.readouterr()
 
     source_home = tmp_path / "source-home"
@@ -517,10 +527,10 @@ allowed_users = ["*"]
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "teleclaw",
-        "--linux-user",
+        "--user",
         "teleclaw",
         "--source-home",
         str(source_home),
@@ -541,7 +551,7 @@ def test_spawn_clones_core_prompts_from_local_source_home(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "zeroclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "zeroclaw") == 0
     capsys.readouterr()
 
     source_home = tmp_path / "source-home"
@@ -562,10 +572,10 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 
     code = run_cli(
         tmp_path,
-        "spawn",
-        "--agent-id",
+        "runtime",
+        "create",
         "teleclaw2",
-        "--linux-user",
+        "--user",
         "teleclaw2",
         "--source-home",
         str(source_home),
@@ -581,7 +591,7 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 
 
 def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
-    assert run_cli(tmp_path, "setup", "--provider", "zeroclaw") == 0
+    assert run_cli(tmp_path, "config", "set", "--provider", "zeroclaw") == 0
     capsys.readouterr()
     service = ZeroClawService(StateStore(config_dir=tmp_path))
     service.create_agent(
@@ -606,11 +616,10 @@ def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys:
 
     code = run_cli(
         tmp_path,
-        "agents",
-        "clone-prompts",
-        "--from-agent",
+        "agent",
+        "prompt",
+        "copy",
         "src",
-        "--to-agent",
         "dst",
         "--no-apply-to-disk",
     )
@@ -688,7 +697,7 @@ def test_batch_create_returns_nonzero_on_errors(
     tmp_path: Path,
     capsys: CaptureFixture[str],
 ) -> None:
-    assert run_cli(tmp_path, "setup", "--api-key", "zc_live_1234") == 0
+    assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
 
     batch_file = tmp_path / "agents.json"
@@ -702,7 +711,7 @@ def test_batch_create_returns_nonzero_on_errors(
         encoding="utf-8",
     )
 
-    code = run_cli(tmp_path, "agents", "batch-create", "--file", str(batch_file))
+    code = run_cli(tmp_path, "agent", "create-batch", str(batch_file))
     output = capsys.readouterr().out
     assert code == 1
     assert "created: 1" in output
@@ -715,6 +724,103 @@ def test_provider_credential_path_registry_contains_codex_and_openai() -> None:
     assert ".config/openai" in paths
 
 
+def test_agents_credentials_commands_show_and_set(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "agent", "create", "alice") == 0
+    capsys.readouterr()
+
+    code = run_cli(tmp_path, "agent", "credentials", "list")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "provider-auth" in output
+    assert "git" in output
+
+    code = run_cli(tmp_path, "agent", "credentials", "show", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "selected: provider-auth" in output
+
+    code = run_cli(
+        tmp_path,
+        "agent",
+        "credentials",
+        "set",
+        "alice",
+        "git",
+        "--include-defaults",
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "Selected bundles: provider-auth, git" in output
+
+    code = run_cli(tmp_path, "agent", "credentials", "show", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "provider-auth" in output
+    assert "git" in output
+
+
+def test_service_syncs_and_revokes_selected_credential_bundles(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+
+    source_home = tmp_path / "source-home"
+    source_home.mkdir(parents=True)
+    (source_home / ".codex").mkdir(parents=True)
+    (source_home / ".codex" / "config.toml").write_text("[model]\n", encoding="utf-8")
+    (source_home / ".gitconfig").write_text("[user]\nname = Alice\n", encoding="utf-8")
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+
+    service.set_agent_credential_bundles("alice", ["provider-auth", "git"])
+    sync = service.sync_agent_credentials("alice", source_home=source_home)
+    assert "provider-auth" in sync["bundles"]
+    assert "git" in sync["bundles"]
+    assert (target_home / ".codex" / "config.toml").exists()
+    assert (target_home / ".gitconfig").exists()
+
+    revoked = service.revoke_agent_credentials("alice", bundles=["git"])
+    assert "git" in revoked["bundles"]
+    assert not (target_home / ".gitconfig").exists()
+    assert (target_home / ".codex" / "config.toml").exists()
+
+    updated = service.get_agent("alice")
+    assert "provider-auth" in updated["credential_sync"]["bundles"]
+    assert "git" not in updated["credential_sync"]["bundles"]
+
+
 def test_detect_installed_claws_command(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     source_home = tmp_path / "home"
     source_home.mkdir(parents=True)
@@ -723,7 +829,7 @@ def test_detect_installed_claws_command(tmp_path: Path, capsys: CaptureFixture[s
     (zeroclaw / "config.toml").write_text("default_provider='openai-codex'\n", encoding="utf-8")
     (zeroclaw / "auth-profiles.json").write_text("{}", encoding="utf-8")
 
-    code = run_cli(tmp_path, "claws", "detect", "--source-home", str(source_home))
+    code = run_cli(tmp_path, "runtime", "detect", "--source-home", str(source_home))
     output = capsys.readouterr().out
     assert code == 0
     assert "zeroclaw" in output
@@ -1200,6 +1306,60 @@ def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None
     _handle_detail_key(ord("j"), state, FakeService())
     _handle_detail_key(ord("j"), state, FakeService())
     assert state.setting_idx > 2
+
+
+def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
+    rows = _settings_items(
+        {
+            "credential_sync": {"bundles": ["provider-auth"], "last_synced_at": ""},
+            "agent": {
+                "local_user": False,
+                "autostart": True,
+                "service_status": "running",
+                "service_mode": "systemd",
+                "heartbeat_seconds": 30,
+                "auth_mode": "linked",
+            },
+        }
+    )
+    kinds = {str(row.get("kind", "")) for row in rows}
+    assert "cred_bundle:provider-auth" in kinds
+    assert "cred_bundle:git" in kinds
+    assert "cred_sync_now" in kinds
+    assert "cred_revoke_now" in kinds
+
+
+def test_dashboard_setting_actions_call_credential_operations() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.toggled: list[str] = []
+            self.synced = 0
+            self.revoked = 0
+
+        def toggle_agent_credential_bundle(self, _agent_id: str, bundle: str) -> None:
+            self.toggled.append(bundle)
+
+        def sync_agent_credentials(self, _agent_id: str) -> dict[str, object]:
+            self.synced += 1
+            return {"copied_paths": ["/tmp/a", "/tmp/b"]}
+
+        def revoke_agent_credentials(self, _agent_id: str) -> dict[str, object]:
+            self.revoked += 1
+            return {"removed_paths": ["/tmp/a"]}
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice")
+    _run_setting_action(service, state, {"kind": "cred_bundle:git"})
+    assert state.notice == "credential bundle toggled: git"
+    assert service.toggled == ["git"]
+
+    _run_setting_action(service, state, {"kind": "cred_sync_now"})
+    assert state.notice == "credentials synced (2 paths)"
+    assert service.synced == 1
+
+    _run_setting_action(service, state, {"kind": "cred_revoke_now"})
+    assert state.notice == "credentials revoked (1 paths)"
+    assert service.revoked == 1
 
 
 def test_service_action_requires_root_for_other_linux_user(

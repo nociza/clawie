@@ -15,12 +15,13 @@ many claws from one place.
 
 ## What It Handles
 
-- Setup provider, auth, workspace, and API settings.
-- Create, clone, and manage agents.
-- Bootstrap or migrate channels between agents.
-- Spawn per-agent Linux users with optional config/credential copy.
+- Configure provider, auth, workspace, and API settings.
+- Create, clone, inspect, and delete agents.
+- Copy agent prompts and manage credential bundle policy.
+- Apply channel presets and move channels between agents.
+- Create per-agent Linux runtimes with optional config/credential copy.
 - Detect installed local claw runtimes and transfer state.
-- Monitor health/events with CLI monitor and dashboard.
+- Inspect health/events from the CLI dashboard.
 - Export/import local state snapshots.
 
 ## Install
@@ -33,23 +34,23 @@ uv tool install -e .
 
 ## Quick Start
 
-1. Initialize setup:
+1. Initialize config:
 
 ```bash
-clawie setup --interactive
+clawie config set --interactive
 ```
 
 2. Select provider (open/pico/zero):
 
 ```bash
-clawie setup --provider zeroclaw --subscription pro --workspace production
+clawie config set --provider picoclaw --subscription pro --workspace production
 ```
 
 3. Create an agent:
 
 ```bash
-clawie agents create \
-  --agent-id alice \
+clawie agent create \
+  alice \
   --display-name "Alice" \
   --template baseline \
   --channel-strategy new
@@ -58,43 +59,63 @@ clawie agents create \
 4. Spawn an isolated Linux runtime for that claw:
 
 ```bash
-sudo clawie spawn --agent-id alice --linux-user alice
+sudo clawie runtime create alice --user alice
 ```
 
 5. Operate the fleet:
 
 ```bash
 clawie dashboard
-# or
-clawie monitor
+```
+
+## Command Layout
+
+```bash
+clawie config set|show
+clawie agent create|clone|list|show|delete|purge|create-batch
+clawie agent prompt copy
+clawie agent credentials list|show|set|sync|revoke
+clawie channel apply|move
+clawie runtime create|detect
+clawie dashboard
+clawie health
+clawie event list
+clawie backup export|import
 ```
 
 ## Common Commands
 
 ```bash
-# setup
-clawie setup --status
-clawie setup --provider openclaw --auth-mode none --install-runtime
-clawie setup --provider zeroclaw --auth-mode api_key --api-key zc_live_1234
+# config
+clawie config show
+clawie config set --provider openclaw --auth-mode none --install-runtime
+clawie config set --provider picoclaw --auth-mode api_key --api-key pico_live_1234
 
 # agents
-clawie list
-clawie agents show --agent-id alice
-clawie agents clone --from-agent alice --agent-id bob --channel-strategy migrate
-clawie agents delete --agent-id bob
+clawie agent list
+clawie agent show alice
+clawie agent clone alice bob --channel-strategy migrate
+clawie agent delete bob
+clawie agent prompt copy alice bob
+clawie agent credentials list
+clawie agent credentials show alice
+clawie agent credentials set alice git --include-defaults
+sudo clawie agent credentials sync alice
+sudo clawie agent credentials revoke alice git
 
 # channels
-clawie channels bootstrap --agent-id alice --preset growth
-clawie channels migrate --from-agent alice --to-agent bob
+clawie channel apply alice --preset growth
+clawie channel move alice bob
 
 # runtime + health
-clawie claws detect
-clawie doctor
-clawie events list --limit 50
+sudo clawie runtime create alice --user alice
+clawie runtime detect
+clawie health
+clawie event list --limit 50
 
 # state backups
-clawie state export --output backup.json
-clawie state import --input backup.json
+clawie backup export backup.json
+clawie backup import backup.json
 ```
 
 ## Dashboard Controls
@@ -112,19 +133,59 @@ clawie state import --input backup.json
   - `c`: assign + run provider channel connect command for selected agent
 - `a`: toggle selected agent autostart
 - In Settings, use service rows to run `<provider> service start|stop|restart|status`
+- In Settings, use `cred ...` rows to toggle bundle policy, sync credentials, and revoke credential access.
 - `d`: purge selected agent (requires confirmation)
 - `b` or `Esc`: back to overview
 - `r`: refresh, `q`: quit
 
 ## Isolation and Credential Reuse
 
-`spawn` is built around the Linux `user` model. Each claw can get an isolated
-OS user/home/runtime, while Clawie can copy common config/credential paths from
-the invoking user (unless `--skip-config-copy` is set).
+`runtime create` is built around the Linux `user` model. Each claw can get an
+isolated OS user/home/runtime, while Clawie can copy common config/credential
+paths from the invoking user (unless `--skip-config-copy` is set).
 
 It also detects installed claw runtimes in the source home and carries relevant
 credential/state paths, enabling an "authorize once, use all" workflow across
 providers.
+
+Credential sync is bundle-based. By default, Clawie syncs `provider-auth`.
+You can opt in additional bundles (for example `git`) during runtime creation
+with `--credential-bundle`, or later with
+`clawie agent credentials set/sync/revoke`.
+
+Available credential bundles:
+
+- `provider-auth` (default): provider and model auth/config paths like `.codex`,
+  `.openai`, and provider state dirs.
+- `git`: `.gitconfig`, `.git-credentials`, `.config/gh`, `.ssh`.
+
+Runtime examples:
+
+```bash
+# default behavior: sync provider-auth
+sudo clawie runtime create alice --user alice
+
+# include git credentials as well
+sudo clawie runtime create alice --user alice --credential-bundle git
+
+# disable defaults and only sync git
+sudo clawie runtime create alice --user alice \
+  --no-default-credentials \
+  --credential-bundle git
+```
+
+Revoke behavior:
+
+- `clawie agent credentials revoke` removes credential files for the selected
+  bundle(s) from the agent Linux home.
+- Revoked bundles are also removed from that agent's credential policy so access
+  stays revoked until explicitly re-enabled.
+
+Simple one-command sync from the main user to an agent:
+
+```bash
+sudo clawie agent credentials sync sandbox git --source-home /home/azicon
+```
 
 When run with `sudo`, Clawie reuses the invoking user's Clawie state by default
 instead of creating separate `/root/.clawie` state.
@@ -149,7 +210,7 @@ instead of creating separate `/root/.clawie` state.
 ```
 
 ```bash
-clawie agents batch-create --file agents.json
+clawie agent create-batch agents.json
 ```
 
 ## Config and State
@@ -160,7 +221,7 @@ clawie agents batch-create --file agents.json
 Override config root per command:
 
 ```bash
-clawie --config-dir /tmp/clawie-dev setup --status
+clawie --config-dir /tmp/clawie-dev config show
 ```
 
 ## Development

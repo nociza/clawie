@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import curses
 import json
 import os
 import tempfile
@@ -1903,16 +1904,46 @@ def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None
                 },
             }
 
-    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=3, setting_idx=2)
+    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=2, setting_idx=2)
     _handle_detail_key(ord("j"), state, FakeService())
     _handle_detail_key(ord("j"), state, FakeService())
     _handle_detail_key(ord("j"), state, FakeService())
     assert state.setting_idx > 2
 
 
+def test_dashboard_detail_right_arrow_twice_reaches_settings_panel() -> None:
+    class FakeService:
+        def get_dashboard_agent(self, _: str) -> dict[str, object]:
+            return {
+                "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
+                "core_prompts": {"SOUL.md": "hello"},
+                "agent": {
+                    "plugins": {"memory": True},
+                    "provider": "picoclaw",
+                    "status": "running",
+                    "version": "1.0.0",
+                    "autostart": True,
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "heartbeat_seconds": 30,
+                    "auth_mode": "linked",
+                    "auth_status": "ready",
+                    "local_user": False,
+                },
+                "credential_sync": {"bundles": []},
+            }
+
+    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=0)
+    _handle_detail_key(curses.KEY_RIGHT, state, FakeService())
+    _handle_detail_key(curses.KEY_RIGHT, state, FakeService())
+    assert dashboard._focus_name(state) == "settings"
+
+
 def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
     rows = _settings_items(
         {
+            "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
+            "core_prompts": {"SOUL.md": "hi"},
             "credential_sync": {"bundles": ["provider-auth"], "last_synced_at": ""},
             "agent": {
                 "local_user": False,
@@ -1925,9 +1956,13 @@ def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
         }
     )
     kinds = {str(row.get("kind", "")) for row in rows}
+    assert "channel_add" in kinds
+    assert "channel_connect" in kinds
     assert "provider_current" in kinds
     assert "auth_status" in kinds
     assert "auth_login" in kinds
+    assert "prompt_sync_from_disk" in kinds
+    assert "prompt_write_to_disk" in kinds
     assert "cred_bundle:provider-auth" in kinds
     assert "cred_bundle:git" in kinds
     assert "cred_sync_now" in kinds
@@ -2014,6 +2049,119 @@ def test_dashboard_setting_actions_call_auth_and_provider_operations() -> None:
     _run_setting_action(service, state, {"kind": "provider_switch:zeroclaw"})
     assert state.notice == "provider changed to zeroclaw"
     assert service.provider_calls == [("alice", "zeroclaw")]
+
+
+def test_dashboard_settings_panel_runs_channel_actions(monkeypatch: MonkeyPatch) -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.channels = [{"kind": "telegram", "name": "team", "enabled": True}]
+            self.assigned: list[tuple[str, str, str, str]] = []
+            self.connected: list[tuple[str, str, str]] = []
+            self.unlinked: list[tuple[str, str, str]] = []
+
+        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
+            return {
+                "channels": list(self.channels),
+                "core_prompts": {"SOUL.md": "hello"},
+                "agent": {
+                    "plugins": {},
+                    "provider": "picoclaw",
+                    "status": "running",
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "version": "1.0.0",
+                    "auth_mode": "linked",
+                    "auth_status": "ready",
+                    "local_user": False,
+                },
+                "credential_sync": {"bundles": []},
+            }
+
+        def assign_channel_to_agent(self, source: str, kind: str, name: str, agent_id: str) -> None:
+            self.assigned.append((source, kind, name, agent_id))
+            self.channels.append({"kind": kind, "name": name, "enabled": True})
+
+        def connect_agent_channel(self, agent_id: str, kind: str, name: str) -> None:
+            self.connected.append((agent_id, kind, name))
+
+        def unassign_channel_from_agent(self, agent_id: str, kind: str, name: str) -> None:
+            self.unlinked.append((agent_id, kind, name))
+            self.channels = [row for row in self.channels if not (row["kind"] == kind and row["name"] == name)]
+
+    def setting_idx(service: FakeService, state: DashboardState, kind: str) -> int:
+        rows = _settings_items(
+            service.get_dashboard_agent(state.selected_agent_id),
+            selected_channel=service.channels[state.channel_idx] if service.channels else None,
+        )
+        return next(idx for idx, row in enumerate(rows) if str(row.get("kind", "")) == kind)
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2, channel_idx=0)
+
+    monkeypatch.setattr(dashboard, "_prompt_channel_values", lambda default_kind="", default_name="": ("slack", "ops"))
+
+    state.setting_idx = setting_idx(service, state, "channel_add")
+    _handle_detail_key(ord(" "), state, service)
+    assert state.notice == "added slack:ops"
+    assert service.assigned == [("", "slack", "ops", "alice")]
+
+    state.setting_idx = setting_idx(service, state, "channel_connect")
+    _handle_detail_key(ord(" "), state, service)
+    assert state.notice == "linked telegram:team"
+    assert service.connected == [("alice", "telegram", "team")]
+
+    state.setting_idx = setting_idx(service, state, "channel_unlink")
+    _handle_detail_key(ord(" "), state, service)
+    assert state.notice == "unlinked telegram:team"
+    assert service.unlinked == [("alice", "telegram", "team")]
+
+
+def test_dashboard_settings_panel_runs_prompt_actions() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.synced = 0
+            self.written = 0
+
+        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
+            return {
+                "channels": [],
+                "core_prompts": {"SOUL.md": "hello"},
+                "agent": {
+                    "plugins": {},
+                    "provider": "picoclaw",
+                    "status": "running",
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "version": "1.0.0",
+                    "auth_mode": "linked",
+                    "auth_status": "ready",
+                    "local_user": False,
+                },
+                "credential_sync": {"bundles": []},
+            }
+
+        def sync_agent_core_prompts_from_disk(self, _agent_id: str) -> None:
+            self.synced += 1
+
+        def write_agent_core_prompts_to_disk(self, _agent_id: str) -> None:
+            self.written += 1
+
+    def setting_idx(service: FakeService, kind: str) -> int:
+        rows = _settings_items(service.get_dashboard_agent("alice"))
+        return next(idx for idx, row in enumerate(rows) if str(row.get("kind", "")) == kind)
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2)
+
+    state.setting_idx = setting_idx(service, "prompt_sync_from_disk")
+    _handle_detail_key(ord(" "), state, service)
+    assert state.notice == "prompts synced from disk"
+    assert service.synced == 1
+
+    state.setting_idx = setting_idx(service, "prompt_write_to_disk")
+    _handle_detail_key(ord(" "), state, service)
+    assert state.notice == "prompts written to disk"
+    assert service.written == 1
 
 
 def test_dashboard_channel_shortcuts_add_link_and_unlink(monkeypatch: MonkeyPatch) -> None:

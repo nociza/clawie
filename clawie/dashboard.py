@@ -81,6 +81,9 @@ class DashboardState:
     notice_error: bool = False
 
 
+DETAIL_FOCUS_NAMES = ("channels", "plugins", "settings")
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Entry Points
 # ═════════════════════════════════════════════════════════════════════
@@ -353,9 +356,8 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
         state.notice_error = False
         return
 
-    focus_names = ["channels", "plugins", "prompts", "settings"]
-    state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
-    focus = focus_names[state.focus_idx]
+    state.focus_idx = max(0, min(state.focus_idx, len(DETAIL_FOCUS_NAMES) - 1))
+    focus = DETAIL_FOCUS_NAMES[state.focus_idx]
 
     try:
         agent = service.get_dashboard_agent(state.selected_agent_id)
@@ -364,21 +366,23 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
 
     channels = agent.get("channels", [])
     plugins = sorted(agent.get("agent", {}).get("plugins", {}).items())
-    prompts = _prompt_items(agent)
     state.channel_idx = min(state.channel_idx, max(0, len(channels) - 1))
     state.plugin_idx = min(state.plugin_idx, max(0, len(plugins) - 1))
-    state.prompt_idx = min(state.prompt_idx, max(0, len(prompts) - 1))
-    settings = _settings_items(agent, _dashboard_provider_choices(service, agent))
+    settings = _settings_items(
+        agent,
+        _dashboard_provider_choices(service, agent),
+        _selected_channel(channels, state.channel_idx),
+    )
     state.setting_idx = min(state.setting_idx, max(0, len(settings) - 1))
 
     if key == 9:  # TAB
-        state.focus_idx = (state.focus_idx + 1) % len(focus_names)
+        state.focus_idx = (state.focus_idx + 1) % len(DETAIL_FOCUS_NAMES)
         return
     if key == curses.KEY_BTAB:  # Shift-Tab
-        state.focus_idx = (state.focus_idx - 1) % len(focus_names)
+        state.focus_idx = (state.focus_idx - 1) % len(DETAIL_FOCUS_NAMES)
         return
     if key == curses.KEY_RIGHT:
-        state.focus_idx = min(len(focus_names) - 1, state.focus_idx + 1)
+        state.focus_idx = min(len(DETAIL_FOCUS_NAMES) - 1, state.focus_idx + 1)
         return
     if key == curses.KEY_LEFT:
         state.focus_idx = max(0, state.focus_idx - 1)
@@ -389,8 +393,6 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = min(max(0, len(channels) - 1), state.channel_idx + 1)
         elif focus == "plugins":
             state.plugin_idx = min(max(0, len(plugins) - 1), state.plugin_idx + 1)
-        elif focus == "prompts":
-            state.prompt_idx = min(max(0, len(prompts) - 1), state.prompt_idx + 1)
         else:
             state.setting_idx = min(max(0, len(settings) - 1), state.setting_idx + 1)
         return
@@ -400,8 +402,6 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = max(0, state.channel_idx - 1)
         elif focus == "plugins":
             state.plugin_idx = max(0, state.plugin_idx - 1)
-        elif focus == "prompts":
-            state.prompt_idx = max(0, state.prompt_idx - 1)
         else:
             state.setting_idx = max(0, state.setting_idx - 1)
         return
@@ -411,8 +411,6 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = 0
         elif focus == "plugins":
             state.plugin_idx = 0
-        elif focus == "prompts":
-            state.prompt_idx = 0
         else:
             state.setting_idx = 0
         return
@@ -421,8 +419,6 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.channel_idx = max(0, len(channels) - 1)
         elif focus == "plugins":
             state.plugin_idx = max(0, len(plugins) - 1)
-        elif focus == "prompts":
-            state.prompt_idx = max(0, len(prompts) - 1)
         else:
             state.setting_idx = max(0, len(settings) - 1)
         return
@@ -476,9 +472,6 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
-        elif focus == "prompts" and prompts:
-            item = prompts[state.prompt_idx]
-            _run_prompt_action(service, state, item)
         elif focus == "settings":
             item = settings[state.setting_idx] if settings else None
             if item:
@@ -561,15 +554,10 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
                     f"j/k navigate {ICON_DOT} Space toggle plugin {ICON_DOT} "
                     f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
                 )
-            elif focus == "prompts":
-                footer = (
-                    f"j/k navigate {ICON_DOT} Space open action {ICON_DOT} "
-                    f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
-                )
             else:
                 footer = (
                     f"j/k navigate {ICON_DOT} Space run action {ICON_DOT} "
-                    f"a autostart {ICON_DOT} d purge {ICON_DOT} "
+                    f"auth/provider/channel/prompt {ICON_DOT} a autostart {ICON_DOT} d purge {ICON_DOT} "
                     f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
                 )
 
@@ -875,11 +863,13 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     agent_info = agent.get("agent", {})
     channels = agent.get("channels", [])
     plugins = sorted(agent_info.get("plugins", {}).items())
-    prompts = _prompt_items(agent)
-    focus_names = ["channels", "plugins", "prompts", "settings"]
-    state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
-    focus = focus_names[state.focus_idx]
-    settings = _settings_items(agent, _dashboard_provider_choices(service, agent))
+    state.focus_idx = max(0, min(state.focus_idx, len(DETAIL_FOCUS_NAMES) - 1))
+    focus = DETAIL_FOCUS_NAMES[state.focus_idx]
+    settings = _settings_items(
+        agent,
+        _dashboard_provider_choices(service, agent),
+        _selected_channel(channels, state.channel_idx),
+    )
     content_bottom = height - 3
 
     # ── Agent info bar (line 1) ──────────────────────────────────────
@@ -899,9 +889,7 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         warn_text = f" {ICON_WARN} permanently delete agent + Linux user? press y to confirm, n to cancel "
         _add(stdscr, 1, 0, warn_text.ljust(width - 1), _color(C_NOTICE_ERR))
 
-    # ── Layout: three visual columns ─────────────────────────────────
-    # Four logical sections (channels, plugins, prompts, settings) –
-    # prompts and settings share the right column, toggled by focus.
+    # ── Layout: three real columns ───────────────────────────────────
     left_w = max(24, int(width * 0.38))
     mid_w = max(20, int(width * 0.28))
     col2_x = left_w + 1
@@ -914,16 +902,11 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     # ── Section headers ──────────────────────────────────────────────
     ch_attr = _color(C_TITLE, bold=True) if focus == "channels" else _color(C_HELP, dim=True)
     pl_attr = _color(C_TITLE, bold=True) if focus == "plugins" else _color(C_HELP, dim=True)
+    st_attr = _color(C_TITLE, bold=True) if focus == "settings" else _color(C_HELP, dim=True)
 
     _add(stdscr, 3, 1, "CHANNELS", ch_attr)
     _add(stdscr, 3, col2_x + 1, "PLUGINS", pl_attr)
-
-    # Right column header: show Prompts when focused, otherwise Settings
-    if focus == "prompts":
-        _add(stdscr, 3, col3_x + 1, "PROMPTS", _color(C_TITLE, bold=True))
-    else:
-        st_attr = _color(C_TITLE, bold=True) if focus == "settings" else _color(C_HELP, dim=True)
-        _add(stdscr, 3, col3_x + 1, "SETTINGS", st_attr)
+    _add(stdscr, 3, col3_x + 1, "SETTINGS", st_attr)
 
     # ── Vertical dividers ────────────────────────────────────────────
     for y in range(2, content_bottom + 1):
@@ -976,13 +959,9 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     if not plugins:
         _add(stdscr, 4, col2_x + 1, "no plugins", _color(C_HELP, dim=True))
 
-    # ── Column 3: Prompts (when focused) or Settings ─────────────────
-    if focus == "prompts":
-        right_rows = prompts
-    else:
-        right_rows = settings
-
-    right_selected_idx = state.prompt_idx if focus == "prompts" else state.setting_idx
+    # ── Column 3: Settings & actions ─────────────────────────────────
+    right_rows = settings
+    right_selected_idx = state.setting_idx
     right_start, visible_right_rows = _window_slice(right_rows, right_selected_idx, column_window)
     line = 4
     for offset, item in enumerate(visible_right_rows):
@@ -999,6 +978,8 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
             label = label.replace("autostart: off", f"autostart {ICON_DOT} off")
         elif kind.startswith("cred_bundle:"):
             r_icon = ICON_ON if "on" in label else ICON_OFF
+        elif kind.startswith("channel_"):
+            r_icon = ICON_PTR
         elif kind.startswith("service_") and kind not in ("service_status",):
             r_icon = ICON_PTR
         elif kind == "auth_login":
@@ -1015,7 +996,7 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
             r_icon = " "
 
         text = f" {r_icon} {label}"
-        is_sel = (focus == "prompts" and idx == state.prompt_idx) or (focus == "settings" and idx == state.setting_idx)
+        is_sel = focus == "settings" and idx == state.setting_idx
         attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
         _add(stdscr, line, col3_x, _fit(text, right_w), attr)
         line += 1
@@ -1143,6 +1124,24 @@ def _window_slice(items: list[Any], selected: int, window: int) -> tuple[int, li
     return (start, items[start : start + window])
 
 
+def _selected_channel(channels: list[dict[str, Any]], selected: int) -> dict[str, Any] | None:
+    if not channels:
+        return None
+    current = min(max(0, selected), len(channels) - 1)
+    item = channels[current]
+    return item if isinstance(item, dict) else None
+
+
+def _selected_channel_label(channel: dict[str, Any] | None) -> str:
+    if not channel:
+        return "selected channel"
+    kind = str(channel.get("kind", "")).strip().lower()
+    name = str(channel.get("name", "")).strip()
+    if kind and name:
+        return f"{kind}:{name}"
+    return "selected channel"
+
+
 def _dashboard_provider_choices(service: Any, agent: dict[str, Any]) -> list[str]:
     current = str(agent.get("agent", {}).get("provider", "")).strip().lower()
     ordered: list[str] = []
@@ -1171,11 +1170,11 @@ def _prompt_items(agent: dict[str, Any]) -> list[dict[str, str]]:
                 {
                     "kind": "prompt_edit",
                     "prompt": str(name),
-                    "label": f"edit {name} ({len(content)} chars)",
+                    "label": f"prompt: edit {name} ({len(content)} chars)",
                 }
             )
-    prompt_rows.append({"kind": "prompt_sync_from_disk", "label": "sync prompts from disk"})
-    prompt_rows.append({"kind": "prompt_write_to_disk", "label": "write prompts to disk"})
+    prompt_rows.append({"kind": "prompt_sync_from_disk", "label": "prompt: sync from disk"})
+    prompt_rows.append({"kind": "prompt_write_to_disk", "label": "prompt: write to disk"})
     return prompt_rows
 
 
@@ -1267,8 +1266,7 @@ def _prompt_channel_values(default_kind: str = "", default_name: str = "") -> tu
 
 
 def _focus_name(state: DashboardState) -> str:
-    focus_names = ["channels", "plugins", "prompts", "settings"]
-    return focus_names[min(max(0, state.focus_idx), len(focus_names) - 1)]
+    return DETAIL_FOCUS_NAMES[min(max(0, state.focus_idx), len(DETAIL_FOCUS_NAMES) - 1)]
 
 
 def _run_channel_detail_action(
@@ -1331,7 +1329,11 @@ def _run_channel_detail_action(
 # ═════════════════════════════════════════════════════════════════════
 
 
-def _settings_items(agent: dict[str, Any], provider_choices: list[str] | None = None) -> list[dict[str, str]]:
+def _settings_items(
+    agent: dict[str, Any],
+    provider_choices: list[str] | None = None,
+    selected_channel: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     info = agent.get("agent", {})
     is_local = bool(info.get("local_user", False))
     prefix = "(local) " if is_local else ""
@@ -1339,12 +1341,34 @@ def _settings_items(agent: dict[str, Any], provider_choices: list[str] | None = 
     auth_profile = str(info.get("auth_profile", "")).strip()
     auth_source = str(info.get("auth_source", "")).strip()
     auth_summary = f"{info.get('auth_status', 'unknown')} {ICON_DOT} {info.get('auth_mode', '')}"
+    selected_channel_label = _selected_channel_label(selected_channel)
     if auth_profile:
         auth_summary += f" {ICON_DOT} {auth_profile}"
     elif auth_source:
         auth_summary += f" {ICON_DOT} {auth_source}"
-    rows = [
+    channel_rows: list[dict[str, str]] = []
+    if not is_local:
+        channel_rows = [
+            {"kind": "channel_add", "label": "channel: add"},
+            {"kind": "channel_add_connect", "label": "channel: add + link"},
+            {"kind": "channel_connect", "label": f"channel: link {selected_channel_label}"},
+            {"kind": "channel_unlink", "label": f"channel: unlink {selected_channel_label}"},
+        ]
+    switch_rows: list[dict[str, str]] = []
+    if not is_local:
+        for provider in provider_choices or []:
+            token = str(provider).strip().lower()
+            if not token or token == current_provider:
+                continue
+            switch_rows.append(
+                {
+                    "kind": f"provider_switch:{token}",
+                    "label": f"switch provider {ICON_DOT} {token}",
+                }
+            )
+    rows: list[dict[str, str]] = channel_rows + [
         {"kind": "provider_current", "label": f"{prefix}provider: {current_provider or 'unknown'}"},
+        *switch_rows,
         {"kind": "auth_status", "label": f"{prefix}auth: {auth_summary}"},
         {"kind": "auth_login", "label": f"{prefix}refresh / re-run login"},
         {
@@ -1368,18 +1392,7 @@ def _settings_items(agent: dict[str, Any], provider_choices: list[str] | None = 
                 "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
             }
         )
-        switch_rows: list[dict[str, str]] = []
-        for provider in provider_choices or []:
-            token = str(provider).strip().lower()
-            if not token or token == current_provider:
-                continue
-            switch_rows.append(
-                {
-                    "kind": f"provider_switch:{token}",
-                    "label": f"switch provider {ICON_DOT} {token}",
-                }
-            )
-        rows[1:1] = switch_rows
+    rows.extend(_prompt_items(agent))
     if is_local:
         return rows
     credential_sync = agent.get("credential_sync", {})
@@ -1414,6 +1427,26 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
     is_local = state.selected_agent_id.startswith("@local:")
     provider = state.selected_agent_id.split(":", 1)[1] if is_local else ""
     try:
+        if kind.startswith("channel_"):
+            channel = None
+            try:
+                agent = service.get_dashboard_agent(state.selected_agent_id)
+                channel = _selected_channel(agent.get("channels", []), state.channel_idx)
+            except Exception:  # noqa: BLE001
+                channel = None
+            action_map = {
+                "channel_add": "add",
+                "channel_add_connect": "add_connect",
+                "channel_connect": "connect",
+                "channel_unlink": "unlink",
+            }
+            action = action_map.get(kind)
+            if action:
+                _run_channel_detail_action(service, state, action, channel)
+                return
+        if kind.startswith("prompt_"):
+            _run_prompt_action(service, state, item)
+            return
         if kind == "autostart":
             if is_local:
                 state.notice = "autostart not applicable for local-user claw"

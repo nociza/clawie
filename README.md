@@ -136,7 +136,7 @@ clawie backup import backup.json
 - `v`: switch overview between `Agents` and `Channels` mode
 - `j` / `k` or arrow keys: move selection
 - `Enter`: open selected agent detail page
-- `Tab`: switch detail section (channels/plugins/settings)
+- `Tab` or `Left` / `Right`: switch detail section (`Channels` -> `Plugins` -> `Settings`)
 - `Space` / `Enter`: run action for selected row
 - In `Channels` overview mode:
   - `Tab`: switch focus between channel list and target agent list
@@ -148,10 +148,13 @@ clawie backup import backup.json
   - `N`: add a channel and immediately link it with the provider
   - `c` / `l`: link the selected assigned channel
   - `u`: unlink the selected assigned channel
-- In Settings, use service rows to run `<provider> service start|stop|restart|status`
-- In Settings, use auth rows to inspect linked-auth state and run re-login
-- In Settings, use provider rows to switch a managed agent between configured providers
-- In Settings, use `cred ...` rows to toggle bundle policy, sync credentials, and revoke credential access.
+- In the detail `Settings` section:
+  - use `channel ...` rows to add, link, and unlink channels for the selected agent
+  - use auth rows to inspect linked-auth state and run re-login
+  - use provider rows to switch a managed agent between configured providers
+  - use service rows to run `<provider> service start|stop|restart|status`
+  - use `prompt ...` rows to edit/sync/write core prompts
+  - use `cred ...` rows to toggle bundle policy, sync credentials, and revoke credential access
 - `d`: purge selected agent (requires confirmation)
 - `b` or `Esc`: back to overview
 - `r`: refresh, `q`: quit

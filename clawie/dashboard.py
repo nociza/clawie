@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,12 @@ class DashboardState:
     purge_confirm: bool = False
     notice: str = ""
     notice_error: bool = False
+    detail_agent: dict[str, Any] | None = None
+    detail_agent_id: str = ""
+    channel_inventory: dict[str, Any] | None = None
+    reload_requested: bool = True
+    live_refresh_requested: bool = True
+    last_live_refresh_at: float = 0.0
 
 
 DETAIL_FOCUS_NAMES = ("channels", "plugins", "settings")
@@ -106,8 +113,7 @@ def run_dashboard(
 
 def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int) -> None:
     curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(max(1, int(refresh_seconds)) * 1000)
+    stdscr.timeout(100)
     _init_colors()
 
     state = DashboardState()
@@ -115,12 +121,39 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
         state.selected_agent_id = agent_id
         state.view = "detail"
 
+    snapshot: dict[str, Any] = {}
+    refresh_interval = max(1.0, float(refresh_seconds))
     while True:
-        snapshot = service.performance_snapshot(
-            agent_id=None if state.view == "detail" else agent_id,
-            refresh=True,
-        )
-        _sync_selection(state, snapshot)
+        now = time.monotonic()
+        live_refresh = False
+        requested_live_refresh = state.live_refresh_requested or not snapshot
+        if requested_live_refresh:
+            live_refresh = True
+        elif (now - state.last_live_refresh_at) >= refresh_interval:
+            live_refresh = True
+
+        if live_refresh or state.reload_requested or not snapshot:
+            snapshot = service.performance_snapshot(
+                agent_id=None if state.view == "detail" else agent_id,
+                refresh=live_refresh,
+            )
+            _sync_selection(state, snapshot)
+            if state.view == "detail" and state.selected_agent_id:
+                if (
+                    state.reload_requested
+                    or requested_live_refresh
+                    or state.detail_agent is None
+                    or state.detail_agent_id != state.selected_agent_id
+                ):
+                    _load_detail_agent(state, service, force=True)
+            if state.overview_mode == "channels":
+                if state.reload_requested or requested_live_refresh or state.channel_inventory is None:
+                    _load_channel_inventory(state, service, force=True)
+            if live_refresh:
+                state.last_live_refresh_at = now
+                state.live_refresh_requested = False
+            state.reload_requested = False
+
         _draw(stdscr, snapshot, state, service)
 
         key = stdscr.getch()
@@ -131,12 +164,32 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
         if key == 27 and state.view == "overview" and state.overview_mode == "agents" and not state.purge_confirm:
             return
         if key in (ord("r"), ord("R")):
+            state.reload_requested = True
+            state.live_refresh_requested = True
             continue
 
+        prev_view = state.view
+        prev_overview_mode = state.overview_mode
+        prev_selected_agent_id = state.selected_agent_id
         if state.view == "overview":
-            _handle_overview_key(key, state, snapshot, service)
+            changed = _handle_overview_key(key, state, snapshot, service)
         else:
-            _handle_detail_key(key, state, service)
+            changed = _handle_detail_key(key, state, service)
+
+        if changed:
+            _invalidate_view_cache(state)
+            state.reload_requested = True
+        if (
+            state.view != prev_view
+            or state.overview_mode != prev_overview_mode
+            or state.selected_agent_id != prev_selected_agent_id
+        ):
+            if state.selected_agent_id != prev_selected_agent_id:
+                state.detail_agent = None
+                state.detail_agent_id = ""
+            if state.overview_mode != prev_overview_mode:
+                state.channel_inventory = None
+            state.reload_requested = True
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -144,7 +197,7 @@ def _loop(stdscr: Any, service: Any, agent_id: str | None, refresh_seconds: int)
 # ═════════════════════════════════════════════════════════════════════
 
 
-def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any], service: Any) -> None:
+def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, Any], service: Any) -> bool:
     # ── Purge confirmation intercept ─────────────────────────────────
     if state.purge_confirm:
         if key in (ord("y"), ord("Y")):
@@ -157,11 +210,11 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
                 state.notice_error = True
             state.purge_confirm = False
             state.selected_agent_id = ""
-            return
+            return True
         if key in (ord("n"), ord("N"), 27):
             state.purge_confirm = False
-            return
-        return  # swallow all other keys during confirm
+            return False
+        return False  # swallow all other keys during confirm
 
     if key in (ord("v"), ord("V")):
         state.notice = ""
@@ -172,11 +225,10 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
         else:
             state.overview_mode = "agents"
             state.overview_focus_idx = 0
-        return
+        return False
 
     if state.overview_mode == "channels":
-        _handle_channels_overview_key(key, state, snapshot, service)
-        return
+        return _handle_channels_overview_key(key, state, snapshot, service)
 
     rows = snapshot.get("rows", [])
     if key in (curses.KEY_DOWN, ord("j")):
@@ -203,6 +255,7 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
     elif key in (ord("d"), ord("D"), curses.KEY_DC):
         if rows and state.selected_agent_id:
             state.purge_confirm = True
+    return False
 
 
 def _handle_channels_overview_key(
@@ -210,12 +263,12 @@ def _handle_channels_overview_key(
     state: DashboardState,
     snapshot: dict[str, Any],
     service: Any,
-) -> None:
-    inventory = service.channel_inventory()
+) -> bool:
+    inventory = _load_channel_inventory(state, service)
     agent_rows = [row for row in snapshot.get("rows", []) if not str(row.get("agent_id", "")).startswith("@local:")]
     state.selected_target_row = min(state.selected_target_row, max(0, len(agent_rows) - 1))
     if not agent_rows:
-        return
+        return False
     target_agent_id = str(agent_rows[state.selected_target_row].get("agent_id", ""))
     rows = list(inventory.get("rows", []))
     available = [row for row in rows if str(row.get("source", "")) in {"local", "pool"}]
@@ -228,20 +281,20 @@ def _handle_channels_overview_key(
         state.overview_focus_idx = 0
         state.notice = ""
         state.notice_error = False
-        return
+        return False
 
     if key == 9:  # TAB
         state.overview_focus_idx = (state.overview_focus_idx + 1) % 3
-        return
+        return False
     if key == curses.KEY_BTAB:  # Shift-Tab
         state.overview_focus_idx = (state.overview_focus_idx - 1) % 3
-        return
+        return False
     if key == curses.KEY_RIGHT:
         state.overview_focus_idx = min(2, state.overview_focus_idx + 1)
-        return
+        return False
     if key == curses.KEY_LEFT:
         state.overview_focus_idx = max(0, state.overview_focus_idx - 1)
-        return
+        return False
 
     if key in (curses.KEY_DOWN, ord("j")):
         if state.overview_focus_idx == 0 and agent_rows:
@@ -250,7 +303,7 @@ def _handle_channels_overview_key(
             state.selected_available_row = min(len(available) - 1, state.selected_available_row + 1)
         elif state.overview_focus_idx == 2 and assigned:
             state.selected_assigned_row = min(len(assigned) - 1, state.selected_assigned_row + 1)
-        return
+        return False
     if key in (curses.KEY_UP, ord("k")):
         if state.overview_focus_idx == 0 and agent_rows:
             state.selected_target_row = max(0, state.selected_target_row - 1)
@@ -258,7 +311,7 @@ def _handle_channels_overview_key(
             state.selected_available_row = max(0, state.selected_available_row - 1)
         elif state.overview_focus_idx == 2 and assigned:
             state.selected_assigned_row = max(0, state.selected_assigned_row - 1)
-        return
+        return False
     if key in (ord("g"), curses.KEY_HOME):
         if state.overview_focus_idx == 0:
             state.selected_target_row = 0
@@ -266,7 +319,7 @@ def _handle_channels_overview_key(
             state.selected_available_row = 0
         else:
             state.selected_assigned_row = 0
-        return
+        return False
     if key in (ord("G"), curses.KEY_END):
         if state.overview_focus_idx == 0:
             state.selected_target_row = max(0, len(agent_rows) - 1)
@@ -274,7 +327,7 @@ def _handle_channels_overview_key(
             state.selected_available_row = max(0, len(available) - 1)
         else:
             state.selected_assigned_row = max(0, len(assigned) - 1)
-        return
+        return False
 
     selected_available = available[state.selected_available_row] if available else {}
     selected_assigned = assigned[state.selected_assigned_row] if assigned else {}
@@ -286,15 +339,16 @@ def _handle_channels_overview_key(
 
     if key in (ord("a"), ord("A")):
         if not available_kind or not available_name:
-            return
+            return False
         try:
             service.assign_channel_to_agent(source_agent_id, available_kind, available_name, target_agent_id)
             state.notice = f"assigned {available_kind}:{available_name} -> {target_agent_id}"
             state.notice_error = False
+            return True
         except Exception as exc:  # noqa: BLE001
             state.notice = str(exc)
             state.notice_error = True
-        return
+        return False
     if key in (ord("c"), ord("C")):
         kind = ""
         name = ""
@@ -302,67 +356,70 @@ def _handle_channels_overview_key(
             if state.overview_focus_idx == 1:
                 kind, name = available_kind, available_name
                 if not kind or not name:
-                    return
+                    return False
                 service.assign_channel_to_agent(source_agent_id, kind, name, target_agent_id)
             else:
                 kind, name = assigned_kind, assigned_name
                 if not kind or not name:
-                    return
+                    return False
             service.connect_agent_channel(target_agent_id, kind, name)
             state.notice = f"connected {kind}:{name} for {target_agent_id}"
             state.notice_error = False
+            return True
         except Exception as exc:  # noqa: BLE001
             state.notice = str(exc)
             state.notice_error = True
-        return
+        return False
     if key in (ord("u"), ord("U")):
         if not assigned_kind or not assigned_name:
-            return
+            return False
         try:
             service.unassign_channel_from_agent(target_agent_id, assigned_kind, assigned_name)
             state.notice = f"unassigned {assigned_kind}:{assigned_name}"
             state.notice_error = False
+            return True
         except Exception as exc:  # noqa: BLE001
             state.notice = str(exc)
             state.notice_error = True
-        return
+        return False
     if key in (curses.KEY_ENTER, 10, 13):
         state.notice = ""
         state.notice_error = False
         state.selected_agent_id = target_agent_id
         state.view = "detail"
+    return False
 
 
-def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
+def _handle_detail_key(key: int, state: DashboardState, service: Any) -> bool:
     if state.purge_confirm:
         if key in (ord("y"), ord("Y")):
             try:
                 service.purge_agent(state.selected_agent_id)
             except Exception:  # noqa: BLE001
                 state.purge_confirm = False
-                return
+                return False
             state.purge_confirm = False
             state.view = "overview"
             state.selected_agent_id = ""
-            return
+            return True
         if key in (ord("n"), ord("N"), 27):
             state.purge_confirm = False
-            return
-        return
+            return False
+        return False
 
     if key in (27, ord("b"), ord("B")):  # ESC/back
         state.view = "overview"
         state.notice = ""
         state.notice_error = False
-        return
+        return False
 
     state.focus_idx = max(0, min(state.focus_idx, len(DETAIL_FOCUS_NAMES) - 1))
     focus = DETAIL_FOCUS_NAMES[state.focus_idx]
 
     try:
-        agent = service.get_dashboard_agent(state.selected_agent_id)
+        agent = _load_detail_agent(state, service)
     except Exception:  # noqa: BLE001
-        return
+        return False
 
     channels = agent.get("channels", [])
     plugins = sorted(agent.get("agent", {}).get("plugins", {}).items())
@@ -377,16 +434,16 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
 
     if key == 9:  # TAB
         state.focus_idx = (state.focus_idx + 1) % len(DETAIL_FOCUS_NAMES)
-        return
+        return False
     if key == curses.KEY_BTAB:  # Shift-Tab
         state.focus_idx = (state.focus_idx - 1) % len(DETAIL_FOCUS_NAMES)
-        return
+        return False
     if key == curses.KEY_RIGHT:
         state.focus_idx = min(len(DETAIL_FOCUS_NAMES) - 1, state.focus_idx + 1)
-        return
+        return False
     if key == curses.KEY_LEFT:
         state.focus_idx = max(0, state.focus_idx - 1)
-        return
+        return False
 
     if key in (curses.KEY_DOWN, ord("j")):
         if focus == "channels":
@@ -395,7 +452,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.plugin_idx = min(max(0, len(plugins) - 1), state.plugin_idx + 1)
         else:
             state.setting_idx = min(max(0, len(settings) - 1), state.setting_idx + 1)
-        return
+        return False
 
     if key in (curses.KEY_UP, ord("k")):
         if focus == "channels":
@@ -404,7 +461,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.plugin_idx = max(0, state.plugin_idx - 1)
         else:
             state.setting_idx = max(0, state.setting_idx - 1)
-        return
+        return False
 
     if key in (ord("g"), curses.KEY_HOME):
         if focus == "channels":
@@ -413,7 +470,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.plugin_idx = 0
         else:
             state.setting_idx = 0
-        return
+        return False
     if key in (ord("G"), curses.KEY_END):
         if focus == "channels":
             state.channel_idx = max(0, len(channels) - 1)
@@ -421,7 +478,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             state.plugin_idx = max(0, len(plugins) - 1)
         else:
             state.setting_idx = max(0, len(settings) - 1)
-        return
+        return False
 
     if key == ord("a"):
         if state.selected_agent_id.startswith("@local:"):
@@ -432,27 +489,24 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
                 service.toggle_agent_autostart(state.selected_agent_id)
                 state.notice = "autostart toggled"
                 state.notice_error = False
+                return True
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
-        return
+        return False
     if focus == "channels" and key in (ord("n"),):
-        _run_channel_detail_action(service, state, "add")
-        return
+        return _run_channel_detail_action(service, state, "add")
     if focus == "channels" and key in (ord("N"),):
-        _run_channel_detail_action(service, state, "add_connect")
-        return
+        return _run_channel_detail_action(service, state, "add_connect")
     if focus == "channels" and key in (ord("c"), ord("C"), ord("l"), ord("L")):
         selected_channel = channels[state.channel_idx] if channels else None
-        _run_channel_detail_action(service, state, "connect", selected_channel)
-        return
+        return _run_channel_detail_action(service, state, "connect", selected_channel)
     if focus == "channels" and key in (ord("u"), ord("U")):
         selected_channel = channels[state.channel_idx] if channels else None
-        _run_channel_detail_action(service, state, "unlink", selected_channel)
-        return
+        return _run_channel_detail_action(service, state, "unlink", selected_channel)
     if key in (ord("d"), ord("D"), curses.KEY_DC):
         state.purge_confirm = True
-        return
+        return False
 
     if key in (ord(" "), curses.KEY_ENTER, 10, 13):
         if focus == "channels" and channels:
@@ -460,6 +514,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
                 service.toggle_agent_channel(state.selected_agent_id, state.channel_idx)
                 state.notice = "channel toggled"
                 state.notice_error = False
+                return True
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
@@ -469,13 +524,15 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
                 service.toggle_agent_plugin(state.selected_agent_id, plugin)
                 state.notice = f"plugin {plugin} toggled"
                 state.notice_error = False
+                return True
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
         elif focus == "settings":
             item = settings[state.setting_idx] if settings else None
             if item:
-                _run_setting_action(service, state, item)
+                return _run_setting_action(service, state, item)
+    return False
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -502,6 +559,32 @@ def _sync_selection(state: DashboardState, snapshot: dict[str, Any]) -> None:
     else:
         state.selected_row = min(state.selected_row, len(rows) - 1)
         state.selected_agent_id = str(rows[state.selected_row].get("agent_id", ""))
+
+
+def _invalidate_view_cache(state: DashboardState) -> None:
+    state.detail_agent = None
+    state.detail_agent_id = ""
+    state.channel_inventory = None
+
+
+def _load_detail_agent(state: DashboardState, service: Any, force: bool = False) -> dict[str, Any]:
+    agent_id = str(state.selected_agent_id).strip()
+    if not agent_id:
+        raise ValueError("selected_agent_id is required")
+    if not force and state.detail_agent is not None and state.detail_agent_id == agent_id:
+        return state.detail_agent
+    payload = service.get_dashboard_agent(agent_id)
+    state.detail_agent = payload
+    state.detail_agent_id = agent_id
+    return payload
+
+
+def _load_channel_inventory(state: DashboardState, service: Any, force: bool = False) -> dict[str, Any]:
+    if not force and state.channel_inventory is not None:
+        return state.channel_inventory
+    payload = service.channel_inventory()
+    state.channel_inventory = payload
+    return payload
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -755,7 +838,7 @@ def _draw_overview_channels(
 
     channels: list[dict[str, Any]] = []
     try:
-        inventory = service.channel_inventory()
+        inventory = _load_channel_inventory(state, service)
         channels = list(inventory.get("rows", []))
     except Exception:  # noqa: BLE001
         channels = []
@@ -855,7 +938,7 @@ def _draw_overview_channels(
 
 def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, width: int) -> None:
     try:
-        agent = service.get_dashboard_agent(state.selected_agent_id)
+        agent = _load_detail_agent(state, service)
     except Exception as exc:  # noqa: BLE001
         _add(stdscr, 2, 1, f"failed loading agent: {exc}", _color(C_ERROR))
         return
@@ -1178,7 +1261,7 @@ def _prompt_items(agent: dict[str, Any]) -> list[dict[str, str]]:
     return prompt_rows
 
 
-def _run_prompt_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
+def _run_prompt_action(service: Any, state: DashboardState, item: dict[str, str]) -> bool:
     kind = str(item.get("kind", ""))
     try:
         if kind == "prompt_sync_from_disk":
@@ -1196,15 +1279,19 @@ def _run_prompt_action(service: Any, state: DashboardState, item: dict[str, str]
             )
             if updated is None:
                 state.notice = "prompt edit cancelled"
+                state.notice_error = False
+                return False
             else:
                 service.set_agent_core_prompt(state.selected_agent_id, prompt, updated, sync_to_disk=True)
                 state.notice = f"updated {prompt}"
         else:
             state.notice = "unknown prompt action"
         state.notice_error = False
+        return True
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True
+        return False
 
 
 def _edit_text_in_editor(initial: str, suffix: str = ".md") -> str | None:
@@ -1274,11 +1361,11 @@ def _run_channel_detail_action(
     state: DashboardState,
     action: str,
     channel: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     if state.selected_agent_id.startswith("@local:"):
         state.notice = "channel management not supported for local-user claw"
         state.notice_error = False
-        return
+        return False
 
     kind = str((channel or {}).get("kind", "")).strip().lower()
     name = str((channel or {}).get("name", "")).strip()
@@ -1288,7 +1375,7 @@ def _run_channel_detail_action(
             if payload is None:
                 state.notice = "channel add cancelled"
                 state.notice_error = False
-                return
+                return False
             kind, name = payload
             service.assign_channel_to_agent("", kind, name, state.selected_agent_id)
             state.notice = f"added {kind}:{name}"
@@ -1297,7 +1384,7 @@ def _run_channel_detail_action(
             if payload is None:
                 state.notice = "channel add cancelled"
                 state.notice_error = False
-                return
+                return False
             kind, name = payload
             service.connect_agent_channel(state.selected_agent_id, kind, name)
             state.notice = f"added + linked {kind}:{name}"
@@ -1305,23 +1392,25 @@ def _run_channel_detail_action(
             if not kind or not name:
                 state.notice = "select a channel to link"
                 state.notice_error = False
-                return
+                return False
             service.connect_agent_channel(state.selected_agent_id, kind, name)
             state.notice = f"linked {kind}:{name}"
         elif action == "unlink":
             if not kind or not name:
                 state.notice = "select a channel to unlink"
                 state.notice_error = False
-                return
+                return False
             service.unassign_channel_from_agent(state.selected_agent_id, kind, name)
             state.channel_idx = max(0, state.channel_idx - 1)
             state.notice = f"unlinked {kind}:{name}"
         else:
             state.notice = "unknown channel action"
         state.notice_error = False
+        return True
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True
+        return False
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1422,7 +1511,7 @@ def _settings_items(
     return rows
 
 
-def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str]) -> None:
+def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str]) -> bool:
     kind = str(item.get("kind", ""))
     is_local = state.selected_agent_id.startswith("@local:")
     provider = state.selected_agent_id.split(":", 1)[1] if is_local else ""
@@ -1430,7 +1519,7 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
         if kind.startswith("channel_"):
             channel = None
             try:
-                agent = service.get_dashboard_agent(state.selected_agent_id)
+                agent = _load_detail_agent(state, service)
                 channel = _selected_channel(agent.get("channels", []), state.channel_idx)
             except Exception:  # noqa: BLE001
                 channel = None
@@ -1442,11 +1531,9 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
             }
             action = action_map.get(kind)
             if action:
-                _run_channel_detail_action(service, state, action, channel)
-                return
+                return _run_channel_detail_action(service, state, action, channel)
         if kind.startswith("prompt_"):
-            _run_prompt_action(service, state, item)
-            return
+            return _run_prompt_action(service, state, item)
         if kind == "autostart":
             if is_local:
                 state.notice = "autostart not applicable for local-user claw"
@@ -1523,9 +1610,11 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
         else:
             state.notice = "read-only setting"
         state.notice_error = False
+        return kind not in {"provider_current", "auth_status", "service_status", "heartbeat", "auth_mode", "cred_last_sync"}
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True
+        return False
 
 
 # ═════════════════════════════════════════════════════════════════════

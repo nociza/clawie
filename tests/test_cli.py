@@ -1939,6 +1939,61 @@ def test_dashboard_detail_right_arrow_twice_reaches_settings_panel() -> None:
     assert dashboard._focus_name(state) == "settings"
 
 
+def test_dashboard_detail_navigation_uses_cached_agent_payload() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_dashboard_agent(self, _: str) -> dict[str, object]:
+            self.calls += 1
+            return {
+                "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
+                "core_prompts": {"SOUL.md": "hello"},
+                "agent": {
+                    "plugins": {"memory": True},
+                    "provider": "picoclaw",
+                    "status": "running",
+                    "version": "1.0.0",
+                    "autostart": True,
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "heartbeat_seconds": 30,
+                    "auth_mode": "linked",
+                    "auth_status": "ready",
+                    "local_user": False,
+                },
+                "credential_sync": {"bundles": []},
+            }
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2)
+    _handle_detail_key(ord("j"), state, service)
+    _handle_detail_key(ord("k"), state, service)
+    assert service.calls == 1
+
+
+def test_dashboard_channels_navigation_uses_cached_inventory() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.inventory_calls = 0
+
+        def channel_inventory(self) -> dict[str, object]:
+            self.inventory_calls += 1
+            return {
+                "rows": [
+                    {"source": "pool", "kind": "telegram", "name": "team"},
+                    {"source": "agent", "owner_agent_id": "alice", "kind": "slack", "name": "ops", "enabled": True},
+                ]
+            }
+
+    service = FakeService()
+    state = DashboardState(view="overview", overview_mode="channels")
+    snapshot = {"rows": [{"agent_id": "alice"}, {"agent_id": "@local:picoclaw"}]}
+    dashboard._handle_overview_key(ord("j"), state, snapshot, service)
+    dashboard._handle_overview_key(ord("k"), state, snapshot, service)
+    assert service.inventory_calls == 1
+
+
 def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
     rows = _settings_items(
         {

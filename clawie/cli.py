@@ -148,7 +148,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     agent_sub = agent.add_subparsers(
         dest="agent_command",
         required=True,
-        metavar="{create,clone,prompt,credentials,auth,provider,list,show,delete,purge,create-batch}",
+        metavar="{create,clone,prompt,credentials,auth,provider,service,list,show,delete,purge,create-batch}",
     )
 
     create = agent_sub.add_parser("create", help="Create a new agent")
@@ -407,6 +407,28 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     )
     auth_login.set_defaults(func=cmd_agents_auth_login)
 
+    service = agent_sub.add_parser(
+        "service",
+        help="Control a managed agent runtime service",
+    )
+    service_sub = service.add_subparsers(
+        dest="agent_service_command",
+        required=True,
+        metavar="{start,stop,restart,status}",
+    )
+    for action in ("start", "stop", "restart", "status"):
+        action_parser = service_sub.add_parser(
+            action,
+            help=f"{action.title()} a managed agent runtime",
+        )
+        _add_positional_argument(
+            action_parser,
+            "agent_id",
+            metavar="AGENT_ID",
+            help_text="Agent ID",
+        )
+        action_parser.set_defaults(func=cmd_agents_service)
+
     provider = agent_sub.add_parser(
         "provider",
         help="Inspect and change an agent provider",
@@ -551,7 +573,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     runtime_sub = runtime.add_subparsers(
         dest="runtime_command",
         required=True,
-        metavar="{create,detect,status,login}",
+        metavar="{create,detect,status,login,service}",
     )
 
     create = runtime_sub.add_parser(
@@ -644,6 +666,28 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         help_text="Installed local provider name",
     )
     login.set_defaults(func=cmd_runtime_login)
+
+    service = runtime_sub.add_parser(
+        "service",
+        help="Control a local runtime service",
+    )
+    service_sub = service.add_subparsers(
+        dest="runtime_service_command",
+        required=True,
+        metavar="{start,stop,restart,status}",
+    )
+    for action in ("start", "stop", "restart", "status"):
+        action_parser = service_sub.add_parser(
+            action,
+            help=f"{action.title()} a local runtime service",
+        )
+        _add_positional_argument(
+            action_parser,
+            "provider",
+            metavar="PROVIDER",
+            help_text="Installed local provider name",
+        )
+        action_parser.set_defaults(func=cmd_runtime_service)
 
 
 def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
@@ -980,11 +1024,58 @@ def cmd_agents_auth_login(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
+def cmd_agents_service(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    action = _resolve_required_value(args.agent_service_command, field_name="action")
+    result = service.agent_service_action(agent_id, action)
+    verb = {"start": "Started", "stop": "Stopped", "restart": "Restarted", "status": "Status"}.get(action, action)
+    if action == "status":
+        print_info(
+            f"{agent_id}: {result.get('service_status', 'unknown')} "
+            f"({result.get('service_mode', 'unknown')})"
+        )
+    else:
+        print_success(f"{verb} service for {agent_id}")
+    print_info("Provider: " + str(result.get("provider", "")))
+    print_info("Linux user: " + str(result.get("linux_user", "")))
+    print_info("Service mode: " + str(result.get("service_mode", "unknown")))
+    output = str(result.get("output", "")).strip()
+    if output:
+        print_info("Output: " + output)
+    return 0
+
+
 def cmd_agents_provider_set(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     provider = _resolve_required_value(args.provider, field_name="provider")
-    agent = service.set_agent_provider(agent_id, provider)
-    print_success(f"Changed provider for {agent_id} to {agent.get('agent', {}).get('provider', '')}")
+    result = service.switch_agent_provider(agent_id, provider)
+    agent = result["agent"]
+    if bool(result.get("changed", True)):
+        print_success(f"Changed provider for {agent_id} to {agent.get('agent', {}).get('provider', '')}")
+    else:
+        print_info(f"{agent_id} already uses {agent.get('agent', {}).get('provider', '')}")
+    stopped = result.get("stopped_service", {})
+    if stopped:
+        print_info(
+            f"Stopped {result.get('from_provider', '')}: "
+            f"{stopped.get('service_status', 'unknown')} ({stopped.get('service_mode', 'unknown')})"
+        )
+    service_result = result.get("service", {})
+    if service_result:
+        print_info(
+            f"Started {result.get('to_provider', '')}: "
+            f"{service_result.get('service_status', 'unknown')} ({service_result.get('service_mode', 'unknown')})"
+        )
+    channels = result.get("reconnected_channels", [])
+    if channels:
+        tokens = [f"{row.get('kind', '')}:{row.get('name', '')}" for row in channels]
+        print_info("Reconnected channels: " + ", ".join(token for token in tokens if token))
+    auth = result.get("auth", {})
+    if auth:
+        print_info(
+            f"Auth after switch: {auth.get('auth_status', 'unknown')}"
+            + (f" ({auth.get('detail', '')})" if str(auth.get("detail", "")).strip() else "")
+        )
     _print_agent(service.get_dashboard_agent(agent_id))
     return 0
 
@@ -1217,6 +1308,24 @@ def cmd_runtime_login(args: argparse.Namespace, service: ZeroClawService) -> int
     else:
         print_success(f"Completed linked login for {provider}")
     _print_auth_status(payload, title="Runtime Auth")
+    return 0
+
+
+def cmd_runtime_service(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    action = _resolve_required_value(args.runtime_service_command, field_name="action")
+    result = service.local_claw_service_action(provider, action)
+    verb = {"start": "Started", "stop": "Stopped", "restart": "Restarted", "status": "Status"}.get(action, action)
+    if action == "status":
+        print_info(
+            f"{provider}: {result.get('service_status', 'unknown')} "
+            f"({result.get('service_mode', 'unknown')})"
+        )
+    else:
+        print_success(f"{verb} runtime service for {provider}")
+    output = str(result.get("output", "")).strip()
+    if output:
+        print_info("Output: " + output)
     return 0
 
 

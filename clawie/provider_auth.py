@@ -94,12 +94,12 @@ def inspect_auth_files(provider: str, home: Path | None) -> dict[str, Any]:
         return {}
     spec = get_provider(provider)
     profiles_path = home / spec.state_dir / "auth-profiles.json"
-    if profiles_path.exists():
+    if _path_exists(profiles_path):
         parsed = auth_status_from_profiles_json(profiles_path)
         if parsed:
             return parsed
     codex_path = home / ".codex" / "auth.json"
-    if codex_path.exists():
+    if _path_exists(codex_path):
         parsed = auth_status_from_codex_auth_json(codex_path)
         if parsed:
             return parsed
@@ -223,3 +223,10 @@ def auth_status_from_expiry(expires_at: str, *, has_token: bool) -> str:
             return "expired"
         return "ready" if has_token else "unknown"
     return "expired" if parsed <= datetime.now(timezone.utc) else "ready"
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False

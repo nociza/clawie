@@ -127,6 +127,55 @@ def test_agent_provider_set_changes_provider(
     assert "provider: picoclaw" in output
 
 
+def test_agent_service_status_cli(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "agent_service_action",
+        lambda self, agent_id, action: {
+            "agent_id": agent_id,
+            "provider": "picoclaw",
+            "linux_user": "alice",
+            "action": action,
+            "service_status": "running",
+            "service_mode": "systemd",
+            "output": "active (running)",
+        },
+    )
+
+    code = run_cli(tmp_path, "agent", "service", "status", "alice")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "alice: running (systemd)" in output
+    assert "Provider: picoclaw" in output
+
+
+def test_runtime_service_status_cli(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "local_claw_service_action",
+        lambda self, provider, action: {
+            "provider": provider,
+            "action": action,
+            "service_status": "running",
+            "service_mode": "systemd",
+            "output": "active (running)",
+        },
+    )
+
+    code = run_cli(tmp_path, "runtime", "service", "status", "picoclaw")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "picoclaw: running (systemd)" in output
+
+
 def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234", "--workspace", "prod") == 0
     capsys.readouterr()
@@ -1603,6 +1652,167 @@ def test_set_agent_provider_updates_runtime_and_auth_mode(tmp_path: Path) -> Non
     assert info["service_mode"] == "unknown"
 
 
+def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        tail3 = cmd[-3:]
+        tail2 = cmd[-2:]
+        if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
+            return Result(stdout="active (running)")
+        if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            return Result(stdout="stopped")
+        if tail3 == ["/usr/bin/picoclaw", "service", "start"]:
+            return Result(stdout="started")
+        if tail2 in (
+            ["/usr/bin/picoclaw", "onboard"],
+            ["/usr/bin/picoclaw", "status"],
+        ):
+            return Result(stdout="ok")
+        if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
+            return Result(stdout="")
+        return Result(stdout="ok")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda provider: f"/usr/bin/{provider}")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.switch_agent_provider("teleclaw", "picoclaw")
+    updated = service.get_agent("teleclaw")
+    info = updated["agent"]
+
+    assert result["service"]["service_status"] == "running"
+    assert result["reconnected_channels"] == [{"kind": "telegram", "name": "teleclaw-team"}]
+    assert info["provider"] == "picoclaw"
+    assert info["runtime"] == "picoclaw-agent"
+    assert info["service_status"] == "running"
+    assert info["service_mode"] == "systemd"
+    assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
+    assert any(cmd[-3:] == ["/usr/bin/picoclaw", "service", "start"] for cmd in calls)
+    assert any(cmd[-2:] == ["/usr/bin/picoclaw", "onboard"] for cmd in calls)
+
+
+def test_set_agent_provider_requires_root_for_managed_user_switch(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    try:
+        service.set_agent_provider("teleclaw", "picoclaw")
+        assert False, "expected SetupError"
+    except Exception as exc:  # noqa: BLE001
+        assert "provider switching requires root" in str(exc)
+
+    assert service.get_agent("teleclaw")["agent"]["provider"] == "zeroclaw"
+
+
+def test_agent_auth_status_reports_permission_barrier_for_managed_user(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    payload = service.agent_auth_status("teleclaw")
+    assert payload["auth_status"] == "unknown"
+    assert payload["source"] == "permission"
+    assert payload["can_login"] is False
+    assert "requires root" in payload["detail"]
+
+
 def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None:
     class FakeService:
         def get_dashboard_agent(self, _: str) -> dict[str, object]:
@@ -1770,6 +1980,62 @@ def test_service_action_falls_back_when_bus_unavailable(
     updated = service.get_agent("teleclaw")
     assert updated["agent"]["service_mode"] == "fallback"
     assert int(updated["agent"]["fallback_pid"]) == 4321
+
+
+def test_service_action_fallback_uses_provider_state_dir(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    commands: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        commands.append(cmd)
+        if cmd[:3] == ["loginctl", "enable-linger", "teleclaw"]:
+            return Result(0)
+        if cmd[:2] == ["systemctl", "start"]:
+            return Result(0)
+        if cmd[:5] == ["sudo", "-u", "teleclaw", "-H", "--"] and "service" in cmd:
+            return Result(1, stderr="Failed to connect to bus: No medium found")
+        if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
+            return Result(0, stdout="4321\n")
+        return Result(0)
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda _: "/home/linuxbrew/.linuxbrew/bin/picoclaw")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.agent_service_action("teleclaw", "start")
+    assert result["service_status"] == "running"
+    assert any(".picoclaw/daemon.log" in cmd[-1] for cmd in commands if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"])
 
 
 def test_performance_snapshot_includes_local_user_claw_rows(
@@ -2577,6 +2843,48 @@ def test_connect_agent_channel_runs_provider_command(
     result = service.connect_agent_channel("alice", "telegram", "team")
     assert result["status"] == "connected"
     assert any(cmd[:3] == ["/usr/bin/openclaw", "channels", "add"] for cmd in calls)
+
+
+def test_connect_agent_channel_rolls_back_assignment_when_provider_command_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/openclaw")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **_: Result(1, stderr="connect failed"),
+    )
+
+    with raises(Exception):
+        service.connect_agent_channel("alice", "telegram", "team")
+
+    agent = service.get_agent("alice")
+    assert not any(c.get("kind") == "telegram" and c.get("name") == "team" for c in agent.get("channels", []))
 
 
 def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(

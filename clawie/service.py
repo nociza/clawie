@@ -547,7 +547,30 @@ class ZeroClawService:
         self._hydrate_agent_controls(agent)
         return agent
 
+    @staticmethod
+    def _current_linux_user() -> str:
+        try:
+            return str(pwd.getpwuid(os.geteuid()).pw_name)
+        except KeyError:
+            return ""
+
+    def _can_manage_linux_user(self, linux_user: str) -> bool:
+        token = str(linux_user).strip()
+        if not token:
+            return True
+        return os.geteuid() == 0 or token == self._current_linux_user()
+
+    def _require_linux_user_access(self, linux_user: str, purpose: str) -> None:
+        if self._can_manage_linux_user(linux_user):
+            return
+        raise SetupError(
+            f"{purpose} requires root when agent linux_user differs from current user. Re-run with sudo/root."
+        )
+
     def set_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
+        return self.switch_agent_provider(agent_id, provider)["agent"]
+
+    def switch_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
         self._require_setup()
         token = str(agent_id).strip()
         if not token:
@@ -574,18 +597,102 @@ class ZeroClawService:
             raise SetupError(f"provider '{target_spec.name}' is not configured. Run 'clawie config set'.")
 
         if current_provider == target_spec.name:
-            return agent
+            auth = self.agent_auth_status(token)
+            return {
+                "agent": agent,
+                "changed": False,
+                "from_provider": current_provider,
+                "to_provider": target_spec.name,
+                "service": {},
+                "stopped_service": {},
+                "reconnected_channels": [],
+                "auth": auth,
+            }
+
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+        stop_result: dict[str, Any] = {}
+        start_result: dict[str, Any] = {}
+        reconnected_channels: list[dict[str, str]] = []
+        old_running = False
+        old_service_state = {
+            "service_status": str(info.get("service_status", "unknown")),
+            "service_mode": str(info.get("service_mode", "unknown")),
+            "fallback_pid": int(info.get("fallback_pid", 0) or 0),
+        }
+        new_service_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
+
+        if linux_user:
+            self._require_linux_user_access(linux_user, "provider switching")
+            self._resolve_provider_executable(target_spec.name)
+            if current_provider:
+                self._resolve_provider_executable(current_provider)
+            if home:
+                self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
+
+        try:
+            if linux_user and current_provider:
+                previous_status = self._run_managed_provider_service_action(
+                    provider=current_provider,
+                    action="status",
+                    linux_user=linux_user,
+                    agent_info=old_service_state,
+                )
+                old_running = str(previous_status.get("service_status", "unknown")) == "running"
+                if old_running or int(old_service_state.get("fallback_pid", 0) or 0) > 0:
+                    stop_result = self._run_managed_provider_service_action(
+                        provider=current_provider,
+                        action="stop",
+                        linux_user=linux_user,
+                        agent_info=old_service_state,
+                    )
+
+            if linux_user:
+                start_result = self._run_managed_provider_service_action(
+                    provider=target_spec.name,
+                    action="start",
+                    linux_user=linux_user,
+                    agent_info=new_service_state,
+                )
+                reconnected_channels = self._reconnect_agent_channels(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    channels=agent.get("channels", []),
+                )
+        except Exception:
+            if linux_user and str(start_result.get("service_status", "")) == "running":
+                try:
+                    self._run_managed_provider_service_action(
+                        provider=target_spec.name,
+                        action="stop",
+                        linux_user=linux_user,
+                        agent_info=new_service_state,
+                    )
+                except Exception:
+                    pass
+            if linux_user and current_provider and old_running:
+                try:
+                    self._run_managed_provider_service_action(
+                        provider=current_provider,
+                        action="start",
+                        linux_user=linux_user,
+                        agent_info=old_service_state,
+                    )
+                except Exception:
+                    pass
+            raise
 
         info["provider"] = target_spec.name
         info["runtime"] = target_spec.runtime
         info["auth_mode"] = str(provider_auth.get("auth_mode", target_spec.default_auth_mode))
-        info["service_status"] = "unknown"
-        info["service_mode"] = "unknown"
+        info["service_status"] = str(start_result.get("service_status", "unknown")) if linux_user else "unknown"
+        info["service_mode"] = str(start_result.get("service_mode", "unknown")) if linux_user else "unknown"
         info["pid"] = 0
-        if "fallback_pid" in info:
-            info["fallback_pid"] = 0
+        if "fallback_pid" in info or int(start_result.get("fallback_pid", 0) or 0) > 0:
+            info["fallback_pid"] = int(start_result.get("fallback_pid", 0) or 0)
         info["last_sync"] = now_iso()
-        agent["core_prompts"] = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+        agent["core_prompts"] = prompts
         self._event(
             state,
             "agents.provider_changed",
@@ -594,10 +701,24 @@ class ZeroClawService:
                 "agent_id": token,
                 "from_provider": current_provider,
                 "to_provider": target_spec.name,
+                "linux_user": linux_user,
+                "service_status": str(start_result.get("service_status", "unknown")),
+                "service_mode": str(start_result.get("service_mode", "unknown")),
+                "reconnected_channels": len(reconnected_channels),
             },
         )
         self.store.write_state(state)
-        return agent
+        auth = self.agent_auth_status(token)
+        return {
+            "agent": agent,
+            "changed": True,
+            "from_provider": current_provider,
+            "to_provider": target_spec.name,
+            "service": start_result,
+            "stopped_service": stop_result,
+            "reconnected_channels": reconnected_channels,
+            "auth": auth,
+        }
 
     def get_agent_credential_sync(self, agent_id: str) -> dict[str, Any]:
         payload = self.get_dashboard_agent(agent_id)
@@ -920,24 +1041,18 @@ class ZeroClawService:
         self.store.write_state(state)
         return agent
 
-    def agent_service_action(self, agent_id: str, action: str) -> dict[str, Any]:
-        self._require_setup()
+    def _run_managed_provider_service_action(
+        self,
+        *,
+        provider: str,
+        action: str,
+        linux_user: str,
+        agent_info: dict[str, Any],
+    ) -> dict[str, Any]:
         command = str(action).strip().lower()
         if command not in {"start", "stop", "restart", "status"}:
             raise ValueError("action must be one of: start, stop, restart, status")
 
-        state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
-        agent = agents.get(agent_id)
-        if not agent:
-            raise AgentNotFoundError(f"agent not found: {agent_id}")
-        self._hydrate_agent_controls(agent)
-
-        agent_info = agent.setdefault("agent", {})
-        provider = str(agent_info.get("provider", "")).strip().lower()
-        if not provider:
-            raise SetupError(f"agent '{agent_id}' has no provider configured")
-        linux_user = str(agent_info.get("linux_user", "")).strip()
         cmd = self._service_command(provider, command, linux_user)
         env = self._service_env(linux_user)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -958,39 +1073,25 @@ class ZeroClawService:
                 provider=provider,
                 action=command,
                 linux_user=linux_user,
-                executable=cmd[-3] if len(cmd) >= 3 else self._resolve_provider_executable(provider),
+                executable=self._command_executable(cmd),
                 agent_info=agent_info,
             )
-            service_status = str(fallback.get("service_status", "unknown"))
-            agent_info["service_status"] = service_status
-            agent_info["service_mode"] = "fallback"
-            agent_info["last_sync"] = now_iso()
-            self._event(
-                state,
-                "agents.service_action",
-                f"Service {command} for {agent_id} (fallback)",
-                {
-                    "agent_id": agent_id,
-                    "provider": provider,
-                    "linux_user": linux_user,
-                    "action": command,
-                    "service_status": service_status,
-                    "mode": "fallback",
-                },
-            )
-            self.store.write_state(state)
             return {
-                "agent_id": agent_id,
                 "provider": provider,
                 "linux_user": linux_user,
                 "action": command,
-                "service_status": service_status,
+                "service_status": str(fallback.get("service_status", "unknown")),
+                "service_mode": "fallback",
+                "fallback_pid": int(agent_info.get("fallback_pid", 0) or 0),
                 "output": str(fallback.get("output", "")),
+                "command": cmd,
             }
 
         if result.returncode != 0:
             raise SetupError(
-                f"{provider} service {command} failed for {agent_id}: "
+                f"{provider} service {command} failed"
+                + (f" for {linux_user}" if linux_user else "")
+                + ": "
                 + (output or f"exit {result.returncode}")
             )
 
@@ -1003,8 +1104,82 @@ class ZeroClawService:
         else:
             service_status = self._infer_service_status(output)
 
-        agent_info["service_status"] = service_status
-        agent_info["service_mode"] = "systemd"
+        return {
+            "provider": provider,
+            "linux_user": linux_user,
+            "action": command,
+            "service_status": service_status,
+            "service_mode": "systemd",
+            "fallback_pid": int(agent_info.get("fallback_pid", 0) or 0),
+            "output": output,
+            "command": cmd,
+        }
+
+    def _reconnect_agent_channels(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        channels: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        reconnectable: list[dict[str, str]] = []
+        commands: list[list[str]] = []
+        seen_commands: set[tuple[str, ...]] = set()
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            if not bool(channel.get("enabled", True)):
+                continue
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or not name or kind == "cli":
+                continue
+            reconnectable.append({"kind": kind, "name": name})
+            for cmd in self._channel_connect_commands(provider, kind, name, linux_user):
+                key = tuple(cmd)
+                if key in seen_commands:
+                    continue
+                seen_commands.add(key)
+                commands.append(cmd)
+
+        env = self._service_env(linux_user)
+        for cmd in commands:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode != 0:
+                raise SetupError(
+                    f"channel reconnect failed for {provider}: {output or f'exit {result.returncode}'}"
+                )
+        return reconnectable
+
+    def agent_service_action(self, agent_id: str, action: str) -> dict[str, Any]:
+        self._require_setup()
+        command = str(action).strip().lower()
+        if command not in {"start", "stop", "restart", "status"}:
+            raise ValueError("action must be one of: start, stop, restart, status")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+
+        agent_info = agent.setdefault("agent", {})
+        provider = str(agent_info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{agent_id}' has no provider configured")
+        linux_user = str(agent_info.get("linux_user", "")).strip()
+        result = self._run_managed_provider_service_action(
+            provider=provider,
+            action=command,
+            linux_user=linux_user,
+            agent_info=agent_info,
+        )
+        agent_info["service_status"] = str(result.get("service_status", "unknown"))
+        agent_info["service_mode"] = str(result.get("service_mode", "unknown"))
+        if "fallback_pid" in agent_info or int(result.get("fallback_pid", 0) or 0) > 0:
+            agent_info["fallback_pid"] = int(result.get("fallback_pid", 0) or 0)
         agent_info["last_sync"] = now_iso()
         self._event(
             state,
@@ -1015,7 +1190,8 @@ class ZeroClawService:
                 "provider": provider,
                 "linux_user": linux_user,
                 "action": command,
-                "service_status": service_status,
+                "service_status": str(result.get("service_status", "unknown")),
+                "mode": str(result.get("service_mode", "unknown")),
             },
         )
         self.store.write_state(state)
@@ -1024,8 +1200,9 @@ class ZeroClawService:
             "provider": provider,
             "linux_user": linux_user,
             "action": command,
-            "service_status": service_status,
-            "output": output,
+            "service_status": str(result.get("service_status", "unknown")),
+            "service_mode": str(result.get("service_mode", "unknown")),
+            "output": str(result.get("output", "")),
         }
 
     def delete_agent(self, agent_id: str) -> None:
@@ -1442,14 +1619,18 @@ class ZeroClawService:
         if not provider:
             raise SetupError(f"agent '{target}' has no provider configured")
         linux_user = str(info.get("linux_user", "")).strip()
-        self.assign_channel_to_agent("", channel_kind, channel_name, target)
+        existing_channels = agent.get("channels", [])
+        already_assigned = (
+            isinstance(existing_channels, list)
+            and self._find_channel(existing_channels, channel_kind, channel_name) is not None
+        )
+        if not already_assigned:
+            self.assign_channel_to_agent("", channel_kind, channel_name, target)
 
         commands = self._channel_connect_commands(provider, channel_kind, channel_name, linux_user)
         last_error = ""
-        chosen: list[str] = []
+        env = self._service_env(linux_user)
         for cmd in commands:
-            chosen = cmd
-            env = self._service_env(linux_user)
             result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
             output = (result.stdout or result.stderr or "").strip()
             if result.returncode == 0:
@@ -1481,6 +1662,12 @@ class ZeroClawService:
                     "status": "connected",
                 }
             last_error = output or f"exit {result.returncode}"
+
+        if not already_assigned:
+            try:
+                self.unassign_channel_from_agent(target, channel_kind, channel_name)
+            except Exception:
+                pass
 
         raise SetupError(
             f"channel connect failed for {target} ({provider}): {last_error}. "
@@ -1713,8 +1900,7 @@ class ZeroClawService:
             home = self._local_agent_home(provider)
             if not home:
                 raise SetupError(f"could not resolve local home for provider '{provider}'")
-            for name, content in prompts.items():
-                self._write_core_prompt_file(provider, home, name, content)
+            self._write_prompt_files_for_home(provider, home, prompts)
             return self._local_agent_view(provider)
 
         state = self.store.read_state()
@@ -1726,11 +1912,7 @@ class ZeroClawService:
         if not home:
             raise SetupError(f"agent '{token}' has no linux_user home to write prompts to")
         linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
-        for name, content in prompts.items():
-            self._write_core_prompt_file(provider, home, name, content)
-            if linux_user and os.geteuid() == 0:
-                target = self._core_prompt_path(provider, home, name)
-                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
+        self._write_prompt_files_for_home(provider, home, prompts, linux_user)
         return agent
 
     def local_claw_service_action(self, provider: str, action: str) -> dict[str, Any]:
@@ -2275,19 +2457,10 @@ class ZeroClawService:
             credential_sync["last_synced_paths"] = list(copied)
         agent_state["credential_sync"] = credential_sync
         if copy_configs:
-            for name, content in cloned_prompts.items():
-                try:
-                    self._write_core_prompt_file(resolved_provider, target_home, name, content)
-                    subprocess.run(
-                        [
-                            "chown",
-                            f"{target_user}:{target_user}",
-                            str(self._core_prompt_path(resolved_provider, target_home, name)),
-                        ],
-                        check=False,
-                    )
-                except PermissionError:
-                    pass
+            try:
+                self._write_prompt_files_for_home(resolved_provider, target_home, cloned_prompts, target_user)
+            except PermissionError:
+                pass
         state = self.store.read_state()
         self._event(
             state,
@@ -3095,23 +3268,7 @@ class ZeroClawService:
     def _service_command(self, provider: str, action: str, linux_user: str) -> list[str]:
         executable = self._resolve_provider_executable(provider)
         base = [executable, "service", action]
-        if not linux_user:
-            return base
-
-        current_user = ""
-        try:
-            current_user = pwd.getpwuid(os.geteuid()).pw_name
-        except KeyError:
-            current_user = ""
-
-        if linux_user == current_user:
-            return base
-
-        if os.geteuid() != 0:
-            raise SetupError(
-                "service control requires root when agent linux_user differs from current user. Re-run with sudo/root."
-            )
-        return ["sudo", "-u", linux_user, "-H", "--", *base]
+        return self._wrap_user_command(base, linux_user, purpose="service control")
 
     def _channel_connect_commands(
         self,
@@ -3126,25 +3283,29 @@ class ZeroClawService:
 
         wrapped: list[list[str]] = []
         for raw in commands:
-            if linux_user:
-                wrapped.append(self._sudo_wrap(raw, linux_user))
-            else:
-                wrapped.append(raw)
+            wrapped.append(self._wrap_user_command(raw, linux_user, purpose="channel connect"))
         return wrapped
 
-    def _sudo_wrap(self, base: list[str], linux_user: str) -> list[str]:
-        current_user = ""
-        try:
-            current_user = pwd.getpwuid(os.geteuid()).pw_name
-        except KeyError:
-            current_user = ""
-        if not linux_user or linux_user == current_user:
+    def _wrap_user_command(self, base: list[str], linux_user: str, *, purpose: str) -> list[str]:
+        if not linux_user or linux_user == self._current_linux_user():
             return base
         if os.geteuid() != 0:
             raise SetupError(
-                "channel connect requires root when agent linux_user differs from current user. Re-run with sudo/root."
+                f"{purpose} requires root when agent linux_user differs from current user. Re-run with sudo/root."
             )
         return ["sudo", "-u", linux_user, "-H", "--", *base]
+
+    @staticmethod
+    def _command_executable(cmd: list[str]) -> str:
+        if "service" in cmd:
+            idx = cmd.index("service")
+            if idx > 0:
+                return str(cmd[idx - 1])
+        if "auth" in cmd:
+            idx = cmd.index("auth")
+            if idx > 0:
+                return str(cmd[idx - 1])
+        return str(cmd[0])
 
     @staticmethod
     def _resolve_provider_executable(provider: str) -> str:
@@ -3190,7 +3351,7 @@ class ZeroClawService:
     def _provider_auth_command(self, provider: str, action: str, linux_user: str) -> list[str]:
         executable = self._resolve_provider_executable(provider)
         base = [executable, "auth", action]
-        return self._sudo_wrap(base, linux_user)
+        return self._wrap_user_command(base, linux_user, purpose="auth control")
 
     @staticmethod
     def _path_or_none(value: Any) -> Path | None:
@@ -3264,6 +3425,17 @@ class ZeroClawService:
             )
             return payload
 
+        if linux_user and not self._can_manage_linux_user(linux_user):
+            payload.update(
+                {
+                    "auth_status": "unknown",
+                    "can_login": False,
+                    "detail": "auth inspection requires root for managed agents owned by another Linux user",
+                    "source": "permission",
+                }
+            )
+            return payload
+
         cli_status = self._run_provider_auth_status(provider=spec.name, linux_user=linux_user, home=home)
         if cli_status:
             payload.update(cli_status)
@@ -3299,6 +3471,8 @@ class ZeroClawService:
         mode = str(auth_mode).strip().lower()
         if mode != "linked":
             raise ValueError(f"{provider} uses '{mode}' auth; linked login is not applicable")
+        if linux_user:
+            self._require_linux_user_access(linux_user, "auth control")
 
         initial = self._inspect_provider_auth_state(
             provider=provider,
@@ -3435,21 +3609,22 @@ class ZeroClawService:
         if action == "restart":
             if pid and self._is_pid_running(pid, linux_user):
                 self._kill_pid(pid, linux_user)
-            new_pid = self._start_fallback_daemon(executable, linux_user)
+            new_pid = self._start_fallback_daemon(provider, executable, linux_user)
             agent_info["fallback_pid"] = new_pid
             return {"service_status": "running", "output": f"fallback daemon restarted pid={new_pid}"}
 
         # start
         if pid and self._is_pid_running(pid, linux_user):
             return {"service_status": "running", "output": f"fallback daemon already running pid={pid}"}
-        new_pid = self._start_fallback_daemon(executable, linux_user)
+        new_pid = self._start_fallback_daemon(provider, executable, linux_user)
         agent_info["fallback_pid"] = new_pid
         return {"service_status": "running", "output": f"fallback daemon started pid={new_pid}"}
 
-    def _start_fallback_daemon(self, executable: str, linux_user: str) -> int:
+    def _start_fallback_daemon(self, provider: str, executable: str, linux_user: str) -> int:
+        state_dir = get_provider(provider).state_dir
         script = (
-            'mkdir -p "$HOME/.zeroclaw"; '
-            f'nohup "{executable}" daemon >>"$HOME/.zeroclaw/daemon.log" 2>&1 & echo $!'
+            f'mkdir -p "$HOME/{state_dir}"; '
+            f'nohup "{executable}" daemon >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
         )
         cmd = self._user_shell_command(linux_user, script)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -3678,6 +3853,21 @@ class ZeroClawService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(content), encoding="utf-8")
         return path
+
+    def _write_prompt_files_for_home(
+        self,
+        provider: str,
+        home: Path,
+        prompts: dict[str, str],
+        linux_user: str = "",
+    ) -> list[str]:
+        written: list[str] = []
+        for name, content in self._normalize_core_prompts(provider, prompts).items():
+            target = self._write_core_prompt_file(provider, home, name, content)
+            if linux_user and os.geteuid() == 0:
+                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
+            written.append(str(target))
+        return written
 
     def _agent_linux_home(self, agent: dict[str, Any]) -> Path | None:
         linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()

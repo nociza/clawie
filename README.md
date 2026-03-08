@@ -76,9 +76,11 @@ clawie agent create|clone|list|show|delete|purge|create-batch
 clawie agent prompt copy
 clawie agent auth show|login
 clawie agent provider set
+clawie agent service start|stop|restart|status
 clawie agent credentials list|show|set|sync|revoke
 clawie channel apply|move
 clawie runtime create|detect|status|login
+clawie runtime service start|stop|restart|status
 clawie dashboard
 clawie health
 clawie event list
@@ -98,7 +100,8 @@ clawie agent list
 clawie agent show alice
 clawie agent auth show alice
 sudo clawie agent auth login alice
-clawie agent provider set alice picoclaw
+sudo clawie agent provider set alice picoclaw
+sudo clawie agent service restart alice
 clawie agent clone alice bob --channel-strategy migrate
 clawie agent delete bob
 clawie agent prompt copy alice bob
@@ -117,6 +120,7 @@ sudo clawie runtime create alice --user alice
 clawie runtime detect
 clawie runtime status
 clawie runtime login zeroclaw
+clawie runtime service status zeroclaw
 clawie health
 clawie event list --limit 50
 
@@ -144,6 +148,18 @@ clawie backup import backup.json
 - `d`: purge selected agent (requires confirmation)
 - `b` or `Esc`: back to overview
 - `r`: refresh, `q`: quit
+
+## Provider Switching
+
+- `agent provider set` is a real cutover for managed agents with a Linux user:
+  it validates the target provider, writes provider-specific prompt files,
+  stops the old provider service, starts the new one, and replays enabled
+  non-CLI channels.
+- Managed-agent cutovers require `sudo/root` when the agent Linux user differs
+  from the current shell user.
+- Linked auth remains on disk in the agent home. Use `clawie agent auth show`
+  to inspect it and `sudo clawie agent auth login AGENT_ID` if the new provider
+  needs a fresh login.
 
 ## Isolation and Credential Reuse
 

@@ -538,6 +538,22 @@ class ZeroClawService:
             key=lambda row: (row.get("created_at", ""), row.get("agent_id", row.get("user_id", ""))),
         )
 
+    def configured_provider_names(self) -> list[str]:
+        config = self.store.read_config()
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for item in [config.get("provider", "")] + list(self._normalized_provider_credentials(config).keys()):
+            token = str(item or "").strip().lower()
+            if not token or token in seen:
+                continue
+            try:
+                get_provider(token)
+            except ValueError:
+                continue
+            seen.add(token)
+            ordered.append(token)
+        return ordered
+
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))

@@ -368,7 +368,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
     state.channel_idx = min(state.channel_idx, max(0, len(channels) - 1))
     state.plugin_idx = min(state.plugin_idx, max(0, len(plugins) - 1))
     state.prompt_idx = min(state.prompt_idx, max(0, len(prompts) - 1))
-    settings = _settings_items(agent)
+    settings = _settings_items(agent, _dashboard_provider_choices(service, agent))
     state.setting_idx = min(state.setting_idx, max(0, len(settings) - 1))
 
     if key == 9:  # TAB
@@ -439,6 +439,20 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> None:
             except Exception as exc:  # noqa: BLE001
                 state.notice = str(exc)
                 state.notice_error = True
+        return
+    if focus == "channels" and key in (ord("n"),):
+        _run_channel_detail_action(service, state, "add")
+        return
+    if focus == "channels" and key in (ord("N"),):
+        _run_channel_detail_action(service, state, "add_connect")
+        return
+    if focus == "channels" and key in (ord("c"), ord("C"), ord("l"), ord("L")):
+        selected_channel = channels[state.channel_idx] if channels else None
+        _run_channel_detail_action(service, state, "connect", selected_channel)
+        return
+    if focus == "channels" and key in (ord("u"), ord("U")):
+        selected_channel = channels[state.channel_idx] if channels else None
+        _run_channel_detail_action(service, state, "unlink", selected_channel)
         return
     if key in (ord("d"), ord("D"), curses.KEY_DC):
         state.purge_confirm = True
@@ -535,11 +549,29 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
         if state.purge_confirm:
             footer = f"{ICON_WARN} CONFIRM PURGE: y confirm {ICON_DOT} n cancel"
         else:
-            footer = (
-                f"j/k navigate {ICON_DOT} Tab/\u2190\u2192 section {ICON_DOT} "
-                f"Space action {ICON_DOT} a autostart {ICON_DOT} d purge {ICON_DOT} "
-                f"Esc/b back {ICON_DOT} q quit"
-            )
+            focus = _focus_name(state)
+            if focus == "channels":
+                footer = (
+                    f"j/k navigate {ICON_DOT} Space enable {ICON_DOT} "
+                    f"n add {ICON_DOT} N add+link {ICON_DOT} c link {ICON_DOT} u unlink {ICON_DOT} "
+                    f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
+                )
+            elif focus == "plugins":
+                footer = (
+                    f"j/k navigate {ICON_DOT} Space toggle plugin {ICON_DOT} "
+                    f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
+                )
+            elif focus == "prompts":
+                footer = (
+                    f"j/k navigate {ICON_DOT} Space open action {ICON_DOT} "
+                    f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
+                )
+            else:
+                footer = (
+                    f"j/k navigate {ICON_DOT} Space run action {ICON_DOT} "
+                    f"a autostart {ICON_DOT} d purge {ICON_DOT} "
+                    f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
+                )
 
     # ── Notice bar ───────────────────────────────────────────────────
     if state.purge_confirm and state.view == "overview":
@@ -648,10 +680,13 @@ def _draw_overview_agents(
         _hline(stdscr, content_bottom, width, junctions={split: BT})
 
     # ── Agent rows ───────────────────────────────────────────────────
+    row_window = max(0, content_bottom - 4)
+    row_start, visible_rows = _window_slice(list(rows), state.selected_row, row_window)
     line = 4
-    for idx, row in enumerate(rows):
+    for offset, row in enumerate(visible_rows):
         if line >= content_bottom:
             break
+        idx = row_start + offset
         agent_id = _display_agent_id(str(row.get("agent_id", "")))
         status = str(row.get("status", ""))
         icon = _status_icon(status)
@@ -768,12 +803,15 @@ def _draw_overview_channels(
         _hline(stdscr, content_bottom, width, junctions={col_w: BT, col3_x - 1: BT})
 
     # ── Column 1: Target agents ──────────────────────────────────────
+    agent_window = max(0, rows_max)
+    agent_start, visible_agents = _window_slice(agent_rows, state.selected_target_row, agent_window)
     line = 5
     if not agent_rows:
         _add(stdscr, line, 1, "no managed agents", _color(C_HELP, dim=True))
-    for idx, row in enumerate(agent_rows[:rows_max]):
+    for offset, row in enumerate(visible_agents):
         if line >= content_bottom:
             break
+        idx = agent_start + offset
         is_sel = idx == state.selected_target_row
         ptr = ICON_PTR if is_sel else " "
         status = str(row.get("status", ""))
@@ -786,12 +824,14 @@ def _draw_overview_channels(
         line += 1
 
     # ── Column 2: Available channels ─────────────────────────────────
+    available_start, visible_available = _window_slice(available, state.selected_available_row, agent_window)
     line = 5
     if not available:
         _add(stdscr, line, col2_x + 1, "none", _color(C_HELP, dim=True))
-    for idx, channel in enumerate(available[:rows_max]):
+    for offset, channel in enumerate(visible_available):
         if line >= content_bottom:
             break
+        idx = available_start + offset
         source = str(channel.get("source", ""))
         badge = "pool" if source == "pool" else "local"
         text = f" {channel.get('kind', '')}:{channel.get('name', '')} [{badge}]"
@@ -802,12 +842,14 @@ def _draw_overview_channels(
         line += 1
 
     # ── Column 3: Assigned channels ──────────────────────────────────
+    assigned_start, visible_assigned = _window_slice(assigned, state.selected_assigned_row, agent_window)
     line = 5
     if not assigned:
         _add(stdscr, line, col3_x + 1, "none", _color(C_HELP, dim=True))
-    for idx, channel in enumerate(assigned[:rows_max]):
+    for offset, channel in enumerate(visible_assigned):
         if line >= content_bottom:
             break
+        idx = assigned_start + offset
         enabled = bool(channel.get("enabled", True))
         icon = ICON_ON if enabled else ICON_OFF
         text = f" {icon} {channel.get('kind', '')}:{channel.get('name', '')}"
@@ -837,15 +879,18 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     focus_names = ["channels", "plugins", "prompts", "settings"]
     state.focus_idx = min(state.focus_idx, len(focus_names) - 1)
     focus = focus_names[state.focus_idx]
+    settings = _settings_items(agent, _dashboard_provider_choices(service, agent))
     content_bottom = height - 3
 
     # ── Agent info bar (line 1) ──────────────────────────────────────
-    status = str(agent_info.get("status", ""))
+    status = str(agent_info.get("service_status", agent_info.get("status", "")))
     icon = _status_icon(status)
+    auth_status = str(agent_info.get("auth_status", "unknown"))
     info_line = (
         f" {ICON_BACK} {_display_agent_id(state.selected_agent_id)}"
         f"   {agent_info.get('provider', '')}"
         f" {ICON_DOT} {icon} {status}"
+        f" {ICON_DOT} auth {auth_status}"
         f" {ICON_DOT} v{agent_info.get('version', '')}"
     )
     _add(stdscr, 1, 0, _fit(info_line, width), _color(C_TITLE))
@@ -890,10 +935,13 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         _hline(stdscr, content_bottom, width, junctions={left_w: BT, col3_x - 1: BT})
 
     # ── Column 1: Channels ───────────────────────────────────────────
+    column_window = max(0, content_bottom - 4)
+    channel_start, visible_channels = _window_slice(channels, state.channel_idx, column_window)
     line = 4
-    for idx, channel in enumerate(channels[: max(0, content_bottom - 4)]):
+    for offset, channel in enumerate(visible_channels):
         if line >= content_bottom:
             break
+        idx = channel_start + offset
         enabled = bool(channel.get("enabled", True))
         ch_icon = ICON_ON if enabled else ICON_OFF
         text = f" {ch_icon} {channel.get('kind', '')}:{channel.get('name', '')}"
@@ -909,10 +957,12 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         _add(stdscr, 4, 1, "no channels", _color(C_HELP, dim=True))
 
     # ── Column 2: Plugins ────────────────────────────────────────────
+    plugin_start, visible_plugins = _window_slice(plugins, state.plugin_idx, column_window)
     line = 4
-    for idx, (key, enabled) in enumerate(plugins[: max(0, content_bottom - 4)]):
+    for offset, (key, enabled) in enumerate(visible_plugins):
         if line >= content_bottom:
             break
+        idx = plugin_start + offset
         pl_icon = ICON_ON if bool(enabled) else ICON_OFF
         text = f" {pl_icon} {key}"
         is_sel = focus == "plugins" and idx == state.plugin_idx
@@ -930,12 +980,15 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     if focus == "prompts":
         right_rows = prompts
     else:
-        right_rows = _settings_items(agent)
+        right_rows = settings
 
+    right_selected_idx = state.prompt_idx if focus == "prompts" else state.setting_idx
+    right_start, visible_right_rows = _window_slice(right_rows, right_selected_idx, column_window)
     line = 4
-    for idx, item in enumerate(right_rows):
+    for offset, item in enumerate(visible_right_rows):
         if line >= content_bottom:
             break
+        idx = right_start + offset
         label = str(item.get("label", ""))
         kind = str(item.get("kind", ""))
 
@@ -947,6 +1000,10 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         elif kind.startswith("cred_bundle:"):
             r_icon = ICON_ON if "on" in label else ICON_OFF
         elif kind.startswith("service_") and kind not in ("service_status",):
+            r_icon = ICON_PTR
+        elif kind == "auth_login":
+            r_icon = ICON_PTR
+        elif kind.startswith("provider_switch:"):
             r_icon = ICON_PTR
         elif kind in {"cred_sync_now", "cred_revoke_now"}:
             r_icon = ICON_PTR
@@ -1069,6 +1126,36 @@ def _display_agent_id(agent_id: str) -> str:
     return token
 
 
+def _window_start(total: int, selected: int, window: int) -> int:
+    if total <= 0 or window <= 0 or total <= window:
+        return 0
+    current = min(max(0, selected), total - 1)
+    start = current - (window // 2)
+    if start < 0:
+        return 0
+    return min(start, total - window)
+
+
+def _window_slice(items: list[Any], selected: int, window: int) -> tuple[int, list[Any]]:
+    start = _window_start(len(items), selected, window)
+    if window <= 0:
+        return (start, [])
+    return (start, items[start : start + window])
+
+
+def _dashboard_provider_choices(service: Any, agent: dict[str, Any]) -> list[str]:
+    current = str(agent.get("agent", {}).get("provider", "")).strip().lower()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in [current] + list(getattr(service, "configured_provider_names", lambda: [])()):
+        token = str(item or "").strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        ordered.append(token)
+    return ordered
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Prompts
 # ═════════════════════════════════════════════════════════════════════
@@ -1142,20 +1229,124 @@ def _edit_text_in_editor(initial: str, suffix: str = ".md") -> str | None:
             pass
 
 
+def _prompt_value(label: str, default: str = "") -> str | None:
+    prompt = label.strip() or "value"
+    try:
+        curses.def_prog_mode()
+    except curses.error:
+        pass
+    try:
+        curses.endwin()
+    except curses.error:
+        pass
+    try:
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{prompt}{suffix}: ").strip()
+        if value:
+            return value
+        return default or None
+    finally:
+        try:
+            curses.reset_prog_mode()
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+def _prompt_channel_values(default_kind: str = "", default_name: str = "") -> tuple[str, str] | None:
+    kind = _prompt_value("Channel kind", default_kind)
+    if not kind:
+        return None
+    name = _prompt_value("Channel name", default_name)
+    if not name:
+        return None
+    return (str(kind).strip(), str(name).strip())
+
+
+def _focus_name(state: DashboardState) -> str:
+    focus_names = ["channels", "plugins", "prompts", "settings"]
+    return focus_names[min(max(0, state.focus_idx), len(focus_names) - 1)]
+
+
+def _run_channel_detail_action(
+    service: Any,
+    state: DashboardState,
+    action: str,
+    channel: dict[str, Any] | None = None,
+) -> None:
+    if state.selected_agent_id.startswith("@local:"):
+        state.notice = "channel management not supported for local-user claw"
+        state.notice_error = False
+        return
+
+    kind = str((channel or {}).get("kind", "")).strip().lower()
+    name = str((channel or {}).get("name", "")).strip()
+    try:
+        if action == "add":
+            payload = _prompt_channel_values()
+            if payload is None:
+                state.notice = "channel add cancelled"
+                state.notice_error = False
+                return
+            kind, name = payload
+            service.assign_channel_to_agent("", kind, name, state.selected_agent_id)
+            state.notice = f"added {kind}:{name}"
+        elif action == "add_connect":
+            payload = _prompt_channel_values()
+            if payload is None:
+                state.notice = "channel add cancelled"
+                state.notice_error = False
+                return
+            kind, name = payload
+            service.connect_agent_channel(state.selected_agent_id, kind, name)
+            state.notice = f"added + linked {kind}:{name}"
+        elif action == "connect":
+            if not kind or not name:
+                state.notice = "select a channel to link"
+                state.notice_error = False
+                return
+            service.connect_agent_channel(state.selected_agent_id, kind, name)
+            state.notice = f"linked {kind}:{name}"
+        elif action == "unlink":
+            if not kind or not name:
+                state.notice = "select a channel to unlink"
+                state.notice_error = False
+                return
+            service.unassign_channel_from_agent(state.selected_agent_id, kind, name)
+            state.channel_idx = max(0, state.channel_idx - 1)
+            state.notice = f"unlinked {kind}:{name}"
+        else:
+            state.notice = "unknown channel action"
+        state.notice_error = False
+    except Exception as exc:  # noqa: BLE001
+        state.notice = str(exc)
+        state.notice_error = True
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Settings & Actions
 # ═════════════════════════════════════════════════════════════════════
 
 
-def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
+def _settings_items(agent: dict[str, Any], provider_choices: list[str] | None = None) -> list[dict[str, str]]:
     info = agent.get("agent", {})
     is_local = bool(info.get("local_user", False))
     prefix = "(local) " if is_local else ""
+    current_provider = str(info.get("provider", "")).strip().lower()
+    auth_profile = str(info.get("auth_profile", "")).strip()
+    auth_source = str(info.get("auth_source", "")).strip()
+    auth_summary = f"{info.get('auth_status', 'unknown')} {ICON_DOT} {info.get('auth_mode', '')}"
+    if auth_profile:
+        auth_summary += f" {ICON_DOT} {auth_profile}"
+    elif auth_source:
+        auth_summary += f" {ICON_DOT} {auth_source}"
     rows = [
-        {
-            "kind": "autostart",
-            "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
-        },
+        {"kind": "provider_current", "label": f"{prefix}provider: {current_provider or 'unknown'}"},
+        {"kind": "auth_status", "label": f"{prefix}auth: {auth_summary}"},
+        {"kind": "auth_login", "label": f"{prefix}refresh / re-run login"},
         {
             "kind": "service_status",
             "label": f"{prefix}status: {info.get('service_status', 'unknown')} {ICON_DOT} {info.get('service_mode', 'unknown')}",
@@ -1168,8 +1359,27 @@ def _settings_items(agent: dict[str, Any]) -> list[dict[str, str]]:
             "kind": "heartbeat",
             "label": f"{prefix}heartbeat: {int(info.get('heartbeat_seconds', 30))}s",
         },
-        {"kind": "auth_mode", "label": f"{prefix}auth: {info.get('auth_mode', '')}"},
+        {"kind": "auth_mode", "label": f"{prefix}auth mode: {info.get('auth_mode', '')}"},
     ]
+    if not is_local:
+        rows.append(
+            {
+                "kind": "autostart",
+                "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
+            }
+        )
+        switch_rows: list[dict[str, str]] = []
+        for provider in provider_choices or []:
+            token = str(provider).strip().lower()
+            if not token or token == current_provider:
+                continue
+            switch_rows.append(
+                {
+                    "kind": f"provider_switch:{token}",
+                    "label": f"switch provider {ICON_DOT} {token}",
+                }
+            )
+        rows[1:1] = switch_rows
     if is_local:
         return rows
     credential_sync = agent.get("credential_sync", {})
@@ -1210,6 +1420,30 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
             else:
                 service.toggle_agent_autostart(state.selected_agent_id)
                 state.notice = "autostart toggled"
+        elif kind == "auth_login":
+            result = service.agent_auth_login(state.selected_agent_id)
+            action = str(result.get("action_performed", "login"))
+            if action == "status":
+                state.notice = "auth already ready"
+            elif action == "refresh":
+                state.notice = "auth refreshed"
+            else:
+                state.notice = "auth login completed"
+        elif kind.startswith("provider_switch:"):
+            if is_local:
+                state.notice = "provider switching not supported for local-user claw"
+            else:
+                target = kind.split(":", 1)[1]
+                runner = getattr(service, "switch_agent_provider", None)
+                if callable(runner):
+                    result = runner(state.selected_agent_id, target)
+                    changed = bool(result.get("changed", True))
+                else:
+                    service.set_agent_provider(state.selected_agent_id, target)
+                    changed = True
+                state.notice = (
+                    f"provider changed to {target}" if changed else f"provider reconciled for {target}"
+                )
         elif kind == "service_start":
             if is_local:
                 service.local_claw_service_action(provider, "start")

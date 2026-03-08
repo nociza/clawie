@@ -143,7 +143,14 @@ clawie backup import backup.json
   - `a`: assign selected channel to selected agent
   - `c`: assign + run provider channel connect command for selected agent
 - `a`: toggle selected agent autostart
+- In the detail `Channels` section:
+  - `n`: add a channel to the selected agent
+  - `N`: add a channel and immediately link it with the provider
+  - `c` / `l`: link the selected assigned channel
+  - `u`: unlink the selected assigned channel
 - In Settings, use service rows to run `<provider> service start|stop|restart|status`
+- In Settings, use auth rows to inspect linked-auth state and run re-login
+- In Settings, use provider rows to switch a managed agent between configured providers
 - In Settings, use `cred ...` rows to toggle bundle policy, sync credentials, and revoke credential access.
 - `d`: purge selected agent (requires confirmation)
 - `b` or `Esc`: back to overview

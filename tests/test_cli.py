@@ -1733,6 +1733,76 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     assert any(cmd[-2:] == ["/usr/bin/picoclaw", "onboard"] for cmd in calls)
 
 
+def test_switch_agent_provider_reconciles_same_provider_runtime(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        calls.append(cmd)
+        tail3 = cmd[-3:]
+        if tail3 == ["/usr/bin/picoclaw", "service", "start"]:
+            return Result(stdout="started")
+        if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
+            return Result(stdout="active (running)")
+        if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            return Result(stdout="stopped")
+        if tail3 == ["/usr/bin/openclaw", "service", "status"]:
+            return Result(stdout="inactive")
+        if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
+            return Result(stdout="")
+        return Result(stdout="ok")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda provider: f"/usr/bin/{provider}")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.switch_agent_provider("teleclaw", "picoclaw")
+    assert result["changed"] is False
+    assert result["service"]["service_status"] == "running"
+    assert result["stopped_services"][-1]["provider"] == "zeroclaw"
+    assert any(cmd[-3:] == ["/usr/bin/picoclaw", "service", "start"] for cmd in calls)
+    assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
+
+
 def test_set_agent_provider_requires_root_for_managed_user_switch(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

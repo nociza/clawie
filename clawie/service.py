@@ -596,23 +596,12 @@ class ZeroClawService:
         if not self._is_provider_configured(target_spec.name, provider_auth):
             raise SetupError(f"provider '{target_spec.name}' is not configured. Run 'clawie config set'.")
 
-        if current_provider == target_spec.name:
-            auth = self.agent_auth_status(token)
-            return {
-                "agent": agent,
-                "changed": False,
-                "from_provider": current_provider,
-                "to_provider": target_spec.name,
-                "service": {},
-                "stopped_service": {},
-                "reconnected_channels": [],
-                "auth": auth,
-            }
-
+        changed = current_provider != target_spec.name
         linux_user = str(info.get("linux_user", "")).strip()
         home = self._agent_linux_home(agent)
         prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
         stop_result: dict[str, Any] = {}
+        stopped_results: list[dict[str, Any]] = []
         start_result: dict[str, Any] = {}
         reconnected_channels: list[dict[str, str]] = []
         old_running = False
@@ -623,16 +612,30 @@ class ZeroClawService:
         }
         new_service_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
 
+        if not changed and not linux_user:
+            auth = self.agent_auth_status(token)
+            return {
+                "agent": agent,
+                "changed": False,
+                "from_provider": current_provider,
+                "to_provider": target_spec.name,
+                "service": {},
+                "stopped_service": {},
+                "stopped_services": [],
+                "reconnected_channels": [],
+                "auth": auth,
+            }
+
         if linux_user:
             self._require_linux_user_access(linux_user, "provider switching")
             self._resolve_provider_executable(target_spec.name)
-            if current_provider:
+            if changed and current_provider:
                 self._resolve_provider_executable(current_provider)
             if home:
                 self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
 
         try:
-            if linux_user and current_provider:
+            if linux_user and changed and current_provider:
                 previous_status = self._run_managed_provider_service_action(
                     provider=current_provider,
                     action="status",
@@ -660,8 +663,34 @@ class ZeroClawService:
                     linux_user=linux_user,
                     channels=agent.get("channels", []),
                 )
+                if not changed:
+                    for other_provider in provider_names():
+                        if other_provider == target_spec.name:
+                            continue
+                        try:
+                            self._resolve_provider_executable(other_provider)
+                        except SetupError:
+                            continue
+                        other_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
+                        other_status = self._run_managed_provider_service_action(
+                            provider=other_provider,
+                            action="status",
+                            linux_user=linux_user,
+                            agent_info=other_state,
+                        )
+                        if (
+                            str(other_status.get("service_status", "unknown")) == "running"
+                            or int(other_state.get("fallback_pid", 0) or 0) > 0
+                        ):
+                            stopped = self._run_managed_provider_service_action(
+                                provider=other_provider,
+                                action="stop",
+                                linux_user=linux_user,
+                                agent_info=other_state,
+                            )
+                            stopped_results.append(stopped)
         except Exception:
-            if linux_user and str(start_result.get("service_status", "")) == "running":
+            if changed and linux_user and str(start_result.get("service_status", "")) == "running":
                 try:
                     self._run_managed_provider_service_action(
                         provider=target_spec.name,
@@ -671,7 +700,7 @@ class ZeroClawService:
                     )
                 except Exception:
                     pass
-            if linux_user and current_provider and old_running:
+            if changed and linux_user and current_provider and old_running:
                 try:
                     self._run_managed_provider_service_action(
                         provider=current_provider,
@@ -693,10 +722,12 @@ class ZeroClawService:
             info["fallback_pid"] = int(start_result.get("fallback_pid", 0) or 0)
         info["last_sync"] = now_iso()
         agent["core_prompts"] = prompts
+        if not stop_result and stopped_results:
+            stop_result = stopped_results[-1]
         self._event(
             state,
-            "agents.provider_changed",
-            f"Changed provider for {token}",
+            "agents.provider_changed" if changed else "agents.provider_reconciled",
+            f"Changed provider for {token}" if changed else f"Reconciled provider runtime for {token}",
             {
                 "agent_id": token,
                 "from_provider": current_provider,
@@ -705,17 +736,19 @@ class ZeroClawService:
                 "service_status": str(start_result.get("service_status", "unknown")),
                 "service_mode": str(start_result.get("service_mode", "unknown")),
                 "reconnected_channels": len(reconnected_channels),
+                "stopped_provider_count": len(stopped_results or ([stop_result] if stop_result else [])),
             },
         )
         self.store.write_state(state)
         auth = self.agent_auth_status(token)
         return {
             "agent": agent,
-            "changed": True,
+            "changed": changed,
             "from_provider": current_provider,
             "to_provider": target_spec.name,
             "service": start_result,
             "stopped_service": stop_result,
+            "stopped_services": stopped_results,
             "reconnected_channels": reconnected_channels,
             "auth": auth,
         }

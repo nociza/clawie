@@ -155,6 +155,9 @@ clawie backup import backup.json
   it validates the target provider, writes provider-specific prompt files,
   stops the old provider service, starts the new one, and replays enabled
   non-CLI channels.
+- If state already says the target provider, the same command still reconciles
+  runtime drift by starting the target provider and stopping other installed
+  provider services for that agent user.
 - Managed-agent cutovers require `sudo/root` when the agent Linux user differs
   from the current shell user.
 - Linked auth remains on disk in the agent home. Use `clawie agent auth show`

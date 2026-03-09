@@ -2064,6 +2064,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
 
     calls: list[list[str]] = []
+    runtime_state = {"zeroclaw": True, "picoclaw": False}
 
     class Result:
         def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
@@ -2073,15 +2074,27 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
+        if cmd[:2] == ["ps", "-eo"]:
+            lines: list[str] = []
+            if runtime_state["zeroclaw"]:
+                lines.append("teleclaw 4321 /usr/bin/zeroclaw daemon")
+            if runtime_state["picoclaw"]:
+                lines.append("teleclaw 5432 /usr/bin/picoclaw gateway")
+            return Result(stdout="\n".join(lines) + ("\n" if lines else ""))
         tail3 = cmd[-3:]
         tail2 = cmd[-2:]
         script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
         if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
-            return Result(stdout="active (running)")
+            return Result(stdout="active (running)" if runtime_state["zeroclaw"] else "inactive")
         if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            runtime_state["zeroclaw"] = False
             return Result(stdout="stopped")
         if "picoclaw" in script and "gateway" in script:
-            return Result(stdout="started pid=123")
+            if "nohup" in script:
+                runtime_state["picoclaw"] = True
+                return Result(stdout="started pid=123")
+            runtime_state["picoclaw"] = True
+            return Result(stdout="active (running)" if runtime_state["picoclaw"] else "inactive")
         if tail2 in (
             ["/usr/bin/picoclaw", "onboard"],
             ["/usr/bin/picoclaw", "status"],
@@ -2146,6 +2159,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
 
     calls: list[list[str]] = []
+    runtime_state = {"zeroclaw": True, "picoclaw": False, "openclaw": False}
 
     class Result:
         def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
@@ -2155,16 +2169,30 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
+        if cmd[:2] == ["ps", "-eo"]:
+            lines: list[str] = []
+            if runtime_state["zeroclaw"]:
+                lines.append("teleclaw 4321 /usr/bin/zeroclaw daemon")
+            if runtime_state["picoclaw"]:
+                lines.append("teleclaw 5432 /usr/bin/picoclaw gateway")
+            if runtime_state["openclaw"]:
+                lines.append("teleclaw 6543 /usr/bin/openclaw gateway run")
+            return Result(stdout="\n".join(lines) + ("\n" if lines else ""))
         tail3 = cmd[-3:]
         script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
         if "picoclaw" in script and "gateway" in script:
-            return Result(stdout="started pid=123")
+            if "nohup" in script:
+                runtime_state["picoclaw"] = True
+                return Result(stdout="started pid=123")
+            runtime_state["picoclaw"] = True
+            return Result(stdout="active (running)" if runtime_state["picoclaw"] else "inactive")
         if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
-            return Result(stdout="active (running)")
+            return Result(stdout="active (running)" if runtime_state["zeroclaw"] else "inactive")
         if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            runtime_state["zeroclaw"] = False
             return Result(stdout="stopped")
         if tail3 == ["/usr/bin/openclaw", "daemon", "status"]:
-            return Result(stdout="inactive")
+            return Result(stdout="active (running)" if runtime_state["openclaw"] else "inactive")
         if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
             return Result(stdout="")
         return Result(stdout="ok")
@@ -2174,11 +2202,88 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     monkeypatch.setattr("subprocess.run", fake_run)
 
     result = service.switch_agent_provider("teleclaw", "picoclaw")
-    assert result["changed"] is False
+    assert result["changed"] is True
+    assert result["from_provider"] == "zeroclaw"
     assert result["service"]["service_status"] == "running"
-    assert result["stopped_services"][-1]["provider"] == "zeroclaw"
+    assert result["stopped_service"]["provider"] == "zeroclaw"
     assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
+
+
+def test_switch_agent_provider_fails_when_live_runtime_does_not_cut_over(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            return Result(stdout="teleclaw 4321 /usr/bin/zeroclaw daemon\n")
+        tail3 = cmd[-3:]
+        script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
+        if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
+            return Result(stdout="active (running)")
+        if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            return Result(stdout="stopped")
+        if "picoclaw" in script and "gateway" in script:
+            if "nohup" in script:
+                return Result(stdout="started pid=123")
+            if "pgrep" in script:
+                return Result(stdout="inactive")
+            return Result(stdout="inactive")
+        return Result(stdout="ok")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda provider: f"/usr/bin/{provider}")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with raises(Exception) as exc:
+        service.switch_agent_provider("teleclaw", "picoclaw")
+
+    assert (
+        "did not produce a live picoclaw runtime" in str(exc.value)
+        or "no live picoclaw runtime was detected" in str(exc.value)
+        or "zeroclaw service stop reported success but zeroclaw is still running" in str(exc.value)
+    )
+    info = service.get_agent("teleclaw")["agent"]
+    assert info["provider"] == "zeroclaw"
+    assert info["provider_status"] == "error"
+    assert "provider switch to picoclaw failed" in info["provider_issue"]
 
 
 def test_set_agent_provider_requires_root_for_managed_user_switch(
@@ -2885,6 +2990,7 @@ def test_service_action_fallback_uses_provider_state_dir(
     service.store.write_state(state)
 
     commands: list[list[str]] = []
+    runtime_running = False
 
     class Result:
         def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
@@ -2893,7 +2999,12 @@ def test_service_action_fallback_uses_provider_state_dir(
             self.stderr = stderr
 
     def fake_run(cmd: list[str], **_: object) -> object:
+        nonlocal runtime_running
         commands.append(cmd)
+        if cmd[:2] == ["ps", "-eo"]:
+            if runtime_running:
+                return Result(0, stdout="teleclaw 4321 /home/linuxbrew/.linuxbrew/bin/picoclaw gateway\n")
+            return Result(0, stdout="")
         if cmd[:3] == ["loginctl", "enable-linger", "teleclaw"]:
             return Result(0)
         if cmd[:2] == ["systemctl", "start"]:
@@ -2901,6 +3012,12 @@ def test_service_action_fallback_uses_provider_state_dir(
         if cmd[:5] == ["sudo", "-u", "teleclaw", "-H", "--"] and "service" in cmd:
             return Result(1, stderr="Failed to connect to bus: No medium found")
         if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
+            script = str(cmd[-1])
+            if "nohup" in script:
+                runtime_running = True
+                return Result(0, stdout="4321\n")
+            if "pgrep" in script:
+                return Result(0, stdout="active (running)" if runtime_running else "inactive")
             return Result(0, stdout="4321\n")
         return Result(0)
 

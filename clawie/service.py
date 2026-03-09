@@ -8,6 +8,7 @@ import pwd
 import shlex
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -954,32 +955,41 @@ class ZeroClawService:
                     linux_user=linux_user,
                     channels=agent.get("channels", []),
                 )
-                if not changed:
-                    for other_provider in provider_names():
-                        if other_provider == target_spec.name:
-                            continue
-                        try:
-                            self._resolve_provider_executable(other_provider)
-                        except SetupError:
-                            continue
-                        other_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
-                        other_status = self._run_managed_provider_service_action(
+                for other_provider in provider_names():
+                    if other_provider == target_spec.name:
+                        continue
+                    try:
+                        self._resolve_provider_executable(other_provider)
+                    except SetupError:
+                        continue
+                    other_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
+                    other_status = self._run_managed_provider_service_action(
+                        provider=other_provider,
+                        action="status",
+                        linux_user=linux_user,
+                        agent_info=other_state,
+                    )
+                    if (
+                        str(other_status.get("service_status", "unknown")) == "running"
+                        or int(other_state.get("fallback_pid", 0) or 0) > 0
+                    ):
+                        stopped = self._run_managed_provider_service_action(
                             provider=other_provider,
-                            action="status",
+                            action="stop",
                             linux_user=linux_user,
                             agent_info=other_state,
                         )
-                        if (
-                            str(other_status.get("service_status", "unknown")) == "running"
-                            or int(other_state.get("fallback_pid", 0) or 0) > 0
-                        ):
-                            stopped = self._run_managed_provider_service_action(
-                                provider=other_provider,
-                                action="stop",
-                                linux_user=linux_user,
-                                agent_info=other_state,
-                            )
-                            stopped_results.append(stopped)
+                        stopped_results.append(stopped)
+                live_after_switch = self._live_provider_names_for_user(linux_user)
+                if target_spec.name not in live_after_switch:
+                    raise SetupError(
+                        f"provider switch to {target_spec.name} did not produce a live {target_spec.name} runtime"
+                    )
+                other_live = [item for item in live_after_switch if item != target_spec.name]
+                if other_live:
+                    raise SetupError(
+                        f"provider switch to {target_spec.name} left other runtimes active: {', '.join(other_live)}"
+                    )
         except Exception as exc:
             self._set_agent_provider_issue(
                 agent,
@@ -1450,14 +1460,35 @@ class ZeroClawService:
                 + (output or f"exit {result.returncode}")
             )
 
-        if command == "start":
-            service_status = "running"
-        elif command == "stop":
-            service_status = "stopped"
-        elif command == "restart":
-            service_status = "running"
-        else:
+        if command == "status":
             service_status = self._infer_service_status(output)
+        else:
+            desired_running = command in {"start", "restart"}
+            observed = self._wait_for_managed_provider_state(
+                provider=provider,
+                linux_user=linux_user,
+                agent_info=agent_info,
+                should_be_running=desired_running,
+            )
+            if not desired_running and observed == "running":
+                self._force_stop_provider_processes(provider, linux_user)
+                observed = self._wait_for_managed_provider_state(
+                    provider=provider,
+                    linux_user=linux_user,
+                    agent_info=agent_info,
+                    should_be_running=False,
+                )
+            if desired_running and observed != "running":
+                raise SetupError(
+                    f"{provider} service {command} reported success but no live {provider} runtime was detected"
+                    + (f" for {linux_user}" if linux_user else "")
+                )
+            if not desired_running and observed == "running":
+                raise SetupError(
+                    f"{provider} service stop reported success but {provider} is still running"
+                    + (f" for {linux_user}" if linux_user else "")
+                )
+            service_status = "running" if desired_running else "stopped"
 
         return {
             "provider": provider,
@@ -1469,6 +1500,66 @@ class ZeroClawService:
             "output": output,
             "command": cmd,
         }
+
+    def _wait_for_managed_provider_state(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        agent_info: dict[str, Any],
+        should_be_running: bool,
+        timeout_seconds: float = 2.0,
+        poll_seconds: float = 0.2,
+    ) -> str:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            status = self._run_managed_provider_service_action(
+                provider=provider,
+                action="status",
+                linux_user=linux_user,
+                agent_info=agent_info,
+            )
+            live = self._provider_process_live(provider, linux_user)
+            if should_be_running and live:
+                return "running"
+            if not should_be_running and not live:
+                return "stopped"
+            if time.monotonic() >= deadline:
+                return "running" if live else "stopped"
+            time.sleep(poll_seconds)
+
+    def _provider_process_live(self, provider: str, linux_user: str) -> bool:
+        token = str(linux_user).strip()
+        if not token:
+            return False
+        daemon_map = self._running_provider_daemons_by_user()
+        return any(
+            str(entry.get("provider", "")).strip().lower() == str(provider).strip().lower()
+            for entry in daemon_map.get(token, [])
+        )
+
+    def _live_provider_names_for_user(self, linux_user: str) -> list[str]:
+        token = str(linux_user).strip()
+        if not token:
+            return []
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for entry in self._running_provider_daemons_by_user().get(token, []):
+            provider = str(entry.get("provider", "")).strip().lower()
+            if not provider or provider in seen:
+                continue
+            seen.add(provider)
+            ordered.append(provider)
+        return ordered
+
+    def _force_stop_provider_processes(self, provider: str, linux_user: str) -> None:
+        token = str(linux_user).strip()
+        if not token:
+            return
+        pattern = self._provider_process_pattern(provider)
+        script = f'pkill -u "$(id -u)" -f {shlex.quote(pattern)} >/dev/null 2>&1 || true'
+        cmd = self._user_shell_command(token, script)
+        subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     def _reconnect_agent_channels(
         self,
@@ -5329,10 +5420,10 @@ class ZeroClawService:
     @staticmethod
     def _infer_service_status(output: str) -> str:
         text = str(output).strip().lower()
+        if "inactive" in text or "stopped" in text or "dead" in text:
+            return "stopped"
         if "running" in text or "active" in text or "started" in text:
             return "running"
-        if "stopped" in text or "inactive" in text or "dead" in text:
-            return "stopped"
         return "unknown"
 
     @staticmethod

@@ -1591,10 +1591,14 @@ class ZeroClawService:
                     should_be_running=False,
                 )
             if desired_running and observed != "running":
-                raise SetupError(
+                message = (
                     f"{provider} service {command} reported success but no live {provider} runtime was detected"
                     + (f" for {linux_user}" if linux_user else "")
                 )
+                detail = self._provider_start_failure_detail(provider, linux_user)
+                if detail:
+                    message = f"{message}\n{detail}"
+                raise SetupError(message)
             if not desired_running and observed == "running":
                 raise SetupError(
                     f"{provider} service stop reported success but {provider} is still running"
@@ -1672,6 +1676,34 @@ class ZeroClawService:
         script = f'pkill -u "$(id -u)" -f {shlex.quote(pattern)} >/dev/null 2>&1 || true'
         cmd = self._user_shell_command(token, script)
         subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    def _provider_start_failure_detail(self, provider: str, linux_user: str, lines: int = 40) -> str:
+        excerpt = self._provider_daemon_log_excerpt(provider=provider, linux_user=linux_user, lines=lines)
+        if not excerpt:
+            return ""
+        spec = get_provider(provider)
+        return f"Last lines from ~/{spec.state_dir}/daemon.log:\n{excerpt}"
+
+    def _provider_daemon_log_excerpt(self, *, provider: str, linux_user: str, lines: int = 40) -> str:
+        spec = get_provider(provider)
+        script = (
+            f'log="$HOME/{spec.state_dir}/daemon.log"; '
+            'if [ -f "$log" ]; then '
+            f'tail -n {int(lines)} "$log"; '
+            "fi"
+        )
+        try:
+            cmd = self._wrap_user_command(["bash", "-lc", script], linux_user, purpose="service log inspection")
+        except SetupError:
+            return ""
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._service_env(linux_user),
+        )
+        return "\n".join(part.strip() for part in [result.stdout, result.stderr] if str(part).strip()).strip()
 
     def _reconnect_agent_channels(
         self,
@@ -1954,6 +1986,23 @@ class ZeroClawService:
 
         return re.sub(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, payload)
 
+    @staticmethod
+    def _looks_like_unresolved_secret(value: str) -> bool:
+        token = str(value).strip()
+        if not token:
+            return False
+        if re.search(r"\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*", token):
+            return True
+        lowered = token.lower()
+        if lowered.startswith("env:") or lowered.startswith("secret:"):
+            return True
+        return "{{" in token and "}}" in token
+
+    @staticmethod
+    def _looks_like_telegram_bot_token(value: str) -> bool:
+        token = str(value).strip()
+        return bool(re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", token))
+
     def _prepare_agent_provider_home(
         self,
         *,
@@ -2105,6 +2154,16 @@ class ZeroClawService:
             if not token:
                 raise SetupError(
                     "picoclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                )
+            if self._looks_like_unresolved_secret(token):
+                raise SetupError(
+                    "picoclaw telegram bootstrap found an unresolved token placeholder; "
+                    "export the bot token in the target user's login shell or re-link Telegram first"
+                )
+            if not self._looks_like_telegram_bot_token(token):
+                raise SetupError(
+                    "picoclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
+                    "re-link Telegram or update the target user's Telegram token"
                 )
             telegram_cfg["enabled"] = True
             telegram_cfg["token"] = token

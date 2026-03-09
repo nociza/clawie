@@ -18,7 +18,7 @@ from clawie.cli import main
 from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
-from clawie.service import ZeroClawService
+from clawie.service import SetupError, ZeroClawService
 from clawie.store import StateStore
 
 
@@ -32,6 +32,10 @@ def _fake_jwt(payload: dict[str, object]) -> str:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode("utf-8")).decode("utf-8").rstrip("=")
     body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
     return f"{header}.{body}.sig"
+
+
+def _fake_telegram_token() -> str:
+    return "123456:" + ("a" * 35)
 
 
 def test_setup_defaults_to_linked_auth_for_picoclaw(
@@ -1383,7 +1387,7 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
             ("telegram", "team"): {
                 "kind": "telegram",
                 "name": "team",
-                "settings": {"bot_token": "telegram-token"},
+                "settings": {"bot_token": _fake_telegram_token()},
             }
         },
     )
@@ -1391,7 +1395,7 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
     assert (shared_home / ".picoclaw" / "auth.json").exists()
     assert (target_home / ".picoclaw" / "auth.json").is_symlink()
     config = json.loads((target_home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
-    assert config["channels"]["telegram"]["token"] == "telegram-token"
+    assert config["channels"]["telegram"]["token"] == _fake_telegram_token()
 
 
 def test_prepare_picoclaw_home_resolves_env_backed_channel_values(
@@ -1444,7 +1448,7 @@ def test_prepare_picoclaw_home_resolves_env_backed_channel_values(
         if cmd[-2:] == ["bash", "-lc"]:
             return Result()
         if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
-            return Result(stdout=b"TELEGRAM_TOKEN=123456:REALTOKEN\n\0")
+            return Result(stdout=f"TELEGRAM_TOKEN={_fake_telegram_token()}\n\0".encode("utf-8"))
         return Result(stdout=b"")
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -1466,7 +1470,7 @@ def test_prepare_picoclaw_home_resolves_env_backed_channel_values(
     )
 
     config = json.loads((target_home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
-    assert config["channels"]["telegram"]["token"] == "123456:REALTOKEN"
+    assert config["channels"]["telegram"]["token"] == _fake_telegram_token()
 
 
 def test_sync_agent_channels_from_provider_replaces_stale_channels(
@@ -2259,13 +2263,12 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     home = tmp_path / "teleclaw-home"
     (home / ".zeroclaw").mkdir(parents=True)
     (home / ".zeroclaw" / "config.toml").write_text(
-        """
-[channels_config.telegram]
-enabled = true
-bot_token = "telegram-token"
-name = "teleclaw-team"
-""".strip()
-        + "\n",
+        (
+            "[channels_config.telegram]\n"
+            "enabled = true\n"
+            f'bot_token = "{_fake_telegram_token()}"\n'
+            'name = "teleclaw-team"\n'
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
@@ -2326,7 +2329,35 @@ name = "teleclaw-team"
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
     assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     config = json.loads((home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
-    assert config["channels"]["telegram"]["token"] == "telegram-token"
+    assert config["channels"]["telegram"]["token"] == _fake_telegram_token()
+
+
+def test_picoclaw_home_prepare_rejects_invalid_telegram_token(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    home = tmp_path / "teleclaw-home"
+    monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
+
+    with raises(SetupError, match="invalid Telegram bot token"):
+        service._ensure_picoclaw_home_prepared(
+            home=home,
+            linux_user="teleclaw",
+            channels=[{"kind": "telegram", "name": "teleclaw-team", "enabled": True}],
+            live_payloads={
+                ("telegram", "teleclaw-team"): {
+                    "kind": "telegram",
+                    "name": "teleclaw-team",
+                    "settings": {
+                        "enabled": True,
+                        "bot_token": "telegram-token",
+                    },
+                }
+            },
+            auth_mode="linked",
+            api_key="",
+        )
 
 
 def test_switch_agent_provider_reconciles_same_provider_runtime(
@@ -2365,13 +2396,12 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     home = tmp_path / "teleclaw-home"
     (home / ".zeroclaw").mkdir(parents=True)
     (home / ".zeroclaw" / "config.toml").write_text(
-        """
-[channels_config.telegram]
-enabled = true
-bot_token = "telegram-token"
-name = "teleclaw-team"
-""".strip()
-        + "\n",
+        (
+            "[channels_config.telegram]\n"
+            "enabled = true\n"
+            f'bot_token = "{_fake_telegram_token()}"\n'
+            'name = "teleclaw-team"\n'
+        ),
         encoding="utf-8",
     )
     agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
@@ -3216,7 +3246,7 @@ def test_service_action_fallback_uses_provider_state_dir(
                 "channels": {
                     "telegram": {
                         "enabled": True,
-                        "token": "telegram-token",
+                        "token": _fake_telegram_token(),
                         "name": "teleclaw-team",
                     }
                 }
@@ -3266,6 +3296,82 @@ def test_service_action_fallback_uses_provider_state_dir(
     result = service.agent_service_action("teleclaw", "start")
     assert result["service_status"] == "running"
     assert any(".picoclaw/daemon.log" in cmd[-1] for cmd in commands if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"])
+
+
+def test_agent_service_start_surfaces_picoclaw_daemon_log_on_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    home = tmp_path / "teleclaw-home"
+    (home / ".picoclaw").mkdir(parents=True)
+    (home / ".picoclaw" / "config.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": _fake_telegram_token(),
+                        "name": "teleclaw-team",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: home)
+    agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
+
+    class Result:
+        def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            return Result(0, stdout="")
+        if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
+            script = str(cmd[-1])
+            if "nohup" in script:
+                return Result(0, stdout="4321\n")
+            if "tail -n" in script and ".picoclaw/daemon.log" in script:
+                return Result(
+                    0,
+                    stdout="Error starting channels: failed to create telegram bot: telego: invalid token format\n",
+                )
+            if "pgrep" in script:
+                return Result(0, stdout="inactive")
+            return Result(0, stdout="")
+        return Result(0, stdout="")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda _: "/home/linuxbrew/.linuxbrew/bin/picoclaw")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    with raises(SetupError, match="failed to create telegram bot"):
+        service.agent_service_action("teleclaw", "start")
 
 
 def test_performance_snapshot_includes_local_user_claw_rows(

@@ -2227,10 +2227,7 @@ name = "teleclaw-team"
                 return Result(stdout="started pid=123")
             runtime_state["picoclaw"] = True
             return Result(stdout="active (running)" if runtime_state["picoclaw"] else "inactive")
-        if tail2 in (
-            ["/usr/bin/picoclaw", "onboard"],
-            ["/usr/bin/picoclaw", "status"],
-        ):
+        if tail2 == ["/usr/bin/picoclaw", "status"]:
             return Result(stdout="ok")
         if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
             return Result(stdout="")
@@ -2253,7 +2250,8 @@ name = "teleclaw-team"
     assert ["chown", "teleclaw:teleclaw", str(home / ".picoclaw")] in calls
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
     assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
-    assert any(cmd[-2:] == ["/usr/bin/picoclaw", "onboard"] for cmd in calls)
+    config = json.loads((home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
+    assert config["channels"]["telegram"]["token"] == "telegram-token"
 
 
 def test_switch_agent_provider_reconciles_same_provider_runtime(

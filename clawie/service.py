@@ -1952,15 +1952,6 @@ class ZeroClawService:
         root.mkdir(parents=True, exist_ok=True)
         self._chown_tree(root, linux_user)
 
-        executable = self._resolve_provider_executable("picoclaw")
-        onboard_cmd = self._wrap_user_command([executable, "onboard"], linux_user, purpose="provider bootstrap")
-        env = self._service_env(linux_user)
-        env["HOME"] = str(home)
-        onboard = subprocess.run(onboard_cmd, capture_output=True, text=True, check=False, env=env)
-        if onboard.returncode != 0:
-            output = (onboard.stdout or onboard.stderr or "").strip()
-            raise SetupError(f"picoclaw onboard failed: {output or f'exit {onboard.returncode}'}")
-
         workspace = root / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
         config_path = root / "config.json"

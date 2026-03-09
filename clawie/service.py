@@ -4853,11 +4853,11 @@ class ZeroClawService:
         elif action == "restart":
             lines.append('if [ -n "$existing" ]; then pkill -u "$(id -u)" -f "$pattern" || true; fi')
             lines.append(f'mkdir -p "$HOME/{state_dir}"')
-            lines.append(f'nohup {start_cmd} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
+            lines.append(f'setsid {start_cmd} < /dev/null >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
         else:
             lines.append('if [ -n "$existing" ]; then echo "already running"; exit 0; fi')
             lines.append(f'mkdir -p "$HOME/{state_dir}"')
-            lines.append(f'nohup {start_cmd} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
+            lines.append(f'setsid {start_cmd} < /dev/null >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
         return "; ".join(lines)
 
     @staticmethod
@@ -5430,7 +5430,7 @@ class ZeroClawService:
         background = " ".join([f'"{executable}"', *[shlex.quote(part) for part in spec.background_command]])
         script = (
             f'mkdir -p "$HOME/{state_dir}"; '
-            f'nohup {background} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
+            f'setsid {background} < /dev/null >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
         )
         cmd = self._user_shell_command(linux_user, script)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)

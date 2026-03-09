@@ -2300,7 +2300,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
             runtime_state["zeroclaw"] = False
             return Result(stdout="stopped")
         if "picoclaw" in script and "gateway" in script:
-            if "nohup" in script:
+            if "setsid" in script:
                 runtime_state["picoclaw"] = True
                 return Result(stdout="started pid=123")
             runtime_state["picoclaw"] = True
@@ -2430,7 +2430,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
         tail3 = cmd[-3:]
         script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
         if "picoclaw" in script and "gateway" in script:
-            if "nohup" in script:
+            if "setsid" in script:
                 runtime_state["picoclaw"] = True
                 return Result(stdout="started pid=123")
             runtime_state["picoclaw"] = True
@@ -2510,7 +2510,7 @@ def test_switch_agent_provider_fails_when_live_runtime_does_not_cut_over(
         if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
             return Result(stdout="stopped")
         if "picoclaw" in script and "gateway" in script:
-            if "nohup" in script:
+            if "setsid" in script:
                 return Result(stdout="started pid=123")
             if "pgrep" in script:
                 return Result(stdout="inactive")
@@ -3281,7 +3281,7 @@ def test_service_action_fallback_uses_provider_state_dir(
             return Result(1, stderr="Failed to connect to bus: No medium found")
         if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
             script = str(cmd[-1])
-            if "nohup" in script:
+            if "setsid" in script:
                 runtime_running = True
                 return Result(0, stdout="4321\n")
             if "pgrep" in script:
@@ -3354,7 +3354,7 @@ def test_agent_service_start_surfaces_picoclaw_daemon_log_on_failure(
             return Result(0, stdout="")
         if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
             script = str(cmd[-1])
-            if "nohup" in script:
+            if "setsid" in script:
                 return Result(0, stdout="4321\n")
             if "tail -n" in script and ".picoclaw/daemon.log" in script:
                 return Result(
@@ -3430,7 +3430,7 @@ def test_agent_service_start_surfaces_picoclaw_probe_output_when_log_is_empty(
             return Result(0, stdout="")
         if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
             script = str(cmd[-1])
-            if "nohup" in script:
+            if "setsid" in script:
                 return Result(0, stdout="4321\n")
             if "tail -n" in script and ".picoclaw/daemon.log" in script:
                 return Result(0, stdout="")

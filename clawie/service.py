@@ -387,7 +387,13 @@ class ZeroClawService:
         token = str(username).strip()
         if not token or os.geteuid() != 0:
             return
-        subprocess.run(["chown", f"{token}:{token}", str(path)], check=False)
+        cmd = ["chown", f"{token}:{token}", str(path)]
+        try:
+            if path.is_symlink():
+                cmd = ["chown", "-h", f"{token}:{token}", str(path)]
+        except OSError:
+            cmd = ["chown", "-h", f"{token}:{token}", str(path)]
+        subprocess.run(cmd, check=False, capture_output=True, text=True)
 
     @classmethod
     def _chown_tree(cls, path: Path, username: str) -> None:
@@ -415,6 +421,13 @@ class ZeroClawService:
         self._relax_shared_path_permissions(dst.parent)
         self._relax_shared_path_permissions(dst)
         return True
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        try:
+            return path.exists()
+        except OSError:
+            return False
 
     def _write_provider_auth_profile(
         self,
@@ -487,6 +500,8 @@ class ZeroClawService:
         updated: list[str] = []
         for rel in shared_auth_paths_for_providers(provider_names()):
             src = shared_home / rel
+            if not self._path_exists(src):
+                continue
             dst = target_home / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             self._chown_tree(dst.parent, username)
@@ -506,6 +521,48 @@ class ZeroClawService:
             subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False)
             updated.append(str(dst))
         return updated
+
+    def _ensure_picoclaw_native_auth(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        use_shared_auth: bool,
+    ) -> None:
+        native_target = home / ".picoclaw" / "auth.json"
+        if self._path_exists(native_target):
+            return
+
+        source_homes: list[Path] = []
+        if use_shared_auth:
+            shared_home = self._ensure_shared_provider_auth_root()
+            shared_native = shared_home / ".picoclaw" / "auth.json"
+            if not self._path_exists(shared_native):
+                shared_codex = shared_home / ".codex" / "auth.json"
+                if self._path_exists(shared_codex):
+                    imported = load_codex_auth(shared_home)
+                    self._write_picoclaw_auth_store(imported)
+            source_homes.append(shared_home)
+        source_homes.append(home)
+
+        for source_home in source_homes:
+            codex_path = source_home / ".codex" / "auth.json"
+            if not self._path_exists(codex_path):
+                continue
+            imported = load_codex_auth(source_home)
+            if source_home == self._ensure_shared_provider_auth_root():
+                self._write_picoclaw_auth_store(imported)
+                if use_shared_auth:
+                    self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
+                    if self._path_exists(native_target):
+                        return
+                continue
+            if native_target.is_symlink() and not self._path_exists(native_target):
+                native_target.unlink(missing_ok=True)
+            payload = merge_picoclaw_auth_store(self._read_json_file(native_target), imported)
+            self._write_json_file(native_target, payload)
+            self._chown_tree(home / ".picoclaw", linux_user)
+            return
 
     def setup(
         self,
@@ -1862,6 +1919,8 @@ class ZeroClawService:
             return
 
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        use_shared_auth = "provider-auth" in set(sync.get("bundles", []))
+        self._ensure_picoclaw_native_auth(home=home, linux_user=linux_user, use_shared_auth=use_shared_auth)
         if "provider-auth" in set(sync.get("bundles", [])):
             self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
 

@@ -1318,6 +1318,82 @@ def test_auth_status_from_picoclaw_auth_json_prefers_openai_credential(tmp_path:
     assert status["source"] == "file:auth.json"
 
 
+def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    shared_home = tmp_path / "shared-provider-auth"
+    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    target_home = tmp_path / "teleclaw-home"
+    target_home.mkdir(parents=True)
+    (shared_home / ".codex").mkdir(parents=True)
+    (shared_home / ".codex" / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "tok",
+                    "refresh_token": "ref",
+                    "id_token": "",
+                    "account_id": "acct-1",
+                },
+                "last_refresh": "2026-03-08T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/picoclaw")
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result(stdout="ok"))
+
+    service._prepare_agent_provider_home(
+        provider="picoclaw",
+        agent=agent,
+        linux_user="teleclaw",
+        home=target_home,
+        channels=[{"kind": "telegram", "name": "team"}],
+        live_payloads={
+            ("telegram", "team"): {
+                "kind": "telegram",
+                "name": "team",
+                "settings": {"bot_token": "telegram-token"},
+            }
+        },
+    )
+
+    assert (shared_home / ".picoclaw" / "auth.json").exists()
+    assert (target_home / ".picoclaw" / "auth.json").is_symlink()
+    config = json.loads((target_home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
+    assert config["channels"]["telegram"]["token"] == "telegram-token"
+
+
 def test_sync_agent_channels_from_provider_replaces_stale_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

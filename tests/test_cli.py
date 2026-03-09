@@ -2459,6 +2459,88 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
 
 
+def test_switch_agent_provider_succeeds_when_status_reports_running_but_ps_misses_picoclaw(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    home = tmp_path / "teleclaw-home"
+    (home / ".zeroclaw").mkdir(parents=True)
+    (home / ".zeroclaw" / "config.toml").write_text(
+        (
+            "[channels_config.telegram]\n"
+            "enabled = true\n"
+            f'bot_token = "{_fake_telegram_token()}"\n'
+            'name = "teleclaw-team"\n'
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+    runtime_state = {"zeroclaw": True}
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            return Result(stdout="")
+        tail3 = cmd[-3:]
+        script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
+        if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
+            return Result(stdout="active (running)" if runtime_state["zeroclaw"] else "inactive")
+        if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
+            runtime_state["zeroclaw"] = False
+            return Result(stdout="stopped")
+        if tail3 == ["/usr/bin/openclaw", "daemon", "status"]:
+            return Result(stdout="inactive")
+        if "picoclaw" in script and "gateway" in script:
+            if "setsid" in script:
+                return Result(stdout="started pid=123")
+            if "pgrep" in script:
+                return Result(stdout="active (running)")
+            return Result(stdout="ok")
+        return Result(stdout="ok")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda provider: f"/usr/bin/{provider}")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.switch_agent_provider("teleclaw", "picoclaw")
+    assert result["service"]["service_status"] == "running"
+    assert result["agent"]["agent"]["provider"] == "picoclaw"
+
+
 def test_switch_agent_provider_fails_when_live_runtime_does_not_cut_over(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

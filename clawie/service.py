@@ -1636,12 +1636,13 @@ class ZeroClawService:
                 agent_info=agent_info,
             )
             live = self._provider_process_live(provider, linux_user)
-            if should_be_running and live:
+            service_running = str(status.get("service_status", "")).strip().lower() == "running"
+            if should_be_running and (live or service_running):
                 return "running"
-            if not should_be_running and not live:
+            if not should_be_running and not live and not service_running:
                 return "stopped"
             if time.monotonic() >= deadline:
-                return "running" if live else "stopped"
+                return "running" if (live or service_running) else "stopped"
             time.sleep(poll_seconds)
 
     def _provider_process_live(self, provider: str, linux_user: str) -> bool:
@@ -1649,24 +1650,53 @@ class ZeroClawService:
         if not token:
             return False
         daemon_map = self._running_provider_daemons_by_user()
-        return any(
+        if any(
             str(entry.get("provider", "")).strip().lower() == str(provider).strip().lower()
             for entry in daemon_map.get(token, [])
-        )
+        ):
+            return True
+        return self._provider_reports_running(provider, token)
 
     def _live_provider_names_for_user(self, linux_user: str) -> list[str]:
         token = str(linux_user).strip()
         if not token:
             return []
+        daemon_map = self._running_provider_daemons_by_user()
         seen: set[str] = set()
         ordered: list[str] = []
-        for entry in self._running_provider_daemons_by_user().get(token, []):
+        for entry in daemon_map.get(token, []):
             provider = str(entry.get("provider", "")).strip().lower()
             if not provider or provider in seen:
                 continue
             seen.add(provider)
             ordered.append(provider)
+        for provider in provider_names():
+            if provider in seen:
+                continue
+            try:
+                self._resolve_provider_executable(provider)
+            except SetupError:
+                continue
+            if not self._provider_reports_running(provider, token):
+                continue
+            seen.add(provider)
+            ordered.append(provider)
         return ordered
+
+    def _provider_reports_running(self, provider: str, linux_user: str) -> bool:
+        token = str(linux_user).strip()
+        if not token:
+            return False
+        try:
+            status = self._run_managed_provider_service_action(
+                provider=provider,
+                action="status",
+                linux_user=token,
+                agent_info={"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0},
+            )
+        except Exception:
+            return False
+        return str(status.get("service_status", "")).strip().lower() == "running"
 
     def _force_stop_provider_processes(self, provider: str, linux_user: str) -> None:
         token = str(linux_user).strip()

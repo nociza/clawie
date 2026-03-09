@@ -1678,11 +1678,17 @@ class ZeroClawService:
         subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     def _provider_start_failure_detail(self, provider: str, linux_user: str, lines: int = 40) -> str:
+        sections: list[str] = []
+        probe = self._provider_start_probe_output(provider=provider, linux_user=linux_user)
+        if probe:
+            sections.append(probe)
         excerpt = self._provider_daemon_log_excerpt(provider=provider, linux_user=linux_user, lines=lines)
-        if not excerpt:
-            return ""
-        spec = get_provider(provider)
-        return f"Last lines from ~/{spec.state_dir}/daemon.log:\n{excerpt}"
+        if excerpt:
+            spec = get_provider(provider)
+            label = f"Last lines from ~/{spec.state_dir}/daemon.log:\n{excerpt}"
+            if label not in sections:
+                sections.append(label)
+        return "\n\n".join(section for section in sections if section)
 
     def _provider_daemon_log_excerpt(self, *, provider: str, linux_user: str, lines: int = 40) -> str:
         spec = get_provider(provider)
@@ -1704,6 +1710,55 @@ class ZeroClawService:
             env=self._service_env(linux_user),
         )
         return "\n".join(part.strip() for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+
+    def _provider_start_probe_output(self, *, provider: str, linux_user: str) -> str:
+        spec = get_provider(provider)
+        try:
+            executable = self._resolve_provider_executable(provider)
+            cmd = self._wrap_user_command(
+                [executable, *spec.background_command],
+                linux_user,
+                purpose="service startup probe",
+            )
+        except SetupError:
+            return ""
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(linux_user),
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = self._join_process_output(exc.stdout, exc.stderr)
+            prefix = f"{provider} foreground startup probe stayed alive for 5s; process detection may be wrong"
+            return f"{prefix}\n{output}".strip()
+
+        output = self._join_process_output(result.stdout, result.stderr)
+        if result.returncode == 0 and not output:
+            return ""
+        if result.returncode == 0:
+            return f"{provider} foreground startup probe output:\n{output}".strip()
+        if output:
+            return f"{provider} foreground startup probe exited {result.returncode}:\n{output}".strip()
+        return f"{provider} foreground startup probe exited {result.returncode}"
+
+    @staticmethod
+    def _join_process_output(stdout: Any, stderr: Any) -> str:
+        parts: list[str] = []
+        for item in (stdout, stderr):
+            if item is None:
+                continue
+            if isinstance(item, bytes):
+                text = item.decode("utf-8", errors="ignore")
+            else:
+                text = str(item)
+            text = text.strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
 
     def _reconnect_agent_channels(
         self,

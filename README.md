@@ -40,13 +40,19 @@ uv tool install -e .
 clawie config set --interactive
 ```
 
-2. Select provider (open/pico/zero):
+2. Install the provider runtime you want to use:
+
+```bash
+clawie runtime install picoclaw
+```
+
+3. Select provider (open/pico/zero):
 
 ```bash
 clawie config set --provider picoclaw --subscription pro --workspace production
 ```
 
-3. Create an agent:
+4. Create an agent:
 
 ```bash
 clawie agent create \
@@ -56,13 +62,13 @@ clawie agent create \
   --channel-strategy new
 ```
 
-4. Spawn an isolated Linux runtime for that claw:
+5. Spawn an isolated Linux runtime for that claw:
 
 ```bash
 sudo clawie runtime create alice --user alice
 ```
 
-5. Operate the fleet:
+6. Operate the fleet:
 
 ```bash
 clawie dashboard
@@ -79,8 +85,9 @@ clawie agent provider set
 clawie agent service start|stop|restart|status
 clawie agent credentials list|show|set|sync|revoke
 clawie channel apply|move
-clawie runtime create|detect|status|login
+clawie runtime create|detect|install|status|login
 clawie runtime service start|stop|restart|status
+clawie auth show|login|import|apply
 clawie dashboard
 clawie health
 clawie event list
@@ -120,11 +127,17 @@ clawie channel apply alice --preset growth
 clawie channel move alice bob
 
 # runtime + health
+clawie runtime install picoclaw
+clawie runtime install openclaw
 sudo clawie runtime create alice --user alice
 clawie runtime detect
 clawie runtime status
 clawie runtime login zeroclaw
 clawie runtime service status zeroclaw
+clawie auth show
+clawie auth login picoclaw
+clawie auth import picoclaw --from codex
+sudo clawie auth apply
 clawie health
 clawie event list --limit 50
 
@@ -152,8 +165,9 @@ clawie backup import backup.json
   - `N`: add a channel and immediately link it with the provider
   - `c` / `l`: link the selected assigned channel
   - `u`: unlink the selected assigned channel
+  - `s`: resync the selected agent's channels from the live provider runtime
 - In the detail `Settings` section:
-  - use `channel ...` rows to add, link, and unlink channels for the selected agent
+  - use `channel ...` rows to sync, add, link, and unlink channels for the selected agent
   - use auth rows to inspect linked-auth state and run re-login
   - use provider rows to switch a managed agent between configured providers
   - use service rows to run `<provider> service start|stop|restart|status`
@@ -167,16 +181,30 @@ clawie backup import backup.json
 
 - `agent provider set` is a real cutover for managed agents with a Linux user:
   it validates the target provider, writes provider-specific prompt files,
-  stops the old provider service, starts the new one, and replays enabled
-  non-CLI channels.
+  installs the target runtime when needed, stops the old provider service,
+  starts the new one, and replays enabled non-CLI channels.
 - If state already says the target provider, the same command still reconciles
   runtime drift by starting the target provider and stopping other installed
   provider services for that agent user.
+- `runtime create` and runtime `start|restart` actions also ensure the selected
+  provider runtime is installed before trying to attach it to an agent or user.
 - Managed-agent cutovers require `sudo/root` when the agent Linux user differs
   from the current shell user.
 - Linked auth remains on disk in the agent home. Use `clawie agent auth show`
   to inspect it and `sudo clawie agent auth login AGENT_ID` if the new provider
   needs a fresh login.
+
+## Shared Auth
+
+- `clawie auth ...` manages the shared provider-auth store used across agents.
+- `clawie auth login PROVIDER` runs the provider login flow against the shared
+  auth home instead of one agent home, then links eligible agents to it.
+- `clawie auth import PROVIDER --from codex|provider|claude` seeds that shared
+  auth home from an existing app/provider login.
+- `clawie auth apply [AGENT_ID]` reapplies shared auth links to one agent or
+  all eligible managed agents.
+- `clawie agent auth show` and `clawie agent auth login` use the shared auth
+  store automatically once that agent has shared provider auth linked.
 
 ## Isolation and Credential Reuse
 
@@ -195,8 +223,9 @@ with `--credential-bundle`, or later with
 
 Available credential bundles:
 
-- `provider-auth` (default): provider and model auth/config paths like `.codex`,
-  `.openai`, and provider state dirs.
+- `provider-auth` (default): shared auth files like `.codex/auth.json` and
+  provider `auth-profiles.json` files. These are linked from a shared auth
+  store so one login can be reused across agents.
 - `git`: `.gitconfig`, `.git-credentials`, `.config/gh`, `.ssh`.
 
 Runtime examples:

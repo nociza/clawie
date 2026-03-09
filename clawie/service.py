@@ -5,12 +5,18 @@ import crypt
 import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from clawie.auth_sources import (
+    load_claude_auth,
+    load_codex_auth,
+    merge_provider_auth_profile,
+)
 from clawie.provider_auth import (
     empty_auth_payload,
     inspect_auth_files,
@@ -19,10 +25,10 @@ from clawie.provider_auth import (
 )
 from clawie.provider_channels import dedupe_channels, get_channel_adapter
 from clawie.providers import (
-    credential_paths_for_providers,
     detect_installed_providers,
     get_provider,
     provider_names,
+    shared_auth_paths_for_providers,
 )
 from clawie.store import StateStore
 
@@ -62,6 +68,7 @@ class ZeroClawService:
     GLOBAL_FNM_PROFILE_FILE = GLOBAL_PROFILE_DIR / "zz-fnm.sh"
     GLOBAL_CLAUDE_PROFILE_FILE = GLOBAL_PROFILE_DIR / "20-claude-shared.sh"
     SHARED_CLAUDE_DIR = Path("/var/lib/clawie/claude-shared")
+    SHARED_PROVIDER_AUTH_DIR = Path("/var/lib/clawie/provider-auth")
     SHARED_CLAUDE_SUBDIRS = ("backups", "cache", "debug")
     GLOBAL_HOMEBREW_PROFILE_CONTENT = "\n".join(
         [
@@ -107,7 +114,7 @@ class ZeroClawService:
     CREDENTIAL_BUNDLE_SPECS: tuple[dict[str, Any], ...] = (
         {
             "id": "provider-auth",
-            "label": "provider auth (.codex/.openai/provider state)",
+            "label": "provider auth sessions (.codex/auth.json + auth-profiles.json)",
             "default": True,
             "kind": "provider",
         },
@@ -267,6 +274,7 @@ class ZeroClawService:
             "last_synced_paths": self._normalized_string_list(payload.get("last_synced_paths", [])),
             "last_revoked_at": str(payload.get("last_revoked_at", "")),
             "last_revoked_paths": self._normalized_string_list(payload.get("last_revoked_paths", [])),
+            "shared_provider_auth": bool(payload.get("shared_provider_auth", False)),
         }
 
     @staticmethod
@@ -306,6 +314,156 @@ class ZeroClawService:
             return Path("/home") / sudo_user
         return Path.home()
 
+    def _shared_provider_auth_home(self) -> Path:
+        preferred = self.SHARED_PROVIDER_AUTH_DIR
+        if preferred.exists():
+            return preferred
+        parent = preferred.parent
+        if os.geteuid() == 0 or os.access(parent, os.W_OK | os.X_OK):
+            return preferred
+        return self.store.root / "shared-provider-auth"
+
+    def _shared_provider_auth_scope(self) -> str:
+        return "system" if self._ensure_shared_provider_auth_root() == self.SHARED_PROVIDER_AUTH_DIR else "local"
+
+    def _ensure_shared_provider_auth_root(self) -> Path:
+        root = self._shared_provider_auth_home()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            root = self.store.root / "shared-provider-auth"
+            root.mkdir(parents=True, exist_ok=True)
+        self._relax_shared_path_permissions(root)
+        for rel in shared_auth_paths_for_providers(provider_names()):
+            parent = (root / rel).parent
+            parent.mkdir(parents=True, exist_ok=True)
+            self._relax_shared_path_permissions(parent)
+        return root
+
+    def _relax_shared_provider_auth_permissions(self) -> None:
+        root = self._shared_provider_auth_home()
+        if not root.exists():
+            return
+        self._relax_shared_path_permissions(root)
+        for rel in shared_auth_paths_for_providers(provider_names()):
+            path = root / rel
+            if path.parent.exists():
+                self._relax_shared_path_permissions(path.parent)
+            if path.exists():
+                self._relax_shared_path_permissions(path)
+
+    @staticmethod
+    def _relax_shared_path_permissions(path: Path) -> None:
+        try:
+            target_mode = 0o777 if path.is_dir() else 0o666
+            current_mode = int(path.stat().st_mode) & 0o777
+            if current_mode != target_mode:
+                os.chmod(path, target_mode)
+        except OSError:
+            return
+
+    @staticmethod
+    def _read_json_file(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _copy_if_present(self, src: Path, dst: Path) -> bool:
+        if not src.exists():
+            return False
+        if src.resolve() == dst.resolve():
+            return False
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        shutil.copy2(src, dst)
+        self._relax_shared_path_permissions(dst.parent)
+        self._relax_shared_path_permissions(dst)
+        return True
+
+    def _write_provider_auth_profile(
+        self,
+        provider: str,
+        imported: dict[str, str],
+    ) -> list[str]:
+        shared_home = self._ensure_shared_provider_auth_root()
+        target = shared_home / get_provider(provider).state_dir / "auth-profiles.json"
+        existing = self._read_json_file(target)
+        payload = merge_provider_auth_profile(existing, imported)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._relax_shared_path_permissions(target.parent)
+        self._relax_shared_path_permissions(target)
+        return [str(target)]
+
+    def _write_provider_auth_profiles(
+        self,
+        providers: list[str],
+        imported: dict[str, str],
+    ) -> list[str]:
+        updated: list[str] = []
+        seen: set[str] = set()
+        for item in providers:
+            token = str(item or "").strip().lower()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            updated.extend(self._write_provider_auth_profile(token, imported))
+        return self._dedupe_paths(updated)
+
+    def _seed_shared_provider_auth_from_home(
+        self,
+        *,
+        source_home: Path,
+        requested_provider: str | None,
+    ) -> list[str]:
+        shared_home = self._ensure_shared_provider_auth_root()
+        providers: list[str] = []
+        if requested_provider:
+            providers.append(str(requested_provider).strip().lower())
+        config = self.store.read_config()
+        providers.append(str(config.get("provider", "picoclaw")).strip().lower())
+        providers.extend(provider_names())
+
+        updated: list[str] = []
+        for rel in shared_auth_paths_for_providers(providers):
+            src = source_home / rel
+            dst = shared_home / rel
+            if self._copy_if_present(src, dst):
+                updated.append(str(dst))
+        return self._dedupe_paths(updated)
+
+    def _ensure_shared_provider_auth_links(self, target_home: Path, username: str) -> list[str]:
+        if not target_home.exists():
+            return []
+        shared_home = self._ensure_shared_provider_auth_root()
+        updated: list[str] = []
+        for rel in shared_auth_paths_for_providers(provider_names()):
+            src = shared_home / rel
+            dst = target_home / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.is_symlink():
+                try:
+                    if dst.resolve() == src.resolve():
+                        continue
+                except OSError:
+                    pass
+                dst.unlink(missing_ok=True)
+            elif dst.exists():
+                if dst.is_dir():
+                    shutil.rmtree(dst)
+                else:
+                    dst.unlink()
+            dst.symlink_to(src)
+            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False)
+            updated.append(str(dst))
+        return updated
+
     def setup(
         self,
         provider: str,
@@ -322,6 +480,9 @@ class ZeroClawService:
         provider_spec = get_provider(provider)
         api_key_value = api_key.strip()
         mode = self._resolve_auth_mode(provider_spec.name, api_key_value, auth_mode)
+        install_result: dict[str, Any] | None = None
+        if install_runtime:
+            install_result = self.install_provider_runtime(provider_spec.name)
         config = self.store.read_config()
         config["provider"] = provider_spec.name
         config["auth_mode"] = mode
@@ -340,7 +501,7 @@ class ZeroClawService:
         elif spawn_password is not None:
             config["spawn_password_hash"] = self._hash_password(spawn_password)
         if install_runtime:
-            config["runtime_installed"] = True
+            self._mark_runtime_installed(config, provider_spec.name)
         created = config.get("created_at") or now_iso()
         config["created_at"] = created
         config["updated_at"] = now_iso()
@@ -357,7 +518,9 @@ class ZeroClawService:
                 "subscription": config["subscription"],
                 "auth_mode": config["auth_mode"],
                 "spawn_password_configured": bool(config.get("spawn_password_hash")),
-                "runtime_installed": bool(config.get("runtime_installed", False)),
+                "runtime_installed": self._is_runtime_marked_installed(config, provider_spec.name),
+                "runtime_install_method": str((install_result or {}).get("method", "")),
+                "runtime_install_package": str((install_result or {}).get("package", "")),
             },
         )
         self.store.write_state(state)
@@ -379,8 +542,116 @@ class ZeroClawService:
             "subscription": config.get("subscription", ""),
             "api_key": redact(str(credentials.get("api_key", ""))),
             "spawn_password_configured": bool(str(config.get("spawn_password_hash", "")).strip()),
-            "runtime_installed": bool(config.get("runtime_installed", False)),
+            "runtime_installed": self._is_runtime_marked_installed(config, provider_spec.name),
             "updated_at": config.get("updated_at", ""),
+        }
+
+    @staticmethod
+    def _installed_runtime_names(config: dict[str, Any]) -> set[str]:
+        names = {
+            str(item).strip().lower()
+            for item in config.get("installed_runtimes", [])
+            if str(item).strip()
+        }
+        if bool(config.get("runtime_installed", False)):
+            provider = str(config.get("provider", "")).strip().lower()
+            if provider:
+                names.add(provider)
+        return names
+
+    def _is_runtime_marked_installed(self, config: dict[str, Any], provider: str) -> bool:
+        return str(provider).strip().lower() in self._installed_runtime_names(config)
+
+    def _mark_runtime_installed(self, config: dict[str, Any], provider: str) -> None:
+        names = sorted(self._installed_runtime_names(config) | {str(provider).strip().lower()})
+        config["installed_runtimes"] = names
+        config["runtime_installed"] = bool(names)
+
+    def install_provider_runtime(self, provider: str) -> dict[str, Any]:
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        spec = get_provider(name)
+        executable = shutil.which(spec.name)
+        if executable:
+            config = self.store.read_config()
+            self._mark_runtime_installed(config, spec.name)
+            config["updated_at"] = now_iso()
+            self.store.write_config(config)
+            return {
+                "provider": spec.name,
+                "installed": False,
+                "already_present": True,
+                "method": spec.install_method,
+                "package": spec.install_package or spec.name,
+                "executable": executable,
+            }
+
+        if spec.install_method == "brew":
+            brew = shutil.which("brew")
+            if not brew:
+                raise SetupError("Homebrew is required to install provider runtimes but was not found in PATH.")
+            cmd = [brew, "install", spec.install_package or spec.name]
+        elif spec.install_method == "pnpm":
+            pnpm = shutil.which("pnpm")
+            if not pnpm:
+                raise SetupError("pnpm is required to install provider runtimes but was not found in PATH.")
+            cmd = [pnpm, "add", "-g", spec.install_package or spec.name]
+        else:
+            raise SetupError(f"provider '{spec.name}' does not define an install method")
+
+        env = self._service_env("")
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+        output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+        if result.returncode != 0:
+            raise SetupError(
+                f"failed to install runtime for {spec.name} via {spec.install_method}: {output or f'exit {result.returncode}'}"
+            )
+
+        executable = self._resolve_provider_executable(spec.name)
+        config = self.store.read_config()
+        self._mark_runtime_installed(config, spec.name)
+        config["updated_at"] = now_iso()
+        self.store.write_config(config)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "runtime.installed",
+            f"Installed runtime for {spec.name}",
+            {
+                "provider": spec.name,
+                "method": spec.install_method,
+                "package": spec.install_package or spec.name,
+                "executable": executable,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "provider": spec.name,
+            "installed": True,
+            "already_present": False,
+            "method": spec.install_method,
+            "package": spec.install_package or spec.name,
+            "executable": executable,
+            "output": output,
+        }
+
+    def ensure_provider_runtime(self, provider: str) -> dict[str, Any]:
+        try:
+            executable = self._resolve_provider_executable(provider)
+        except SetupError:
+            return self.install_provider_runtime(provider)
+        config = self.store.read_config()
+        self._mark_runtime_installed(config, provider)
+        config["updated_at"] = now_iso()
+        self.store.write_config(config)
+        return {
+            "provider": str(provider).strip().lower(),
+            "installed": False,
+            "already_present": True,
+            "method": get_provider(provider).install_method,
+            "package": get_provider(provider).install_package or str(provider).strip().lower(),
+            "executable": executable,
         }
 
     def create_agent(
@@ -532,6 +803,7 @@ class ZeroClawService:
         return agent_state
 
     def list_agents(self) -> list[dict[str, Any]]:
+        self._refresh_managed_agent_provider_alignments()
         state = self.store.read_state()
         agents = list(state.setdefault("agents", state.get("users", {})).values())
         for agent in agents:
@@ -596,6 +868,7 @@ class ZeroClawService:
             raise ValueError("agent_id is required")
         if token.startswith("@local:"):
             raise ValueError("provider switching is only supported for managed agents")
+        self._refresh_managed_agent_provider_alignment(token)
 
         target_provider = str(provider).strip().lower()
         if not target_provider:
@@ -645,15 +918,14 @@ class ZeroClawService:
                 "auth": auth,
             }
 
-        if linux_user:
-            self._require_linux_user_access(linux_user, "provider switching")
-            self._resolve_provider_executable(target_spec.name)
-            if changed and current_provider:
-                self._resolve_provider_executable(current_provider)
-            if home:
-                self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
-
         try:
+            if linux_user:
+                self._require_linux_user_access(linux_user, "provider switching")
+                self.ensure_provider_runtime(target_spec.name)
+                if changed and current_provider:
+                    self._resolve_provider_executable(current_provider)
+                if home:
+                    self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
             if linux_user and changed and current_provider:
                 previous_status = self._run_managed_provider_service_action(
                     provider=current_provider,
@@ -708,7 +980,33 @@ class ZeroClawService:
                                 agent_info=other_state,
                             )
                             stopped_results.append(stopped)
-        except Exception:
+        except Exception as exc:
+            self._set_agent_provider_issue(
+                agent,
+                status="error",
+                kind="switch_failed",
+                issue=f"provider switch to {target_spec.name} failed: {exc}",
+                remediation=self._provider_switch_remediation(
+                    agent_id=token,
+                    target_provider=target_spec.name,
+                    linux_user=linux_user,
+                    error=str(exc),
+                ),
+                requested_provider=target_spec.name,
+            )
+            self._event(
+                state,
+                "agents.provider_switch_failed",
+                f"Provider switch failed for {token}",
+                {
+                    "agent_id": token,
+                    "from_provider": current_provider,
+                    "to_provider": target_spec.name,
+                    "linux_user": linux_user,
+                    "error": str(exc),
+                },
+            )
+            self.store.write_state(state)
             if changed and linux_user and str(start_result.get("service_status", "")) == "running":
                 try:
                     self._run_managed_provider_service_action(
@@ -741,6 +1039,7 @@ class ZeroClawService:
             info["fallback_pid"] = int(start_result.get("fallback_pid", 0) or 0)
         info["last_sync"] = now_iso()
         agent["core_prompts"] = prompts
+        self._clear_agent_provider_issue(agent)
         if not stop_result and stopped_results:
             stop_result = stopped_results[-1]
         self._event(
@@ -793,6 +1092,7 @@ class ZeroClawService:
             "linux_user": str(info.get("linux_user", "")),
             "local_user": bool(info.get("local_user", False)),
             "selected_bundles": list(sync.get("bundles", [])),
+            "shared_provider_auth": bool(sync.get("shared_provider_auth", False)),
             "last_synced_at": str(sync.get("last_synced_at", "")),
             "last_source_home": str(sync.get("last_source_home", "")),
             "last_synced_paths": list(sync.get("last_synced_paths", [])),
@@ -928,6 +1228,7 @@ class ZeroClawService:
         sync["last_source_home"] = str(src_home)
         sync["last_synced_paths"] = copied
         sync["last_revoked_paths"] = []
+        sync["shared_provider_auth"] = "provider-auth" in set(selected)
         agent["credential_sync"] = sync
         info["last_sync"] = now_iso()
         self._event(
@@ -989,6 +1290,8 @@ class ZeroClawService:
         sync["last_revoked_at"] = now_iso()
         sync["last_revoked_paths"] = removed
         sync["last_synced_paths"] = []
+        if "provider-auth" in set(revoked_bundles):
+            sync["shared_provider_auth"] = False
         agent["credential_sync"] = sync
         info["last_sync"] = now_iso()
         self._event(
@@ -1209,6 +1512,7 @@ class ZeroClawService:
         command = str(action).strip().lower()
         if command not in {"start", "stop", "restart", "status"}:
             raise ValueError("action must be one of: start, stop, restart, status")
+        self._refresh_managed_agent_provider_alignment(agent_id)
 
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
@@ -1222,6 +1526,9 @@ class ZeroClawService:
         if not provider:
             raise SetupError(f"agent '{agent_id}' has no provider configured")
         linux_user = str(agent_info.get("linux_user", "")).strip()
+        if command in {"start", "restart"}:
+            self.ensure_provider_runtime(provider)
+
         result = self._run_managed_provider_service_action(
             provider=provider,
             action=command,
@@ -1452,9 +1759,9 @@ class ZeroClawService:
         rows: list[dict[str, Any]] = []
         assigned_keys: set[tuple[str, str]] = set()
         for aid, payload in sorted(agents.items()):
-            self._hydrate_agent_controls(payload)
-            provider = str(payload.get("agent", {}).get("provider", "")).strip().lower()
-            for channel in payload.get("channels", []):
+            view = self._attach_agent_channel_view(copy.deepcopy(payload))
+            provider = str(view.get("agent", {}).get("provider", "")).strip().lower()
+            for channel in view.get("channels", []):
                 if not isinstance(channel, dict):
                     continue
                 kind = str(channel.get("kind", "")).strip().lower()
@@ -1464,12 +1771,13 @@ class ZeroClawService:
                 assigned_keys.add((kind, name))
                 rows.append(
                     {
-                        "source": "agent",
+                        "source": str(channel.get("channel_source", "agent")) or "agent",
                         "owner_agent_id": str(aid),
                         "provider": provider,
                         "kind": kind,
                         "name": name,
                         "enabled": bool(channel.get("enabled", True)),
+                        "discovered_provider": str(channel.get("discovered_provider", "")),
                     }
                 )
 
@@ -1502,7 +1810,9 @@ class ZeroClawService:
             "totals": {
                 "channels": len(rows),
                 "kinds": len(kinds),
-                "assigned": sum(1 for row in rows if str(row.get("source", "")) == "agent"),
+                "assigned": sum(
+                    1 for row in rows if str(row.get("owner_agent_id", "")).strip() not in {"", "@pool"}
+                ),
                 "local": sum(1 for row in rows if str(row.get("source", "")) == "local"),
                 "pool": sum(1 for row in rows if str(row.get("source", "")) == "pool"),
             },
@@ -1659,6 +1969,7 @@ class ZeroClawService:
             raise ValueError("kind and name are required")
         if target.startswith("@local:"):
             raise ValueError("connect is only supported for managed agents")
+        self._refresh_managed_agent_provider_alignment(target)
 
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
@@ -1825,8 +2136,79 @@ class ZeroClawService:
             provider = token.split(":", 1)[1]
             payload = self._local_agent_view(provider)
         else:
+            self._refresh_managed_agent_provider_alignment(token)
             payload = copy.deepcopy(self.get_agent(token))
-        return self._attach_agent_auth_status(payload)
+        payload = self._attach_agent_runtime_status(payload)
+        payload = self._attach_agent_auth_status(payload)
+        return self._attach_agent_channel_view(payload)
+
+    def sync_agent_channels_from_provider(self, agent_id: str, *, replace: bool = True) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            raise ValueError("channel sync is only supported for managed agents")
+        self._refresh_managed_agent_provider_alignment(token)
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        discovery = self._discover_agent_channels(agent)
+        if str(discovery.get("source", "")) == "permission":
+            raise SetupError(str(discovery.get("detail", "live channel discovery requires root")))
+        discovered = discovery.get("channels", [])
+        if not isinstance(discovered, list) or not discovered:
+            raise SetupError(str(discovery.get("detail", "no live channels discovered")))
+
+        existing = agent.get("channels", [])
+        existing_map: dict[tuple[str, str], dict[str, Any]] = {}
+        if isinstance(existing, list):
+            for row in existing:
+                if not isinstance(row, dict):
+                    continue
+                key = self._channel_key(row.get("kind", ""), row.get("name", ""))
+                if key[0] and key[1]:
+                    existing_map[key] = dict(row)
+
+        synced: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for channel in discovered:
+            key = self._channel_key(channel.get("kind", ""), channel.get("name", ""))
+            if key in seen or not key[0] or not key[1]:
+                continue
+            seen.add(key)
+            row = dict(existing_map.get(key, {}))
+            row["kind"] = key[0]
+            row["name"] = key[1]
+            row["enabled"] = bool(row.get("enabled", True))
+            row["external_id"] = str(row.get("external_id", f"{token}:{key[0]}:{len(synced) + 1}"))
+            synced.append(row)
+
+        if not replace and isinstance(existing, list):
+            for row in existing:
+                if not isinstance(row, dict):
+                    continue
+                key = self._channel_key(row.get("kind", ""), row.get("name", ""))
+                if key in seen or not key[0] or not key[1]:
+                    continue
+                synced.append(dict(row))
+
+        agent["channels"] = synced
+        agent.setdefault("agent", {})["last_sync"] = now_iso()
+        self._event(
+            state,
+            "channels.synced_from_provider",
+            f"Synced live channels for {token}",
+            {
+                "agent_id": token,
+                "replace": bool(replace),
+                "channel_count": len(synced),
+                "discovered_provider": list(discovery.get("providers", [])),
+            },
+        )
+        self.store.write_state(state)
+        return self.get_dashboard_agent(token)
 
     def list_agent_core_prompts(self, agent_id: str) -> list[dict[str, Any]]:
         payload = self.get_dashboard_agent(agent_id)
@@ -1967,6 +2349,187 @@ class ZeroClawService:
         self._write_prompt_files_for_home(provider, home, prompts, linux_user)
         return agent
 
+    def shared_auth_status(self, provider: str) -> dict[str, Any]:
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        spec = get_provider(name)
+        shared_home = self._ensure_shared_provider_auth_root()
+        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        payload = self._inspect_provider_auth_state(
+            provider=spec.name,
+            auth_mode=auth_mode,
+            linux_user="",
+            home=shared_home,
+        )
+        payload.update(
+            {
+                "provider": spec.name,
+                "linux_user": "",
+                "home": str(shared_home),
+                "shared_scope": self._shared_provider_auth_scope(),
+                "shared_agents": self._shared_provider_auth_agent_ids(spec.name),
+            }
+        )
+        return payload
+
+    def list_shared_auth_statuses(self) -> list[dict[str, Any]]:
+        providers = self.configured_provider_names()
+        if not providers:
+            config = self.store.read_config()
+            providers = [str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"]
+        return [self.shared_auth_status(provider) for provider in providers]
+
+    def shared_auth_login(self, provider: str) -> dict[str, Any]:
+        self._require_setup()
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        spec = get_provider(name)
+        shared_home = self._ensure_shared_provider_auth_root()
+        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        payload = self._refresh_or_login_linked_auth(
+            provider=spec.name,
+            auth_mode=auth_mode,
+            linux_user="",
+            home=shared_home,
+        )
+        self._relax_shared_provider_auth_permissions()
+        applied = self.apply_shared_auth_links()
+        payload.update(
+            {
+                "provider": spec.name,
+                "linux_user": "",
+                "home": str(shared_home),
+                "shared_scope": self._shared_provider_auth_scope(),
+                "shared_agents": list(applied.get("updated_agents", [])),
+            }
+        )
+        return payload
+
+    def import_shared_auth(
+        self,
+        provider: str,
+        *,
+        source: str,
+        source_home: str | Path | None = None,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        name = str(provider).strip().lower()
+        if not name:
+            raise ValueError("provider is required")
+        shared_home = self._ensure_shared_provider_auth_root()
+        src_home = Path(source_home).expanduser() if source_home else self._default_source_home()
+        if not src_home.exists():
+            raise FileNotFoundError(f"source home not found: {src_home}")
+
+        mode = str(source).strip().lower()
+        updated: list[str] = []
+        if mode == "provider":
+            updated.extend(
+                self._seed_shared_provider_auth_from_home(
+                    source_home=src_home,
+                    requested_provider=name,
+                )
+            )
+        elif mode == "codex":
+            imported = load_codex_auth(src_home)
+            updated.extend(self._write_provider_auth_profiles(provider_names(), imported))
+            target = shared_home / ".codex" / "auth.json"
+            if self._copy_if_present(src_home / ".codex" / "auth.json", target):
+                updated.append(str(target))
+        elif mode == "claude":
+            imported = load_claude_auth(src_home)
+            updated.extend(self._write_provider_auth_profiles(provider_names(), imported))
+        else:
+            raise ValueError("source must be one of: provider, codex, claude")
+
+        self._relax_shared_provider_auth_permissions()
+        applied = self.apply_shared_auth_links()
+        auth = self.shared_auth_status(name)
+        return {
+            "provider": name,
+            "source": mode,
+            "source_home": str(src_home),
+            "home": str(shared_home),
+            "updated_paths": self._dedupe_paths(updated),
+            "updated_agents": list(applied.get("updated_agents", [])),
+            "skipped_agents": list(applied.get("skipped_agents", [])),
+            "auth": auth,
+        }
+
+    def apply_shared_auth_links(self, agent_id: str | None = None) -> dict[str, Any]:
+        self._require_setup()
+        shared_home = self._ensure_shared_provider_auth_root()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        updated_agents: list[str] = []
+        skipped_agents: list[str] = []
+        linked_paths: list[str] = []
+        changed = False
+        for aid, agent in sorted(agents.items()):
+            token = str(aid).strip()
+            if agent_id and token != str(agent_id).strip():
+                continue
+            self._hydrate_agent_controls(agent)
+            sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+            if "provider-auth" not in set(sync.get("bundles", [])):
+                continue
+            info = agent.setdefault("agent", {})
+            linux_user = str(info.get("linux_user", "")).strip()
+            home = self._agent_linux_home(agent)
+            if not linux_user or home is None or not home.exists():
+                skipped_agents.append(token)
+                continue
+            if not self._can_manage_linux_user(linux_user):
+                skipped_agents.append(token)
+                continue
+            linked = self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
+            linked_paths.extend(linked)
+            sync["shared_provider_auth"] = True
+            sync["last_synced_at"] = now_iso()
+            sync["last_source_home"] = str(shared_home)
+            sync["last_synced_paths"] = self._dedupe_paths(list(sync.get("last_synced_paths", [])) + linked)
+            sync["last_revoked_paths"] = []
+            agent["credential_sync"] = sync
+            info["last_sync"] = now_iso()
+            updated_agents.append(token)
+            changed = True
+        if changed:
+            self._event(
+                state,
+                "agents.shared_auth_applied",
+                "Applied shared provider auth links",
+                {
+                    "agent_id": str(agent_id or ""),
+                    "shared_home": str(shared_home),
+                    "updated_agents": updated_agents,
+                    "linked_paths": self._dedupe_paths(linked_paths),
+                },
+            )
+            self.store.write_state(state)
+        return {
+            "home": str(shared_home),
+            "updated_agents": updated_agents,
+            "skipped_agents": skipped_agents,
+            "linked_paths": self._dedupe_paths(linked_paths),
+        }
+
+    def _shared_provider_auth_agent_ids(self, provider: str) -> list[str]:
+        name = str(provider).strip().lower()
+        rows: list[str] = []
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        for aid, agent in sorted(agents.items()):
+            self._hydrate_agent_controls(agent)
+            info = agent.get("agent", {})
+            if str(info.get("provider", "")).strip().lower() != name:
+                continue
+            sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+            if bool(sync.get("shared_provider_auth", False)):
+                rows.append(str(aid))
+        return rows
+
     def local_claw_service_action(self, provider: str, action: str) -> dict[str, Any]:
         self._require_setup()
         name = str(provider).strip().lower()
@@ -1975,6 +2538,8 @@ class ZeroClawService:
             raise ValueError("provider is required")
         if command not in {"start", "stop", "restart", "status"}:
             raise ValueError("action must be one of: start, stop, restart, status")
+        if command in {"start", "restart"}:
+            self.ensure_provider_runtime(name)
 
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)
@@ -2198,6 +2763,7 @@ class ZeroClawService:
             payload = self.local_claw_auth_status(token.split(":", 1)[1])
             payload["agent_id"] = token
             return payload
+        self._refresh_managed_agent_provider_alignment(token)
 
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
@@ -2212,17 +2778,22 @@ class ZeroClawService:
         auth_mode = str(info.get("auth_mode", get_provider(provider).default_auth_mode))
         linux_user = str(info.get("linux_user", "")).strip()
         home = self._agent_linux_home(agent)
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        shared_provider_auth = bool(sync.get("shared_provider_auth", False))
+        inspect_linux_user = "" if shared_provider_auth else linux_user
+        inspect_home = self._shared_provider_auth_home() if shared_provider_auth else home
         payload = self._inspect_provider_auth_state(
             provider=provider,
             auth_mode=auth_mode,
-            linux_user=linux_user,
-            home=home,
+            linux_user=inspect_linux_user,
+            home=inspect_home,
         )
         payload.update(
             {
                 "agent_id": token,
                 "linux_user": linux_user,
-                "home": str(home or ""),
+                "home": str(inspect_home or ""),
+                "shared_provider_auth": shared_provider_auth,
                 "local_user": False,
             }
         )
@@ -2234,6 +2805,7 @@ class ZeroClawService:
             payload = self.local_claw_auth_login(token.split(":", 1)[1])
             payload["agent_id"] = token
             return payload
+        self._refresh_managed_agent_provider_alignment(token)
 
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
@@ -2247,17 +2819,23 @@ class ZeroClawService:
             raise SetupError(f"agent '{token}' has no provider configured")
         linux_user = str(info.get("linux_user", "")).strip()
         home = self._agent_linux_home(agent)
-        payload = self._refresh_or_login_linked_auth(
-            provider=provider,
-            auth_mode=str(info.get("auth_mode", get_provider(provider).default_auth_mode)),
-            linux_user=linux_user,
-            home=home,
-        )
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        shared_provider_auth = bool(sync.get("shared_provider_auth", False))
+        if shared_provider_auth:
+            payload = self.shared_auth_login(provider)
+        else:
+            payload = self._refresh_or_login_linked_auth(
+                provider=provider,
+                auth_mode=str(info.get("auth_mode", get_provider(provider).default_auth_mode)),
+                linux_user=linux_user,
+                home=home,
+            )
         payload.update(
             {
                 "agent_id": token,
                 "linux_user": linux_user,
-                "home": str(home or ""),
+                "home": str(self._shared_provider_auth_home() if shared_provider_auth else (home or "")),
+                "shared_provider_auth": shared_provider_auth,
                 "local_user": False,
             }
         )
@@ -2273,6 +2851,8 @@ class ZeroClawService:
     ) -> dict[str, Any]:
         if refresh:
             self.collect_metrics(agent_id=agent_id)
+        daemon_map = self._running_provider_daemons_by_user()
+        self._refresh_managed_agent_provider_alignments(agent_id=agent_id, daemon_map=daemon_map)
         state = self.store.read_state()
         agents = list(state.setdefault("agents", state.get("users", {})).values())
         if agent_id:
@@ -2293,7 +2873,10 @@ class ZeroClawService:
             key=lambda row: row.get("agent_id", row.get("user_id", "")),
         ):
             self._hydrate_agent_controls(agent_state)
-            channels = agent_state.get("channels", [])
+            channel_view = self._attach_agent_channel_view(copy.deepcopy(agent_state))
+            channel_view = self._attach_agent_runtime_status(channel_view, daemon_map=daemon_map)
+            agent_info = channel_view.get("agent", {})
+            channels = channel_view.get("channels", [])
             active_channels = sum(1 for channel in channels if bool(channel.get("enabled", True)))
             migrated_count = sum(1 for row in channels if row.get("migrated_from"))
             channel_total += len(channels)
@@ -2304,7 +2887,15 @@ class ZeroClawService:
             mem = float(metric.get("mem_percent", 0.0))
             rss = int(metric.get("rss_kb", 0))
             metric_status = str(metric.get("status", "")).strip()
-            sampled_status = self._dashboard_status(metric_status, agent_state.get("agent", {}))
+            live_pid = int(agent_info.get("live_pid", 0) or 0)
+            if live_pid > 0 and (metric_status in {"", "offline", "stopped", "unknown"} or rss <= 0):
+                probe = self._probe_process(live_pid)
+                if probe is not None:
+                    cpu = float(probe["cpu_percent"])
+                    mem = float(probe["mem_percent"])
+                    rss = int(probe["rss_kb"])
+                    metric_status = "running"
+            sampled_status = self._dashboard_status(metric_status, agent_info)
             cpu_total += cpu
             mem_total += mem
             rows.append(
@@ -2312,14 +2903,17 @@ class ZeroClawService:
                     "agent_id": current_id,
                     "display_name": agent_state.get("display_name", ""),
                     "status": sampled_status,
-                    "version": agent_state.get("agent", {}).get("version", ""),
-                    "provider": agent_state.get("agent", {}).get("provider", ""),
+                    "version": agent_info.get("version", ""),
+                    "provider": agent_info.get("provider", ""),
+                    "provider_status": agent_info.get("provider_status", "ok"),
+                    "provider_issue": agent_info.get("provider_issue", ""),
+                    "provider_remediation": agent_info.get("provider_remediation", ""),
                     "strategy": agent_state.get("channel_strategy", ""),
                     "channels": active_channels,
                     "channels_total": len(channels),
                     "migrated": migrated_count,
-                    "last_sync": agent_state.get("agent", {}).get("last_sync", ""),
-                    "pid": int(agent_state.get("agent", {}).get("pid") or 0),
+                    "last_sync": agent_info.get("last_sync", ""),
+                    "pid": live_pid or int(agent_info.get("pid") or 0),
                     "cpu_percent": cpu,
                     "mem_percent": mem,
                     "rss_kb": rss,
@@ -2419,6 +3013,10 @@ class ZeroClawService:
                 "spawn requires root privileges. Re-run with sudo/root to create Linux users."
             )
 
+        config = self.store.read_config()
+        resolved_provider = str(provider or config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        self.ensure_provider_runtime(resolved_provider)
+
         target_home = Path("/home") / target_user
         if self._linux_user_exists(target_user):
             raise AgentExistsError(f"linux user already exists: {target_user}")
@@ -2438,9 +3036,6 @@ class ZeroClawService:
         else:
             src_home = self._default_source_home()
         system_prepared = self._ensure_system_shared_runtime(src_home)
-
-        config = self.store.read_config()
-        resolved_provider = str(provider or config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
         selected_credential_bundles = self._ordered_credential_bundles(
             self._normalize_credential_bundles(
                 credential_bundles,
@@ -2504,6 +3099,7 @@ class ZeroClawService:
         credential_sync = self._normalize_credential_sync_state({}, default_when_missing=False)
         credential_sync["bundles"] = selected_credential_bundles
         credential_sync["last_source_home"] = str(src_home)
+        credential_sync["shared_provider_auth"] = copy_configs and "provider-auth" in set(selected_credential_bundles)
         if copy_configs:
             credential_sync["last_synced_at"] = now_iso()
             credential_sync["last_synced_paths"] = list(copied)
@@ -2984,7 +3580,7 @@ class ZeroClawService:
             if isinstance(raw, list):
                 return [str(item) for item in raw if str(item).strip()]
         if token == "provider-auth":
-            return credential_paths_for_providers(provider_names())
+            return shared_auth_paths_for_providers(provider_names())
         return []
 
     def _sync_selected_credential_bundles(
@@ -2999,12 +3595,11 @@ class ZeroClawService:
         for bundle in self._ordered_credential_bundles(bundles):
             if bundle == "provider-auth":
                 copied.extend(
-                    self._copy_provider_credentials(
+                    self._sync_shared_provider_auth(
                         source_home=source_home,
                         target_home=target_home,
                         username=username,
                         requested_provider=requested_provider,
-                        enabled=True,
                     )
                 )
                 continue
@@ -3039,45 +3634,20 @@ class ZeroClawService:
                 removed.append(str(dst))
         return self._dedupe_paths(removed)
 
-    def _copy_provider_credentials(
+    def _sync_shared_provider_auth(
         self,
         source_home: Path,
         target_home: Path,
         username: str,
         requested_provider: str | None,
-        enabled: bool,
     ) -> list[str]:
-        if not enabled:
-            return []
-
-        config = self.store.read_config()
-        configured = list(self._normalized_provider_credentials(config).keys())
-        configured.append(str(config.get("provider", "picoclaw")))
-        if requested_provider:
-            configured.append(requested_provider)
-        for row in self.list_installed_claws(source_home=source_home):
-            configured.append(str(row.get("provider", "")))
-
-        providers: list[str] = []
-        seen: set[str] = set()
-        valid = set(provider_names())
-        for item in configured:
-            name = str(item or "").strip().lower()
-            if not name or name in seen:
-                continue
-            if name not in valid:
-                continue
-            providers.append(name)
-            seen.add(name)
-
-        candidates = credential_paths_for_providers(providers)
-        return self._copy_selected_paths(
+        updated = self._seed_shared_provider_auth_from_home(
             source_home=source_home,
-            target_home=target_home,
-            username=username,
-            relative_paths=candidates,
-            enabled=True,
+            requested_provider=requested_provider,
         )
+        updated.extend(self._ensure_shared_provider_auth_links(target_home=target_home, username=username))
+        self._relax_shared_provider_auth_permissions()
+        return self._dedupe_paths(updated)
 
     def _copy_selected_paths(
         self,
@@ -3318,8 +3888,12 @@ class ZeroClawService:
         return str(crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)))
 
     def _service_command(self, provider: str, action: str, linux_user: str) -> list[str]:
-        executable = self._resolve_provider_executable(provider)
-        base = [executable, "service", action]
+        spec = get_provider(provider)
+        executable = self._resolve_provider_executable(spec.name)
+        if spec.service_group:
+            base = [executable, spec.service_group, action]
+        else:
+            base = ["bash", "-lc", self._process_service_shell(spec.name, executable, action)]
         return self._wrap_user_command(base, linux_user, purpose="service control")
 
     def _channel_connect_commands(
@@ -3349,12 +3923,10 @@ class ZeroClawService:
 
     @staticmethod
     def _command_executable(cmd: list[str]) -> str:
-        if "service" in cmd:
-            idx = cmd.index("service")
-            if idx > 0:
-                return str(cmd[idx - 1])
-        if "auth" in cmd:
-            idx = cmd.index("auth")
+        for marker in ("service", "daemon", "auth", "gateway"):
+            if marker not in cmd:
+                continue
+            idx = cmd.index(marker)
             if idx > 0:
                 return str(cmd[idx - 1])
         return str(cmd[0])
@@ -3368,7 +3940,7 @@ class ZeroClawService:
         if Path(fallback).exists():
             return fallback
         raise SetupError(
-            f"provider executable '{provider}' was not found in PATH. Install or link it before using service controls."
+            f"provider executable '{provider}' was not found in PATH. Run 'clawie runtime install {provider}' first."
         )
 
     def _service_env(self, linux_user: str) -> dict[str, str]:
@@ -3401,9 +3973,44 @@ class ZeroClawService:
         return env
 
     def _provider_auth_command(self, provider: str, action: str, linux_user: str) -> list[str]:
-        executable = self._resolve_provider_executable(provider)
-        base = [executable, "auth", action]
+        spec = get_provider(provider)
+        executable = self._resolve_provider_executable(spec.name)
+        if action == "login":
+            base = [executable, *spec.auth_login_command]
+        elif action == "refresh":
+            base = [executable, *spec.auth_refresh_command]
+        elif action == "status":
+            base = [executable, *spec.auth_status_command]
+        else:
+            base = [executable, "auth", action]
         return self._wrap_user_command(base, linux_user, purpose="auth control")
+
+    def _process_service_shell(self, provider: str, executable: str, action: str) -> str:
+        spec = get_provider(provider)
+        state_dir = spec.state_dir
+        pattern = self._provider_process_pattern(spec.name)
+        quoted_executable = shlex.quote(executable)
+        start_cmd = " ".join([quoted_executable, *[shlex.quote(part) for part in spec.background_command]])
+        lines = [f'pattern={shlex.quote(pattern)}']
+        lines.append('existing="$(pgrep -u "$(id -u)" -f "$pattern" | tr \'\\n\' \' \' | sed \'s/[[:space:]]*$//\')"')
+        if action == "status":
+            lines.append('if [ -n "$existing" ]; then echo "active (running)"; else echo "inactive"; fi')
+        elif action == "stop":
+            lines.append('if [ -n "$existing" ]; then pkill -u "$(id -u)" -f "$pattern" || true; echo "stopped"; else echo "inactive"; fi')
+        elif action == "restart":
+            lines.append('if [ -n "$existing" ]; then pkill -u "$(id -u)" -f "$pattern" || true; fi')
+            lines.append(f'mkdir -p "$HOME/{state_dir}"')
+            lines.append(f'nohup {start_cmd} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
+        else:
+            lines.append('if [ -n "$existing" ]; then echo "already running"; exit 0; fi')
+            lines.append(f'mkdir -p "$HOME/{state_dir}"')
+            lines.append(f'nohup {start_cmd} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo "started pid=$!"')
+        return "; ".join(lines)
+
+    @staticmethod
+    def _provider_process_pattern(provider: str) -> str:
+        spec = get_provider(provider)
+        return " ".join([spec.name, *spec.background_command]).strip()
 
     @staticmethod
     def _path_or_none(value: Any) -> Path | None:
@@ -3623,6 +4230,298 @@ class ZeroClawService:
         info["can_login"] = bool(auth.get("can_login", False))
         return payload
 
+    def _attach_agent_runtime_status(
+        self,
+        payload: dict[str, Any],
+        *,
+        daemon_map: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
+        info = payload.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        info["provider_status"] = str(info.get("provider_status", "ok") or "ok")
+        if bool(info.get("local_user", False)):
+            info["live_provider"] = provider
+            info["live_providers"] = [provider] if provider else []
+            info["live_pid"] = int(info.get("fallback_pid", 0) or 0)
+            return payload
+
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            info["live_provider"] = ""
+            info["live_providers"] = []
+            info["live_pid"] = 0
+            return payload
+
+        if daemon_map is None:
+            daemon_map = self._running_provider_daemons_by_user()
+        live_entries = list(daemon_map.get(linux_user, []))
+        live_providers: list[str] = []
+        chosen_entry: dict[str, Any] | None = None
+        for entry in live_entries:
+            entry_provider = str(entry.get("provider", "")).strip().lower()
+            if not entry_provider:
+                continue
+            if entry_provider not in live_providers:
+                live_providers.append(entry_provider)
+            if chosen_entry is None and (
+                not str(info.get("provider", "")).strip().lower()
+                or entry_provider == str(info.get("provider", "")).strip().lower()
+            ):
+                chosen_entry = entry
+        if chosen_entry is None and live_entries:
+            chosen_entry = live_entries[0]
+
+        info["live_provider"] = str((chosen_entry or {}).get("provider", "")).strip().lower()
+        info["live_providers"] = live_providers
+        info["live_pid"] = int((chosen_entry or {}).get("pid", 0) or 0)
+        info["live_command"] = str((chosen_entry or {}).get("args", ""))
+        if live_entries:
+            info["service_status"] = "running"
+            if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
+                info["service_mode"] = "process"
+        return payload
+
+    def _refresh_managed_agent_provider_alignment(
+        self,
+        agent_id: str,
+        *,
+        daemon_map: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            return
+        self._refresh_managed_agent_provider_alignments(agent_id=token, daemon_map=daemon_map)
+
+    def _refresh_managed_agent_provider_alignments(
+        self,
+        *,
+        agent_id: str | None = None,
+        daemon_map: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        if daemon_map is None:
+            daemon_map = self._running_provider_daemons_by_user()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        dirty = False
+        for token, agent in agents.items():
+            if agent_id and token != agent_id:
+                continue
+            self._hydrate_agent_controls(agent)
+            if self._apply_live_provider_alignment(
+                state=state,
+                agent_id=token,
+                agent=agent,
+                daemon_map=daemon_map,
+            ):
+                dirty = True
+        if dirty:
+            self.store.write_state(state)
+
+    def _apply_live_provider_alignment(
+        self,
+        *,
+        state: dict[str, Any],
+        agent_id: str,
+        agent: dict[str, Any],
+        daemon_map: dict[str, list[dict[str, Any]]],
+    ) -> bool:
+        info = agent.setdefault("agent", {})
+        if bool(info.get("local_user", False)):
+            return False
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            return self._clear_runtime_provider_issue(agent)
+
+        current_provider = str(info.get("provider", "")).strip().lower()
+        live_entries = list(daemon_map.get(linux_user, []))
+        live_providers: list[str] = []
+        for entry in live_entries:
+            provider = str(entry.get("provider", "")).strip().lower()
+            if provider and provider not in live_providers:
+                live_providers.append(provider)
+
+        if not live_providers:
+            return self._clear_runtime_provider_issue(agent)
+
+        effective_provider = current_provider if current_provider in live_providers else live_providers[0]
+        changed = False
+        if effective_provider and effective_provider != current_provider:
+            info["provider"] = effective_provider
+            info["runtime"] = get_provider(effective_provider).runtime
+            auth_mode = str(info.get("auth_mode", "")).strip().lower()
+            spec = get_provider(effective_provider)
+            if not spec.supports_auth_mode(auth_mode):
+                info["auth_mode"] = spec.default_auth_mode
+            changed = True
+
+        if len(live_providers) > 1:
+            changed = self._set_agent_provider_issue(
+                agent,
+                status="warning",
+                kind="runtime_conflict",
+                issue=f"multiple provider daemons detected: {', '.join(live_providers)}; using {effective_provider}",
+                remediation=(
+                    f"Run 'sudo clawie agent provider set {agent_id} {effective_provider}' to stop the extra runtimes."
+                ),
+                requested_provider="",
+            ) or changed
+            if changed:
+                self._event(
+                    state,
+                    "agents.provider_runtime_conflict",
+                    f"Detected multiple runtimes for {agent_id}",
+                    {
+                        "agent_id": agent_id,
+                        "linux_user": linux_user,
+                        "live_providers": list(live_providers),
+                        "effective_provider": effective_provider,
+                    },
+                )
+            return changed
+
+        live_provider = live_providers[0]
+        if live_provider != current_provider:
+            changed = self._set_agent_provider_issue(
+                agent,
+                status="warning",
+                kind="runtime_drift",
+                issue=(
+                    f"live runtime was {live_provider}; Clawie aligned state away from {current_provider or 'unknown'}"
+                ),
+                remediation=(
+                    f"Run 'sudo clawie agent provider set {agent_id} {current_provider}' if you still want to switch."
+                    if current_provider
+                    else ""
+                ),
+                requested_provider=current_provider,
+            ) or changed
+            self._event(
+                state,
+                "agents.provider_aligned_to_runtime",
+                f"Aligned {agent_id} to live runtime {live_provider}",
+                {
+                    "agent_id": agent_id,
+                    "linux_user": linux_user,
+                    "previous_provider": current_provider,
+                    "live_provider": live_provider,
+                },
+            )
+            return True
+
+        return self._clear_runtime_provider_issue(agent) or changed
+
+    @staticmethod
+    def _clear_agent_provider_issue(agent: dict[str, Any]) -> None:
+        info = agent.setdefault("agent", {})
+        info["provider_status"] = "ok"
+        for key in ("provider_issue_kind", "provider_issue", "provider_remediation", "provider_requested"):
+            info.pop(key, None)
+
+    def _clear_runtime_provider_issue(self, agent: dict[str, Any]) -> bool:
+        info = agent.setdefault("agent", {})
+        if str(info.get("provider_issue_kind", "")) != "runtime_conflict":
+            return False
+        self._clear_agent_provider_issue(agent)
+        return True
+
+    @staticmethod
+    def _set_agent_provider_issue(
+        agent: dict[str, Any],
+        *,
+        status: str,
+        kind: str,
+        issue: str,
+        remediation: str,
+        requested_provider: str,
+    ) -> bool:
+        info = agent.setdefault("agent", {})
+        next_values = {
+            "provider_status": str(status or "warning"),
+            "provider_issue_kind": str(kind or "").strip(),
+            "provider_issue": str(issue or "").strip(),
+            "provider_remediation": str(remediation or "").strip(),
+            "provider_requested": str(requested_provider or "").strip().lower(),
+        }
+        current_values = {
+            key: str(info.get(key, "") if key != "provider_status" else info.get(key, "ok"))
+            for key in next_values
+        }
+        if current_values == next_values:
+            return False
+        info.update(next_values)
+        return True
+
+    def _provider_switch_remediation(
+        self,
+        *,
+        agent_id: str,
+        target_provider: str,
+        linux_user: str,
+        error: str,
+    ) -> str:
+        message = str(error).strip().lower()
+        if "requires root" in message or "sudo" in message:
+            return f"Re-run 'sudo clawie agent provider set {agent_id} {target_provider}'."
+        if "executable" in message or "not found" in message or "install" in message:
+            return f"Install or link '{target_provider}', then run 'sudo clawie agent provider set {agent_id} {target_provider}'."
+        if linux_user:
+            return (
+                f"Check the {target_provider} service for {linux_user}, then run "
+                f"'sudo clawie agent provider set {agent_id} {target_provider}' again."
+            )
+        return f"Retry 'clawie agent provider set {agent_id} {target_provider}' after fixing the provider runtime."
+
+    def _running_provider_daemons_by_user(self) -> dict[str, list[dict[str, Any]]]:
+        result = subprocess.run(["ps", "-eo", "user=,pid=,args="], capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return {}
+
+        rows: dict[str, list[dict[str, Any]]] = {}
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3:
+                continue
+            linux_user, pid_text, args = parts
+            provider = self._provider_from_process_args(args)
+            if not provider:
+                continue
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            rows.setdefault(linux_user, []).append(
+                {
+                    "provider": provider,
+                    "pid": pid,
+                    "args": args,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _provider_from_process_args(args: str) -> str:
+        raw = str(args).strip()
+        if not raw:
+            return ""
+        try:
+            tokens = shlex.split(raw)
+        except ValueError:
+            tokens = raw.split()
+        if len(tokens) < 2:
+            return ""
+        known = set(provider_names())
+        for idx, token in enumerate(tokens):
+            candidate = Path(token).name.strip().lower()
+            if candidate not in known:
+                continue
+            expected = [str(item).strip().lower() for item in get_provider(candidate).background_command]
+            if not expected:
+                continue
+            tail = [str(item).strip().lower() for item in tokens[idx + 1 : idx + 1 + len(expected)]]
+            if tail == expected:
+                return candidate
+        return ""
+
     def _bootstrap_user_bus(self, linux_user: str) -> None:
         if not linux_user or os.geteuid() != 0:
             return
@@ -3673,10 +4572,12 @@ class ZeroClawService:
         return {"service_status": "running", "output": f"fallback daemon started pid={new_pid}"}
 
     def _start_fallback_daemon(self, provider: str, executable: str, linux_user: str) -> int:
-        state_dir = get_provider(provider).state_dir
+        spec = get_provider(provider)
+        state_dir = spec.state_dir
+        background = " ".join([f'"{executable}"', *[shlex.quote(part) for part in spec.background_command]])
         script = (
             f'mkdir -p "$HOME/{state_dir}"; '
-            f'nohup "{executable}" daemon >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
+            f'nohup {background} >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
         )
         cmd = self._user_shell_command(linux_user, script)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -3846,6 +4747,135 @@ class ZeroClawService:
     def _discover_channels_for_provider_root(self, provider: str, root: Path) -> list[dict[str, str]]:
         adapter = get_channel_adapter(provider)
         return adapter.discover_channels(root)
+
+    def _discover_agent_channels(self, payload: dict[str, Any]) -> dict[str, Any]:
+        info = payload.get("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        linux_user = str(info.get("linux_user", "")).strip()
+        is_local = bool(info.get("local_user", False))
+        if is_local:
+            home = self._local_agent_home(provider)
+        else:
+            home = self._agent_linux_home(payload)
+        if not home:
+            return {"source": "none", "detail": "agent home is not available", "channels": [], "providers": []}
+        if linux_user and not is_local and not self._can_manage_linux_user(linux_user):
+            return {
+                "source": "permission",
+                "detail": "live channel discovery requires root for managed agents owned by another Linux user",
+                "channels": [],
+                "providers": [],
+            }
+
+        ordered: list[str] = []
+        seen_providers: set[str] = set()
+        for item in [provider] + provider_names():
+            token = str(item or "").strip().lower()
+            if not token or token in seen_providers:
+                continue
+            seen_providers.add(token)
+            ordered.append(token)
+
+        discovered: list[dict[str, Any]] = []
+        found_providers: list[str] = []
+        seen_channels: set[tuple[str, str]] = set()
+        for name in ordered:
+            root = home / get_provider(name).state_dir
+            channels = self._discover_channels_for_provider_root(name, root)
+            provider_had_rows = False
+            for channel in channels:
+                key = self._channel_key(channel.get("kind", ""), channel.get("name", ""))
+                if key in seen_channels or not key[0] or not key[1]:
+                    continue
+                seen_channels.add(key)
+                provider_had_rows = True
+                discovered.append(
+                    {
+                        "kind": key[0],
+                        "name": key[1],
+                        "enabled": bool(channel.get("enabled", True)),
+                        "discovered_provider": name,
+                    }
+                )
+            if provider_had_rows:
+                found_providers.append(name)
+
+        if discovered:
+            return {
+                "source": "provider",
+                "detail": "live channels discovered",
+                "channels": discovered,
+                "providers": found_providers,
+            }
+        return {
+            "source": "none",
+            "detail": "no live channels discovered",
+            "channels": [],
+            "providers": [],
+        }
+
+    def _attach_agent_channel_view(self, payload: dict[str, Any]) -> dict[str, Any]:
+        info = payload.setdefault("agent", {})
+        stored = payload.get("channels", [])
+        stored_rows = [dict(row) for row in stored if isinstance(row, dict)] if isinstance(stored, list) else []
+        discovery = self._discover_agent_channels(payload)
+        live_rows = discovery.get("channels", [])
+        live_map = {
+            self._channel_key(row.get("kind", ""), row.get("name", "")): dict(row)
+            for row in live_rows
+            if isinstance(row, dict)
+        }
+
+        merged: list[dict[str, Any]] = []
+        appended: set[tuple[str, str]] = set()
+        for row in stored_rows:
+            key = self._channel_key(row.get("kind", ""), row.get("name", ""))
+            if not key[0] or not key[1]:
+                continue
+            live = live_map.get(key)
+            if live:
+                row["channel_source"] = "live"
+                row["discovered_provider"] = str(live.get("discovered_provider", ""))
+            elif str(discovery.get("source", "")) == "provider":
+                row["channel_source"] = "stale"
+            else:
+                row["channel_source"] = "state"
+            merged.append(row)
+            appended.add(key)
+
+        for row in live_rows:
+            if not isinstance(row, dict):
+                continue
+            key = self._channel_key(row.get("kind", ""), row.get("name", ""))
+            if key in appended or not key[0] or not key[1]:
+                continue
+            merged.append(
+                {
+                    "kind": key[0],
+                    "name": key[1],
+                    "enabled": bool(row.get("enabled", True)),
+                    "external_id": "",
+                    "channel_source": "discovered",
+                    "discovered_provider": str(row.get("discovered_provider", "")),
+                }
+            )
+            appended.add(key)
+
+        def _sort_key(row: dict[str, Any]) -> tuple[int, str, str]:
+            source = str(row.get("channel_source", "state"))
+            order = {"live": 0, "discovered": 1, "state": 2, "stale": 3}
+            return (order.get(source, 9), str(row.get("kind", "")), str(row.get("name", "")))
+
+        payload["channels"] = sorted(merged, key=_sort_key)
+        info["channel_status_source"] = str(discovery.get("source", "state"))
+        info["channel_status_detail"] = str(discovery.get("detail", ""))
+        info["live_channel_count"] = sum(
+            1 for row in payload["channels"] if str(row.get("channel_source", "")) in {"live", "discovered"}
+        )
+        info["stale_channel_count"] = sum(
+            1 for row in payload["channels"] if str(row.get("channel_source", "")) == "stale"
+        )
+        return payload
 
     @staticmethod
     def _provider_core_prompt_names(provider: str) -> tuple[str, ...]:

@@ -14,7 +14,7 @@ from clawie.service import (
     AgentNotFoundError,
     ZeroClawService,
 )
-from clawie.store import DEFAULT_CONFIG, StateStore
+from clawie.store import StateStore
 from clawie.ui import (
     print_error,
     print_info,
@@ -37,13 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{config,agent,channel,runtime,dashboard,health,event,backup}",
+        metavar="{config,agent,channel,runtime,auth,dashboard,health,event,backup}",
     )
 
     _build_config_parser(subparsers)
     _build_agent_parser(subparsers)
     _build_channel_parser(subparsers)
     _build_runtime_parser(subparsers)
+    _build_auth_parser(subparsers)
 
     dashboard = subparsers.add_parser(
         "dashboard",
@@ -138,6 +139,77 @@ def _build_config_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
         help="Show current configuration status",
     )
     config_show.set_defaults(func=cmd_config_show)
+
+
+def _build_auth_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    auth = subparsers.add_parser(
+        "auth",
+        help="Manage shared provider auth for all agents",
+    )
+    auth_sub = auth.add_subparsers(
+        dest="shared_auth_command",
+        required=True,
+        metavar="{show,login,import,apply}",
+    )
+
+    auth_show = auth_sub.add_parser(
+        "show",
+        help="Show shared auth status for one or more providers",
+    )
+    _add_positional_argument(
+        auth_show,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Provider name",
+    )
+    auth_show.set_defaults(func=cmd_shared_auth_show)
+
+    auth_login = auth_sub.add_parser(
+        "login",
+        help="Run linked login against the shared auth store",
+    )
+    _add_positional_argument(
+        auth_login,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Provider name",
+    )
+    auth_login.set_defaults(func=cmd_shared_auth_login)
+
+    auth_import = auth_sub.add_parser(
+        "import",
+        help="Import existing Codex, Claude, or provider auth into the shared auth store",
+    )
+    _add_positional_argument(
+        auth_import,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Provider name",
+    )
+    auth_import.add_argument(
+        "--from",
+        dest="source",
+        required=True,
+        choices=["provider", "codex", "claude"],
+        help="Auth source to import",
+    )
+    auth_import.add_argument(
+        "--source-home",
+        help="Home directory to import from (default: current user home)",
+    )
+    auth_import.set_defaults(func=cmd_shared_auth_import)
+
+    auth_apply = auth_sub.add_parser(
+        "apply",
+        help="Link the shared auth store into one agent or all eligible agents",
+    )
+    _add_positional_argument(
+        auth_apply,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Only apply to one agent",
+    )
+    auth_apply.set_defaults(func=cmd_shared_auth_apply)
 
 
 def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -573,7 +645,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     runtime_sub = runtime.add_subparsers(
         dest="runtime_command",
         required=True,
-        metavar="{create,detect,status,login,service}",
+        metavar="{create,detect,install,status,login,service}",
     )
 
     create = runtime_sub.add_parser(
@@ -649,6 +721,18 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     )
     detect.set_defaults(func=cmd_claws_detect)
 
+    install = runtime_sub.add_parser(
+        "install",
+        help="Install a provider runtime on this host",
+    )
+    _add_positional_argument(
+        install,
+        "provider",
+        metavar="PROVIDER",
+        help_text="Provider runtime to install",
+    )
+    install.set_defaults(func=cmd_runtime_install)
+
     status = runtime_sub.add_parser(
         "status",
         help="Show local runtime service and auth status",
@@ -716,8 +800,7 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--api-url",
-        default=str(DEFAULT_CONFIG["api_url"]),
-        help="API base URL",
+        help="API base URL (defaults to the selected provider endpoint)",
     )
     parser.add_argument(
         "--install-runtime",
@@ -771,12 +854,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
     provider = str(args.provider).strip().lower() or "picoclaw"
+    provider_spec = get_provider(provider)
     api_key = str(args.api_key or "").strip()
     auth_mode = str(args.auth_mode or "").strip().lower() or None
     spawn_password = args.spawn_password
     subscription = str(args.subscription).strip()
     workspace = str(args.workspace).strip()
-    api_url = str(args.api_url).strip()
+    api_url = str(args.api_url or "").strip()
 
     if args.interactive:
         print_info("Interactive setup mode")
@@ -786,17 +870,17 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
         ).lower()
         if provider not in set(provider_names()):
             raise ValueError("provider must be one of: " + ", ".join(provider_names()))
-        spec = get_provider(provider)
-        auth_mode = auth_mode or spec.default_auth_mode
+        provider_spec = get_provider(provider)
+        auth_mode = auth_mode or provider_spec.default_auth_mode
         auth_mode = _prompt_with_default(
-            f"Auth mode ({'/'.join(spec.auth_modes)})",
+            f"Auth mode ({'/'.join(provider_spec.auth_modes)})",
             auth_mode,
         ).lower()
         if auth_mode == "api_key":
             api_key = api_key or _prompt_required(f"{provider} API key")
         subscription = _prompt_with_default("Subscription", subscription)
         workspace = _prompt_with_default("Workspace", workspace)
-        api_url = _prompt_with_default("API URL", api_url)
+        api_url = _prompt_with_default("API URL", api_url or provider_spec.default_api_url)
 
     config = service.setup(
         provider=provider,
@@ -806,7 +890,7 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
         clear_spawn_password=bool(args.clear_spawn_password),
         subscription=subscription or "starter",
         workspace=workspace or "default",
-        api_url=api_url or str(DEFAULT_CONFIG["api_url"]),
+        api_url=api_url or provider_spec.default_api_url,
         install_runtime=bool(args.install_runtime),
     )
     status = service.setup_status()
@@ -821,7 +905,7 @@ def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
             f"api_url: {config.get('api_url', '')}",
             f"auth_mode: {config.get('auth_mode', '')}",
             f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
-            f"runtime_installed: {bool(config.get('runtime_installed', False))}",
+            f"runtime_installed: {status.get('runtime_installed', False)}",
             f"api_key: {status.get('api_key', '')}",
         ],
     )
@@ -853,6 +937,86 @@ def _print_setup_status(service: ZeroClawService) -> int:
     if not status.get("configured"):
         print_warning("Config is incomplete. Run `clawie config set`.")
         return 1
+    return 0
+
+
+def cmd_shared_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = str(args.provider or "").strip().lower()
+    if provider:
+        payload = service.shared_auth_status(provider)
+        _print_auth_status(payload, title="Shared Auth")
+        agents = payload.get("shared_agents", [])
+        print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+        return 0
+
+    rows: list[list[str]] = []
+    for payload in service.list_shared_auth_statuses():
+        rows.append(
+            [
+                str(payload.get("provider", "")),
+                str(payload.get("auth_status", "unknown")),
+                str(payload.get("auth_profile", "")),
+                str(payload.get("shared_scope", "")),
+                str(len(payload.get("shared_agents", []))),
+                str(payload.get("home", "")),
+            ]
+        )
+    print_table(["provider", "auth", "profile", "scope", "agents", "home"], rows)
+    return 0
+
+
+def cmd_shared_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    payload = service.shared_auth_login(provider)
+    action = str(payload.get("action_performed", "login"))
+    if action == "status":
+        print_success(f"Shared auth already ready for {provider}")
+    elif action == "refresh":
+        print_success(f"Refreshed shared auth for {provider}")
+    else:
+        print_success(f"Completed shared auth login for {provider}")
+    _print_auth_status(payload, title="Shared Auth")
+    agents = payload.get("shared_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    return 0
+
+
+def cmd_shared_auth_import(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    result = service.import_shared_auth(
+        provider,
+        source=str(args.source),
+        source_home=args.source_home,
+    )
+    print_success(f"Imported {result.get('source', '')} auth into shared store for {provider}")
+    print_info(f"Shared home: {result.get('home', '')}")
+    updated_paths = result.get("updated_paths", [])
+    if updated_paths:
+        print_info("Updated shared auth paths:")
+        for path in updated_paths:
+            print(f"- {path}")
+    updated_agents = result.get("updated_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in updated_agents) or "<none>"))
+    skipped_agents = result.get("skipped_agents", [])
+    if skipped_agents:
+        print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
+    auth = result.get("auth", {})
+    if auth:
+        _print_auth_status(auth, title="Shared Auth")
+    return 0
+
+
+def cmd_shared_auth_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = str(args.agent_id or "").strip() or None
+    result = service.apply_shared_auth_links(agent_id=agent_id)
+    target = agent_id or "eligible agents"
+    print_success(f"Applied shared auth links for {target}")
+    print_info(f"Shared home: {result.get('home', '')}")
+    updated_agents = result.get("updated_agents", [])
+    print_info("Updated agents: " + (", ".join(str(item) for item in updated_agents) or "<none>"))
+    skipped_agents = result.get("skipped_agents", [])
+    if skipped_agents:
+        print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
     return 0
 
 
@@ -931,6 +1095,7 @@ def cmd_agents_credentials_show(args: argparse.Namespace, service: ZeroClawServi
             f"agent_id: {payload.get('agent_id', '')}",
             f"linux_user: {payload.get('linux_user', '')}",
             f"selected: {selected}",
+            f"shared_provider_auth: {payload.get('shared_provider_auth', False)}",
             f"last_synced_at: {payload.get('last_synced_at', '')}",
             f"last_source_home: {payload.get('last_source_home', '')}",
             f"last_revoked_at: {payload.get('last_revoked_at', '')}",
@@ -1268,6 +1433,28 @@ def cmd_claws_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_runtime_install(args: argparse.Namespace, service: ZeroClawService) -> int:
+    provider = _resolve_required_value(args.provider, field_name="provider")
+    result = service.install_provider_runtime(provider)
+    if bool(result.get("already_present", False)):
+        print_info(f"Runtime already available for {provider}")
+    else:
+        print_success(f"Installed runtime for {provider}")
+    print_panel(
+        "Runtime Install",
+        [
+            f"provider: {result.get('provider', '')}",
+            f"method: {result.get('method', '')}",
+            f"package: {result.get('package', '')}",
+            f"executable: {result.get('executable', '')}",
+        ],
+    )
+    output = str(result.get("output", "")).strip()
+    if output:
+        print_info("Output: " + output)
+    return 0
+
+
 def cmd_runtime_status(args: argparse.Namespace, service: ZeroClawService) -> int:
     _ = args
     rows = service.list_local_runtime_statuses(refresh=True)
@@ -1406,11 +1593,16 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"channels: {len(channels)}",
             f"migrated_channels: {migrated}",
             f"provider: {agent.get('agent', {}).get('provider', '')}",
+            f"provider_status: {agent.get('agent', {}).get('provider_status', 'ok')}",
+            f"provider_issue: {agent.get('agent', {}).get('provider_issue', '')}",
+            f"provider_remediation: {agent.get('agent', {}).get('provider_remediation', '')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
             f"auth_status: {agent.get('agent', {}).get('auth_status', 'unknown')}",
             f"auth_profile: {agent.get('agent', {}).get('auth_profile', '')}",
             f"auth_account: {agent.get('agent', {}).get('auth_account', '')}",
             f"auth_expires_at: {agent.get('agent', {}).get('auth_expires_at', '')}",
+            f"channel_status: {agent.get('agent', {}).get('channel_status_source', 'state')}",
+            f"channel_detail: {agent.get('agent', {}).get('channel_status_detail', '')}",
             f"core_prompts: {len(agent.get('core_prompts', {}))}",
             f"credential_bundles: {selected_bundles}",
             f"autostart: {agent.get('agent', {}).get('autostart', True)}",
@@ -1428,11 +1620,16 @@ def _print_agent(agent: dict[str, Any]) -> None:
                     str(channel.get("kind", "")),
                     str(channel.get("name", "")),
                     str(bool(channel.get("enabled", True))),
+                    str(channel.get("channel_source", "")),
+                    str(channel.get("discovered_provider", "")),
                     str(channel.get("external_id", "")),
                     str(channel.get("migrated_from", "")),
                 ]
             )
-        print_table(["kind", "name", "enabled", "external_id", "migrated_from"], rows)
+        print_table(
+            ["kind", "name", "enabled", "source", "provider", "external_id", "migrated_from"],
+            rows,
+        )
 
     plugins = agent.get("agent", {}).get("plugins", {})
     if plugins:
@@ -1442,24 +1639,26 @@ def _print_agent(agent: dict[str, Any]) -> None:
 
 
 def _print_auth_status(payload: dict[str, Any], *, title: str) -> None:
-    print_panel(
-        title,
-        [
-            f"agent_id: {payload.get('agent_id', '')}",
-            f"provider: {payload.get('provider', '')}",
-            f"linux_user: {payload.get('linux_user', '')}",
-            f"home: {payload.get('home', '')}",
-            f"auth_mode: {payload.get('auth_mode', '')}",
-            f"auth_status: {payload.get('auth_status', 'unknown')}",
-            f"auth_profile: {payload.get('auth_profile', '')}",
-            f"account: {payload.get('account', '')}",
-            f"expires_at: {payload.get('expires_at', '')}",
-            f"last_refresh: {payload.get('last_refresh', '')}",
-            f"source: {payload.get('source', '')}",
-            f"detail: {payload.get('detail', '')}",
-            f"login_required: {payload.get('login_required', False)}",
-        ],
-    )
+    lines = [
+        f"agent_id: {payload.get('agent_id', '')}",
+        f"provider: {payload.get('provider', '')}",
+        f"linux_user: {payload.get('linux_user', '')}",
+        f"home: {payload.get('home', '')}",
+        f"auth_mode: {payload.get('auth_mode', '')}",
+        f"auth_status: {payload.get('auth_status', 'unknown')}",
+        f"auth_profile: {payload.get('auth_profile', '')}",
+        f"account: {payload.get('account', '')}",
+        f"expires_at: {payload.get('expires_at', '')}",
+        f"last_refresh: {payload.get('last_refresh', '')}",
+        f"source: {payload.get('source', '')}",
+        f"detail: {payload.get('detail', '')}",
+        f"login_required: {payload.get('login_required', False)}",
+    ]
+    if "shared_scope" in payload:
+        lines.append(f"shared_scope: {payload.get('shared_scope', '')}")
+    if "shared_provider_auth" in payload:
+        lines.append(f"shared_provider_auth: {payload.get('shared_provider_auth', False)}")
+    print_panel(title, lines)
 
 
 def _resolve_channels(

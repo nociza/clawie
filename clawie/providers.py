@@ -9,11 +9,20 @@ class ProviderSpec:
     runtime: str
     auth_modes: tuple[str, ...]
     default_auth_mode: str
+    default_api_url: str
     state_dir: str
     workspace_dir: str
     marker_files: tuple[str, ...]
     credential_paths: tuple[str, ...] = ()
+    shared_auth_paths: tuple[str, ...] = ()
     core_prompt_files: tuple[str, ...] = ()
+    install_method: str = ""
+    install_package: str = ""
+    service_group: str = "service"
+    background_command: tuple[str, ...] = ("daemon",)
+    auth_login_command: tuple[str, ...] = ("auth", "login")
+    auth_refresh_command: tuple[str, ...] = ("auth", "refresh")
+    auth_status_command: tuple[str, ...] = ("auth", "status")
 
     def supports_auth_mode(self, mode: str) -> bool:
         return mode in self.auth_modes
@@ -25,6 +34,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         runtime="zeroclaw-agent",
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
+        default_api_url="https://api.zeroclaw.example/v1",
         state_dir=".zeroclaw",
         workspace_dir="workspace",
         marker_files=("config.toml", "auth-profiles.json", ".secret_key"),
@@ -35,6 +45,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".config/openai",
             ".openai",
         ),
+        shared_auth_paths=(
+            ".zeroclaw/auth-profiles.json",
+        ),
         core_prompt_files=(
             "SOUL.md",
             "IDENTITY.md",
@@ -45,12 +58,17 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "BOOTSTRAP.md",
             "USER.md",
         ),
+        install_method="brew",
+        install_package="zeroclaw",
+        service_group="service",
+        background_command=("daemon",),
     ),
     "picoclaw": ProviderSpec(
         name="picoclaw",
         runtime="picoclaw-agent",
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
+        default_api_url="https://api.picoclaw.example/v1",
         state_dir=".picoclaw",
         workspace_dir="workspace",
         marker_files=("config.json", "config.toml", "auth-profiles.json"),
@@ -61,6 +79,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".config/openai",
             ".openai",
         ),
+        shared_auth_paths=(
+            ".picoclaw/auth-profiles.json",
+        ),
         core_prompt_files=(
             "SOUL.md",
             "IDENTITY.md",
@@ -71,12 +92,20 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "BOOTSTRAP.md",
             "USER.md",
         ),
+        install_method="brew",
+        install_package="picoclaw",
+        service_group="",
+        background_command=("gateway",),
+        auth_login_command=("auth", "login", "--provider", "openai"),
+        auth_refresh_command=("auth", "status"),
+        auth_status_command=("auth", "status"),
     ),
     "openclaw": ProviderSpec(
         name="openclaw",
         runtime="openclaw-agent",
         auth_modes=("none", "linked", "api_key"),
         default_auth_mode="none",
+        default_api_url="https://api.openclaw.example/v1",
         state_dir=".openclaw",
         workspace_dir="workspace",
         marker_files=(
@@ -91,6 +120,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".config/openai",
             ".openai",
         ),
+        shared_auth_paths=(
+            ".openclaw/auth-profiles.json",
+        ),
         core_prompt_files=(
             "SOUL.md",
             "IDENTITY.md",
@@ -101,6 +133,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "BOOTSTRAP.md",
             "USER.md",
         ),
+        install_method="pnpm",
+        install_package="openclaw",
+        service_group="daemon",
+        background_command=("gateway", "run"),
     ),
 }
 
@@ -123,6 +159,19 @@ def credential_paths_for_providers(names: list[str]) -> list[str]:
     for name in names:
         spec = get_provider(name)
         for rel in spec.credential_paths:
+            if rel in seen:
+                continue
+            seen.add(rel)
+            ordered.append(rel)
+    return ordered
+
+
+def shared_auth_paths_for_providers(names: list[str]) -> list[str]:
+    ordered = [".codex/auth.json"]
+    seen = {".codex/auth.json"}
+    for name in names:
+        spec = get_provider(name)
+        for rel in spec.shared_auth_paths:
             if rel in seen:
                 continue
             seen.add(rel)

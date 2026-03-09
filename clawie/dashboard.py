@@ -504,6 +504,8 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> bool:
     if focus == "channels" and key in (ord("u"), ord("U")):
         selected_channel = channels[state.channel_idx] if channels else None
         return _run_channel_detail_action(service, state, "unlink", selected_channel)
+    if focus == "channels" and key in (ord("s"), ord("S")):
+        return _run_channel_detail_action(service, state, "sync")
     if key in (ord("d"), ord("D"), curses.KEY_DC):
         state.purge_confirm = True
         return False
@@ -630,6 +632,7 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
                 footer = (
                     f"j/k navigate {ICON_DOT} Space enable {ICON_DOT} "
                     f"n add {ICON_DOT} N add+link {ICON_DOT} c link {ICON_DOT} u unlink {ICON_DOT} "
+                    f"s sync live {ICON_DOT} "
                     f"Tab/\u2190\u2192 section {ICON_DOT} Esc/b back {ICON_DOT} q quit"
                 )
             elif focus == "plugins":
@@ -765,6 +768,8 @@ def _draw_overview_agents(
         mem = f"{float(row.get('mem_percent', 0.0)):.1f}"
         ch = f"{row.get('channels', 0)}/{row.get('channels_total', 0)}"
         prov = str(row.get("provider", ""))
+        if str(row.get("provider_status", "ok")) != "ok" and prov:
+            prov = f"{prov}!"
         is_sel = idx == state.selected_row
         ptr = ICON_PTR if is_sel else " "
 
@@ -788,16 +793,26 @@ def _draw_overview_agents(
         _add(stdscr, 4, 2, "no agents found", _color(C_HELP, dim=True))
 
     # ── Right panel: selected agent ──────────────────────────────────
+    info_lines: list[tuple[str, int]] = []
     if rows and state.selected_row < len(rows):
         sel = rows[state.selected_row]
+        provider_label = str(sel.get("provider", ""))
+        if str(sel.get("provider_status", "ok")) != "ok" and provider_label:
+            provider_label = f"{provider_label}!"
         info_lines = [
             (_display_agent_id(str(sel.get("agent_id", ""))), _color(C_TITLE, bold=True)),
             (f"display  {sel.get('display_name', '')}", _color(C_DEFAULT)),
-            (f"provider {sel.get('provider', '')}", _color(C_DEFAULT)),
+            (f"provider {provider_label}", _color(C_DEFAULT)),
             (f"status   {_status_icon(str(sel.get('status', '')))} {sel.get('status', '')}", _color(C_DEFAULT)),
             (f"version  {sel.get('version', '')}", _color(C_DEFAULT)),
             (f"strategy {sel.get('strategy', '')}", _color(C_DEFAULT)),
         ]
+        issue = str(sel.get("provider_issue", "")).strip()
+        remediation = str(sel.get("provider_remediation", "")).strip()
+        if issue:
+            info_lines.append((f"issue    {issue}", _color(C_ERROR)))
+        if remediation:
+            info_lines.append((f"fix      {remediation}", _color(C_HELP)))
         for i, (text, attr) in enumerate(info_lines):
             y = 4 + i
             if y >= content_bottom:
@@ -806,7 +821,7 @@ def _draw_overview_agents(
 
     # ── Right panel: recent events ───────────────────────────────────
     events = snapshot.get("events", [])
-    events_start = 11
+    events_start = min(content_bottom, 5 + len(info_lines))
     if events and events_start < content_bottom:
         _add(stdscr, events_start, right_x, "RECENT EVENTS", _color(C_HEAD, bold=True))
         ev_line = events_start + 1
@@ -924,6 +939,13 @@ def _draw_overview_channels(
         enabled = bool(channel.get("enabled", True))
         icon = ICON_ON if enabled else ICON_OFF
         text = f" {icon} {channel.get('kind', '')}:{channel.get('name', '')}"
+        source = str(channel.get("source", ""))
+        if source == "live":
+            text += " [live]"
+        elif source == "discovered":
+            text += " [disc]"
+        elif source == "stale":
+            text += " [stale]"
         focused = state.overview_focus_idx == 2
         is_sel = idx == state.selected_assigned_row
         attr = _color(C_SELECT) if focused and is_sel else _color(C_DEFAULT)
@@ -959,9 +981,12 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     status = str(agent_info.get("service_status", agent_info.get("status", "")))
     icon = _status_icon(status)
     auth_status = str(agent_info.get("auth_status", "unknown"))
+    provider_summary = str(agent_info.get("provider", ""))
+    if str(agent_info.get("provider_status", "ok")) != "ok" and provider_summary:
+        provider_summary = f"{provider_summary}!"
     info_line = (
         f" {ICON_BACK} {_display_agent_id(state.selected_agent_id)}"
-        f"   {agent_info.get('provider', '')}"
+        f"   {provider_summary}"
         f" {ICON_DOT} {icon} {status}"
         f" {ICON_DOT} auth {auth_status}"
         f" {ICON_DOT} v{agent_info.get('version', '')}"
@@ -1011,6 +1036,13 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
         enabled = bool(channel.get("enabled", True))
         ch_icon = ICON_ON if enabled else ICON_OFF
         text = f" {ch_icon} {channel.get('kind', '')}:{channel.get('name', '')}"
+        source = str(channel.get("channel_source", "state"))
+        if source == "live":
+            text += " [live]"
+        elif source == "discovered":
+            text += " [disc]"
+        elif source == "stale":
+            text += " [stale]"
         is_sel = focus == "channels" and idx == state.channel_idx
         attr = _color(C_SELECT) if is_sel else _color(C_DEFAULT)
         _add(stdscr, line, 0, _fit(text, left_w), attr)
@@ -1061,6 +1093,8 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
             label = label.replace("autostart: off", f"autostart {ICON_DOT} off")
         elif kind.startswith("cred_bundle:"):
             r_icon = ICON_ON if "on" in label else ICON_OFF
+        elif kind == "channel_status":
+            r_icon = " "
         elif kind.startswith("channel_"):
             r_icon = ICON_PTR
         elif kind.startswith("service_") and kind not in ("service_status",):
@@ -1369,6 +1403,7 @@ def _run_channel_detail_action(
 
     kind = str((channel or {}).get("kind", "")).strip().lower()
     name = str((channel or {}).get("name", "")).strip()
+    source = str((channel or {}).get("channel_source", "")).strip().lower()
     try:
         if action == "add":
             payload = _prompt_channel_values()
@@ -1393,16 +1428,27 @@ def _run_channel_detail_action(
                 state.notice = "select a channel to link"
                 state.notice_error = False
                 return False
-            service.connect_agent_channel(state.selected_agent_id, kind, name)
-            state.notice = f"linked {kind}:{name}"
+            if source == "discovered":
+                service.assign_channel_to_agent("", kind, name, state.selected_agent_id)
+                state.notice = f"tracked live channel {kind}:{name}"
+            else:
+                service.connect_agent_channel(state.selected_agent_id, kind, name)
+                state.notice = f"linked {kind}:{name}"
         elif action == "unlink":
             if not kind or not name:
                 state.notice = "select a channel to unlink"
                 state.notice_error = False
                 return False
+            if source == "discovered":
+                state.notice = "channel is live but not tracked; sync from provider first"
+                state.notice_error = False
+                return False
             service.unassign_channel_from_agent(state.selected_agent_id, kind, name)
             state.channel_idx = max(0, state.channel_idx - 1)
             state.notice = f"unlinked {kind}:{name}"
+        elif action == "sync":
+            service.sync_agent_channels_from_provider(state.selected_agent_id)
+            state.notice = "synced channels from provider"
         else:
             state.notice = "unknown channel action"
         state.notice_error = False
@@ -1429,6 +1475,8 @@ def _settings_items(
     current_provider = str(info.get("provider", "")).strip().lower()
     auth_profile = str(info.get("auth_profile", "")).strip()
     auth_source = str(info.get("auth_source", "")).strip()
+    provider_issue = str(info.get("provider_issue", "")).strip()
+    provider_remediation = str(info.get("provider_remediation", "")).strip()
     auth_summary = f"{info.get('auth_status', 'unknown')} {ICON_DOT} {info.get('auth_mode', '')}"
     selected_channel_label = _selected_channel_label(selected_channel)
     if auth_profile:
@@ -1438,6 +1486,15 @@ def _settings_items(
     channel_rows: list[dict[str, str]] = []
     if not is_local:
         channel_rows = [
+            {
+                "kind": "channel_status",
+                "label": (
+                    f"channels: {info.get('channel_status_source', 'state')} {ICON_DOT} "
+                    f"live {int(info.get('live_channel_count', 0))} {ICON_DOT} "
+                    f"stale {int(info.get('stale_channel_count', 0))}"
+                ),
+            },
+            {"kind": "channel_sync", "label": "channel: sync from provider"},
             {"kind": "channel_add", "label": "channel: add"},
             {"kind": "channel_add_connect", "label": "channel: add + link"},
             {"kind": "channel_connect", "label": f"channel: link {selected_channel_label}"},
@@ -1455,8 +1512,15 @@ def _settings_items(
                     "label": f"switch provider {ICON_DOT} {token}",
                 }
             )
-    rows: list[dict[str, str]] = channel_rows + [
+    provider_rows: list[dict[str, str]] = [
         {"kind": "provider_current", "label": f"{prefix}provider: {current_provider or 'unknown'}"},
+    ]
+    if provider_issue:
+        provider_rows.append({"kind": "provider_issue", "label": f"{prefix}provider issue: {provider_issue}"})
+    if provider_remediation:
+        provider_rows.append({"kind": "provider_fix", "label": f"{prefix}provider fix: {provider_remediation}"})
+    rows: list[dict[str, str]] = channel_rows + [
+        *provider_rows,
         *switch_rows,
         {"kind": "auth_status", "label": f"{prefix}auth: {auth_summary}"},
         {"kind": "auth_login", "label": f"{prefix}refresh / re-run login"},
@@ -1528,6 +1592,7 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
                 "channel_add_connect": "add_connect",
                 "channel_connect": "connect",
                 "channel_unlink": "unlink",
+                "channel_sync": "sync",
             }
             action = action_map.get(kind)
             if action:
@@ -1610,7 +1675,17 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
         else:
             state.notice = "read-only setting"
         state.notice_error = False
-        return kind not in {"provider_current", "auth_status", "service_status", "heartbeat", "auth_mode", "cred_last_sync"}
+        return kind not in {
+            "provider_current",
+            "provider_issue",
+            "provider_fix",
+            "auth_status",
+            "service_status",
+            "heartbeat",
+            "auth_mode",
+            "cred_last_sync",
+            "channel_status",
+        }
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True
@@ -1634,11 +1709,14 @@ def _print_static(snapshot: dict[str, Any]) -> None:
     rows = []
     for row in snapshot["rows"]:
         status = str(row.get("status", ""))
+        provider = str(row.get("provider", ""))
+        if str(row.get("provider_status", "ok")) != "ok" and provider:
+            provider = f"{provider}!"
         rows.append(
             [
                 _display_agent_id(str(row.get("agent_id", row.get("user_id", "")))),
                 row.get("display_name", ""),
-                row.get("provider", ""),
+                provider,
                 f"{_status_icon(status)} {status}",
                 str(row.get("pid", 0)),
                 f"{float(row.get('cpu_percent', 0.0)):.1f}",

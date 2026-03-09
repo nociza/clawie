@@ -13,12 +13,21 @@ from clawie.provider_auth import auth_status_from_profiles_json, parse_provider_
 from clawie.cli import main
 from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
+from clawie.auth_sources import load_codex_auth
 from clawie.service import ZeroClawService
 from clawie.store import StateStore
 
 
 def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
+
+
+def _fake_jwt(payload: dict[str, object]) -> str:
+    import base64
+
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode("utf-8")).decode("utf-8").rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"{header}.{body}.sig"
 
 
 def test_setup_defaults_to_linked_auth_for_picoclaw(
@@ -31,7 +40,23 @@ def test_setup_defaults_to_linked_auth_for_picoclaw(
     assert "auth_mode: linked" in output
 
 
-def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+def test_setup_openclaw_without_api_key(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "install_provider_runtime",
+        lambda self, provider: {
+            "provider": provider,
+            "installed": True,
+            "already_present": False,
+            "method": "pnpm",
+            "package": "openclaw",
+            "executable": "/mock/bin/openclaw",
+        },
+    )
     code = run_cli(
         tmp_path,
         "config",
@@ -46,6 +71,7 @@ def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[s
     assert code == 0
     assert "provider: openclaw" in output
     assert "auth_mode: none" in output
+    assert "api_url: https://api.openclaw.example/v1" in output
     assert "spawn_password_default: not set" in output
     assert "runtime_installed: True" in output
 
@@ -53,6 +79,39 @@ def test_setup_openclaw_without_api_key(tmp_path: Path, capsys: CaptureFixture[s
     status_output = capsys.readouterr().out
     assert status == 0
     assert "configured: True" in status_output
+    assert "api_url: https://api.openclaw.example/v1" in status_output
+
+
+def test_runtime_install_cli(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+
+    def fake_install(self: ZeroClawService, provider: str) -> dict[str, object]:
+        seen.append(provider)
+        return {
+            "provider": provider,
+            "installed": True,
+            "already_present": False,
+            "method": "brew",
+            "package": provider,
+            "executable": f"/mock/bin/{provider}",
+            "output": "installed",
+        }
+
+    monkeypatch.setattr(ZeroClawService, "install_provider_runtime", fake_install)
+
+    code = run_cli(tmp_path, "runtime", "install", "picoclaw")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert seen == ["picoclaw"]
+    assert "Installed runtime for picoclaw" in output
+    assert "provider: picoclaw" in output
+    assert "method: brew" in output
+    assert "executable: /mock/bin/picoclaw" in output
 
 
 def test_setup_api_key_mode_requires_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -996,6 +1055,30 @@ def test_provider_credential_path_registry_contains_codex_and_openai() -> None:
     assert ".config/openai" in paths
 
 
+def test_load_codex_auth_prefers_access_token_expiry_over_id_token(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {
+                    "access_token": _fake_jwt({"exp": 1773823443}),
+                    "refresh_token": "ref",
+                    "id_token": _fake_jwt({"exp": 1772963042}),
+                    "account_id": "acct-1",
+                },
+                "last_refresh": "2026-03-08T08:44:02.652868418Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = load_codex_auth(home)
+    assert payload["expires_at"] == "2026-03-18T08:44:03Z"
+
+
 def test_agents_credentials_commands_show_and_set(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
     capsys.readouterr()
@@ -1037,6 +1120,8 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
+    shared_home = tmp_path / "shared-provider-auth"
+    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
     service = ZeroClawService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
@@ -1062,7 +1147,22 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     source_home = tmp_path / "source-home"
     source_home.mkdir(parents=True)
     (source_home / ".codex").mkdir(parents=True)
-    (source_home / ".codex" / "config.toml").write_text("[model]\n", encoding="utf-8")
+    (source_home / ".codex" / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {
+                    "access_token": "tok",
+                    "refresh_token": "ref",
+                    "id_token": "",
+                    "account_id": "acct-1",
+                },
+                "last_refresh": "2026-03-08T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
     (source_home / ".gitconfig").write_text("[user]\nname = Alice\n", encoding="utf-8")
     target_home = tmp_path / "target-home"
     target_home.mkdir(parents=True)
@@ -1080,17 +1180,177 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     sync = service.sync_agent_credentials("alice", source_home=source_home)
     assert "provider-auth" in sync["bundles"]
     assert "git" in sync["bundles"]
-    assert (target_home / ".codex" / "config.toml").exists()
+    assert (shared_home / ".codex" / "auth.json").exists()
+    assert (target_home / ".codex" / "auth.json").is_symlink()
+    assert (target_home / ".codex" / "auth.json").resolve() == (shared_home / ".codex" / "auth.json").resolve()
     assert (target_home / ".gitconfig").exists()
 
     revoked = service.revoke_agent_credentials("alice", bundles=["git"])
     assert "git" in revoked["bundles"]
     assert not (target_home / ".gitconfig").exists()
-    assert (target_home / ".codex" / "config.toml").exists()
+    assert (target_home / ".codex" / "auth.json").exists()
 
     updated = service.get_agent("alice")
     assert "provider-auth" in updated["credential_sync"]["bundles"]
     assert "git" not in updated["credential_sync"]["bundles"]
+    assert updated["credential_sync"]["shared_provider_auth"] is True
+
+
+def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    shared_home = tmp_path / "shared-provider-auth"
+    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+
+    source_home = tmp_path / "source-home"
+    (source_home / ".codex").mkdir(parents=True)
+    (source_home / ".codex" / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {
+                    "access_token": "tok",
+                    "refresh_token": "ref",
+                    "id_token": "",
+                    "account_id": "acct-1",
+                },
+                "last_refresh": "2026-03-08T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+
+    result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
+    assert result["source"] == "codex"
+    assert (shared_home / ".codex" / "auth.json").exists()
+    profile_path = shared_home / ".picoclaw" / "auth-profiles.json"
+    assert profile_path.exists()
+    assert (shared_home / ".zeroclaw" / "auth-profiles.json").exists()
+    assert (shared_home / ".openclaw" / "auth-profiles.json").exists()
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert payload["active_profiles"]["openai-codex"] == "openai-codex:default"
+    assert (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".codex" / "auth.json").is_symlink()
+
+    status = service.agent_auth_status("alice")
+    assert status["auth_status"] == "ready"
+    assert status["shared_provider_auth"] is True
+    assert status["source"] == "file:auth-profiles.json"
+
+
+def test_sync_agent_channels_from_provider_replaces_stale_channels(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "cli", "name": "teleclaw-local"}],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    target_home = tmp_path / "teleclaw-home"
+    provider_root = target_home / ".zeroclaw"
+    provider_root.mkdir(parents=True)
+    (provider_root / "config.toml").write_text(
+        """
+[channels_config.telegram]
+enabled = true
+bot_token = "tok"
+name = "team"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+
+    synced = service.sync_agent_channels_from_provider("teleclaw")
+    channels = synced["channels"]
+    assert [(row.get("kind"), row.get("name")) for row in channels] == [("telegram", "team")]
+    assert channels[0]["channel_source"] == "live"
+    assert channels[0]["discovered_provider"] == "zeroclaw"
+
+
+def test_shared_auth_show_cli_lists_rows(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "list_shared_auth_statuses",
+        lambda self: [
+            {
+                "provider": "picoclaw",
+                "auth_status": "ready",
+                "auth_profile": "openai-codex:default",
+                "shared_scope": "system",
+                "shared_agents": ["alice", "bob"],
+                "home": "/var/lib/clawie/provider-auth",
+            }
+        ],
+    )
+
+    code = run_cli(tmp_path, "auth", "show")
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "picoclaw" in output
+    assert "openai-codex:default" in output
+    assert "system" in output
 
 
 def test_detect_installed_claws_command(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -1706,6 +1966,68 @@ def test_set_agent_provider_updates_runtime_and_auth_mode(tmp_path: Path) -> Non
     assert info["service_mode"] == "unknown"
 
 
+def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remediation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    monkeypatch.setattr(
+        service,
+        "agent_auth_status",
+        lambda _agent_id: {
+            "auth_mode": "linked",
+            "auth_status": "ready",
+            "auth_profile": "default",
+            "account": "",
+            "expires_at": "",
+            "last_refresh": "",
+            "source": "file",
+            "detail": "",
+            "login_required": False,
+            "can_login": True,
+        },
+    )
+
+    class Result:
+        returncode = 0
+        stdout = "teleclaw 4321 /home/linuxbrew/.linuxbrew/bin/zeroclaw daemon\n"
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda cmd, **_: Result() if cmd[:2] == ["ps", "-eo"] else Result())
+    payload = service.get_dashboard_agent("teleclaw")
+    info = payload["agent"]
+
+    assert info["provider"] == "zeroclaw"
+    assert info["live_provider"] == "zeroclaw"
+    assert info["provider_status"] == "warning"
+    assert "aligned state away from picoclaw" in info["provider_issue"]
+    assert "sudo clawie agent provider set teleclaw picoclaw" in info["provider_remediation"]
+    assert info["service_status"] == "running"
+    assert info["live_pid"] == 4321
+    assert service.get_agent("teleclaw")["agent"]["provider"] == "zeroclaw"
+
+
 def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -1753,12 +2075,13 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
         calls.append(cmd)
         tail3 = cmd[-3:]
         tail2 = cmd[-2:]
+        script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
         if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
             return Result(stdout="active (running)")
         if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
             return Result(stdout="stopped")
-        if tail3 == ["/usr/bin/picoclaw", "service", "start"]:
-            return Result(stdout="started")
+        if "picoclaw" in script and "gateway" in script:
+            return Result(stdout="started pid=123")
         if tail2 in (
             ["/usr/bin/picoclaw", "onboard"],
             ["/usr/bin/picoclaw", "status"],
@@ -1783,7 +2106,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     assert info["service_status"] == "running"
     assert info["service_mode"] == "systemd"
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
-    assert any(cmd[-3:] == ["/usr/bin/picoclaw", "service", "start"] for cmd in calls)
+    assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     assert any(cmd[-2:] == ["/usr/bin/picoclaw", "onboard"] for cmd in calls)
 
 
@@ -1833,13 +2156,14 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
         tail3 = cmd[-3:]
-        if tail3 == ["/usr/bin/picoclaw", "service", "start"]:
-            return Result(stdout="started")
+        script = str(cmd[-1]) if cmd and cmd[-2:-1] == ["-lc"] else ""
+        if "picoclaw" in script and "gateway" in script:
+            return Result(stdout="started pid=123")
         if tail3 == ["/usr/bin/zeroclaw", "service", "status"]:
             return Result(stdout="active (running)")
         if tail3 == ["/usr/bin/zeroclaw", "service", "stop"]:
             return Result(stdout="stopped")
-        if tail3 == ["/usr/bin/openclaw", "service", "status"]:
+        if tail3 == ["/usr/bin/openclaw", "daemon", "status"]:
             return Result(stdout="inactive")
         if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
             return Result(stdout="")
@@ -1853,7 +2177,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     assert result["changed"] is False
     assert result["service"]["service_status"] == "running"
     assert result["stopped_services"][-1]["provider"] == "zeroclaw"
-    assert any(cmd[-3:] == ["/usr/bin/picoclaw", "service", "start"] for cmd in calls)
+    assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
 
 
@@ -1898,7 +2222,11 @@ def test_set_agent_provider_requires_root_for_managed_user_switch(
     except Exception as exc:  # noqa: BLE001
         assert "provider switching requires root" in str(exc)
 
-    assert service.get_agent("teleclaw")["agent"]["provider"] == "zeroclaw"
+    info = service.get_agent("teleclaw")["agent"]
+    assert info["provider"] == "zeroclaw"
+    assert info["provider_status"] == "error"
+    assert "provider switch to picoclaw failed" in info["provider_issue"]
+    assert "sudo clawie agent provider set teleclaw picoclaw" in info["provider_remediation"]
 
 
 def test_agent_auth_status_reports_permission_barrier_for_managed_user(
@@ -2063,6 +2391,8 @@ def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
         }
     )
     kinds = {str(row.get("kind", "")) for row in rows}
+    assert "channel_status" in kinds
+    assert "channel_sync" in kinds
     assert "channel_add" in kinds
     assert "channel_connect" in kinds
     assert "provider_current" in kinds
@@ -2099,6 +2429,29 @@ def test_dashboard_settings_include_provider_switch_rows_when_choices_available(
     assert "provider_switch:picoclaw" not in kinds
 
 
+def test_dashboard_settings_provider_rows_show_issue_and_fix() -> None:
+    rows = _settings_items(
+        {
+            "agent": {
+                "provider": "zeroclaw",
+                "provider_status": "warning",
+                "provider_issue": "live runtime was zeroclaw; Clawie aligned state away from picoclaw",
+                "provider_remediation": "Run 'sudo clawie agent provider set teleclaw picoclaw' if you still want to switch.",
+                "auth_status": "ready",
+                "auth_mode": "linked",
+            }
+        },
+        provider_choices=["picoclaw", "zeroclaw"],
+    )
+
+    current = next(row["label"] for row in rows if row["kind"] == "provider_current")
+    issue = next(row["label"] for row in rows if row["kind"] == "provider_issue")
+    fix = next(row["label"] for row in rows if row["kind"] == "provider_fix")
+    assert current == "provider: zeroclaw"
+    assert "aligned state away from picoclaw" in issue
+    assert "sudo clawie agent provider set teleclaw picoclaw" in fix
+
+
 def test_dashboard_setting_actions_call_credential_operations() -> None:
     class FakeService:
         def __init__(self) -> None:
@@ -2130,6 +2483,37 @@ def test_dashboard_setting_actions_call_credential_operations() -> None:
     _run_setting_action(service, state, {"kind": "cred_revoke_now"})
     assert state.notice == "credentials revoked (1 paths)"
     assert service.revoked == 1
+
+
+def test_dashboard_setting_action_syncs_channels_from_provider() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.synced: list[str] = []
+
+        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
+            return {
+                "channels": [{"kind": "telegram", "name": "team", "channel_source": "discovered"}],
+                "agent": {
+                    "plugins": {},
+                    "provider": "picoclaw",
+                    "service_status": "running",
+                    "service_mode": "systemd",
+                    "heartbeat_seconds": 30,
+                    "auth_mode": "linked",
+                    "local_user": False,
+                },
+                "credential_sync": {"bundles": []},
+            }
+
+        def sync_agent_channels_from_provider(self, agent_id: str) -> dict[str, object]:
+            self.synced.append(agent_id)
+            return {}
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice")
+    assert _run_setting_action(service, state, {"kind": "channel_sync"}) is True
+    assert state.notice == "synced channels from provider"
+    assert service.synced == ["alice"]
 
 
 def test_dashboard_setting_actions_call_auth_and_provider_operations() -> None:
@@ -2559,6 +2943,61 @@ def test_performance_snapshot_includes_local_user_claw_rows(
     ids = {str(row.get("agent_id", "")) for row in snapshot["rows"]}
     assert "alice" in ids
     assert "@local:zeroclaw" in ids
+
+
+def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            return Result(stdout="teleclaw 4321 /home/linuxbrew/.linuxbrew/bin/zeroclaw daemon\n")
+        if cmd[:2] == ["ps", "-p"]:
+            return Result(stdout=" 1.5  2.5  4096\n")
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    snapshot = service.performance_snapshot(refresh=False)
+    row = next(r for r in snapshot["rows"] if r["agent_id"] == "teleclaw")
+
+    assert row["provider"] == "zeroclaw"
+    assert row["provider_status"] == "warning"
+    assert "aligned state away from picoclaw" in row["provider_issue"]
+    assert "sudo clawie agent provider set teleclaw picoclaw" in row["provider_remediation"]
+    assert row["status"] == "running"
+    assert row["pid"] == 4321
+    assert row["cpu_percent"] == 1.5
+    assert row["mem_percent"] == 2.5
+    assert row["rss_kb"] == 4096
 
 
 def test_local_claw_service_action_updates_local_state(

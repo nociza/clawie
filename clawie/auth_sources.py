@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import base64
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def load_codex_auth(source_home: Path) -> dict[str, str]:
+    path = source_home / ".codex" / "auth.json"
+    payload = _read_json_object(path)
+    tokens = payload.get("tokens", {})
+    if not isinstance(tokens, dict):
+        tokens = {}
+    access_token = str(tokens.get("access_token", "")).strip()
+    refresh_token = str(tokens.get("refresh_token", "")).strip()
+    id_token = str(tokens.get("id_token", "")).strip()
+    account_id = str(tokens.get("account_id", payload.get("account_id", ""))).strip()
+    if not any((access_token, refresh_token, id_token)):
+        raise ValueError(f"codex auth is missing tokens: {path}")
+    updated_at = str(payload.get("last_refresh", "")).strip()
+    access_expires_at = _jwt_expiry(access_token)
+    id_expires_at = _jwt_expiry(id_token)
+    expires_at = access_expires_at or id_expires_at
+    return {
+        "source": "codex",
+        "upstream_provider": "openai-codex",
+        "profile_name": "default",
+        "profile_id": "openai-codex:default",
+        "kind": "oauth",
+        "account_id": account_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "expires_at": expires_at,
+        "updated_at": updated_at,
+    }
+
+
+def load_claude_auth(source_home: Path) -> dict[str, str]:
+    credentials_path = source_home / ".claude" / ".credentials.json"
+    state_path = source_home / ".claude.json"
+    payload = _read_json_object(credentials_path)
+    oauth = payload.get("claudeAiOauth", {})
+    if not isinstance(oauth, dict):
+        oauth = {}
+    access_token = str(oauth.get("accessToken", "")).strip()
+    refresh_token = str(oauth.get("refreshToken", "")).strip()
+    expires_at = str(oauth.get("expiresAt", "")).strip()
+    if not any((access_token, refresh_token)):
+        raise ValueError(f"claude auth is missing tokens: {credentials_path}")
+
+    state = _read_json_object(state_path, allow_missing=True)
+    account = ""
+    if state:
+        oauth_account = state.get("oauthAccount", {})
+        if isinstance(oauth_account, dict):
+            account = str(oauth_account.get("accountUuid", oauth_account.get("emailAddress", ""))).strip()
+        if not account:
+            account = str(state.get("userID", "")).strip()
+    updated_at = _mtime_iso(credentials_path) or _mtime_iso(state_path)
+    return {
+        "source": "claude",
+        "upstream_provider": "anthropic-claude",
+        "profile_name": "default",
+        "profile_id": "anthropic-claude:default",
+        "kind": "oauth",
+        "account_id": account,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": "",
+        "expires_at": expires_at,
+        "updated_at": updated_at,
+    }
+
+
+def merge_provider_auth_profile(existing: dict[str, Any], imported: dict[str, str]) -> dict[str, Any]:
+    payload = dict(existing) if isinstance(existing, dict) else {}
+    active_profiles = payload.get("active_profiles", {})
+    if not isinstance(active_profiles, dict):
+        active_profiles = {}
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+
+    upstream_provider = str(imported.get("upstream_provider", "")).strip()
+    profile_id = str(imported.get("profile_id", "")).strip()
+    if not upstream_provider or not profile_id:
+        raise ValueError("imported auth profile is incomplete")
+
+    profile_payload = {
+        "profile_name": str(imported.get("profile_name", "default")).strip() or "default",
+        "provider": upstream_provider,
+        "account_id": str(imported.get("account_id", "")).strip(),
+        "kind": str(imported.get("kind", "oauth")).strip() or "oauth",
+        "access_token": str(imported.get("access_token", "")).strip(),
+        "refresh_token": str(imported.get("refresh_token", "")).strip(),
+        "updated_at": str(imported.get("updated_at", "")).strip(),
+    }
+    id_token = str(imported.get("id_token", "")).strip()
+    expires_at = str(imported.get("expires_at", "")).strip()
+    if id_token:
+        profile_payload["id_token"] = id_token
+    if expires_at:
+        profile_payload["expires_at"] = expires_at
+
+    active_profiles[upstream_provider] = profile_id
+    profiles[profile_id] = profile_payload
+    payload["active_profiles"] = active_profiles
+    payload["profiles"] = profiles
+    payload["updated_at"] = profile_payload["updated_at"]
+    return payload
+
+
+def _read_json_object(path: Path, *, allow_missing: bool = False) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if allow_missing:
+            return {}
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"failed reading auth source {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"auth source must be a JSON object: {path}")
+    return payload
+
+
+def _jwt_expiry(token: str) -> str:
+    value = str(token).strip()
+    if not value or value.count(".") < 2:
+        return ""
+    segment = value.split(".", 2)[1]
+    padding = "=" * ((4 - (len(segment) % 4)) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(segment + padding)
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return ""
+    exp = payload.get("exp")
+    try:
+        stamp = datetime.fromtimestamp(int(exp), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return ""
+    return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _mtime_iso(path: Path) -> str:
+    try:
+        stamp = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return ""
+    return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")

@@ -489,6 +489,7 @@ class ZeroClawService:
             src = shared_home / rel
             dst = target_home / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
+            self._chown_tree(dst.parent, username)
             if dst.is_symlink():
                 try:
                     if dst.resolve() == src.resolve():
@@ -1888,6 +1889,10 @@ class ZeroClawService:
         auth_mode: str,
         api_key: str,
     ) -> None:
+        root = home / ".picoclaw"
+        root.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(root, linux_user)
+
         executable = self._resolve_provider_executable("picoclaw")
         onboard_cmd = self._wrap_user_command([executable, "onboard"], linux_user, purpose="provider bootstrap")
         env = self._service_env(linux_user)
@@ -1897,8 +1902,6 @@ class ZeroClawService:
             output = (onboard.stdout or onboard.stderr or "").strip()
             raise SetupError(f"picoclaw onboard failed: {output or f'exit {onboard.returncode}'}")
 
-        root = home / ".picoclaw"
-        root.mkdir(parents=True, exist_ok=True)
         workspace = root / "workspace"
         workspace.mkdir(parents=True, exist_ok=True)
         config_path = root / "config.json"

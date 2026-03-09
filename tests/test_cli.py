@@ -1170,6 +1170,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     (source_home / ".gitconfig").write_text("[user]\nname = Alice\n", encoding="utf-8")
     target_home = tmp_path / "target-home"
     target_home.mkdir(parents=True)
+    calls: list[list[str]] = []
 
     class Result:
         returncode = 0
@@ -1177,7 +1178,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
         stderr = ""
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr("subprocess.run", lambda cmd, **_kwargs: calls.append(cmd) or Result())
     monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
 
     service.set_agent_credential_bundles("alice", ["provider-auth", "git"])
@@ -1249,6 +1250,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     )
     target_home = tmp_path / "target-home"
     target_home.mkdir(parents=True)
+    calls: list[list[str]] = []
 
     class Result:
         returncode = 0
@@ -1256,7 +1258,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
         stderr = ""
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr("subprocess.run", lambda cmd, **_kwargs: calls.append(cmd) or Result())
     monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
 
     result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
@@ -1276,6 +1278,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     assert (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
     assert (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
     assert (target_home / ".codex" / "auth.json").is_symlink()
+    assert ["chown", "alice:alice", str(target_home / ".picoclaw")] in calls
 
     status = service.agent_auth_status("alice")
     assert status["auth_status"] == "ready"
@@ -2171,6 +2174,7 @@ name = "teleclaw-team"
     assert info["runtime"] == "picoclaw-agent"
     assert info["service_status"] == "running"
     assert info["service_mode"] == "systemd"
+    assert ["chown", "teleclaw:teleclaw", str(home / ".picoclaw")] in calls
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
     assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     assert any(cmd[-2:] == ["/usr/bin/picoclaw", "onboard"] for cmd in calls)

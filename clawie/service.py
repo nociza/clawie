@@ -5,6 +5,7 @@ import crypt
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import subprocess
@@ -1902,6 +1903,57 @@ class ZeroClawService:
                 rows.append(token)
         return rows
 
+    def _login_shell_env(self, linux_user: str) -> dict[str, str]:
+        env = self._service_env(linux_user)
+        if not linux_user:
+            return env
+        try:
+            cmd = self._user_shell_command(linux_user, "env -0")
+        except Exception:
+            return env
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,
+                check=False,
+                env=self._service_env(linux_user),
+                timeout=5,
+            )
+        except Exception:
+            return env
+        if result.returncode != 0 or not result.stdout:
+            return env
+        try:
+            raw = result.stdout.decode("utf-8", errors="ignore")
+        except Exception:
+            return env
+        for item in raw.split("\x00"):
+            if "=" not in item:
+                continue
+            key, value = item.split("=", 1)
+            key = str(key).strip()
+            if key:
+                env[key] = value
+        return env
+
+    @staticmethod
+    def _resolve_shell_placeholders(payload: Any, env: dict[str, str]) -> Any:
+        if isinstance(payload, dict):
+            return {key: ZeroClawService._resolve_shell_placeholders(value, env) for key, value in payload.items()}
+        if isinstance(payload, list):
+            return [ZeroClawService._resolve_shell_placeholders(item, env) for item in payload]
+        if not isinstance(payload, str):
+            return payload
+
+        def replace(match: re.Match[str]) -> str:
+            token = str(match.group(1) or match.group(2) or "").strip()
+            if not token:
+                return match.group(0)
+            return str(env.get(token, match.group(0)))
+
+        return re.sub(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)", replace, payload)
+
     def _prepare_agent_provider_home(
         self,
         *,
@@ -2023,6 +2075,7 @@ class ZeroClawService:
         channels_cfg = config.get("channels", {})
         if not isinstance(channels_cfg, dict):
             channels_cfg = {}
+        login_env = self._login_shell_env(linux_user)
         payload_by_kind: dict[str, dict[str, Any]] = {}
         for payload in live_payloads.values():
             kind = str(payload.get("kind", "")).strip().lower()
@@ -2038,6 +2091,7 @@ class ZeroClawService:
             settings = payload.get("settings", {}) if isinstance(payload, dict) else {}
             if not isinstance(settings, dict):
                 settings = {}
+            settings = self._resolve_shell_placeholders(settings, login_env)
             if kind != "telegram":
                 continue
             telegram_cfg = channels_cfg.get("telegram", {})

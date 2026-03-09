@@ -1394,6 +1394,81 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
     assert config["channels"]["telegram"]["token"] == "telegram-token"
 
 
+def test_prepare_picoclaw_home_resolves_env_backed_channel_values(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    target_home = tmp_path / "teleclaw-home"
+    target_home.mkdir(parents=True)
+    (target_home / ".picoclaw").mkdir(parents=True)
+    (target_home / ".picoclaw" / "auth.json").write_text(
+        json.dumps(
+            {
+                "credentials": {
+                    "openai": {
+                        "access_token": "tok",
+                        "provider": "openai",
+                        "auth_method": "oauth",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: bytes = b"", stderr: bytes = b"") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[-2:] == ["bash", "-lc"]:
+            return Result()
+        if cmd[:7] == ["sudo", "-u", "teleclaw", "-H", "--", "bash", "-lc"]:
+            return Result(stdout=b"TELEGRAM_TOKEN=123456:REALTOKEN\n\0")
+        return Result(stdout=b"")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    service._prepare_agent_provider_home(
+        provider="picoclaw",
+        agent=agent,
+        linux_user="teleclaw",
+        home=target_home,
+        channels=[{"kind": "telegram", "name": "team"}],
+        live_payloads={
+            ("telegram", "team"): {
+                "kind": "telegram",
+                "name": "team",
+                "settings": {"bot_token": "${TELEGRAM_TOKEN}"},
+            }
+        },
+    )
+
+    config = json.loads((target_home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
+    assert config["channels"]["telegram"]["token"] == "123456:REALTOKEN"
+
+
 def test_sync_agent_channels_from_provider_replaces_stale_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

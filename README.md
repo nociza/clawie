@@ -181,8 +181,9 @@ clawie backup import backup.json
 
 - `agent provider set` is a real cutover for managed agents with a Linux user:
   it validates the target provider, writes provider-specific prompt files,
-  installs the target runtime when needed, stops the old provider service,
-  starts the new one, and replays enabled non-CLI channels.
+  installs the target runtime when needed, bootstraps provider-native config,
+  migrates live channel settings into the target home before start, stops the
+  old provider service, starts the new one, and replays enabled non-CLI channels.
 - If state already says the target provider, the same command still reconciles
   runtime drift by starting the target provider and stopping other installed
   provider services for that agent user.
@@ -201,6 +202,9 @@ clawie backup import backup.json
   auth home instead of one agent home, then links eligible agents to it.
 - `clawie auth import PROVIDER --from codex|provider|claude` seeds that shared
   auth home from an existing app/provider login.
+- `picoclaw` shared auth is written in the provider's native
+  `.picoclaw/auth.json` format, so imported Codex subscription auth is usable by
+  the real `picoclaw` binary without an extra login step.
 - `clawie auth apply [AGENT_ID]` reapplies shared auth links to one agent or
   all eligible managed agents.
 - `clawie agent auth show` and `clawie agent auth login` use the shared auth

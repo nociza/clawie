@@ -22,7 +22,7 @@ class ProviderChannelAdapter(Protocol):
 class ZeroClawChannelAdapter:
     def discover_channels(self, provider_root: Path) -> list[dict[str, str]]:
         config_path = provider_root / "config.toml"
-        if tomllib is None or not config_path.exists():
+        if tomllib is None or not _path_exists(config_path):
             return []
         try:
             payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -67,7 +67,7 @@ class ZeroClawChannelAdapter:
 class PicoClawChannelAdapter:
     def discover_channels(self, provider_root: Path) -> list[dict[str, str]]:
         config_path = provider_root / "config.json"
-        if not config_path.exists():
+        if not _path_exists(config_path):
             return []
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -95,17 +95,14 @@ class PicoClawChannelAdapter:
         return dedupe_channels(channels)
 
     def connect_commands(self, executable: str, kind: str, name: str) -> list[list[str]]:
-        _ = (kind, name)
-        return [
-            [executable, "onboard"],
-            [executable, "status"],
-        ]
+        _ = (executable, kind, name)
+        return []
 
 
 class OpenClawChannelAdapter:
     def discover_channels(self, provider_root: Path) -> list[dict[str, str]]:
         config_path = provider_root / "openclaw.json"
-        if not config_path.exists():
+        if not _path_exists(config_path):
             return []
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -201,3 +198,10 @@ def _looks_like_sender_identity(value: str) -> bool:
     if token.startswith("@") and len(token) > 1:
         return True
     return token.isdigit()
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False

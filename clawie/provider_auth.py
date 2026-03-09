@@ -93,6 +93,11 @@ def inspect_auth_files(provider: str, home: Path | None) -> dict[str, Any]:
     if not home:
         return {}
     spec = get_provider(provider)
+    native_path = home / spec.state_dir / "auth.json"
+    if spec.name == "picoclaw" and _path_exists(native_path):
+        parsed = auth_status_from_picoclaw_auth_json(native_path)
+        if parsed:
+            return parsed
     profiles_path = home / spec.state_dir / "auth-profiles.json"
     if _path_exists(profiles_path):
         parsed = auth_status_from_profiles_json(profiles_path)
@@ -182,6 +187,53 @@ def auth_status_from_codex_auth_json(path: Path) -> dict[str, Any]:
         "expires_at": "",
         "last_refresh": str(payload.get("last_refresh", "")).strip(),
         "detail": auth_mode or "codex-auth",
+        "source": f"file:{path.name}",
+    }
+
+
+def auth_status_from_picoclaw_auth_json(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    credentials = payload.get("credentials", {})
+    if not isinstance(credentials, dict) or not credentials:
+        return {"auth_status": "missing", "detail": "no picoclaw auth credentials found", "source": f"file:{path.name}"}
+
+    ordered = []
+    for name in ("openai", "anthropic", "google-antigravity"):
+        if name in credentials:
+            ordered.append(name)
+    for name in credentials:
+        token = str(name).strip()
+        if token and token not in ordered:
+            ordered.append(token)
+
+    selected_key = ""
+    selected: dict[str, Any] = {}
+    for key in ordered:
+        item = credentials.get(key)
+        if isinstance(item, dict):
+            selected_key = key
+            selected = item
+            break
+    if not selected:
+        return {}
+
+    expires_at = str(selected.get("expires_at", "")).strip()
+    has_token = any(
+        str(selected.get(name, "")).strip()
+        for name in ("access_token", "refresh_token")
+    )
+    detail = str(selected.get("auth_method", "")).strip() or "oauth"
+    return {
+        "auth_status": auth_status_from_expiry(expires_at, has_token=has_token),
+        "auth_profile": selected_key or "default",
+        "account": str(selected.get("account_id", "")).strip(),
+        "expires_at": expires_at,
+        "last_refresh": "",
+        "detail": detail,
         "source": f"file:{path.name}",
     }
 

@@ -9,7 +9,11 @@ from pathlib import Path
 from pytest import CaptureFixture, MonkeyPatch, raises
 
 import clawie.dashboard as dashboard
-from clawie.provider_auth import auth_status_from_profiles_json, parse_provider_auth_status_output
+from clawie.provider_auth import (
+    auth_status_from_picoclaw_auth_json,
+    auth_status_from_profiles_json,
+    parse_provider_auth_status_output,
+)
 from clawie.cli import main
 from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
@@ -1258,12 +1262,17 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
     assert result["source"] == "codex"
     assert (shared_home / ".codex" / "auth.json").exists()
+    native_path = shared_home / ".picoclaw" / "auth.json"
+    assert native_path.exists()
     profile_path = shared_home / ".picoclaw" / "auth-profiles.json"
     assert profile_path.exists()
     assert (shared_home / ".zeroclaw" / "auth-profiles.json").exists()
     assert (shared_home / ".openclaw" / "auth-profiles.json").exists()
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
     assert payload["active_profiles"]["openai-codex"] == "openai-codex:default"
+    native_payload = json.loads(native_path.read_text(encoding="utf-8"))
+    assert native_payload["credentials"]["openai"]["access_token"] == "tok"
+    assert (target_home / ".picoclaw" / "auth.json").is_symlink()
     assert (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
     assert (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
     assert (target_home / ".codex" / "auth.json").is_symlink()
@@ -1271,7 +1280,39 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     status = service.agent_auth_status("alice")
     assert status["auth_status"] == "ready"
     assert status["shared_provider_auth"] is True
-    assert status["source"] == "file:auth-profiles.json"
+    assert status["source"] == "file:auth.json"
+
+
+def test_auth_status_from_picoclaw_auth_json_prefers_openai_credential(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    path.write_text(
+        json.dumps(
+            {
+                "credentials": {
+                    "anthropic": {
+                        "access_token": "other",
+                        "provider": "anthropic",
+                        "auth_method": "token",
+                    },
+                    "openai": {
+                        "access_token": "tok",
+                        "refresh_token": "ref",
+                        "account_id": "acct-1",
+                        "provider": "openai",
+                        "auth_method": "oauth",
+                        "expires_at": "2026-03-18T08:44:03Z",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = auth_status_from_picoclaw_auth_json(path)
+    assert status["auth_status"] == "ready"
+    assert status["auth_profile"] == "openai"
+    assert status["account"] == "acct-1"
+    assert status["source"] == "file:auth.json"
 
 
 def test_sync_agent_channels_from_provider_replaces_stale_channels(
@@ -2061,7 +2102,19 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
-    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
+    home = tmp_path / "teleclaw-home"
+    (home / ".zeroclaw").mkdir(parents=True)
+    (home / ".zeroclaw" / "config.toml").write_text(
+        """
+[channels_config.telegram]
+enabled = true
+bot_token = "telegram-token"
+name = "teleclaw-team"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
 
     calls: list[list[str]] = []
     runtime_state = {"zeroclaw": True, "picoclaw": False}
@@ -2156,7 +2209,20 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
-    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: tmp_path / "teleclaw-home")
+    home = tmp_path / "teleclaw-home"
+    (home / ".zeroclaw").mkdir(parents=True)
+    (home / ".zeroclaw" / "config.toml").write_text(
+        """
+[channels_config.telegram]
+enabled = true
+bot_token = "telegram-token"
+name = "teleclaw-team"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
 
     calls: list[list[str]] = []
     runtime_state = {"zeroclaw": True, "picoclaw": False, "openclaw": False}
@@ -2932,6 +2998,7 @@ def test_service_action_falls_back_when_bus_unavailable(
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: tmp_path / "teleclaw-home")
 
     class Result:
         def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
@@ -2988,6 +3055,24 @@ def test_service_action_fallback_uses_provider_state_dir(
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
+    home = tmp_path / "teleclaw-home"
+    (home / ".picoclaw").mkdir(parents=True)
+    (home / ".picoclaw" / "config.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "telegram-token",
+                        "name": "teleclaw-team",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: home)
+    agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
 
     commands: list[list[str]] = []
     runtime_running = False
@@ -3948,5 +4033,5 @@ def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(
     )
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/picoclaw")
     commands = service._channel_connect_commands("picoclaw", "telegram", "team", linux_user="")
-    assert any(len(cmd) >= 2 and cmd[1] == "onboard" for cmd in commands)
+    assert commands == []
     assert not any(len(cmd) >= 2 and cmd[1] == "channel" for cmd in commands)

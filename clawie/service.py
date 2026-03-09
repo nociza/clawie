@@ -13,9 +13,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
+
 from clawie.auth_sources import (
     load_claude_auth,
     load_codex_auth,
+    merge_picoclaw_auth_store,
     merge_provider_auth_profile,
 )
 from clawie.provider_auth import (
@@ -371,6 +377,29 @@ class ZeroClawService:
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    @staticmethod
+    def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _chown_path(path: Path, username: str) -> None:
+        token = str(username).strip()
+        if not token or os.geteuid() != 0:
+            return
+        subprocess.run(["chown", f"{token}:{token}", str(path)], check=False)
+
+    @classmethod
+    def _chown_tree(cls, path: Path, username: str) -> None:
+        token = str(username).strip()
+        if not token or os.geteuid() != 0 or not path.exists():
+            return
+        cls._chown_path(path, token)
+        if not path.is_dir():
+            return
+        for child in path.rglob("*"):
+            cls._chown_path(child, token)
+
     def _copy_if_present(self, src: Path, dst: Path) -> bool:
         if not src.exists():
             return False
@@ -402,6 +431,16 @@ class ZeroClawService:
         self._relax_shared_path_permissions(target)
         return [str(target)]
 
+    def _write_picoclaw_auth_store(self, imported: dict[str, str]) -> list[str]:
+        shared_home = self._ensure_shared_provider_auth_root()
+        target = shared_home / ".picoclaw" / "auth.json"
+        existing = self._read_json_file(target)
+        payload = merge_picoclaw_auth_store(existing, imported)
+        self._write_json_file(target, payload)
+        self._relax_shared_path_permissions(target.parent)
+        self._relax_shared_path_permissions(target)
+        return [str(target)]
+
     def _write_provider_auth_profiles(
         self,
         providers: list[str],
@@ -414,6 +453,8 @@ class ZeroClawService:
             if not token or token in seen:
                 continue
             seen.add(token)
+            if token == "picoclaw":
+                updated.extend(self._write_picoclaw_auth_store(imported))
             updated.extend(self._write_provider_auth_profile(token, imported))
         return self._dedupe_paths(updated)
 
@@ -893,6 +934,8 @@ class ZeroClawService:
         linux_user = str(info.get("linux_user", "")).strip()
         home = self._agent_linux_home(agent)
         prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+        effective_channels = self._effective_agent_channels(agent) if linux_user else []
+        live_channel_payloads = self._discover_live_channel_payloads(agent) if linux_user else {}
         stop_result: dict[str, Any] = {}
         stopped_results: list[dict[str, Any]] = []
         start_result: dict[str, Any] = {}
@@ -944,6 +987,14 @@ class ZeroClawService:
                     )
 
             if linux_user:
+                self._prepare_agent_provider_home(
+                    provider=target_spec.name,
+                    agent=agent,
+                    linux_user=linux_user,
+                    home=home,
+                    channels=effective_channels,
+                    live_payloads=live_channel_payloads,
+                )
                 start_result = self._run_managed_provider_service_action(
                     provider=target_spec.name,
                     action="start",
@@ -953,7 +1004,7 @@ class ZeroClawService:
                 reconnected_channels = self._reconnect_agent_channels(
                     provider=target_spec.name,
                     linux_user=linux_user,
-                    channels=agent.get("channels", []),
+                    channels=effective_channels,
                 )
                 for other_provider in provider_names():
                     if other_provider == target_spec.name:
@@ -1048,6 +1099,8 @@ class ZeroClawService:
         if "fallback_pid" in info or int(start_result.get("fallback_pid", 0) or 0) > 0:
             info["fallback_pid"] = int(start_result.get("fallback_pid", 0) or 0)
         info["last_sync"] = now_iso()
+        if effective_channels:
+            self._persist_effective_agent_channels(agent, effective_channels)
         agent["core_prompts"] = prompts
         self._clear_agent_provider_issue(agent)
         if not stop_result and stopped_results:
@@ -1569,6 +1622,19 @@ class ZeroClawService:
         channels: list[dict[str, Any]],
     ) -> list[dict[str, str]]:
         reconnectable: list[dict[str, str]] = []
+        if str(provider).strip().lower() == "picoclaw":
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                if not bool(channel.get("enabled", True)):
+                    continue
+                kind = str(channel.get("kind", "")).strip().lower()
+                name = str(channel.get("name", "")).strip()
+                if not kind or not name or kind == "cli":
+                    continue
+                reconnectable.append({"kind": kind, "name": name})
+            return reconnectable
+
         commands: list[list[str]] = []
         seen_commands: set[tuple[str, ...]] = set()
         for channel in channels:
@@ -1598,6 +1664,395 @@ class ZeroClawService:
                 )
         return reconnectable
 
+    def _effective_agent_channels(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        view = self._attach_agent_channel_view(copy.deepcopy(payload))
+        rows: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for channel in view.get("channels", []):
+            if not isinstance(channel, dict):
+                continue
+            if not bool(channel.get("enabled", True)):
+                continue
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or not name:
+                continue
+            key = (kind, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "enabled": True,
+                    "external_id": str(channel.get("external_id", "")).strip(),
+                    "discovered_provider": str(channel.get("discovered_provider", "")).strip().lower(),
+                }
+            )
+        return rows
+
+    def _persist_effective_agent_channels(
+        self,
+        payload: dict[str, Any],
+        channels: list[dict[str, Any]],
+    ) -> None:
+        agent_id = str(payload.get("agent_id", payload.get("user_id", ""))).strip()
+        existing_rows = payload.get("channels", [])
+        existing_map: dict[tuple[str, str], dict[str, Any]] = {}
+        if isinstance(existing_rows, list):
+            for row in existing_rows:
+                if not isinstance(row, dict):
+                    continue
+                key = self._channel_key(row.get("kind", ""), row.get("name", ""))
+                if key[0] and key[1]:
+                    existing_map[key] = dict(row)
+
+        persisted: list[dict[str, Any]] = []
+        for idx, channel in enumerate(channels, start=1):
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or not name:
+                continue
+            key = (kind, name)
+            row = dict(existing_map.get(key, {}))
+            row["kind"] = kind
+            row["name"] = name
+            row["enabled"] = bool(channel.get("enabled", True))
+            external_id = str(channel.get("external_id", row.get("external_id", ""))).strip()
+            if external_id:
+                row["external_id"] = external_id
+            elif agent_id:
+                row["external_id"] = f"{agent_id}:{kind}:{idx}"
+            row.pop("channel_source", None)
+            row.pop("discovered_provider", None)
+            persisted.append(row)
+        payload["channels"] = persisted
+
+    def _provider_channel_payloads_for_home(
+        self,
+        provider: str,
+        root: Path,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        name = str(provider).strip().lower()
+        if name == "zeroclaw":
+            return self._read_zeroclaw_channel_payloads(root)
+        if name == "picoclaw":
+            return self._read_picoclaw_channel_payloads(root)
+        return {}
+
+    def _read_zeroclaw_channel_payloads(self, root: Path) -> dict[tuple[str, str], dict[str, Any]]:
+        config_path = root / "config.toml"
+        if tomllib is None or not config_path.exists():
+            return {}
+        try:
+            payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        channels_cfg = payload.get("channels_config", {})
+        if not isinstance(channels_cfg, dict):
+            return {}
+
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        if bool(channels_cfg.get("cli")):
+            rows[("cli", "local")] = {
+                "kind": "cli",
+                "name": "local",
+                "provider": "zeroclaw",
+                "settings": {"enabled": True},
+            }
+        for key, value in channels_cfg.items():
+            kind = str(key).strip().lower()
+            if kind == "cli" or not kind or not isinstance(value, dict):
+                continue
+            if not bool(value.get("enabled", True)):
+                continue
+            name = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
+            rows[(kind, name)] = {
+                "kind": kind,
+                "name": name,
+                "provider": "zeroclaw",
+                "settings": dict(value),
+            }
+        return rows
+
+    def _read_picoclaw_channel_payloads(self, root: Path) -> dict[tuple[str, str], dict[str, Any]]:
+        config_path = root / "config.json"
+        payload = self._read_json_file(config_path)
+        channels_cfg = payload.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return {}
+
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, value in channels_cfg.items():
+            kind = str(key).strip().lower()
+            if not kind:
+                continue
+            if isinstance(value, dict):
+                enabled = bool(value.get("enabled", True))
+                name = str(value.get("name", kind)).strip().lower() or kind
+                settings = dict(value)
+            else:
+                enabled = bool(value)
+                name = kind
+                settings = {"enabled": enabled}
+            if not enabled:
+                continue
+            rows[(kind, name)] = {
+                "kind": kind,
+                "name": name,
+                "provider": "picoclaw",
+                "settings": settings,
+            }
+        return rows
+
+    def _discover_live_channel_payloads(self, payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+        info = payload.get("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        is_local = bool(info.get("local_user", False))
+        provider = str(info.get("provider", "")).strip().lower()
+        home = self._local_agent_home(provider) if is_local else self._agent_linux_home(payload)
+        if not home:
+            return {}
+        if linux_user and not is_local and not self._can_manage_linux_user(linux_user):
+            return {}
+
+        ordered: list[str] = []
+        seen_providers: set[str] = set()
+        for item in [provider] + provider_names():
+            token = str(item).strip().lower()
+            if not token or token in seen_providers:
+                continue
+            seen_providers.add(token)
+            ordered.append(token)
+
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for name in ordered:
+            root = home / get_provider(name).state_dir
+            for key, value in self._provider_channel_payloads_for_home(name, root).items():
+                rows.setdefault(key, value)
+        return rows
+
+    @staticmethod
+    def _coerce_string_list(payload: Any) -> list[str]:
+        rows: list[str] = []
+        if not isinstance(payload, list):
+            return rows
+        for item in payload:
+            token = str(item).strip()
+            if token:
+                rows.append(token)
+        return rows
+
+    def _prepare_agent_provider_home(
+        self,
+        *,
+        provider: str,
+        agent: dict[str, Any],
+        linux_user: str,
+        home: Path | None,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        if not home:
+            return
+        name = str(provider).strip().lower()
+        if name != "picoclaw":
+            return
+
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        if "provider-auth" in set(sync.get("bundles", [])):
+            self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
+
+        auth = self._provider_auth(name)
+        auth_mode = str(agent.get("agent", {}).get("auth_mode", auth.get("auth_mode", ""))).strip().lower()
+        if not auth_mode:
+            auth_mode = str(auth.get("auth_mode", get_provider(name).default_auth_mode)).strip().lower()
+        api_key = str(auth.get("api_key", "")).strip()
+        self._ensure_picoclaw_home_prepared(
+            home=home,
+            linux_user=linux_user,
+            channels=channels,
+            live_payloads=live_payloads,
+            auth_mode=auth_mode,
+            api_key=api_key,
+        )
+
+    def _ensure_picoclaw_home_prepared(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+        auth_mode: str,
+        api_key: str,
+    ) -> None:
+        executable = self._resolve_provider_executable("picoclaw")
+        onboard_cmd = self._wrap_user_command([executable, "onboard"], linux_user, purpose="provider bootstrap")
+        env = self._service_env(linux_user)
+        env["HOME"] = str(home)
+        onboard = subprocess.run(onboard_cmd, capture_output=True, text=True, check=False, env=env)
+        if onboard.returncode != 0:
+            output = (onboard.stdout or onboard.stderr or "").strip()
+            raise SetupError(f"picoclaw onboard failed: {output or f'exit {onboard.returncode}'}")
+
+        root = home / ".picoclaw"
+        root.mkdir(parents=True, exist_ok=True)
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_path = root / "config.json"
+        config = self._read_json_file(config_path)
+
+        agents_cfg = config.get("agents", {})
+        if not isinstance(agents_cfg, dict):
+            agents_cfg = {}
+        defaults = agents_cfg.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["workspace"] = str(workspace)
+        defaults["restrict_to_workspace"] = bool(defaults.get("restrict_to_workspace", True))
+        defaults["provider"] = "openai"
+        defaults["model_name"] = "gpt-5.2"
+        defaults["model"] = "gpt-5.2"
+        agents_cfg["defaults"] = defaults
+        config["agents"] = agents_cfg
+
+        providers_cfg = config.get("providers", {})
+        if not isinstance(providers_cfg, dict):
+            providers_cfg = {}
+        openai_cfg = providers_cfg.get("openai", {})
+        if not isinstance(openai_cfg, dict):
+            openai_cfg = {}
+        openai_cfg.setdefault("api_base", "https://api.openai.com/v1")
+        if auth_mode == "linked":
+            openai_cfg["auth_method"] = "oauth"
+            openai_cfg.pop("api_key", None)
+        elif auth_mode == "api_key":
+            if not api_key:
+                raise SetupError("picoclaw API-key mode requires an API key before the runtime can start")
+            openai_cfg["api_key"] = api_key
+            openai_cfg.pop("auth_method", None)
+        providers_cfg["openai"] = openai_cfg
+        config["providers"] = providers_cfg
+
+        model_list = config.get("model_list", [])
+        if not isinstance(model_list, list):
+            model_list = []
+        model_entry: dict[str, Any] | None = None
+        for item in model_list:
+            if not isinstance(item, dict):
+                continue
+            model_name = str(item.get("model_name", "")).strip()
+            model_ref = str(item.get("model", "")).strip()
+            if model_name == "gpt-5.2" or model_ref == "openai/gpt-5.2":
+                model_entry = item
+                break
+        if model_entry is None:
+            for item in model_list:
+                if isinstance(item, dict) and str(item.get("model", "")).startswith("openai/"):
+                    model_entry = item
+                    break
+        if model_entry is None:
+            model_entry = {}
+            model_list.append(model_entry)
+        model_entry["model_name"] = "gpt-5.2"
+        model_entry["model"] = "openai/gpt-5.2"
+        model_entry.setdefault("api_base", "https://api.openai.com/v1")
+        if auth_mode == "linked":
+            model_entry["auth_method"] = "oauth"
+            model_entry.pop("api_key", None)
+        elif auth_mode == "api_key":
+            model_entry["api_key"] = api_key
+            model_entry.pop("auth_method", None)
+        config["model_list"] = model_list
+
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            channels_cfg = {}
+        payload_by_kind: dict[str, dict[str, Any]] = {}
+        for payload in live_payloads.values():
+            kind = str(payload.get("kind", "")).strip().lower()
+            if kind and kind not in payload_by_kind:
+                payload_by_kind[kind] = payload
+
+        for channel in channels:
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or kind == "cli":
+                continue
+            payload = live_payloads.get((kind, name)) or payload_by_kind.get(kind, {})
+            settings = payload.get("settings", {}) if isinstance(payload, dict) else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            if kind != "telegram":
+                continue
+            telegram_cfg = channels_cfg.get("telegram", {})
+            if not isinstance(telegram_cfg, dict):
+                telegram_cfg = {}
+            token = (
+                str(settings.get("token", "")).strip()
+                or str(settings.get("bot_token", "")).strip()
+                or str(telegram_cfg.get("token", "")).strip()
+            )
+            if not token:
+                raise SetupError(
+                    "picoclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                )
+            telegram_cfg["enabled"] = True
+            telegram_cfg["token"] = token
+            if name:
+                telegram_cfg["name"] = name
+            base_url = str(settings.get("base_url", telegram_cfg.get("base_url", ""))).strip()
+            if base_url:
+                telegram_cfg["base_url"] = base_url
+            proxy = str(settings.get("proxy", telegram_cfg.get("proxy", ""))).strip()
+            if proxy:
+                telegram_cfg["proxy"] = proxy
+            allow_from = self._coerce_string_list(settings.get("allow_from", telegram_cfg.get("allow_from", [])))
+            telegram_cfg["allow_from"] = allow_from
+            group_trigger = settings.get("group_trigger", telegram_cfg.get("group_trigger", {}))
+            if isinstance(group_trigger, dict) and group_trigger:
+                normalized_trigger: dict[str, Any] = {}
+                if "mention_only" in group_trigger:
+                    normalized_trigger["mention_only"] = bool(group_trigger.get("mention_only"))
+                prefixes = self._coerce_string_list(group_trigger.get("prefixes", []))
+                if prefixes:
+                    normalized_trigger["prefixes"] = prefixes
+                if normalized_trigger:
+                    telegram_cfg["group_trigger"] = normalized_trigger
+            channels_cfg["telegram"] = telegram_cfg
+
+        config["channels"] = channels_cfg
+        has_enabled_channel = any(
+            isinstance(value, dict) and bool(value.get("enabled", False))
+            for value in channels_cfg.values()
+        )
+        if not has_enabled_channel:
+            raise SetupError("picoclaw requires at least one enabled provider channel before the gateway can run")
+
+        self._write_json_file(config_path, config)
+        self._chown_tree(root, linux_user)
+
+    def _remove_picoclaw_channel_from_home(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        kind: str,
+    ) -> None:
+        config_path = home / ".picoclaw" / "config.json"
+        config = self._read_json_file(config_path)
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return
+        token = str(kind).strip().lower()
+        if token in channels_cfg:
+            channels_cfg.pop(token, None)
+            config["channels"] = channels_cfg
+            self._write_json_file(config_path, config)
+            self._chown_tree(home / ".picoclaw", linux_user)
+
     def agent_service_action(self, agent_id: str, action: str) -> dict[str, Any]:
         self._require_setup()
         command = str(action).strip().lower()
@@ -1617,8 +2072,17 @@ class ZeroClawService:
         if not provider:
             raise SetupError(f"agent '{agent_id}' has no provider configured")
         linux_user = str(agent_info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
         if command in {"start", "restart"}:
             self.ensure_provider_runtime(provider)
+            self._prepare_agent_provider_home(
+                provider=provider,
+                agent=agent,
+                linux_user=linux_user,
+                home=home,
+                channels=self._effective_agent_channels(agent),
+                live_payloads=self._discover_live_channel_payloads(agent),
+            )
 
         result = self._run_managed_provider_service_action(
             provider=provider,
@@ -2026,6 +2490,29 @@ class ZeroClawService:
             )
             self._write_channel_pool(pool)
 
+        provider = str(source.get("agent", {}).get("provider", "")).strip().lower()
+        linux_user = str(source.get("agent", {}).get("linux_user", "")).strip()
+        home = self._agent_linux_home(source)
+        if provider == "picoclaw" and linux_user and home:
+            self._prepare_agent_provider_home(
+                provider=provider,
+                agent=source,
+                linux_user=linux_user,
+                home=home,
+                channels=self._effective_agent_channels(source),
+                live_payloads=self._discover_live_channel_payloads(source),
+            )
+            self._remove_picoclaw_channel_from_home(home=home, linux_user=linux_user, kind=channel_kind)
+            if self._provider_process_live(provider, linux_user):
+                result = self._run_managed_provider_service_action(
+                    provider=provider,
+                    action="restart",
+                    linux_user=linux_user,
+                    agent_info=source.setdefault("agent", {}),
+                )
+                source["agent"]["service_status"] = str(result.get("service_status", "unknown"))
+                source["agent"]["service_mode"] = str(result.get("service_mode", "unknown"))
+
         self._event(
             state,
             "channels.unassigned",
@@ -2080,6 +2567,60 @@ class ZeroClawService:
         )
         if not already_assigned:
             self.assign_channel_to_agent("", channel_kind, channel_name, target)
+            state = self.store.read_state()
+            agents = state.setdefault("agents", state.get("users", {}))
+            agent = agents.get(target)
+            if not agent:
+                raise AgentNotFoundError(f"agent not found: {target}")
+            self._hydrate_agent_controls(agent)
+            info = agent.setdefault("agent", {})
+            provider = str(info.get("provider", "")).strip().lower()
+            linux_user = str(info.get("linux_user", "")).strip()
+
+        if provider == "picoclaw":
+            home = self._agent_linux_home(agent)
+            effective_channels = self._effective_agent_channels(agent)
+            live_payloads = self._discover_live_channel_payloads(agent)
+            self._prepare_agent_provider_home(
+                provider=provider,
+                agent=agent,
+                linux_user=linux_user,
+                home=home,
+                channels=effective_channels,
+                live_payloads=live_payloads,
+            )
+            if self._provider_process_live(provider, linux_user):
+                result = self._run_managed_provider_service_action(
+                    provider=provider,
+                    action="restart",
+                    linux_user=linux_user,
+                    agent_info=info,
+                )
+                info["service_status"] = str(result.get("service_status", "unknown"))
+                info["service_mode"] = str(result.get("service_mode", "unknown"))
+            info["last_sync"] = now_iso()
+            self._event(
+                state,
+                "channels.connected",
+                f"Connected channel {channel_kind}:{channel_name} for {target}",
+                {
+                    "agent_id": target,
+                    "provider": provider,
+                    "kind": channel_kind,
+                    "name": channel_name,
+                    "command": "config-write",
+                },
+            )
+            self.store.write_state(state)
+            return {
+                "agent_id": target,
+                "provider": provider,
+                "kind": channel_kind,
+                "name": channel_name,
+                "command": [],
+                "output": "configured provider channel",
+                "status": "connected",
+            }
 
         commands = self._channel_connect_commands(provider, channel_kind, channel_name, linux_user)
         last_error = ""

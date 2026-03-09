@@ -71,7 +71,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         default_api_url="https://api.picoclaw.example/v1",
         state_dir=".picoclaw",
         workspace_dir="workspace",
-        marker_files=("config.json", "config.toml", "auth-profiles.json"),
+        marker_files=("config.json", "config.toml", "auth.json", "auth-profiles.json"),
         credential_paths=(
             ".picoclaw",
             ".config/picoclaw",
@@ -80,6 +80,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".openai",
         ),
         shared_auth_paths=(
+            ".picoclaw/auth.json",
             ".picoclaw/auth-profiles.json",
         ),
         core_prompt_files=(

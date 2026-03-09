@@ -113,6 +113,36 @@ def merge_provider_auth_profile(existing: dict[str, Any], imported: dict[str, st
     return payload
 
 
+def merge_picoclaw_auth_store(existing: dict[str, Any], imported: dict[str, str]) -> dict[str, Any]:
+    payload = dict(existing) if isinstance(existing, dict) else {}
+    credentials = payload.get("credentials", {})
+    if not isinstance(credentials, dict):
+        credentials = {}
+
+    provider = _picoclaw_provider_name(imported)
+    if not provider:
+        raise ValueError("imported auth profile cannot be mapped to picoclaw provider auth")
+
+    credential: dict[str, Any] = {
+        "access_token": str(imported.get("access_token", "")).strip(),
+        "provider": provider,
+        "auth_method": "oauth" if str(imported.get("kind", "oauth")).strip().lower() == "oauth" else "token",
+    }
+    refresh_token = str(imported.get("refresh_token", "")).strip()
+    if refresh_token:
+        credential["refresh_token"] = refresh_token
+    account_id = str(imported.get("account_id", "")).strip()
+    if account_id:
+        credential["account_id"] = account_id
+    expires_at = str(imported.get("expires_at", "")).strip()
+    if expires_at:
+        credential["expires_at"] = expires_at
+
+    credentials[provider] = credential
+    payload["credentials"] = credentials
+    return payload
+
+
 def _read_json_object(path: Path, *, allow_missing: bool = False) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -152,3 +182,14 @@ def _mtime_iso(path: Path) -> str:
     except OSError:
         return ""
     return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _picoclaw_provider_name(imported: dict[str, str]) -> str:
+    upstream = str(imported.get("upstream_provider", "")).strip().lower()
+    if upstream in {"openai", "openai-codex"}:
+        return "openai"
+    if upstream in {"anthropic", "anthropic-claude"}:
+        return "anthropic"
+    if upstream in {"google-antigravity", "antigravity"}:
+        return "google-antigravity"
+    return ""

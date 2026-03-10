@@ -428,6 +428,7 @@ def _handle_detail_key(key: int, state: DashboardState, service: Any) -> bool:
     settings = _settings_items(
         agent,
         _dashboard_provider_choices(service, agent),
+        service.addon_options() if hasattr(service, "addon_options") else [],
         _selected_channel(channels, state.channel_idx),
     )
     state.setting_idx = min(state.setting_idx, max(0, len(settings) - 1))
@@ -973,6 +974,7 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     settings = _settings_items(
         agent,
         _dashboard_provider_choices(service, agent),
+        service.addon_options() if hasattr(service, "addon_options") else [],
         _selected_channel(channels, state.channel_idx),
     )
     content_bottom = height - 3
@@ -1467,6 +1469,7 @@ def _run_channel_detail_action(
 def _settings_items(
     agent: dict[str, Any],
     provider_choices: list[str] | None = None,
+    addon_choices: list[dict[str, Any]] | None = None,
     selected_channel: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     info = agent.get("agent", {})
@@ -1572,6 +1575,49 @@ def _settings_items(
             },
         ]
     )
+    addon_access = agent.get("addon_access", {})
+    addon_rows = []
+    addon_map = {
+        str(item.get("addon", "")).strip().lower(): item
+        for item in addon_access.get("addons", [])
+        if isinstance(item, dict)
+    }
+    for addon in addon_choices or []:
+        addon_id = str(addon.get("id", "")).strip().lower()
+        if not addon_id:
+            continue
+        item = addon_map.get(addon_id, {})
+        enabled = bool(item.get("enabled", False))
+        applied = bool(item.get("applied", False))
+        auth_status = str(item.get("auth_status", "unknown"))
+        addon_rows.extend(
+            [
+                {
+                    "kind": f"addon_status:{addon_id}",
+                    "label": (
+                        f"addon {addon_id}: {'on' if enabled else 'off'} {ICON_DOT} "
+                        f"auth {auth_status} {ICON_DOT} {'applied' if applied else 'pending'}"
+                    ),
+                },
+                {
+                    "kind": f"addon_enable:{addon_id}",
+                    "label": f"addon {addon_id}: enable",
+                },
+                {
+                    "kind": f"addon_disable:{addon_id}",
+                    "label": f"addon {addon_id}: disable",
+                },
+                {
+                    "kind": f"addon_apply:{addon_id}",
+                    "label": f"addon {addon_id}: apply",
+                },
+                {
+                    "kind": f"addon_login:{addon_id}",
+                    "label": f"addon {addon_id}: shared login",
+                },
+            ]
+        )
+    rows.extend(addon_rows)
     return rows
 
 
@@ -1672,6 +1718,38 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
             else:
                 result = service.revoke_agent_credentials(state.selected_agent_id)
                 state.notice = f"credentials revoked ({len(result.get('removed_paths', []))} paths)"
+        elif kind.startswith("addon_enable:"):
+            if is_local:
+                state.notice = "addon management not supported for local-user claw"
+            else:
+                addon = kind.split(":", 1)[1]
+                result = service.enable_agent_addon(state.selected_agent_id, addon)
+                if result.get("pending", False):
+                    state.notice = f"addon {addon} enabled (pending home apply)"
+                else:
+                    state.notice = f"addon {addon} enabled"
+        elif kind.startswith("addon_disable:"):
+            if is_local:
+                state.notice = "addon management not supported for local-user claw"
+            else:
+                addon = kind.split(":", 1)[1]
+                service.disable_agent_addon(state.selected_agent_id, addon)
+                state.notice = f"addon {addon} disabled"
+        elif kind.startswith("addon_apply:"):
+            if is_local:
+                state.notice = "addon management not supported for local-user claw"
+            else:
+                addon = kind.split(":", 1)[1]
+                service.apply_agent_addons(state.selected_agent_id, addons=[addon])
+                state.notice = f"addon {addon} applied"
+        elif kind.startswith("addon_login:"):
+            addon = kind.split(":", 1)[1]
+            result = service.shared_addon_auth_login(addon)
+            action = str(result.get("action_performed", "login"))
+            if action == "status":
+                state.notice = f"addon {addon} auth already ready"
+            else:
+                state.notice = f"addon {addon} login completed"
         else:
             state.notice = "read-only setting"
         state.notice_error = False
@@ -1685,7 +1763,7 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
             "auth_mode",
             "cred_last_sync",
             "channel_status",
-        }
+        } and not kind.startswith("addon_status:")
     except Exception as exc:  # noqa: BLE001
         state.notice = str(exc)
         state.notice_error = True

@@ -18,6 +18,7 @@ many claws from one place.
 - Configure provider, auth, workspace, and API settings.
 - Create, clone, inspect, and delete agents.
 - Copy agent prompts and manage credential bundle policy.
+- Install shared addon CLIs and attach them to agents.
 - Apply channel presets and move channels between agents.
 - Create per-agent Linux runtimes with optional config/credential copy.
 - Detect installed local claw runtimes and transfer state.
@@ -84,10 +85,13 @@ clawie agent auth show|login
 clawie agent provider set
 clawie agent service start|stop|restart|status
 clawie agent credentials list|show|set|sync|revoke
+clawie agent addon show|enable|disable|apply
 clawie channel apply|move
 clawie runtime create|detect|install|status|login
 clawie runtime service start|stop|restart|status
 clawie auth show|login|import|apply
+clawie addon list|show|install
+clawie addon auth show|login|import
 clawie dashboard
 clawie health
 clawie event list
@@ -117,6 +121,12 @@ clawie agent credentials show alice
 clawie agent credentials set alice git --include-defaults
 sudo clawie agent credentials sync alice
 sudo clawie agent credentials revoke alice git
+clawie addon list
+clawie addon install gws
+clawie addon auth show gws
+sudo clawie addon auth login gws
+sudo clawie agent addon enable alice gws
+clawie agent addon show alice
 
 # new agents start with no channels; add them explicitly
 clawie agent create alice --template baseline
@@ -138,6 +148,8 @@ clawie auth show
 clawie auth login picoclaw
 clawie auth import picoclaw --from codex
 sudo clawie auth apply
+clawie addon auth import gws --source-home /home/azicon
+sudo clawie agent addon apply alice gws
 clawie health
 clawie event list --limit 50
 
@@ -173,6 +185,7 @@ clawie backup import backup.json
   - use service rows to run `<provider> service start|stop|restart|status`
   - use `prompt ...` rows to edit/sync/write core prompts
   - use `cred ...` rows to toggle bundle policy, sync credentials, and revoke credential access
+  - use `addon ...` rows to enable, disable, reapply, and log in shared addons such as `gws`
 - `d`: purge selected agent (requires confirmation)
 - `b` or `Esc`: back to overview
 - `r`: refresh, `q`: quit
@@ -209,6 +222,23 @@ clawie backup import backup.json
   all eligible managed agents.
 - `clawie agent auth show` and `clawie agent auth login` use the shared auth
   store automatically once that agent has shared provider auth linked.
+
+## Shared Addons
+
+- `clawie addon ...` is the central console for shared addon tools.
+- `clawie addon install gws` installs the official Google Workspace CLI package
+  (`@googleworkspace/cli`) and makes `gws` available on the shared runtime path.
+- `clawie addon auth login gws` runs `gws auth setup` or `gws auth login`
+  against a shared config dir, auto-installs `gcloud` into Clawie's shared
+  toolchain if setup needs it, then exports portable plaintext credentials so
+  every enabled agent can reuse the same Google Workspace session.
+- `clawie addon auth import gws --source-home PATH` or `--from-agent AGENT_ID`
+  imports an existing `~/.config/gws` config into that shared store.
+- `clawie agent addon enable AGENT_ID gws` links the shared `gws` config into
+  the target agent home at `~/.config/gws`.
+- If shared `gws` credentials do not exist yet, enable will tell you to log in
+  first, or you can pass `--login-if-missing` to perform the shared login flow
+  immediately.
 
 ## Isolation and Credential Reuse
 

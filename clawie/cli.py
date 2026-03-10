@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{config,agent,channel,runtime,auth,dashboard,health,event,backup}",
+        metavar="{config,agent,channel,runtime,auth,addon,dashboard,health,event,backup}",
     )
 
     _build_config_parser(subparsers)
@@ -45,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_channel_parser(subparsers)
     _build_runtime_parser(subparsers)
     _build_auth_parser(subparsers)
+    _build_addon_parser(subparsers)
 
     dashboard = subparsers.add_parser(
         "dashboard",
@@ -212,6 +214,75 @@ def _build_auth_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     auth_apply.set_defaults(func=cmd_shared_auth_apply)
 
 
+def _build_addon_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    addon = subparsers.add_parser(
+        "addon",
+        help="Install and manage shared addon tools",
+    )
+    addon_sub = addon.add_subparsers(
+        dest="addon_command",
+        required=True,
+        metavar="{list,show,install,auth}",
+    )
+
+    addon_list = addon_sub.add_parser("list", help="List available addons")
+    addon_list.set_defaults(func=cmd_addons_list)
+
+    addon_show = addon_sub.add_parser("show", help="Show one addon")
+    _add_positional_argument(
+        addon_show,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_show.set_defaults(func=cmd_addons_show)
+
+    addon_install = addon_sub.add_parser("install", help="Install one addon CLI")
+    _add_positional_argument(
+        addon_install,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_install.set_defaults(func=cmd_addons_install)
+
+    addon_auth = addon_sub.add_parser("auth", help="Manage shared addon credentials")
+    addon_auth_sub = addon_auth.add_subparsers(
+        dest="addon_auth_command",
+        required=True,
+        metavar="{show,login,import}",
+    )
+
+    addon_auth_show = addon_auth_sub.add_parser("show", help="Show shared addon auth status")
+    _add_positional_argument(
+        addon_auth_show,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_auth_show.set_defaults(func=cmd_addon_auth_show)
+
+    addon_auth_login = addon_auth_sub.add_parser("login", help="Run shared addon login")
+    _add_positional_argument(
+        addon_auth_login,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_auth_login.set_defaults(func=cmd_addon_auth_login)
+
+    addon_auth_import = addon_auth_sub.add_parser("import", help="Import addon credentials from a user or agent")
+    _add_positional_argument(
+        addon_auth_import,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_auth_import.add_argument("--source-home", help="Home directory to import from")
+    addon_auth_import.add_argument("--from-agent", help="Managed agent ID to import from")
+    addon_auth_import.set_defaults(func=cmd_addon_auth_import)
+
+
 def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     agent = subparsers.add_parser(
         "agent",
@@ -220,7 +291,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     agent_sub = agent.add_subparsers(
         dest="agent_command",
         required=True,
-        metavar="{create,clone,prompt,credentials,auth,provider,service,list,show,delete,purge,create-batch}",
+        metavar="{create,clone,prompt,credentials,addon,auth,provider,service,list,show,delete,purge,create-batch}",
     )
 
     create = agent_sub.add_parser("create", help="Create a new agent")
@@ -444,6 +515,77 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         help="Only revoke these bundles (repeatable)",
     )
     credentials_revoke.set_defaults(func=cmd_agents_credentials_revoke)
+
+    addon = agent_sub.add_parser(
+        "addon",
+        help="Attach shared addon tools to an agent",
+    )
+    addon_sub = addon.add_subparsers(
+        dest="agent_addon_command",
+        required=True,
+        metavar="{show,enable,disable,apply}",
+    )
+
+    addon_show = addon_sub.add_parser("show", help="Show addon access for an agent")
+    _add_positional_argument(
+        addon_show,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    addon_show.set_defaults(func=cmd_agents_addons_show)
+
+    addon_enable = addon_sub.add_parser("enable", help="Enable one addon for an agent")
+    _add_positional_argument(
+        addon_enable,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    _add_positional_argument(
+        addon_enable,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_enable.add_argument("--source-home", help="Import addon credentials from this home before enabling")
+    addon_enable.add_argument("--from-agent", help="Import addon credentials from this managed agent before enabling")
+    addon_enable.add_argument(
+        "--login-if-missing",
+        action="store_true",
+        help="Run shared addon login automatically if credentials are missing",
+    )
+    addon_enable.set_defaults(func=cmd_agents_addons_enable)
+
+    addon_disable = addon_sub.add_parser("disable", help="Disable one addon for an agent")
+    _add_positional_argument(
+        addon_disable,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    _add_positional_argument(
+        addon_disable,
+        "addon",
+        metavar="ADDON",
+        help_text="Addon ID",
+    )
+    addon_disable.set_defaults(func=cmd_agents_addons_disable)
+
+    addon_apply = addon_sub.add_parser("apply", help="Apply enabled addons into the agent home")
+    _add_positional_argument(
+        addon_apply,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    _add_positional_argument(
+        addon_apply,
+        "addon",
+        metavar="ADDON",
+        help_text="Only apply one addon",
+    )
+    addon_apply.set_defaults(func=cmd_agents_addons_apply)
 
     auth = agent_sub.add_parser(
         "auth",
@@ -1020,6 +1162,89 @@ def cmd_shared_auth_apply(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
+def cmd_addons_list(args: argparse.Namespace, service: ZeroClawService) -> int:
+    _ = args
+    rows: list[list[str]] = []
+    for addon in service.list_addons():
+        rows.append(
+            [
+                str(addon.get("addon", "")),
+                str(bool(addon.get("installed", False))),
+                str(addon.get("auth_status", "unknown")),
+                str(len(addon.get("linked_agents", []))),
+                str(addon.get("config_dir", "")),
+                str(addon.get("description", "")),
+            ]
+        )
+    print_table(["addon", "installed", "auth", "agents", "config_dir", "description"], rows)
+    return 0
+
+
+def cmd_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    payload = service.get_addon_status(addon)
+    _print_addon_status(payload, title="Addon")
+    agents = payload.get("linked_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    return 0
+
+
+def cmd_addons_install(args: argparse.Namespace, service: ZeroClawService) -> int:
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    payload = service.install_addon(addon)
+    print_success(f"Installed addon {payload.get('addon', addon)}")
+    _print_addon_status(service.get_addon_status(addon), title="Addon")
+    return 0
+
+
+def cmd_addon_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    payload = service.shared_addon_auth_status(addon)
+    _print_addon_auth_status(payload, title="Shared Addon Auth")
+    agents = payload.get("linked_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    return 0
+
+
+def cmd_addon_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    payload = service.shared_addon_auth_login(addon)
+    action = str(payload.get("action_performed", "login"))
+    if action == "status":
+        print_success(f"Shared addon auth already ready for {addon}")
+    else:
+        print_success(f"Completed shared addon auth login for {addon}")
+    _print_addon_auth_status(payload, title="Shared Addon Auth")
+    agents = payload.get("linked_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    return 0
+
+
+def cmd_addon_auth_import(args: argparse.Namespace, service: ZeroClawService) -> int:
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    result = service.import_shared_addon_auth(
+        addon,
+        source_home=args.source_home,
+        source_agent=args.from_agent,
+    )
+    print_success(f"Imported shared addon auth for {addon}")
+    print_info(f"Config dir: {result.get('config_dir', '')}")
+    updated_paths = result.get("updated_paths", [])
+    if updated_paths:
+        print_info("Updated paths:")
+        for path in updated_paths:
+            print(f"- {path}")
+    updated_agents = result.get("updated_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in updated_agents) or "<none>"))
+    skipped_agents = result.get("skipped_agents", [])
+    if skipped_agents:
+        print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
+    auth = result.get("auth", {})
+    if auth:
+        _print_addon_auth_status(auth, title="Shared Addon Auth")
+    return 0
+
+
 def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
@@ -1165,6 +1390,75 @@ def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ZeroClawSer
         print_info("Removed credential paths:")
         for path in removed:
             print(f"- {path}")
+    return 0
+
+
+def cmd_agents_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    payload = service.get_agent_addons(agent_id)
+    _print_agent_addons(payload)
+    return 0
+
+
+def cmd_agents_addons_enable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    login_if_missing = bool(args.login_if_missing)
+    if not login_if_missing and sys.stdin.isatty():
+        try:
+            status = service.shared_addon_auth_status(addon)
+        except Exception:
+            status = {}
+        if str(status.get("auth_status", "")).strip().lower() != "ready":
+            login_if_missing = _prompt_yes_no(
+                f"No shared {addon} credentials are ready. Run shared login now?",
+                default=False,
+            )
+    result = service.enable_agent_addon(
+        agent_id,
+        addon,
+        source_home=args.source_home,
+        source_agent=args.from_agent,
+        login_if_missing=login_if_missing,
+    )
+    print_success(f"Enabled addon {result.get('addon', addon)} for {agent_id}")
+    linked = result.get("linked_paths", [])
+    if linked:
+        print_info("Linked paths:")
+        for path in linked:
+            print(f"- {path}")
+    if result.get("pending", False):
+        print_warning("Addon is enabled in state but not yet applied because the agent has no manageable Linux home")
+    _print_agent(result.get("agent", {}))
+    return 0
+
+
+def cmd_agents_addons_disable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    addon = _resolve_required_value(args.addon, field_name="addon")
+    result = service.disable_agent_addon(agent_id, addon)
+    print_success(f"Disabled addon {result.get('addon', addon)} for {agent_id}")
+    removed = result.get("removed_paths", [])
+    if removed:
+        print_info("Removed paths:")
+        for path in removed:
+            print(f"- {path}")
+    _print_agent(result.get("agent", {}))
+    return 0
+
+
+def cmd_agents_addons_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    addons = [str(args.addon).strip()] if str(args.addon or "").strip() else None
+    result = service.apply_agent_addons(agent_id, addons=addons)
+    print_success(f"Applied addons for {agent_id}")
+    print_info("Addons: " + ", ".join(str(item) for item in result.get("addons", [])))
+    linked = result.get("linked_paths", [])
+    if linked:
+        print_info("Linked paths:")
+        for path in linked:
+            print(f"- {path}")
+    _print_agent(result.get("agent", {}))
     return 0
 
 
@@ -1582,6 +1876,13 @@ def _print_agent(agent: dict[str, Any]) -> None:
     migrated = sum(1 for row in channels if row.get("migrated_from"))
     credential_sync = agent.get("credential_sync", {})
     selected_bundles = ", ".join(str(item) for item in credential_sync.get("bundles", [])) or "<none>"
+    enabled_addons = ", ".join(
+        sorted(
+            str(name)
+            for name, payload in agent.get("addons", {}).items()
+            if isinstance(payload, dict) and bool(payload.get("enabled", False))
+        )
+    ) or "<none>"
     print_panel(
         "Agent",
         [
@@ -1605,6 +1906,7 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"channel_detail: {agent.get('agent', {}).get('channel_status_detail', '')}",
             f"core_prompts: {len(agent.get('core_prompts', {}))}",
             f"credential_bundles: {selected_bundles}",
+            f"addons: {enabled_addons}",
             f"autostart: {agent.get('agent', {}).get('autostart', True)}",
             f"service_status: {agent.get('agent', {}).get('service_status', 'unknown')}",
             f"agent_status: {agent.get('agent', {}).get('status', '')}",
@@ -1637,6 +1939,41 @@ def _print_agent(agent: dict[str, Any]) -> None:
         print()
         print_table(["plugin", "enabled"], plugin_rows)
 
+    addons = agent.get("addons", {})
+    addon_rows = []
+    if isinstance(addons, dict):
+        for key, payload in sorted(addons.items()):
+            if not isinstance(payload, dict):
+                continue
+            addon_rows.append(
+                [
+                    str(key),
+                    str(bool(payload.get("enabled", False))),
+                    str(payload.get("credential_mode", "")),
+                    str(payload.get("last_applied_at", "")),
+                ]
+            )
+    if addon_rows:
+        print()
+        print_table(["addon", "enabled", "mode", "last_applied_at"], addon_rows)
+
+
+def _print_addon_status(payload: dict[str, Any], *, title: str) -> None:
+    lines = [
+        f"addon: {payload.get('addon', '')}",
+        f"label: {payload.get('label', '')}",
+        f"description: {payload.get('description', '')}",
+        f"installed: {payload.get('installed', False)}",
+        f"executable: {payload.get('executable', '')}",
+        f"install_method: {payload.get('install_method', '')}",
+        f"install_package: {payload.get('install_package', '')}",
+        f"auth_status: {payload.get('auth_status', 'unknown')}",
+        f"auth_detail: {payload.get('auth_detail', '')}",
+        f"config_dir: {payload.get('config_dir', '')}",
+        f"shared_scope: {payload.get('shared_scope', '')}",
+    ]
+    print_panel(title, lines)
+
 
 def _print_auth_status(payload: dict[str, Any], *, title: str) -> None:
     lines = [
@@ -1659,6 +1996,47 @@ def _print_auth_status(payload: dict[str, Any], *, title: str) -> None:
     if "shared_provider_auth" in payload:
         lines.append(f"shared_provider_auth: {payload.get('shared_provider_auth', False)}")
     print_panel(title, lines)
+
+
+def _print_addon_auth_status(payload: dict[str, Any], *, title: str) -> None:
+    lines = [
+        f"addon: {payload.get('addon', '')}",
+        f"label: {payload.get('label', '')}",
+        f"config_dir: {payload.get('config_dir', '')}",
+        f"auth_status: {payload.get('auth_status', 'unknown')}",
+        f"source: {payload.get('source', '')}",
+        f"detail: {payload.get('detail', '')}",
+        f"login_required: {payload.get('login_required', False)}",
+        f"client_secret_present: {payload.get('client_secret_present', False)}",
+        f"credentials_path: {payload.get('credentials_path', '')}",
+        f"shared_scope: {payload.get('shared_scope', '')}",
+    ]
+    print_panel(title, lines)
+
+
+def _print_agent_addons(payload: dict[str, Any]) -> None:
+    print_panel(
+        "Agent Addons",
+        [
+            f"agent_id: {payload.get('agent_id', '')}",
+            f"linux_user: {payload.get('linux_user', '')}",
+            f"home: {payload.get('home', '')}",
+        ],
+    )
+    rows = []
+    for item in payload.get("addons", []):
+        rows.append(
+            [
+                str(item.get("addon", "")),
+                str(bool(item.get("enabled", False))),
+                str(bool(item.get("installed", False))),
+                str(item.get("auth_status", "unknown")),
+                str(bool(item.get("applied", False))),
+                str(item.get("last_applied_at", "")),
+            ]
+        )
+    if rows:
+        print_table(["addon", "enabled", "installed", "auth", "applied", "last_applied_at"], rows)
 
 
 def _resolve_channels(
@@ -1743,6 +2121,14 @@ def _prompt_required(label: str) -> str:
 def _prompt_with_default(label: str, default: str) -> str:
     value = input(f"{label} [{default}]: ").strip()
     return value or default
+
+
+def _prompt_yes_no(label: str, *, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    value = input(f"{label} [{suffix}]: ").strip().lower()
+    if not value:
+        return default
+    return value in {"y", "yes"}
 
 
 if __name__ == "__main__":

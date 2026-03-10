@@ -4,12 +4,16 @@ import copy
 import crypt
 import json
 import os
+import platform
 import pwd
 import re
 import shlex
 import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +29,8 @@ from clawie.auth_sources import (
     merge_picoclaw_auth_store,
     merge_provider_auth_profile,
 )
+from clawie.addon_auth import inspect_addon_auth, parse_gws_exported_credentials
+from clawie.addons import addon_names, get_addon
 from clawie.provider_auth import (
     empty_auth_payload,
     inspect_auth_files,
@@ -77,6 +83,7 @@ class ZeroClawService:
     GLOBAL_CLAUDE_PROFILE_FILE = GLOBAL_PROFILE_DIR / "20-claude-shared.sh"
     SHARED_CLAUDE_DIR = Path("/var/lib/clawie/claude-shared")
     SHARED_PROVIDER_AUTH_DIR = Path("/var/lib/clawie/provider-auth")
+    SHARED_TOOLCHAIN_DIR = Path("/var/lib/clawie/toolchain")
     SHARED_CLAUDE_SUBDIRS = ("backups", "cache", "debug")
     GLOBAL_HOMEBREW_PROFILE_CONTENT = "\n".join(
         [
@@ -113,6 +120,7 @@ class ZeroClawService:
             "",
         ]
     )
+    SHARED_ADDON_AUTH_DIR = Path("/var/lib/clawie/addon-auth")
     DEFAULT_AGENT_PLUGINS: dict[str, bool] = {
         "scheduler": True,
         "gateway": True,
@@ -142,6 +150,13 @@ class ZeroClawService:
         "git": "git",
     }
     DEFAULT_CREDENTIAL_BUNDLES: tuple[str, ...] = ("provider-auth",)
+    ADDON_ALIASES: dict[str, str] = {
+        "googleworkspace": "gws",
+        "google-workspace": "gws",
+        "googleworkspace-cli": "gws",
+        "google-workspace-cli": "gws",
+        "gws": "gws",
+    }
     SHARED_TOOLCHAIN_BEGIN = "# >>> clawie-shared-toolchain >>>"
     SHARED_TOOLCHAIN_END = "# <<< clawie-shared-toolchain <<<"
     SHARED_TOOLCHAIN_BLOCK = "\n".join(
@@ -163,6 +178,19 @@ class ZeroClawService:
             "fi",
             'export PNPM_HOME="$HOMEBREW_PREFIX/bin"',
             'export CLAUDE_CONFIG_DIR="/var/lib/clawie/claude-shared"',
+            'export CLAWIE_SHARED_TOOLCHAIN="/var/lib/clawie/toolchain"',
+            'if [ -d "$CLAWIE_SHARED_TOOLCHAIN/bin" ]; then',
+            '  case ":$PATH:" in',
+            '    *":$CLAWIE_SHARED_TOOLCHAIN/bin:"*) ;;',
+            '    *) export PATH="$CLAWIE_SHARED_TOOLCHAIN/bin:$PATH" ;;',
+            "  esac",
+            "fi",
+            'if [ -d "$CLAWIE_SHARED_TOOLCHAIN/google-cloud-sdk/bin" ]; then',
+            '  case ":$PATH:" in',
+            '    *":$CLAWIE_SHARED_TOOLCHAIN/google-cloud-sdk/bin:"*) ;;',
+            '    *) export PATH="$CLAWIE_SHARED_TOOLCHAIN/google-cloud-sdk/bin:$PATH" ;;',
+            "  esac",
+            "fi",
             'case ":$PATH:" in',
             '  *":$PNPM_HOME:"*) ;;',
             '  *) export PATH="$PNPM_HOME:$PATH" ;;',
@@ -198,6 +226,20 @@ class ZeroClawService:
         return rows
 
     @classmethod
+    def addon_options(cls) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for addon_id in addon_names():
+            spec = get_addon(addon_id)
+            rows.append(
+                {
+                    "id": spec.name,
+                    "label": spec.label,
+                    "description": spec.description,
+                }
+            )
+        return rows
+
+    @classmethod
     def _credential_bundle_spec_map(cls) -> dict[str, dict[str, Any]]:
         rows: dict[str, dict[str, Any]] = {}
         for spec in cls.CREDENTIAL_BUNDLE_SPECS:
@@ -211,6 +253,50 @@ class ZeroClawService:
         if not token:
             return ""
         return str(self.CREDENTIAL_BUNDLE_ALIASES.get(token, token))
+
+    def _canonical_addon(self, addon: str) -> str:
+        token = str(addon).strip().lower().replace("_", "-")
+        if not token:
+            return ""
+        return str(self.ADDON_ALIASES.get(token, token))
+
+    def _normalize_agent_addons(self, payload: Any) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
+        if not isinstance(payload, dict):
+            return rows
+        for raw_key, raw_value in payload.items():
+            token = self._canonical_addon(str(raw_key))
+            if not token:
+                continue
+            try:
+                get_addon(token)
+            except ValueError:
+                continue
+            if isinstance(raw_value, dict):
+                enabled = bool(raw_value.get("enabled", True))
+                last_paths = self._normalized_string_list(raw_value.get("last_applied_paths", []))
+                rows[token] = {
+                    "enabled": enabled,
+                    "credential_mode": str(raw_value.get("credential_mode", "shared")).strip().lower() or "shared",
+                    "last_applied_at": str(raw_value.get("last_applied_at", "")),
+                    "last_applied_paths": last_paths,
+                    "last_revoked_at": str(raw_value.get("last_revoked_at", "")),
+                    "last_source": str(raw_value.get("last_source", "")),
+                }
+                continue
+            rows[token] = {
+                "enabled": bool(raw_value),
+                "credential_mode": "shared",
+                "last_applied_at": "",
+                "last_applied_paths": [],
+                "last_revoked_at": "",
+                "last_source": "",
+            }
+        return rows
+
+    def _enabled_agent_addons(self, agent_state: dict[str, Any]) -> list[str]:
+        addons = self._normalize_agent_addons(agent_state.get("addons"))
+        return sorted(token for token, data in addons.items() if bool(data.get("enabled", False)))
 
     def _normalize_credential_bundles(
         self,
@@ -360,6 +446,73 @@ class ZeroClawService:
             if path.exists():
                 self._relax_shared_path_permissions(path)
 
+    def _shared_toolchain_home(self) -> Path:
+        preferred = self.SHARED_TOOLCHAIN_DIR
+        if preferred.exists():
+            return preferred
+        parent = preferred.parent
+        if os.geteuid() == 0 or os.access(parent, os.W_OK | os.X_OK):
+            return preferred
+        return self.store.root / "shared-toolchain"
+
+    def _shared_toolchain_scope(self) -> str:
+        return "system" if self._ensure_shared_toolchain_root() == self.SHARED_TOOLCHAIN_DIR else "local"
+
+    def _ensure_shared_toolchain_root(self) -> Path:
+        root = self._shared_toolchain_home()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            root = self.store.root / "shared-toolchain"
+            root.mkdir(parents=True, exist_ok=True)
+        (root / "bin").mkdir(parents=True, exist_ok=True)
+        self._relax_path_tree_permissions(root)
+        return root
+
+    def _shared_toolchain_path_entries(self) -> list[str]:
+        root = self._shared_toolchain_home()
+        return [str(root / "bin"), str(root / "google-cloud-sdk" / "bin")]
+
+    def _shared_addon_auth_home(self) -> Path:
+        preferred = self.SHARED_ADDON_AUTH_DIR
+        if preferred.exists():
+            return preferred
+        parent = preferred.parent
+        if os.geteuid() == 0 or os.access(parent, os.W_OK | os.X_OK):
+            return preferred
+        return self.store.root / "shared-addon-auth"
+
+    def _shared_addon_auth_scope(self) -> str:
+        return "system" if self._ensure_shared_addon_auth_root() == self.SHARED_ADDON_AUTH_DIR else "local"
+
+    def _ensure_shared_addon_auth_root(self) -> Path:
+        root = self._shared_addon_auth_home()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            root = self.store.root / "shared-addon-auth"
+            root.mkdir(parents=True, exist_ok=True)
+        self._relax_path_tree_permissions(root)
+        return root
+
+    def _shared_addon_config_dir(self, addon: str) -> Path:
+        spec = get_addon(addon)
+        return self._ensure_shared_addon_auth_root() / spec.shared_config_dir
+
+    def _ensure_shared_addon_config_dir(self, addon: str) -> Path:
+        root = self._shared_addon_config_dir(addon)
+        root.mkdir(parents=True, exist_ok=True)
+        self._relax_path_tree_permissions(root)
+        return root
+
+    def _relax_shared_addon_permissions(self, addon: str | None = None) -> None:
+        root = self._shared_addon_auth_home()
+        if addon:
+            root = self._shared_addon_config_dir(addon)
+        if not root.exists():
+            return
+        self._relax_path_tree_permissions(root)
+
     @staticmethod
     def _relax_shared_path_permissions(path: Path) -> None:
         try:
@@ -369,6 +522,16 @@ class ZeroClawService:
                 os.chmod(path, target_mode)
         except OSError:
             return
+
+    @classmethod
+    def _relax_path_tree_permissions(cls, path: Path) -> None:
+        if not path.exists():
+            return
+        cls._relax_shared_path_permissions(path)
+        if not path.is_dir():
+            return
+        for child in path.rglob("*"):
+            cls._relax_shared_path_permissions(child)
 
     @staticmethod
     def _read_json_file(path: Path) -> dict[str, Any]:
@@ -673,7 +836,7 @@ class ZeroClawService:
         if not name:
             raise ValueError("provider is required")
         spec = get_provider(name)
-        executable = shutil.which(spec.name)
+        executable = self._resolve_executable_in_service_env(spec.name)
         if executable:
             config = self.store.read_config()
             self._mark_runtime_installed(config, spec.name)
@@ -689,12 +852,12 @@ class ZeroClawService:
             }
 
         if spec.install_method == "brew":
-            brew = shutil.which("brew")
+            brew = self._resolve_executable_in_service_env("brew")
             if not brew:
                 raise SetupError("Homebrew is required to install provider runtimes but was not found in PATH.")
             cmd = [brew, "install", spec.install_package or spec.name]
         elif spec.install_method == "pnpm":
-            pnpm = shutil.which("pnpm")
+            pnpm = self._resolve_executable_in_service_env("pnpm")
             if not pnpm:
                 raise SetupError("pnpm is required to install provider runtimes but was not found in PATH.")
             cmd = [pnpm, "add", "-g", spec.install_package or spec.name]
@@ -755,6 +918,185 @@ class ZeroClawService:
             "executable": executable,
         }
 
+    def install_addon(self, addon: str) -> dict[str, Any]:
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        executable = self._resolve_executable_in_service_env(spec.executable)
+        if executable:
+            return {
+                "addon": spec.name,
+                "installed": False,
+                "already_present": True,
+                "method": spec.install_method,
+                "package": spec.install_package or spec.executable,
+                "executable": executable,
+            }
+
+        method_used = spec.install_method
+        if spec.install_method == "npm":
+            npm = self._resolve_executable_in_service_env("npm")
+            pnpm = self._resolve_executable_in_service_env("pnpm")
+            if npm:
+                cmd = [npm, "install", "-g", spec.install_package or spec.executable]
+            elif pnpm:
+                cmd = [pnpm, "add", "-g", spec.install_package or spec.executable]
+                method_used = "pnpm"
+            else:
+                raise SetupError("npm or pnpm is required to install addons but neither was found in PATH.")
+        elif spec.install_method == "pnpm":
+            pnpm = self._resolve_executable_in_service_env("pnpm")
+            if not pnpm:
+                raise SetupError("pnpm is required to install addons but was not found in PATH.")
+            cmd = [pnpm, "add", "-g", spec.install_package or spec.executable]
+        else:
+            raise SetupError(f"addon '{spec.name}' does not define an install method")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=self._service_env(""))
+        output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+        if result.returncode != 0:
+            raise SetupError(
+                f"failed to install addon {spec.name} via {spec.install_method}: {output or f'exit {result.returncode}'}"
+            )
+
+        executable = self._resolve_executable_in_service_env(spec.executable)
+        if not executable:
+            raise SetupError(f"addon install finished but '{spec.executable}' is still not in PATH")
+
+        state = self.store.read_state()
+        self._event(
+            state,
+            "addons.installed",
+            f"Installed addon {spec.name}",
+            {
+                "addon": spec.name,
+                "method": method_used,
+                "package": spec.install_package or spec.executable,
+                "executable": executable,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "addon": spec.name,
+            "installed": True,
+            "already_present": False,
+            "method": method_used,
+            "package": spec.install_package or spec.executable,
+            "executable": executable,
+            "output": output,
+        }
+
+    def ensure_support_tool_installed(self, tool: str) -> dict[str, Any]:
+        token = str(tool or "").strip().lower()
+        if token != "gcloud":
+            raise ValueError("support tool must be one of: gcloud")
+        executable = self._resolve_executable_in_service_env("gcloud")
+        if executable:
+            return {
+                "tool": token,
+                "installed": False,
+                "already_present": True,
+                "method": "archive",
+                "scope": self._shared_toolchain_scope(),
+                "executable": executable,
+            }
+        return self.install_support_tool(token)
+
+    def install_support_tool(self, tool: str) -> dict[str, Any]:
+        token = str(tool or "").strip().lower()
+        if token != "gcloud":
+            raise ValueError("support tool must be one of: gcloud")
+        executable = self._resolve_executable_in_service_env("gcloud")
+        if executable:
+            return {
+                "tool": token,
+                "installed": False,
+                "already_present": True,
+                "method": "archive",
+                "scope": self._shared_toolchain_scope(),
+                "executable": executable,
+            }
+
+        root = self._ensure_shared_toolchain_root()
+        archive_name = self._gcloud_archive_name()
+        url = f"https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/{archive_name}"
+        install_dir = root / "google-cloud-sdk"
+        if install_dir.exists() or install_dir.is_symlink():
+            if install_dir.is_symlink() or install_dir.is_file():
+                install_dir.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(install_dir)
+
+        archive_path = Path(
+            tempfile.mkstemp(prefix="clawie-gcloud-", suffix=".tar.gz", dir=str(root))[1]
+        )
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response, archive_path.open("wb") as handle:
+                shutil.copyfileobj(response, handle)
+            self._extract_tarball_safe(archive_path, root)
+        except Exception as exc:  # noqa: BLE001
+            archive_path.unlink(missing_ok=True)
+            raise SetupError(f"failed to install gcloud from {url}: {exc}") from exc
+        archive_path.unlink(missing_ok=True)
+        executable = str(root / "google-cloud-sdk" / "bin" / "gcloud")
+        if not Path(executable).exists():
+            raise SetupError(f"gcloud install finished but executable was not found at {executable}")
+        verify = subprocess.run(
+            [executable, "version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._service_env(""),
+        )
+        if verify.returncode != 0:
+            output = "\n".join(
+                part for part in [verify.stdout, verify.stderr] if str(part).strip()
+            ).strip()
+            raise SetupError(f"installed gcloud but version check failed: {output or f'exit {verify.returncode}'}")
+
+        self._relax_path_tree_permissions(root)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "toolchain.installed",
+            "Installed support tool gcloud",
+            {
+                "tool": token,
+                "method": "archive",
+                "scope": self._shared_toolchain_scope(),
+                "url": url,
+                "executable": executable,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "tool": token,
+            "installed": True,
+            "already_present": False,
+            "method": "archive",
+            "scope": self._shared_toolchain_scope(),
+            "url": url,
+            "executable": executable,
+        }
+
+    def ensure_addon_installed(self, addon: str) -> dict[str, Any]:
+        try:
+            spec = get_addon(addon)
+        except ValueError:
+            raise
+        executable = self._resolve_executable_in_service_env(spec.executable)
+        if executable:
+            return {
+                "addon": spec.name,
+                "installed": False,
+                "already_present": True,
+                "method": spec.install_method,
+                "package": spec.install_package or spec.executable,
+                "executable": executable,
+            }
+        return self.install_addon(spec.name)
+
     def create_agent(
         self,
         agent_id: str,
@@ -785,6 +1127,7 @@ class ZeroClawService:
         base_channels: list[dict[str, str]] = []
         source_template = template
         source_agent_defaults: dict[str, Any] = {}
+        source_addons: dict[str, Any] = {}
 
         if clone_from:
             source = agents.get(clone_from)
@@ -793,6 +1136,7 @@ class ZeroClawService:
             base_channels = copy.deepcopy(source.get("channels", []))
             source_template = source.get("source_template") or template
             source_agent_defaults = copy.deepcopy(source.get("agent", {}))
+            source_addons = copy.deepcopy(source.get("addons", {}))
         else:
             template_data = state["templates"].get(template)
             if not template_data:
@@ -873,6 +1217,7 @@ class ZeroClawService:
             "channels": final_channels,
             "core_prompts": normalized_prompts,
             "credential_sync": self._normalize_credential_sync_state({}, default_when_missing=True),
+            "addons": self._normalize_agent_addons(source_addons),
             "agent": agent,
         }
         agents[agent_id] = agent_state
@@ -3144,6 +3489,7 @@ class ZeroClawService:
             payload = copy.deepcopy(self.get_agent(token))
         payload = self._attach_agent_runtime_status(payload)
         payload = self._attach_agent_auth_status(payload)
+        payload = self._attach_agent_addon_status(payload)
         return self._attach_agent_channel_view(payload)
 
     def sync_agent_channels_from_provider(self, agent_id: str, *, replace: bool = True) -> dict[str, Any]:
@@ -3533,6 +3879,590 @@ class ZeroClawService:
             if bool(sync.get("shared_provider_auth", False)):
                 rows.append(str(aid))
         return rows
+
+    def list_addons(self) -> list[dict[str, Any]]:
+        return [self.get_addon_status(addon) for addon in addon_names()]
+
+    def get_addon_status(self, addon: str) -> dict[str, Any]:
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        auth = self.shared_addon_auth_status(spec.name)
+        executable = self._resolve_executable_in_service_env(spec.executable)
+        return {
+            "addon": spec.name,
+            "label": spec.label,
+            "description": spec.description,
+            "installed": bool(executable),
+            "executable": executable,
+            "install_method": spec.install_method,
+            "install_package": spec.install_package or spec.executable,
+            "auth_status": str(auth.get("auth_status", "unknown")),
+            "auth_detail": str(auth.get("detail", "")),
+            "config_dir": str(auth.get("config_dir", "")),
+            "shared_scope": str(auth.get("shared_scope", "")),
+            "linked_agents": list(auth.get("linked_agents", [])),
+        }
+
+    def shared_addon_auth_status(self, addon: str) -> dict[str, Any]:
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        config_dir = self._ensure_shared_addon_config_dir(spec.name)
+        payload = inspect_addon_auth(spec.name, config_dir)
+        payload.update(
+            {
+                "addon": spec.name,
+                "label": spec.label,
+                "description": spec.description,
+                "config_dir": str(config_dir),
+                "shared_scope": self._shared_addon_auth_scope(),
+                "linked_agents": self._shared_addon_agent_ids(spec.name),
+            }
+        )
+        return payload
+
+    def shared_addon_auth_login(self, addon: str) -> dict[str, Any]:
+        self._require_setup()
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        self.ensure_addon_installed(spec.name)
+        status = self.shared_addon_auth_status(spec.name)
+        if str(status.get("auth_status", "")).strip().lower() == "ready":
+            status["action_performed"] = "status"
+            return status
+
+        config_dir = self._ensure_shared_addon_config_dir(spec.name)
+        command = spec.auth_login_command
+        if spec.name == "gws" and not (config_dir / "client_secret.json").exists():
+            try:
+                self.ensure_support_tool_installed("gcloud")
+            except SetupError as exc:
+                raise SetupError(
+                    "gws auth setup requires gcloud, and Clawie could not provision it automatically: "
+                    f"{exc}"
+                ) from exc
+            command = spec.auth_setup_command or spec.auth_login_command
+        result = subprocess.run(
+            self._addon_shell_command(spec.name, command, linux_user="", config_dir=config_dir),
+            check=False,
+            env=self._service_env(""),
+        )
+        if result.returncode != 0:
+            action = " ".join(command)
+            raise SetupError(f"{spec.name} {action} failed with exit code {result.returncode}")
+
+        updated = self._materialize_shared_addon_credentials(spec.name, source_config_dir=config_dir, linux_user="")
+        self._relax_shared_addon_permissions(spec.name)
+        applied = self.apply_shared_addon_links(spec.name)
+        payload = self.shared_addon_auth_status(spec.name)
+        payload["action_performed"] = "login"
+        payload["updated_paths"] = updated
+        payload["linked_agents"] = list(applied.get("updated_agents", []))
+        return payload
+
+    def import_shared_addon_auth(
+        self,
+        addon: str,
+        *,
+        source_home: str | Path | None = None,
+        source_agent: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        self.ensure_addon_installed(spec.name)
+        src_home, src_linux_user, source_label = self._resolve_addon_source(source_home=source_home, source_agent=source_agent)
+        src_config = src_home / spec.target_config_rel
+        if not src_config.exists():
+            raise FileNotFoundError(f"{spec.label} config directory not found: {src_config}")
+        shared_dir = self._ensure_shared_addon_config_dir(spec.name)
+        updated = self._replace_tree(src_config, shared_dir)
+        updated.extend(
+            self._materialize_shared_addon_credentials(
+                spec.name,
+                source_config_dir=src_config,
+                linux_user=src_linux_user,
+            )
+        )
+        status = self.shared_addon_auth_status(spec.name)
+        if str(status.get("auth_status", "")).strip().lower() != "ready":
+            raise SetupError(
+                f"no portable {spec.name} credentials were found in {src_config}. "
+                f"Log in with 'clawie addon auth login {spec.name}' first."
+            )
+        self._relax_shared_addon_permissions(spec.name)
+        applied = self.apply_shared_addon_links(spec.name)
+        auth = self.shared_addon_auth_status(spec.name)
+        return {
+            "addon": spec.name,
+            "source_home": str(src_home),
+            "source_agent": str(source_agent or ""),
+            "source_label": source_label,
+            "config_dir": str(shared_dir),
+            "updated_paths": self._dedupe_paths(updated),
+            "updated_agents": list(applied.get("updated_agents", [])),
+            "skipped_agents": list(applied.get("skipped_agents", [])),
+            "auth": auth,
+        }
+
+    def apply_shared_addon_links(self, addon: str, agent_id: str | None = None) -> dict[str, Any]:
+        self._require_setup()
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        status = self.shared_addon_auth_status(name)
+        if str(status.get("auth_status", "")).strip().lower() != "ready":
+            raise SetupError(
+                f"shared {name} credentials are missing. Run 'clawie addon auth login {name}' or import them first."
+            )
+        shared_dir = self._shared_addon_config_dir(name)
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        updated_agents: list[str] = []
+        skipped_agents: list[str] = []
+        linked_paths: list[str] = []
+        changed = False
+        for aid, agent in sorted(agents.items()):
+            token = str(aid).strip()
+            if agent_id and token != str(agent_id).strip():
+                continue
+            self._hydrate_agent_controls(agent)
+            addons = self._normalize_agent_addons(agent.get("addons"))
+            addon_state = dict(addons.get(name, {}))
+            if not bool(addon_state.get("enabled", False)):
+                continue
+            info = agent.setdefault("agent", {})
+            linux_user = str(info.get("linux_user", "")).strip()
+            home = self._agent_linux_home(agent)
+            if not linux_user or home is None or not home.exists():
+                skipped_agents.append(token)
+                continue
+            if not self._can_manage_linux_user(linux_user):
+                skipped_agents.append(token)
+                continue
+            linked = self._ensure_shared_addon_links(name, target_home=home, username=linux_user)
+            linked_paths.extend(linked)
+            addon_state["enabled"] = True
+            addon_state["credential_mode"] = "shared"
+            addon_state["last_applied_at"] = now_iso()
+            addon_state["last_applied_paths"] = self._dedupe_paths(
+                list(addon_state.get("last_applied_paths", [])) + linked
+            )
+            addon_state["last_source"] = str(shared_dir)
+            addons[name] = addon_state
+            agent["addons"] = addons
+            info["last_sync"] = now_iso()
+            updated_agents.append(token)
+            changed = True
+        if changed:
+            self._event(
+                state,
+                "addons.applied",
+                f"Applied shared addon {name}",
+                {
+                    "addon": name,
+                    "agent_id": str(agent_id or ""),
+                    "config_dir": str(shared_dir),
+                    "updated_agents": updated_agents,
+                    "linked_paths": self._dedupe_paths(linked_paths),
+                },
+            )
+            self.store.write_state(state)
+        return {
+            "addon": name,
+            "config_dir": str(shared_dir),
+            "updated_agents": updated_agents,
+            "skipped_agents": skipped_agents,
+            "linked_paths": self._dedupe_paths(linked_paths),
+        }
+
+    def get_agent_addons(self, agent_id: str) -> dict[str, Any]:
+        token = str(agent_id).strip()
+        if token.startswith("@local:"):
+            raise ValueError("addon management is only supported for managed agents")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        home = self._agent_linux_home(agent)
+        rows: list[dict[str, Any]] = []
+        addons = self._normalize_agent_addons(agent.get("addons"))
+        for addon_name in addon_names():
+            spec = get_addon(addon_name)
+            addon_state = dict(addons.get(spec.name, {}))
+            shared_auth = self.shared_addon_auth_status(spec.name)
+            link = self._agent_addon_link_status(spec.name, home)
+            rows.append(
+                {
+                    "addon": spec.name,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "enabled": bool(addon_state.get("enabled", False)),
+                    "installed": bool(self._resolve_executable_in_service_env(spec.executable)),
+                    "auth_status": str(shared_auth.get("auth_status", "unknown")),
+                    "auth_detail": str(shared_auth.get("detail", "")),
+                    "applied": bool(link.get("applied", False)),
+                    "target_path": str(link.get("target_path", "")),
+                    "last_applied_at": str(addon_state.get("last_applied_at", "")),
+                    "last_revoked_at": str(addon_state.get("last_revoked_at", "")),
+                }
+            )
+        return {
+            "agent_id": token,
+            "linux_user": str(info.get("linux_user", "")),
+            "home": str(home or ""),
+            "addons": rows,
+        }
+
+    def enable_agent_addon(
+        self,
+        agent_id: str,
+        addon: str,
+        *,
+        source_home: str | Path | None = None,
+        source_agent: str | None = None,
+        login_if_missing: bool = False,
+    ) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            raise ValueError("addon management is only supported for managed agents")
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        self.ensure_addon_installed(spec.name)
+        if source_home or source_agent:
+            self.import_shared_addon_auth(spec.name, source_home=source_home, source_agent=source_agent)
+        status = self.shared_addon_auth_status(spec.name)
+        if str(status.get("auth_status", "")).strip().lower() != "ready":
+            if login_if_missing:
+                status = self.shared_addon_auth_login(spec.name)
+            if str(status.get("auth_status", "")).strip().lower() != "ready":
+                raise SetupError(
+                    f"shared {spec.name} credentials are missing. Run 'clawie addon auth login {spec.name}' first."
+                )
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        addons = self._normalize_agent_addons(agent.get("addons"))
+        addon_state = dict(addons.get(spec.name, {}))
+        addon_state["enabled"] = True
+        addon_state["credential_mode"] = "shared"
+        linked: list[str] = []
+        pending = True
+        if linux_user and home is not None and home.exists():
+            if not self._can_manage_linux_user(linux_user):
+                raise SetupError(
+                    "addon activation requires root when agent linux_user differs from current user. Re-run with sudo/root."
+                )
+            linked = self._ensure_shared_addon_links(spec.name, target_home=home, username=linux_user)
+            addon_state["last_applied_at"] = now_iso()
+            addon_state["last_applied_paths"] = self._dedupe_paths(
+                list(addon_state.get("last_applied_paths", [])) + linked
+            )
+            addon_state["last_source"] = str(self._shared_addon_config_dir(spec.name))
+            pending = False
+        addons[spec.name] = addon_state
+        agent["addons"] = addons
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.enabled",
+            f"Enabled addon {spec.name} for {token}",
+            {
+                "agent_id": token,
+                "addon": spec.name,
+                "linked_paths": linked,
+                "pending": pending,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent": agent,
+            "addon": spec.name,
+            "linked_paths": linked,
+            "pending": pending,
+            "shared_auth": status,
+        }
+
+    def disable_agent_addon(self, agent_id: str, addon: str) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            raise ValueError("addon management is only supported for managed agents")
+        name = self._canonical_addon(addon)
+        if not name:
+            raise ValueError("addon is required")
+        spec = get_addon(name)
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        addons = self._normalize_agent_addons(agent.get("addons"))
+        addon_state = dict(addons.get(spec.name, {}))
+        removed: list[str] = []
+        if linux_user and home is not None and home.exists() and self._can_manage_linux_user(linux_user):
+            removed = self._revoke_addon_from_home(spec.name, home)
+        addon_state["enabled"] = False
+        addon_state["last_revoked_at"] = now_iso()
+        addon_state["last_applied_paths"] = []
+        addons[spec.name] = addon_state
+        agent["addons"] = addons
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.disabled",
+            f"Disabled addon {spec.name} for {token}",
+            {
+                "agent_id": token,
+                "addon": spec.name,
+                "removed_paths": removed,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent": agent,
+            "addon": spec.name,
+            "removed_paths": removed,
+        }
+
+    def apply_agent_addons(self, agent_id: str, addons: list[str] | None = None) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            raise ValueError("addon management is only supported for managed agents")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        if not linux_user or home is None or not home.exists():
+            raise SetupError(f"agent '{token}' has no linux_user home to apply addons to")
+        self._assert_linux_user_manageable(linux_user, "addon apply")
+        selected = [self._canonical_addon(item) for item in (addons or self._enabled_agent_addons(agent))]
+        selected = [item for item in selected if item]
+        if not selected:
+            raise ValueError("no enabled addons selected")
+        updated: list[str] = []
+        addon_state_map = self._normalize_agent_addons(agent.get("addons"))
+        for name in selected:
+            if str(self.shared_addon_auth_status(name).get("auth_status", "")).strip().lower() != "ready":
+                raise SetupError(
+                    f"shared {name} credentials are missing. Run 'clawie addon auth login {name}' first."
+                )
+            linked = self._ensure_shared_addon_links(name, target_home=home, username=linux_user)
+            updated.extend(linked)
+            addon_state = dict(addon_state_map.get(name, {}))
+            addon_state["enabled"] = True
+            addon_state["credential_mode"] = "shared"
+            addon_state["last_applied_at"] = now_iso()
+            addon_state["last_applied_paths"] = self._dedupe_paths(
+                list(addon_state.get("last_applied_paths", [])) + linked
+            )
+            addon_state["last_source"] = str(self._shared_addon_config_dir(name))
+            addon_state_map[name] = addon_state
+        agent["addons"] = addon_state_map
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.reapplied",
+            f"Applied addons for {token}",
+            {
+                "agent_id": token,
+                "addons": selected,
+                "linked_paths": self._dedupe_paths(updated),
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent": agent,
+            "addons": selected,
+            "linked_paths": self._dedupe_paths(updated),
+        }
+
+    def _shared_addon_agent_ids(self, addon: str) -> list[str]:
+        name = self._canonical_addon(addon)
+        rows: list[str] = []
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        for aid, agent in sorted(agents.items()):
+            self._hydrate_agent_controls(agent)
+            addons = self._normalize_agent_addons(agent.get("addons"))
+            if bool(addons.get(name, {}).get("enabled", False)):
+                rows.append(str(aid))
+        return rows
+
+    def _resolve_addon_source(
+        self,
+        *,
+        source_home: str | Path | None,
+        source_agent: str | None,
+    ) -> tuple[Path, str, str]:
+        if source_home and source_agent:
+            raise ValueError("use either source_home or source_agent, not both")
+        if source_agent:
+            token = str(source_agent).strip()
+            if token.startswith("@local:"):
+                raise ValueError("source_agent must be a managed agent")
+            state = self.store.read_state()
+            agents = state.setdefault("agents", state.get("users", {}))
+            agent = agents.get(token)
+            if not agent:
+                raise AgentNotFoundError(f"agent not found: {token}")
+            self._hydrate_agent_controls(agent)
+            linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
+            if linux_user:
+                self._require_linux_user_access(linux_user, "addon credential import")
+            home = self._agent_linux_home(agent)
+            if home is None or not home.exists():
+                raise SetupError(f"agent '{token}' has no linux_user home to import addon credentials from")
+            return (home, linux_user, token)
+        src_home = Path(source_home).expanduser() if source_home else self._default_source_home()
+        if not src_home.exists():
+            raise FileNotFoundError(f"source home not found: {src_home}")
+        return (src_home, "", str(src_home))
+
+    def _addon_shell_command(
+        self,
+        addon: str,
+        command: tuple[str, ...],
+        *,
+        linux_user: str,
+        config_dir: Path,
+    ) -> list[str]:
+        spec = get_addon(addon)
+        env_bits: list[str] = []
+        if spec.config_dir_env:
+            env_bits.append(f'export {spec.config_dir_env}={shlex.quote(str(config_dir))}')
+        env_bits.append(
+            "exec " + " ".join([shlex.quote(spec.executable), *[shlex.quote(part) for part in command]])
+        )
+        script = "; ".join(env_bits)
+        return self._user_shell_command(linux_user, script)
+
+    def _materialize_shared_addon_credentials(
+        self,
+        addon: str,
+        *,
+        source_config_dir: Path,
+        linux_user: str,
+    ) -> list[str]:
+        spec = get_addon(addon)
+        if spec.name != "gws":
+            return []
+        target_dir = self._ensure_shared_addon_config_dir(spec.name)
+        target = target_dir / "credentials.json"
+        try:
+            result = subprocess.run(
+                self._addon_shell_command(
+                    spec.name,
+                    spec.auth_export_command,
+                    linux_user=linux_user,
+                    config_dir=source_config_dir,
+                ),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(linux_user),
+            )
+        except Exception:
+            result = None
+        if result is None or result.returncode != 0 or not str(result.stdout).strip():
+            copied = self._copy_if_present(source_config_dir / "credentials.json", target)
+            return [str(target)] if copied else []
+        payload = parse_gws_exported_credentials(result.stdout)
+        self._write_json_file(target, payload)
+        self._relax_shared_addon_permissions(spec.name)
+        return [str(target)]
+
+    def _replace_tree(self, src: Path, dst: Path) -> list[str]:
+        if dst.exists() or dst.is_symlink():
+            if dst.is_symlink() or dst.is_file():
+                dst.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+        self._relax_path_tree_permissions(dst)
+        return [str(dst)]
+
+    def _ensure_shared_addon_links(self, addon: str, *, target_home: Path, username: str) -> list[str]:
+        spec = get_addon(addon)
+        src = self._shared_addon_config_dir(spec.name)
+        if not src.exists():
+            return []
+        target = target_home / spec.target_config_rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(target.parent, username)
+        if target.is_symlink():
+            try:
+                if target.resolve() == src.resolve():
+                    return [str(target)]
+            except OSError:
+                pass
+            target.unlink(missing_ok=True)
+        elif target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        target.symlink_to(src, target_is_directory=True)
+        self._chown_path(target, username)
+        return [str(target)]
+
+    def _revoke_addon_from_home(self, addon: str, target_home: Path) -> list[str]:
+        spec = get_addon(addon)
+        target = target_home / spec.target_config_rel
+        if not target.exists() and not target.is_symlink():
+            return []
+        if target.is_symlink() or target.is_file():
+            target.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(target)
+        return [str(target)]
+
+    def _agent_addon_link_status(self, addon: str, home: Path | None) -> dict[str, Any]:
+        spec = get_addon(addon)
+        target = (home / spec.target_config_rel) if home else Path(spec.target_config_rel)
+        applied = False
+        if home is not None and (target.exists() or target.is_symlink()):
+            if target.is_symlink():
+                try:
+                    applied = target.resolve() == self._shared_addon_config_dir(spec.name).resolve()
+                except OSError:
+                    applied = False
+            else:
+                applied = True
+        return {
+            "applied": applied,
+            "target_path": str(target) if home is not None else "",
+        }
 
     def local_claw_service_action(self, provider: str, action: str) -> dict[str, Any]:
         self._require_setup()
@@ -4935,26 +5865,67 @@ class ZeroClawService:
                 return str(cmd[idx - 1])
         return str(cmd[0])
 
-    @staticmethod
-    def _resolve_provider_executable(provider: str) -> str:
-        resolved = shutil.which(provider)
+    def _resolve_executable_in_service_env(self, executable: str, *, linux_user: str = "") -> str:
+        token = str(executable).strip()
+        if not token:
+            return ""
+        env = self._service_env(linux_user)
+        env_path = env.get("PATH", "")
+        try:
+            resolved = shutil.which(token, path=env_path)
+        except TypeError:
+            resolved = shutil.which(token)
         if resolved:
             return resolved
-        fallback = f"/home/linuxbrew/.linuxbrew/bin/{provider}"
+        if "/" in token:
+            candidate = Path(token)
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        for segment in env_path.split(":"):
+            piece = segment.strip()
+            if not piece:
+                continue
+            candidate = Path(piece) / token
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        fallback = f"/home/linuxbrew/.linuxbrew/bin/{token}"
         if Path(fallback).exists():
             return fallback
+        return ""
+
+    def _resolve_provider_executable(self, provider: str) -> str:
+        resolved = self._resolve_executable_in_service_env(provider)
+        if resolved:
+            return resolved
         raise SetupError(
             f"provider executable '{provider}' was not found in PATH. Run 'clawie runtime install {provider}' first."
+        )
+
+    def _resolve_addon_executable(self, addon: str) -> str:
+        spec = get_addon(addon)
+        resolved = self._resolve_executable_in_service_env(spec.executable)
+        if resolved:
+            return resolved
+        raise SetupError(
+            f"addon executable '{spec.executable}' was not found in PATH. Run 'clawie addon install {spec.name}' first."
         )
 
     def _service_env(self, linux_user: str) -> dict[str, str]:
         env = dict(os.environ)
         current_path = env.get("PATH", "")
-        required_paths = ["/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-        merged = [segment for segment in current_path.split(":") if segment]
-        for segment in required_paths:
-            if segment not in merged:
-                merged.append(segment)
+        required_paths = [
+            *self._shared_toolchain_path_entries(),
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+        merged: list[str] = []
+        for segment in [*required_paths, *current_path.split(":")]:
+            piece = segment.strip()
+            if not piece or piece in merged:
+                continue
+            merged.append(piece)
         env["PATH"] = ":".join(merged)
 
         if linux_user:
@@ -4972,6 +5943,32 @@ class ZeroClawService:
                 env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
                 env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
         return env
+
+    @staticmethod
+    def _extract_tarball_safe(archive_path: Path, target_dir: Path) -> None:
+        root = target_dir.resolve()
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                candidate = (target_dir / member.name).resolve()
+                try:
+                    candidate.relative_to(root)
+                except ValueError as exc:
+                    raise SetupError(f"archive contained an unsafe path: {member.name}") from exc
+            archive.extractall(target_dir)
+
+    @staticmethod
+    def _gcloud_archive_name() -> str:
+        machine = platform.machine().strip().lower()
+        mapping = {
+            "x86_64": "google-cloud-cli-linux-x86_64.tar.gz",
+            "amd64": "google-cloud-cli-linux-x86_64.tar.gz",
+            "aarch64": "google-cloud-cli-linux-arm.tar.gz",
+            "arm64": "google-cloud-cli-linux-arm.tar.gz",
+        }
+        archive = mapping.get(machine)
+        if archive:
+            return archive
+        raise SetupError(f"automatic gcloud install is not supported on architecture '{machine}'")
 
     def _linux_home_for_user(self, linux_user: str) -> Path | None:
         token = str(linux_user).strip()
@@ -5351,6 +6348,17 @@ class ZeroClawService:
         info["auth_detail"] = str(auth.get("detail", ""))
         info["login_required"] = bool(auth.get("login_required", False))
         info["can_login"] = bool(auth.get("can_login", False))
+        return payload
+
+    def _attach_agent_addon_status(self, payload: dict[str, Any]) -> dict[str, Any]:
+        agent_id = str(payload.get("agent_id", payload.get("user_id", ""))).strip()
+        if not agent_id or agent_id.startswith("@local:"):
+            payload["addon_access"] = {"agent_id": agent_id, "addons": []}
+            return payload
+        try:
+            payload["addon_access"] = self.get_agent_addons(agent_id)
+        except Exception:
+            payload["addon_access"] = {"agent_id": agent_id, "addons": []}
         return payload
 
     def _attach_agent_runtime_status(
@@ -6512,6 +7520,7 @@ class ZeroClawService:
             agent_state.get("credential_sync"),
             default_when_missing=True,
         )
+        agent_state["addons"] = self._normalize_agent_addons(agent_state.get("addons"))
 
     def _discover_channels_from_source_home(
         self,

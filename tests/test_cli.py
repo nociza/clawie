@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+import io
 import json
 import os
 import tempfile
@@ -120,6 +121,161 @@ def test_runtime_install_cli(
     assert "provider: picoclaw" in output
     assert "method: brew" in output
     assert "executable: /mock/bin/picoclaw" in output
+
+
+def test_addon_install_cli(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ZeroClawService,
+        "install_addon",
+        lambda self, addon: {
+            "addon": addon,
+            "installed": True,
+            "already_present": False,
+            "method": "npm",
+            "package": "@googleworkspace/cli",
+            "executable": "/mock/bin/gws",
+        },
+    )
+    monkeypatch.setattr(
+        ZeroClawService,
+        "get_addon_status",
+        lambda self, addon: {
+            "addon": addon,
+            "label": "Google Workspace CLI",
+            "description": "Google Workspace API CLI",
+            "installed": True,
+            "executable": "/mock/bin/gws",
+            "install_method": "npm",
+            "install_package": "@googleworkspace/cli",
+            "auth_status": "missing",
+            "auth_detail": "no addon credentials configured",
+            "config_dir": "/mock/shared/gws",
+            "shared_scope": "local",
+            "linked_agents": [],
+        },
+    )
+
+    code = run_cli(tmp_path, "addon", "install", "gws")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Installed addon gws" in output
+    assert "install_method: npm" in output
+    assert "install_package: @googleworkspace/cli" in output
+
+
+def test_ensure_addon_installed_uses_service_path_for_existing_binary(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    def fake_which(cmd: str, path: str | None = None) -> str | None:
+        if cmd == "gws" and path and "/home/linuxbrew/.linuxbrew/bin" in path:
+            return "/home/linuxbrew/.linuxbrew/bin/gws"
+        return None
+
+    monkeypatch.setattr("shutil.which", fake_which)
+
+    result = service.ensure_addon_installed("gws")
+
+    assert result["already_present"] is True
+    assert result["executable"] == "/home/linuxbrew/.linuxbrew/bin/gws"
+
+
+def test_install_addon_falls_back_to_pnpm_when_npm_missing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    state = {"installed": False}
+
+    def fake_run(cmd: list[str], **_: object) -> Result:
+        calls.append(cmd)
+        state["installed"] = True
+        return Result(stdout="installed")
+
+    monkeypatch.setattr(
+        service,
+        "_resolve_executable_in_service_env",
+        lambda executable, linux_user="": (
+            "/mock/bin/pnpm"
+            if executable == "pnpm"
+            else ("/mock/bin/gws" if executable == "gws" and state["installed"] else "")
+        ),
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.install_addon("gws")
+
+    assert result["installed"] is True
+    assert result["method"] == "pnpm"
+    assert calls == [["/mock/bin/pnpm", "add", "-g", "@googleworkspace/cli"]]
+
+
+def test_service_env_includes_shared_toolchain_paths(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    path_entries = service._service_env("").get("PATH", "").split(":")
+
+    assert str(service._shared_toolchain_home() / "bin") in path_entries
+    assert str(service._shared_toolchain_home() / "google-cloud-sdk" / "bin") in path_entries
+
+
+def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    downloads: list[str] = []
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            self.close()
+            return False
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_urlopen(url: str, timeout: int = 0) -> FakeResponse:
+        downloads.append(url)
+        return FakeResponse(b"archive")
+
+    def fake_extract(archive_path: Path, target_dir: Path) -> None:
+        assert archive_path.exists()
+        bin_dir = target_dir / "google-cloud-sdk" / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        executable = bin_dir / "gcloud"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        os.chmod(executable, 0o755)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(ZeroClawService, "_extract_tarball_safe", staticmethod(fake_extract))
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **_: Result(stdout="Google Cloud SDK 1.0\n") if cmd[-1] == "version" else Result(),
+    )
+
+    result = service.install_support_tool("gcloud")
+
+    assert result["installed"] is True
+    assert result["tool"] == "gcloud"
+    assert result["method"] == "archive"
+    assert result["scope"] == "local"
+    assert result["executable"].endswith("/google-cloud-sdk/bin/gcloud")
+    assert downloads and downloads[0].endswith(".tar.gz")
 
 
 def test_setup_api_key_mode_requires_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -1347,8 +1503,8 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
         agent_version="1.0.0",
         provider="picoclaw",
     )
-    agent["agent"]["linux_user"] = "teleclaw"
-    target_home = tmp_path / "teleclaw-home"
+    agent["agent"]["linux_user"] = "fixture-sync"
+    target_home = tmp_path / "fixture-sync-home"
     target_home.mkdir(parents=True)
     (shared_home / ".codex").mkdir(parents=True)
     (shared_home / ".codex" / "auth.json").write_text(
@@ -1495,7 +1651,7 @@ def test_sync_agent_channels_from_provider_replaces_stale_channels(
         agent_version="1.0.0",
         provider="picoclaw",
     )
-    agent["agent"]["linux_user"] = "teleclaw"
+    agent["agent"]["linux_user"] = "fixture-switch"
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
@@ -1850,6 +2006,221 @@ def test_service_toggles_channel_plugin_and_autostart(tmp_path: Path) -> None:
 
     toggled_autostart = service.toggle_agent_autostart("alice")
     assert toggled_autostart["agent"]["autostart"] is False
+
+
+def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name="Alice",
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    state = service.store.read_state()
+    state["agents"]["alice"]["agent"]["linux_user"] = "alice"
+    service.store.write_state(state)
+
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+    source_home = tmp_path / "source-home"
+    source_config = source_home / ".config" / "gws"
+    source_config.mkdir(parents=True)
+    (source_config / "credentials.json").write_text('{"refresh_token":"rtok"}\n', encoding="utf-8")
+    (source_config / "client_secret.json").write_text('{"installed":{"client_id":"cid"}}\n', encoding="utf-8")
+
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_addon_installed",
+        lambda self, addon: {
+            "addon": addon,
+            "installed": False,
+            "already_present": True,
+            "method": "npm",
+            "package": "@googleworkspace/cli",
+            "executable": "/mock/bin/gws",
+        },
+    )
+
+    result = service.enable_agent_addon("alice", "gws", source_home=source_home)
+
+    shared_dir = service._shared_addon_config_dir("gws")
+    assert result["addon"] == "gws"
+    assert result["pending"] is False
+    assert (shared_dir / "credentials.json").exists()
+    assert (target_home / ".config" / "gws").is_symlink()
+    assert (target_home / ".config" / "gws").resolve() == shared_dir.resolve()
+
+    addon_payload = service.get_agent_addons("alice")
+    row = next(item for item in addon_payload["addons"] if item["addon"] == "gws")
+    assert row["enabled"] is True
+    assert row["auth_status"] == "ready"
+    assert row["applied"] is True
+
+
+def test_enable_agent_addon_can_trigger_shared_login_when_requested(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    shared_root = tmp_path / "shared-addon-auth"
+    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name="Alice",
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    state = service.store.read_state()
+    state["agents"]["alice"]["agent"]["linux_user"] = "alice"
+    service.store.write_state(state)
+
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+    shared_dir = service._ensure_shared_addon_config_dir("gws")
+
+    calls: list[str] = []
+
+    def fake_status(self: ZeroClawService, addon: str) -> dict[str, object]:
+        if (shared_dir / "credentials.json").exists():
+            return {
+                "addon": addon,
+                "auth_status": "ready",
+                "detail": "plaintext credentials",
+                "login_required": False,
+                "config_dir": str(shared_dir),
+                "shared_scope": "local",
+                "linked_agents": [],
+            }
+        return {
+            "addon": addon,
+            "auth_status": "missing",
+            "detail": "no addon credentials configured",
+            "login_required": True,
+            "config_dir": str(shared_dir),
+            "shared_scope": "local",
+            "linked_agents": [],
+        }
+
+    def fake_login(self: ZeroClawService, addon: str) -> dict[str, object]:
+        calls.append(addon)
+        (shared_dir / "credentials.json").write_text('{"refresh_token":"rtok"}\n', encoding="utf-8")
+        return fake_status(self, addon)
+
+    monkeypatch.setattr(ZeroClawService, "shared_addon_auth_status", fake_status)
+    monkeypatch.setattr(ZeroClawService, "shared_addon_auth_login", fake_login)
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_addon_installed",
+        lambda self, addon: {
+            "addon": addon,
+            "installed": False,
+            "already_present": True,
+            "method": "npm",
+            "package": "@googleworkspace/cli",
+            "executable": "/mock/bin/gws",
+        },
+    )
+
+    result = service.enable_agent_addon("alice", "gws", login_if_missing=True)
+
+    assert calls == ["gws"]
+    assert result["pending"] is False
+    assert (target_home / ".config" / "gws").is_symlink()
+
+
+def test_shared_addon_auth_login_gws_bootstraps_gcloud_before_setup(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    shared_root = tmp_path / "shared-addon-auth"
+    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="",
+        workspace="dev",
+        api_url="",
+        auth_mode="linked",
+    )
+    shared_dir = service._ensure_shared_addon_config_dir("gws")
+    tool_calls: list[str] = []
+    shell_calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> Result:
+        shell_calls.append(cmd)
+        script = cmd[-1] if cmd else ""
+        if "gws" in script and "auth export" in script:
+            return Result(stdout='{"refresh_token":"rtok"}\n')
+        return Result()
+
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_addon_installed",
+        lambda self, addon: {
+            "addon": addon,
+            "installed": False,
+            "already_present": True,
+            "method": "npm",
+            "package": "@googleworkspace/cli",
+            "executable": "/mock/bin/gws",
+        },
+    )
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_support_tool_installed",
+        lambda self, tool: tool_calls.append(tool) or {
+            "tool": tool,
+            "installed": True,
+            "already_present": False,
+            "method": "archive",
+            "scope": "local",
+            "executable": "/mock/bin/gcloud",
+        },
+    )
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    payload = service.shared_addon_auth_login("gws")
+
+    assert tool_calls == ["gcloud"]
+    assert payload["action_performed"] == "login"
+    assert (shared_dir / "credentials.json").exists()
+    assert any("auth setup" in str(cmd[-1]) for cmd in shell_calls)
 
 
 def test_service_action_runs_provider_service_command(
@@ -2229,7 +2600,7 @@ def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remedi
         agent_version="1.0.0",
         provider="picoclaw",
     )
-    agent["agent"]["linux_user"] = "teleclaw"
+    agent["agent"]["linux_user"] = "fixture-switch"
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
@@ -2252,7 +2623,7 @@ def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remedi
 
     class Result:
         returncode = 0
-        stdout = "teleclaw 4321 /home/linuxbrew/.linuxbrew/bin/zeroclaw daemon\n"
+        stdout = "fixture-switch 4321 /home/linuxbrew/.linuxbrew/bin/zeroclaw daemon\n"
         stderr = ""
 
     monkeypatch.setattr("subprocess.run", lambda cmd, **_: Result() if cmd[:2] == ["ps", "-eo"] else Result())
@@ -2298,7 +2669,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
         agent_version="1.0.0",
         provider="zeroclaw",
     )
-    agent["agent"]["linux_user"] = "teleclaw"
+    agent["agent"]["linux_user"] = "fixture-switch"
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
@@ -2349,7 +2720,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
             return Result(stdout="active (running)" if runtime_state["picoclaw"] else "inactive")
         if tail2 == ["/usr/bin/picoclaw", "status"]:
             return Result(stdout="ok")
-        if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
+        if cmd[:2] == ["chown", "fixture-switch:fixture-switch"]:
             return Result(stdout="")
         return Result(stdout="ok")
 
@@ -2367,7 +2738,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     assert info["runtime"] == "picoclaw-agent"
     assert info["service_status"] == "running"
     assert info["service_mode"] == "systemd"
-    assert ["chown", "teleclaw:teleclaw", str(home / ".picoclaw")] in calls
+    assert ["chown", "fixture-switch:fixture-switch", str(home / ".picoclaw")] in calls
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
     assert any(cmd[-2:-1] == ["-lc"] and "picoclaw" in str(cmd[-1]) and "gateway" in str(cmd[-1]) for cmd in calls)
     config = json.loads((home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
@@ -2865,7 +3236,7 @@ def test_set_agent_provider_requires_root_for_managed_user_switch(
         agent_version="1.0.0",
         provider="zeroclaw",
     )
-    agent["agent"]["linux_user"] = "teleclaw"
+    agent["agent"]["linux_user"] = "fixture-switch"
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
@@ -3035,6 +3406,16 @@ def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
             "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
             "core_prompts": {"SOUL.md": "hi"},
             "credential_sync": {"bundles": ["provider-auth"], "last_synced_at": ""},
+            "addon_access": {
+                "addons": [
+                    {
+                        "addon": "gws",
+                        "enabled": False,
+                        "auth_status": "missing",
+                        "applied": False,
+                    }
+                ]
+            },
             "agent": {
                 "local_user": False,
                 "autostart": True,
@@ -3043,7 +3424,14 @@ def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
                 "heartbeat_seconds": 30,
                 "auth_mode": "linked",
             },
-        }
+        },
+        addon_choices=[
+            {
+                "id": "gws",
+                "label": "Google Workspace CLI",
+                "description": "Google Workspace API CLI",
+            }
+        ],
     )
     kinds = {str(row.get("kind", "")) for row in rows}
     assert "channel_status" in kinds
@@ -3059,6 +3447,11 @@ def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
     assert "cred_bundle:git" in kinds
     assert "cred_sync_now" in kinds
     assert "cred_revoke_now" in kinds
+    assert "addon_status:gws" in kinds
+    assert "addon_enable:gws" in kinds
+    assert "addon_disable:gws" in kinds
+    assert "addon_apply:gws" in kinds
+    assert "addon_login:gws" in kinds
 
 
 def test_dashboard_settings_include_provider_switch_rows_when_choices_available() -> None:
@@ -3138,6 +3531,50 @@ def test_dashboard_setting_actions_call_credential_operations() -> None:
     _run_setting_action(service, state, {"kind": "cred_revoke_now"})
     assert state.notice == "credentials revoked (1 paths)"
     assert service.revoked == 1
+
+
+def test_dashboard_setting_actions_call_addon_operations() -> None:
+    class FakeService:
+        def __init__(self) -> None:
+            self.enabled: list[tuple[str, str]] = []
+            self.disabled: list[tuple[str, str]] = []
+            self.applied: list[tuple[str, tuple[str, ...]]] = []
+            self.logged_in: list[str] = []
+
+        def enable_agent_addon(self, agent_id: str, addon: str) -> dict[str, object]:
+            self.enabled.append((agent_id, addon))
+            return {"addon": addon, "pending": False}
+
+        def disable_agent_addon(self, agent_id: str, addon: str) -> dict[str, object]:
+            self.disabled.append((agent_id, addon))
+            return {"addon": addon}
+
+        def apply_agent_addons(self, agent_id: str, addons: list[str] | None = None) -> dict[str, object]:
+            self.applied.append((agent_id, tuple(addons or [])))
+            return {"addons": addons or []}
+
+        def shared_addon_auth_login(self, addon: str) -> dict[str, object]:
+            self.logged_in.append(addon)
+            return {"action_performed": "login"}
+
+    service = FakeService()
+    state = DashboardState(view="detail", selected_agent_id="alice")
+
+    _run_setting_action(service, state, {"kind": "addon_enable:gws"})
+    assert state.notice == "addon gws enabled"
+    assert service.enabled == [("alice", "gws")]
+
+    _run_setting_action(service, state, {"kind": "addon_apply:gws"})
+    assert state.notice == "addon gws applied"
+    assert service.applied == [("alice", ("gws",))]
+
+    _run_setting_action(service, state, {"kind": "addon_login:gws"})
+    assert state.notice == "addon gws login completed"
+    assert service.logged_in == ["gws"]
+
+    _run_setting_action(service, state, {"kind": "addon_disable:gws"})
+    assert state.notice == "addon gws disabled"
+    assert service.disabled == [("alice", "gws")]
 
 
 def test_dashboard_setting_action_syncs_channels_from_provider() -> None:

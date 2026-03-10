@@ -1036,7 +1036,10 @@ class ZeroClawService:
                     linux_user=linux_user,
                     agent_info=old_service_state,
                 )
-                old_running = str(previous_status.get("service_status", "unknown")) == "running"
+                old_running = (
+                    str(previous_status.get("service_status", "unknown")) == "running"
+                    or self._provider_process_live_ps_only(current_provider, linux_user)
+                )
                 if old_running or int(old_service_state.get("fallback_pid", 0) or 0) > 0:
                     stop_result = self._run_managed_provider_service_action(
                         provider=current_provider,
@@ -1081,6 +1084,7 @@ class ZeroClawService:
                     )
                     if (
                         str(other_status.get("service_status", "unknown")) == "running"
+                        or self._provider_process_live_ps_only(other_provider, linux_user)
                         or int(other_state.get("fallback_pid", 0) or 0) > 0
                     ):
                         stopped = self._run_managed_provider_service_action(
@@ -1645,15 +1649,21 @@ class ZeroClawService:
                 return "running" if (live or service_running) else "stopped"
             time.sleep(poll_seconds)
 
-    def _provider_process_live(self, provider: str, linux_user: str) -> bool:
+    def _provider_process_live_ps_only(self, provider: str, linux_user: str) -> bool:
         token = str(linux_user).strip()
         if not token:
             return False
         daemon_map = self._running_provider_daemons_by_user()
-        if any(
+        return any(
             str(entry.get("provider", "")).strip().lower() == str(provider).strip().lower()
             for entry in daemon_map.get(token, [])
-        ):
+        )
+
+    def _provider_process_live(self, provider: str, linux_user: str) -> bool:
+        token = str(linux_user).strip()
+        if not token:
+            return False
+        if self._provider_process_live_ps_only(provider, token):
             return True
         return self._provider_reports_running(provider, token)
 
@@ -1703,7 +1713,16 @@ class ZeroClawService:
         if not token:
             return
         pattern = self._provider_process_pattern(provider)
-        script = f'pkill -u "$(id -u)" -f {shlex.quote(pattern)} >/dev/null 2>&1 || true'
+        quoted = shlex.quote(pattern)
+        script = (
+            f'if pgrep -u "$(id -u)" -f {quoted} >/dev/null 2>&1; then '
+            f'pkill -u "$(id -u)" -f {quoted} >/dev/null 2>&1 || true; '
+            'sleep 1; '
+            f'if pgrep -u "$(id -u)" -f {quoted} >/dev/null 2>&1; then '
+            f'pkill -9 -u "$(id -u)" -f {quoted} >/dev/null 2>&1 || true; '
+            "fi; "
+            "fi"
+        )
         cmd = self._user_shell_command(token, script)
         subprocess.run(cmd, capture_output=True, text=True, check=False)
 
@@ -5428,7 +5447,7 @@ class ZeroClawService:
         pid = int(agent_info.get("fallback_pid", 0) or 0)
 
         if action == "status":
-            running = self._is_pid_running(pid, linux_user)
+            running = self._is_pid_running(pid, linux_user) or self._provider_process_live_ps_only(provider, linux_user)
             return {
                 "service_status": "running" if running else "stopped",
                 "output": "fallback daemon " + ("running" if running else "stopped"),
@@ -5437,8 +5456,13 @@ class ZeroClawService:
         if action == "stop":
             if pid and self._is_pid_running(pid, linux_user):
                 self._kill_pid(pid, linux_user)
+            self._force_stop_provider_processes(provider, linux_user)
             agent_info["fallback_pid"] = 0
-            return {"service_status": "stopped", "output": "fallback daemon stopped"}
+            running = self._provider_process_live_ps_only(provider, linux_user)
+            return {
+                "service_status": "running" if running else "stopped",
+                "output": "fallback daemon " + ("running" if running else "stopped"),
+            }
 
         if action == "restart":
             if pid and self._is_pid_running(pid, linux_user):

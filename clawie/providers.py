@@ -188,16 +188,32 @@ def detect_installed_providers(home_dir: str) -> list[dict[str, object]]:
     for name in provider_names():
         spec = get_provider(name)
         root = source / spec.state_dir
-        if not root.exists():
+        try:
+            exists = root.exists()
+        except OSError:
+            continue
+        if not exists:
             continue
         markers = []
         for marker in spec.marker_files:
             rel = f"{spec.state_dir}/{marker}"
             if "*" in marker:
-                matched = list(source.glob(rel))
+                try:
+                    matched = list(source.glob(rel))
+                except OSError:
+                    matched = []
                 for item in matched[:3]:
-                    markers.append(str(item.relative_to(source)))
-            elif (source / rel).exists():
+                    try:
+                        markers.append(str(item.relative_to(source)))
+                    except OSError:
+                        continue
+            else:
+                try:
+                    marker_exists = (source / rel).exists()
+                except OSError:
+                    marker_exists = False
+                if not marker_exists:
+                    continue
                 markers.append(rel)
         if not markers:
             continue

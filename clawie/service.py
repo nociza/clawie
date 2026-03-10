@@ -1534,6 +1534,52 @@ class ZeroClawService:
         if command not in {"start", "stop", "restart", "status"}:
             raise ValueError("action must be one of: start, stop, restart, status")
 
+        if self._provider_uses_generated_user_unit(provider):
+            generated = self._run_generated_user_service_action(
+                provider=provider,
+                action=command,
+                linux_user=linux_user,
+                agent_info=agent_info,
+            )
+            if generated is not None:
+                if command == "status":
+                    return generated
+                desired_running = command in {"start", "restart"}
+                observed = self._wait_for_managed_provider_state(
+                    provider=provider,
+                    linux_user=linux_user,
+                    agent_info=agent_info,
+                    should_be_running=desired_running,
+                    timeout_seconds=5.0,
+                )
+                if not desired_running and observed == "running":
+                    self._force_stop_provider_processes(provider, linux_user)
+                    observed = self._wait_for_managed_provider_state(
+                        provider=provider,
+                        linux_user=linux_user,
+                        agent_info=agent_info,
+                        should_be_running=False,
+                        timeout_seconds=5.0,
+                    )
+                if desired_running and observed != "running":
+                    message = (
+                        f"{provider} service {command} reported success but no live {provider} runtime was detected"
+                        + (f" for {linux_user}" if linux_user else "")
+                    )
+                    detail = self._provider_start_failure_detail(provider, linux_user)
+                    if detail:
+                        message = f"{message}\n{detail}"
+                    raise SetupError(message)
+                if not desired_running and observed == "running":
+                    raise SetupError(
+                        f"{provider} service stop reported success but {provider} is still running"
+                        + (f" for {linux_user}" if linux_user else "")
+                    )
+                return {
+                    **generated,
+                    "service_status": "running" if desired_running else "stopped",
+                }
+
         cmd = self._service_command(provider, command, linux_user)
         env = self._service_env(linux_user)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -1619,6 +1665,62 @@ class ZeroClawService:
             "fallback_pid": int(agent_info.get("fallback_pid", 0) or 0),
             "output": output,
             "command": cmd,
+        }
+
+    def _run_generated_user_service_action(
+        self,
+        *,
+        provider: str,
+        action: str,
+        linux_user: str,
+        agent_info: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        token = str(linux_user).strip()
+        if not token:
+            return None
+        try:
+            self._ensure_generated_user_service_unit(provider, token)
+        except Exception:
+            return None
+        if os.geteuid() == 0:
+            self._bootstrap_user_bus(token)
+        reloaded = self._run_systemd_user_command(token, ["daemon-reload"])
+        if not reloaded.get("ok", False):
+            return None
+
+        if action == "status":
+            service_status = self._systemd_user_service_status(provider, token)
+            if service_status == "unknown":
+                return None
+            return {
+                "provider": provider,
+                "linux_user": token,
+                "action": action,
+                "service_status": service_status,
+                "service_mode": "systemd",
+                "fallback_pid": int(agent_info.get("fallback_pid", 0) or 0),
+                "output": service_status,
+                "command": ["systemctl", "--user", "is-active", f"{provider}.service"],
+            }
+
+        if action in {"start", "restart"}:
+            self._run_systemd_user_command(token, ["reset-failed", f"{provider}.service"])
+            enabled = self._run_systemd_user_command(token, ["enable", f"{provider}.service"])
+            if not enabled.get("ok", False):
+                return None
+
+        managed = self._systemd_user_service_manage(provider, action, token)
+        if not managed.get("ok", False):
+            return None
+        return {
+            "provider": provider,
+            "linux_user": token,
+            "action": action,
+            "service_status": "unknown",
+            "service_mode": "systemd",
+            "fallback_pid": int(agent_info.get("fallback_pid", 0) or 0),
+            "output": str(managed.get("output", "")),
+            "command": managed.get("command", []),
         }
 
     def _wait_for_managed_provider_state(
@@ -4856,17 +4958,136 @@ class ZeroClawService:
         env["PATH"] = ":".join(merged)
 
         if linux_user:
+            home = self._linux_home_for_user(linux_user)
+            if home is not None:
+                env["HOME"] = str(home)
+            env["USER"] = linux_user
+            env["LOGNAME"] = linux_user
             try:
                 record = pwd.getpwnam(linux_user)
+            except KeyError:
+                record = None
+            if record is not None:
                 uid = int(record.pw_uid)
-                env["HOME"] = record.pw_dir
-                env["USER"] = linux_user
-                env["LOGNAME"] = linux_user
                 env["XDG_RUNTIME_DIR"] = f"/run/user/{uid}"
                 env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path=/run/user/{uid}/bus"
-            except KeyError:
-                pass
         return env
+
+    def _linux_home_for_user(self, linux_user: str) -> Path | None:
+        token = str(linux_user).strip()
+        if not token:
+            return None
+        try:
+            return Path(pwd.getpwnam(token).pw_dir)
+        except KeyError:
+            if token == self._current_linux_user():
+                return Path.home()
+            return Path("/home") / token
+
+    @staticmethod
+    def _provider_uses_generated_user_unit(provider: str) -> bool:
+        spec = get_provider(provider)
+        return not bool(spec.service_group) and bool(spec.background_command)
+
+    def _generated_user_service_unit_path(self, provider: str, linux_user: str) -> Path | None:
+        home = self._linux_home_for_user(linux_user)
+        if home is None:
+            return None
+        return home / ".config" / "systemd" / "user" / f"{provider}.service"
+
+    def _generated_user_service_unit_contents(self, provider: str, executable: str) -> str:
+        spec = get_provider(provider)
+        command = " ".join([shlex.quote(executable), *[shlex.quote(part) for part in spec.background_command]])
+        state_dir = spec.state_dir
+        workspace_dir = spec.workspace_dir
+        path_entries = self._service_env("").get("PATH", "")
+        shell = (
+            f'mkdir -p "$HOME/{state_dir}" "$HOME/{state_dir}/{workspace_dir}"; '
+            f'cd "$HOME/{state_dir}/{workspace_dir}"; '
+            f'exec {command} >>"$HOME/{state_dir}/daemon.log" 2>&1'
+        )
+        lines = [
+            "[Unit]",
+            f"Description=Clawie managed {provider} runtime",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            "Environment=HOME=%h",
+            "Environment=USER=%u",
+            "Environment=LOGNAME=%u",
+            f"Environment=PATH={path_entries}",
+            f"ExecStart=/bin/bash -lc {shlex.quote(shell)}",
+            "Restart=always",
+            "RestartSec=2",
+            "KillMode=control-group",
+            "TimeoutStopSec=20",
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _ensure_generated_user_service_unit(self, provider: str, linux_user: str) -> bool:
+        unit_path = self._generated_user_service_unit_path(provider, linux_user)
+        if unit_path is None:
+            return False
+        executable = self._resolve_provider_executable(provider)
+        unit_text = self._generated_user_service_unit_contents(provider, executable)
+        unit_dir = unit_path.parent
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        current = ""
+        try:
+            current = unit_path.read_text(encoding="utf-8")
+        except OSError:
+            current = ""
+        if current != unit_text:
+            unit_path.write_text(unit_text, encoding="utf-8")
+        self._chown_tree(unit_dir, linux_user)
+        return True
+
+    def _run_systemd_user_command(self, linux_user: str, args: list[str]) -> dict[str, Any]:
+        candidates = self._systemd_user_candidates(linux_user)
+        last_output = ""
+        for candidate in candidates:
+            if candidate == "root":
+                continue
+            cmd = ["systemctl", "--machine", f"{candidate}@", "--user", *args]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._systemctl_env(),
+                )
+            except Exception as exc:
+                last_output = str(exc)
+                continue
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                return {"ok": True, "output": output, "command": cmd}
+            last_output = output or f"exit {result.returncode}"
+
+        fallback_user = candidates[0] if candidates else str(linux_user).strip()
+        cmd = ["systemctl", "--user", *args]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(fallback_user),
+            )
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0:
+                return {"ok": True, "output": output, "command": cmd}
+            last_output = output or f"exit {result.returncode}"
+        except Exception as exc:
+            last_output = str(exc)
+        return {"ok": False, "output": last_output, "command": cmd}
 
     def _auth_env(self, linux_user: str, home: Path | None) -> dict[str, str]:
         env = self._service_env(linux_user)
@@ -5179,6 +5400,10 @@ class ZeroClawService:
         info["live_command"] = str((chosen_entry or {}).get("args", ""))
         if live_entries:
             info["service_status"] = "running"
+            if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
+                info["service_mode"] = "process"
+        else:
+            info["service_status"] = "stopped"
             if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
                 info["service_mode"] = "process"
         return payload
@@ -5867,7 +6092,7 @@ class ZeroClawService:
         linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
         if not linux_user:
             return None
-        return Path("/home") / linux_user
+        return self._linux_home_for_user(linux_user)
 
     def _local_agent_home(self, provider: str) -> Path | None:
         for claw in self.list_installed_claws():
@@ -5876,10 +6101,10 @@ class ZeroClawService:
             root = Path(str(claw.get("root", "")).strip())
             hint = self._linux_user_from_provider_root(root)
             if hint and hint != "root":
-                return Path("/home") / hint
+                return self._linux_home_for_user(hint)
         target = self._local_target_user()
         if target and target != "root":
-            return Path("/home") / target
+            return self._linux_home_for_user(target)
         return None
 
     def _refresh_local_service_statuses(
@@ -5956,13 +6181,13 @@ class ZeroClawService:
             self.store.write_config(config)
         return local_state
 
-    def _systemd_user_service_status(self, provider: str, linux_user: str) -> str:
-        service = f"{provider}.service"
+    def _systemd_user_candidates(self, linux_user: str, provider: str = "") -> list[str]:
         candidates: list[str] = []
+        hint = str(self._local_linux_user_hint(provider, "")).strip() if provider else ""
         for token in (
             str(linux_user).strip(),
             str(self._local_target_user()).strip(),
-            str(self._local_linux_user_hint(provider, "")).strip(),
+            hint,
         ):
             if token and token not in candidates:
                 candidates.append(token)
@@ -5974,6 +6199,11 @@ class ZeroClawService:
                 token = entry.name.strip()
                 if token and token not in candidates:
                     candidates.append(token)
+        return candidates
+
+    def _systemd_user_service_status(self, provider: str, linux_user: str) -> str:
+        service = f"{provider}.service"
+        candidates = self._systemd_user_candidates(linux_user, provider)
 
         saw_stopped = False
         for candidate in candidates:
@@ -6011,22 +6241,7 @@ class ZeroClawService:
 
     def _systemd_user_service_manage(self, provider: str, action: str, linux_user: str) -> dict[str, Any]:
         service = f"{provider}.service"
-        candidates: list[str] = []
-        for token in (
-            str(linux_user).strip(),
-            str(self._local_target_user()).strip(),
-            str(self._local_linux_user_hint(provider, "")).strip(),
-        ):
-            if token and token not in candidates:
-                candidates.append(token)
-        home_root = Path("/home")
-        if home_root.exists():
-            for entry in sorted(home_root.iterdir(), key=lambda row: str(getattr(row, "name", ""))):
-                if not entry.is_dir():
-                    continue
-                token = entry.name.strip()
-                if token and token not in candidates:
-                    candidates.append(token)
+        candidates = self._systemd_user_candidates(linux_user, provider)
 
         last_output = ""
         for candidate in candidates:

@@ -2583,6 +2583,89 @@ def test_switch_agent_provider_succeeds_when_status_reports_running_but_ps_misse
     assert result["agent"]["agent"]["provider"] == "picoclaw"
 
 
+def test_agent_service_start_installs_generated_picoclaw_user_unit(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="picoclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+    home = tmp_path / "teleclaw-home"
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+    monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: home)
+    monkeypatch.setattr(service, "_prepare_agent_provider_home", lambda **_: None)
+
+    calls: list[list[str]] = []
+    runtime_running = False
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        nonlocal runtime_running
+        calls.append(cmd)
+        if cmd[:2] == ["ps", "-eo"]:
+            if runtime_running:
+                return Result(0, stdout="teleclaw 4321 /usr/bin/picoclaw gateway\n")
+            return Result(0, stdout="")
+        if cmd[:5] == ["systemctl", "--machine", "teleclaw@", "--user", "daemon-reload"]:
+            return Result(0, stdout="")
+        if cmd[:5] == ["systemctl", "--machine", "teleclaw@", "--user", "reset-failed"]:
+            return Result(0, stdout="")
+        if cmd[:5] == ["systemctl", "--machine", "teleclaw@", "--user", "enable"]:
+            return Result(0, stdout="")
+        if cmd[:5] == ["systemctl", "--machine", "teleclaw@", "--user", "start"]:
+            runtime_running = True
+            return Result(0, stdout="")
+        if cmd[:5] == ["systemctl", "--machine", "teleclaw@", "--user", "is-active"]:
+            if runtime_running:
+                return Result(0, stdout="active")
+            return Result(3, stdout="inactive")
+        if cmd[:2] == ["chown", "teleclaw:teleclaw"]:
+            return Result(0, stdout="")
+        return Result(0, stdout="")
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/picoclaw")
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = service.agent_service_action("teleclaw", "start")
+
+    assert result["service_status"] == "running"
+    unit_path = home / ".config" / "systemd" / "user" / "picoclaw.service"
+    assert unit_path.exists()
+    unit_text = unit_path.read_text(encoding="utf-8")
+    assert "Clawie managed picoclaw runtime" in unit_text
+    assert "ExecStart=/bin/bash -lc" in unit_text
+    assert "/usr/bin/picoclaw gateway" in unit_text
+    assert "Restart=always" in unit_text
+    assert ["systemctl", "--machine", "teleclaw@", "--user", "daemon-reload"] in calls
+    assert ["systemctl", "--machine", "teleclaw@", "--user", "enable", "picoclaw.service"] in calls
+    assert ["systemctl", "--machine", "teleclaw@", "--user", "start", "picoclaw.service"] in calls
+
+
 def test_switch_agent_provider_force_stops_lingering_zeroclaw_when_bus_control_falls_back(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3665,6 +3748,27 @@ def test_agent_service_start_surfaces_picoclaw_probe_output_when_log_is_empty(
 
     with raises(SetupError, match="foreground startup probe exited 1"):
         service.agent_service_action("teleclaw", "start")
+
+
+def test_attach_agent_runtime_status_marks_managed_agent_stopped_when_no_live_daemon(
+    tmp_path: Path,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    payload = {
+        "agent": {
+            "provider": "picoclaw",
+            "linux_user": "teleclaw",
+            "service_status": "running",
+            "service_mode": "systemd",
+        }
+    }
+
+    updated = service._attach_agent_runtime_status(payload, daemon_map={})
+
+    assert updated["agent"]["service_status"] == "stopped"
+    assert updated["agent"]["live_provider"] == ""
+    assert updated["agent"]["live_providers"] == []
+    assert updated["agent"]["live_pid"] == 0
 
 
 def test_performance_snapshot_includes_local_user_claw_rows(

@@ -5676,7 +5676,12 @@ class ZeroClawService:
 
         ordered: list[str] = []
         seen_providers: set[str] = set()
-        for item in [provider] + provider_names():
+        candidate_providers: list[str] = []
+        if linux_user and not is_local:
+            candidate_providers.extend(self._live_provider_names_for_user(linux_user))
+        if not candidate_providers:
+            candidate_providers = [provider, *provider_names()]
+        for item in candidate_providers:
             token = str(item or "").strip().lower()
             if not token or token in seen_providers:
                 continue

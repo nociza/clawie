@@ -1524,6 +1524,48 @@ name = "team"
     assert channels[0]["discovered_provider"] == "zeroclaw"
 
 
+def test_agent_channel_view_prefers_live_provider_channels_after_cutover(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    payload = {
+        "agent_id": "teleclaw",
+        "channels": [{"kind": "cli", "name": "local", "enabled": True, "external_id": "teleclaw:cli:1"}],
+        "agent": {
+            "provider": "picoclaw",
+            "linux_user": "teleclaw",
+        },
+    }
+    home = tmp_path / "teleclaw-home"
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _payload: home)
+    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(ZeroClawService, "_live_provider_names_for_user", lambda self, _user: ["picoclaw"])
+
+    def fake_discover(self: ZeroClawService, provider: str, root: Path) -> list[dict[str, str]]:
+        if provider == "picoclaw":
+            return [{"kind": "telegram", "name": "telegram", "enabled": True}]
+        if provider == "zeroclaw":
+            return [{"kind": "cli", "name": "local", "enabled": True}]
+        return []
+
+    monkeypatch.setattr(ZeroClawService, "_discover_channels_for_provider_root", fake_discover)
+
+    view = service._attach_agent_channel_view(payload)
+    live_or_discovered = [
+        (row.get("kind"), row.get("name"), row.get("channel_source"), row.get("discovered_provider"))
+        for row in view["channels"]
+        if row.get("channel_source") in {"live", "discovered"}
+    ]
+    assert live_or_discovered == [("telegram", "telegram", "discovered", "picoclaw")]
+    stale_rows = [
+        (row.get("kind"), row.get("name"), row.get("channel_source"))
+        for row in view["channels"]
+        if row.get("kind") == "cli"
+    ]
+    assert stale_rows == [("cli", "local", "stale")]
+
+
 def test_shared_auth_show_cli_lists_rows(
     tmp_path: Path,
     capsys: CaptureFixture[str],

@@ -144,18 +144,18 @@ def auth_status_from_profiles_json(path: Path) -> dict[str, Any]:
     if not selected:
         return {}
 
-    expires_at = str(selected.get("expires_at", "")).strip()
+    expires_at = _profile_expiry_for_display(selected)
     has_token = any(
         str(selected.get(name, "")).strip()
-        for name in ("access_token", "refresh_token", "token", "id_token")
+        for name in ("access_token", "refresh_token", "token", "id_token", "access", "refresh", "key")
     )
     return {
         "auth_status": auth_status_from_expiry(expires_at, has_token=has_token),
         "auth_profile": str(selected.get("profile_name", "")).strip() or selected_key,
-        "account": str(selected.get("account_id", "")).strip(),
+        "account": str(selected.get("account_id", selected.get("accountId", ""))).strip(),
         "expires_at": expires_at,
         "last_refresh": str(selected.get("updated_at", payload.get("updated_at", ""))).strip(),
-        "detail": str(selected.get("kind", "")).strip(),
+        "detail": str(selected.get("kind", selected.get("type", ""))).strip(),
         "source": f"file:{path.name}",
     }
 
@@ -242,6 +242,12 @@ def parse_iso_timestamp(value: str) -> datetime | None:
     token = str(value or "").strip()
     if not token:
         return None
+    if token.isdigit():
+        try:
+            stamp = datetime.fromtimestamp(int(token) / 1000, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+        return stamp.astimezone(timezone.utc)
     match = re.match(r"^(?P<head>.+?)(?:\.(?P<frac>\d+))?(?P<tz>Z|[+-]\d\d:\d\d)?$", token)
     if not match:
         return None
@@ -282,3 +288,18 @@ def _path_exists(path: Path) -> bool:
         return path.exists()
     except OSError:
         return False
+
+
+def _profile_expiry_for_display(profile: dict[str, Any]) -> str:
+    expires_at = str(profile.get("expires_at", "")).strip()
+    if expires_at:
+        return expires_at
+    raw = profile.get("expires")
+    if isinstance(raw, (int, float)):
+        stamp = datetime.fromtimestamp(float(raw) / 1000, tz=timezone.utc)
+        return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    token = str(raw or "").strip()
+    if token.isdigit():
+        stamp = datetime.fromtimestamp(int(token) / 1000, tz=timezone.utc)
+        return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return token

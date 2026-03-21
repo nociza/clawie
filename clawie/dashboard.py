@@ -1582,6 +1582,7 @@ def _settings_items(
         for item in addon_access.get("addons", [])
         if isinstance(item, dict)
     }
+    agent_addons = agent.get("addons", {})
     for addon in addon_choices or []:
         addon_id = str(addon.get("id", "")).strip().lower()
         if not addon_id:
@@ -1590,6 +1591,32 @@ def _settings_items(
         enabled = bool(item.get("enabled", False))
         applied = bool(item.get("applied", False))
         auth_status = str(item.get("auth_status", "unknown"))
+
+        if addon_id == "display":
+            display_data = agent_addons.get("display", {}) if isinstance(agent_addons, dict) else {}
+            display_num = display_data.get("display_number", "") if isinstance(display_data, dict) else ""
+            novnc_port = display_data.get("novnc_port", "") if isinstance(display_data, dict) else ""
+            display_detail = ""
+            if display_num:
+                display_detail = f" :{display_num} novnc={novnc_port}"
+            addon_rows.extend(
+                [
+                    {
+                        "kind": f"addon_status:{addon_id}",
+                        "label": f"display: {'on' if enabled else 'off'}{display_detail}",
+                    },
+                    {
+                        "kind": f"addon_enable:{addon_id}",
+                        "label": "display: enable",
+                    },
+                    {
+                        "kind": f"addon_disable:{addon_id}",
+                        "label": "display: disable",
+                    },
+                ]
+            )
+            continue
+
         addon_rows.extend(
             [
                 {

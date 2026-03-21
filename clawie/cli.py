@@ -920,7 +920,7 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=provider_names(),
-        default="picoclaw",
+        default="openclaw",
         help="Agent provider",
     )
     parser.add_argument("--api-key", help="Provider API key (if using api_key auth)")
@@ -995,7 +995,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
-    provider = str(args.provider).strip().lower() or "picoclaw"
+    provider = str(args.provider).strip().lower() or "openclaw"
     provider_spec = get_provider(provider)
     api_key = str(args.api_key or "").strip()
     auth_mode = str(args.auth_mode or "").strip().lower() or None
@@ -1186,6 +1186,18 @@ def cmd_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
     _print_addon_status(payload, title="Addon")
     agents = payload.get("linked_agents", [])
     print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    active_displays = payload.get("active_displays", [])
+    if active_displays:
+        rows = []
+        for d in active_displays:
+            rows.append([
+                str(d.get("agent_id", "")),
+                str(d.get("display_number", "")),
+                str(d.get("vnc_port", "")),
+                str(d.get("novnc_port", "")),
+                str(d.get("resolution", "")),
+            ])
+        print_table(["agent", "display", "vnc_port", "novnc_port", "resolution"], rows)
     return 0
 
 
@@ -1397,12 +1409,54 @@ def cmd_agents_addons_show(args: argparse.Namespace, service: ZeroClawService) -
     agent_id = _resolve_agent_id(args.agent_id)
     payload = service.get_agent_addons(agent_id)
     _print_agent_addons(payload)
+    try:
+        ds = service.agent_display_status(agent_id)
+        if ds.get("enabled"):
+            status = ds.get("status", "unknown")
+            print_panel(
+                "Display",
+                [
+                    f"display: :{ds.get('display_number', '')}",
+                    f"resolution: {ds.get('resolution', '')}",
+                    f"vnc_port: {ds.get('vnc_port', '')}",
+                    f"novnc_port: {ds.get('novnc_port', '')}",
+                    f"novnc_url: http://<server-ip>:{ds.get('novnc_port', '')}/vnc.html",
+                    f"status: {status}",
+                ],
+            )
+            services = ds.get("services", {})
+            if services:
+                svc_rows = [[str(k), str(v)] for k, v in services.items()]
+                print_table(["service", "status"], svc_rows)
+    except Exception:
+        pass
     return 0
 
 
 def cmd_agents_addons_enable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from clawie.addons import is_service_addon
+
     agent_id = _resolve_agent_id(args.agent_id)
     addon = _resolve_required_value(args.addon, field_name="addon")
+
+    if is_service_addon(addon):
+        result = service.enable_agent_addon(agent_id, addon)
+        if result.get("already_enabled"):
+            print_info(f"Display already enabled for {agent_id}")
+        else:
+            print_success(f"Enabled display for {agent_id}")
+        display_num = result.get("display_number", "")
+        print_info(f"Display: :{display_num}")
+        print_info(f"Resolution: {result.get('resolution', '')}")
+        print_info(f"VNC port: {result.get('vnc_port', '')}")
+        print_info(f"noVNC port: {result.get('novnc_port', '')}")
+        print_info(f"noVNC URL: http://<server-ip>:{result.get('novnc_port', '')}/vnc.html")
+        services = result.get("services", [])
+        if services:
+            print_info("Services: " + ", ".join(str(s) for s in services))
+        _print_agent(result.get("agent", {}))
+        return 0
+
     login_if_missing = bool(args.login_if_missing)
     if not login_if_missing and sys.stdin.isatty():
         try:
@@ -1434,9 +1488,23 @@ def cmd_agents_addons_enable(args: argparse.Namespace, service: ZeroClawService)
 
 
 def cmd_agents_addons_disable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from clawie.addons import is_service_addon
+
     agent_id = _resolve_agent_id(args.agent_id)
     addon = _resolve_required_value(args.addon, field_name="addon")
     result = service.disable_agent_addon(agent_id, addon)
+
+    if is_service_addon(addon):
+        print_success(f"Disabled display :{result.get('display_number', '')} for {agent_id}")
+        stopped = result.get("stopped", [])
+        if stopped:
+            print_info("Stopped services: " + ", ".join(str(s) for s in stopped))
+        removed_units = result.get("removed_units", [])
+        if removed_units:
+            print_info("Removed unit files: " + ", ".join(str(u) for u in removed_units))
+        _print_agent(result.get("agent", {}))
+        return 0
+
     print_success(f"Disabled addon {result.get('addon', addon)} for {agent_id}")
     removed = result.get("removed_paths", [])
     if removed:
@@ -1521,10 +1589,22 @@ def cmd_agents_provider_set(args: argparse.Namespace, service: ZeroClawService) 
         )
     service_result = result.get("service", {})
     if service_result:
+        action = str(service_result.get("action", "start")).strip().lower() or "start"
+        verb = {"start": "Started", "restart": "Restarted", "stop": "Stopped", "status": "Status"}.get(action, "Started")
         print_info(
-            f"Started {result.get('to_provider', '')}: "
+            f"{verb} {result.get('to_provider', '')}: "
             f"{service_result.get('service_status', 'unknown')} ({service_result.get('service_mode', 'unknown')})"
         )
+    auth_prepare = result.get("auth_prepare", {})
+    if bool(auth_prepare.get("prepared", False)):
+        source = str(auth_prepare.get("source", "")).strip()
+        source_home = str(auth_prepare.get("source_home", "")).strip()
+        if source == "shared":
+            print_info("Prepared shared auth: refreshed/login completed in shared store")
+        elif source and source_home:
+            print_info(f"Prepared shared auth: imported {source} session from {source_home}")
+        elif source:
+            print_info(f"Prepared shared auth: imported {source} session")
     channels = result.get("reconnected_channels", [])
     if channels:
         tokens = [f"{row.get('kind', '')}:{row.get('name', '')}" for row in channels]
@@ -1945,12 +2025,15 @@ def _print_agent(agent: dict[str, Any]) -> None:
         for key, payload in sorted(addons.items()):
             if not isinstance(payload, dict):
                 continue
+            extra = ""
+            if key == "display" and payload.get("display_number"):
+                extra = f" :{payload['display_number']} vnc={payload.get('vnc_port', '')} novnc={payload.get('novnc_port', '')}"
             addon_rows.append(
                 [
                     str(key),
                     str(bool(payload.get("enabled", False))),
                     str(payload.get("credential_mode", "")),
-                    str(payload.get("last_applied_at", "")),
+                    str(payload.get("last_applied_at", "")) + extra,
                 ]
             )
     if addon_rows:
@@ -2025,18 +2108,22 @@ def _print_agent_addons(payload: dict[str, Any]) -> None:
     )
     rows = []
     for item in payload.get("addons", []):
+        access = str(item.get("access_status", "ok"))
+        if access == "ok":
+            access = ""
         rows.append(
             [
                 str(item.get("addon", "")),
                 str(bool(item.get("enabled", False))),
                 str(bool(item.get("installed", False))),
                 str(item.get("auth_status", "unknown")),
+                access,
                 str(bool(item.get("applied", False))),
                 str(item.get("last_applied_at", "")),
             ]
         )
     if rows:
-        print_table(["addon", "enabled", "installed", "auth", "applied", "last_applied_at"], rows)
+        print_table(["addon", "enabled", "installed", "auth", "access", "applied", "last_applied_at"], rows)
 
 
 def _resolve_channels(

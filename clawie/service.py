@@ -29,12 +29,32 @@ from clawie.auth_sources import (
     merge_picoclaw_auth_store,
     merge_provider_auth_profile,
 )
-from clawie.addon_auth import inspect_addon_auth, parse_gws_exported_credentials
-from clawie.addons import addon_names, get_addon
+from clawie.addon_auth import inspect_addon_auth, parse_gws_exported_credentials, parse_gws_status_output
+from clawie.addon_integration import (
+    inject_addon_env_block,
+    inject_addon_tools_snippet,
+    remove_addon_env_block,
+    remove_addon_tools_snippet,
+    render_addon_env_block,
+)
+from clawie.addons import AddonSpec, ServiceAddonSpec, addon_names, get_addon, is_service_addon
+from clawie.display import (
+    allocate_display_number,
+    check_display_installed,
+    display_status as _display_stack_status,
+    install_display_packages,
+    novnc_port_for_display,
+    remove_systemd_units,
+    start_display_services,
+    stop_display_services,
+    vnc_port_for_display,
+    write_systemd_units,
+)
 from clawie.provider_auth import (
     empty_auth_payload,
     inspect_auth_files,
     login_required,
+    parse_iso_timestamp,
     parse_provider_auth_status_output,
 )
 from clawie.provider_channels import dedupe_channels, get_channel_adapter
@@ -84,7 +104,21 @@ class ZeroClawService:
     SHARED_CLAUDE_DIR = Path("/var/lib/clawie/claude-shared")
     SHARED_PROVIDER_AUTH_DIR = Path("/var/lib/clawie/provider-auth")
     SHARED_TOOLCHAIN_DIR = Path("/var/lib/clawie/toolchain")
-    SHARED_CLAUDE_SUBDIRS = ("backups", "cache", "debug")
+    SHARED_CLAUDE_SUBDIRS = (
+        "backups",
+        "cache",
+        "debug",
+        "session-env",
+        "projects",
+        "plans",
+        "tasks",
+        "file-history",
+        "paste-cache",
+        "plugins",
+        "shell-snapshots",
+        "telemetry",
+        "todos",
+    )
     GLOBAL_HOMEBREW_PROFILE_CONTENT = "\n".join(
         [
             "# Managed by clawie: shared runtime path for all users.",
@@ -156,6 +190,11 @@ class ZeroClawService:
         "googleworkspace-cli": "gws",
         "google-workspace-cli": "gws",
         "gws": "gws",
+        "display": "display",
+        "virtual-display": "display",
+        "vnc": "display",
+        "novnc": "display",
+        "xvfb": "display",
     }
     SHARED_TOOLCHAIN_BEGIN = "# >>> clawie-shared-toolchain >>>"
     SHARED_TOOLCHAIN_END = "# <<< clawie-shared-toolchain <<<"
@@ -275,7 +314,8 @@ class ZeroClawService:
             if isinstance(raw_value, dict):
                 enabled = bool(raw_value.get("enabled", True))
                 last_paths = self._normalized_string_list(raw_value.get("last_applied_paths", []))
-                rows[token] = {
+                _STANDARD_KEYS = {"enabled", "credential_mode", "last_applied_at", "last_applied_paths", "last_revoked_at", "last_source"}
+                row: dict[str, Any] = {
                     "enabled": enabled,
                     "credential_mode": str(raw_value.get("credential_mode", "shared")).strip().lower() or "shared",
                     "last_applied_at": str(raw_value.get("last_applied_at", "")),
@@ -283,6 +323,10 @@ class ZeroClawService:
                     "last_revoked_at": str(raw_value.get("last_revoked_at", "")),
                     "last_source": str(raw_value.get("last_source", "")),
                 }
+                for key, val in raw_value.items():
+                    if key not in _STANDARD_KEYS:
+                        row[key] = val
+                rows[token] = row
                 continue
             rows[token] = {
                 "enabled": bool(raw_value),
@@ -516,8 +560,12 @@ class ZeroClawService:
     @staticmethod
     def _relax_shared_path_permissions(path: Path) -> None:
         try:
-            target_mode = 0o777 if path.is_dir() else 0o666
             current_mode = int(path.stat().st_mode) & 0o777
+            if path.is_dir():
+                target_mode = 0o777
+            else:
+                # Preserve execute bits for toolchain binaries/scripts while still relaxing readability/writability.
+                target_mode = 0o666 | (current_mode & 0o111)
             if current_mode != target_mode:
                 os.chmod(path, target_mode)
         except OSError:
@@ -646,7 +694,7 @@ class ZeroClawService:
         if requested_provider:
             providers.append(str(requested_provider).strip().lower())
         config = self.store.read_config()
-        providers.append(str(config.get("provider", "picoclaw")).strip().lower())
+        providers.append(str(config.get("provider", "openclaw")).strip().lower())
         providers.extend(provider_names())
 
         updated: list[str] = []
@@ -728,6 +776,90 @@ class ZeroClawService:
             self._chown_tree(home / ".picoclaw", linux_user)
             return
 
+    def _ensure_openclaw_agent_auth_link(self, *, home: Path, linux_user: str) -> None:
+        root = home / ".openclaw"
+        source = root / "auth-profiles.json"
+        if not self._path_exists(source):
+            return
+        self._repair_openclaw_auth_store(source)
+        agent_dir = root / "agents" / "main" / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(agent_dir, linux_user)
+        target = agent_dir / "auth-profiles.json"
+        if target.is_symlink():
+            try:
+                if target.resolve() == source.resolve():
+                    return
+            except OSError:
+                pass
+            target.unlink(missing_ok=True)
+        elif target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        target.symlink_to(source)
+        subprocess.run(["chown", "-h", f"{linux_user}:{linux_user}", str(target)], check=False)
+
+    def _repair_openclaw_auth_store(self, path: Path) -> bool:
+        if not self._path_exists(path):
+            return False
+        payload = self._read_json_file(path)
+        profiles = payload.get("profiles", {})
+        if not isinstance(profiles, dict):
+            return False
+
+        changed = False
+        payload["version"] = int(payload.get("version", 1) or 1)
+        order = payload.get("order", {})
+        if not isinstance(order, dict):
+            order = {}
+            payload["order"] = order
+            changed = True
+        active_profiles = payload.get("active_profiles", {})
+        if not isinstance(active_profiles, dict):
+            active_profiles = {}
+            payload["active_profiles"] = active_profiles
+            changed = True
+
+        for profile_id, raw_profile in profiles.items():
+            if not isinstance(raw_profile, dict):
+                continue
+            profile = dict(raw_profile)
+            kind = str(profile.get("kind", profile.get("type", ""))).strip().lower()
+            provider = str(profile.get("provider", "")).strip()
+            if kind and "type" not in profile:
+                profile["type"] = "oauth" if kind == "oauth" else kind
+            if provider and not order.get(provider):
+                order[provider] = [str(profile_id).strip()]
+                changed = True
+            if provider and not active_profiles.get(provider):
+                active_profiles[provider] = str(profile_id).strip()
+                changed = True
+
+            access_token = str(profile.get("access_token", "")).strip()
+            refresh_token = str(profile.get("refresh_token", "")).strip()
+            account_id = str(profile.get("account_id", "")).strip()
+            expires_at = str(profile.get("expires_at", "")).strip()
+            if access_token and not str(profile.get("access", "")).strip():
+                profile["access"] = access_token
+            if refresh_token and not str(profile.get("refresh", "")).strip():
+                profile["refresh"] = refresh_token
+            if account_id and not str(profile.get("accountId", "")).strip():
+                profile["accountId"] = account_id
+            if expires_at and "expires" not in profile:
+                parsed = parse_iso_timestamp(expires_at)
+                if parsed is not None:
+                    profile["expires"] = int(parsed.timestamp() * 1000)
+
+            if profile != raw_profile:
+                profiles[profile_id] = profile
+                changed = True
+
+        if changed:
+            self._write_json_file(path, payload)
+        return changed
+
     def setup(
         self,
         provider: str,
@@ -740,7 +872,7 @@ class ZeroClawService:
         clear_spawn_password: bool = False,
         install_runtime: bool = False,
     ) -> dict[str, Any]:
-        provider = provider.strip().lower() or "picoclaw"
+        provider = provider.strip().lower() or "openclaw"
         provider_spec = get_provider(provider)
         api_key_value = api_key.strip()
         mode = self._resolve_auth_mode(provider_spec.name, api_key_value, auth_mode)
@@ -792,7 +924,7 @@ class ZeroClawService:
 
     def setup_status(self) -> dict[str, Any]:
         config = self.store.read_config()
-        provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
         provider_spec = get_provider(provider)
         credentials = self._provider_auth(provider)
         auth_mode = credentials.get("auth_mode", provider_spec.default_auth_mode)
@@ -923,6 +1055,10 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+
+        if isinstance(spec, ServiceAddonSpec):
+            return self._install_service_addon(spec)
+
         executable = self._resolve_executable_in_service_env(spec.executable)
         if executable:
             return {
@@ -1085,6 +1221,17 @@ class ZeroClawService:
             spec = get_addon(addon)
         except ValueError:
             raise
+        if isinstance(spec, ServiceAddonSpec):
+            if check_display_installed(spec.check_executables):
+                return {
+                    "addon": spec.name,
+                    "installed": False,
+                    "already_present": True,
+                    "method": spec.install_method,
+                    "package": ", ".join(spec.apt_packages[:3]) + "...",
+                    "executable": spec.check_executables[0] if spec.check_executables else "",
+                }
+            return self.install_addon(spec.name)
         executable = self._resolve_executable_in_service_env(spec.executable)
         if executable:
             return {
@@ -1096,6 +1243,322 @@ class ZeroClawService:
                 "executable": executable,
             }
         return self.install_addon(spec.name)
+
+    def _install_service_addon(self, spec: ServiceAddonSpec) -> dict[str, Any]:
+        """Install a service addon (apt packages)."""
+        if check_display_installed(spec.check_executables):
+            return {
+                "addon": spec.name,
+                "installed": False,
+                "already_present": True,
+                "method": spec.install_method,
+                "packages": list(spec.apt_packages),
+            }
+        result = install_display_packages(spec.apt_packages)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "addons.installed",
+            f"Installed service addon {spec.name}",
+            {
+                "addon": spec.name,
+                "method": spec.install_method,
+                "packages": list(spec.apt_packages),
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "addon": spec.name,
+            "installed": True,
+            "already_present": False,
+            "method": spec.install_method,
+            "packages": list(spec.apt_packages),
+            "output": result.get("output", ""),
+        }
+
+    # ── Display addon methods ───────────────────────────────────────
+
+    def _collect_used_display_numbers(self) -> list[int]:
+        """Gather display numbers already allocated to agents."""
+        state = self.store.read_state()
+        agents = state.get("agents", state.get("users", {}))
+        used: list[int] = []
+        for agent in agents.values():
+            addons = agent.get("addons", {})
+            display_data = addons.get("display", {})
+            if isinstance(display_data, dict) and display_data.get("display_number"):
+                used.append(int(display_data["display_number"]))
+        return used
+
+    def enable_agent_display(
+        self,
+        agent_id: str,
+        *,
+        resolution: str | None = None,
+    ) -> dict[str, Any]:
+        """Allocate a display, write systemd units, start services for an agent."""
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+        spec = get_addon("display")
+        if not isinstance(spec, ServiceAddonSpec):
+            raise SetupError("display addon spec is misconfigured")
+        self.ensure_addon_installed("display")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            raise SetupError(f"agent '{token}' has no linux_user assigned")
+
+        addons = agent.setdefault("addons", {})
+        existing_display = addons.get("display", {})
+        if isinstance(existing_display, dict) and existing_display.get("enabled") and existing_display.get("display_number"):
+            return {
+                "addon": "display",
+                "agent_id": token,
+                "already_enabled": True,
+                "display_number": existing_display["display_number"],
+                "resolution": existing_display.get("resolution", spec.default_resolution),
+                "vnc_port": existing_display.get("vnc_port"),
+                "novnc_port": existing_display.get("novnc_port"),
+            }
+
+        res = resolution or spec.default_resolution
+        used = self._collect_used_display_numbers()
+        display_num = allocate_display_number(used, offset=spec.default_display_offset)
+        vnc_port = vnc_port_for_display(display_num, spec.default_vnc_port_offset)
+        novnc_port = novnc_port_for_display(display_num, spec.default_novnc_port_offset)
+
+        unit_paths = write_systemd_units(
+            display_num=display_num,
+            linux_user=linux_user,
+            resolution=res,
+            vnc_port=vnc_port,
+            novnc_port=novnc_port,
+        )
+        services = start_display_services(display_num)
+
+        # ── Inject display awareness into agent's TOOLS.md and shell profile ──
+        home = self._agent_linux_home(agent)
+        provider = str(info.get("provider", "")).strip().lower()
+        if home and provider:
+            self._apply_addon_agent_integration(
+                "display",
+                provider=provider,
+                home=home,
+                linux_user=linux_user,
+                context={
+                    "display_number": str(display_num),
+                    "resolution": res,
+                    "vnc_port": str(vnc_port),
+                    "novnc_port": str(novnc_port),
+                },
+            )
+
+        addon_state: dict[str, Any] = {
+            "enabled": True,
+            "display_number": display_num,
+            "resolution": res,
+            "vnc_port": vnc_port,
+            "novnc_port": novnc_port,
+            "services": services,
+            "credential_mode": "none",
+            "last_applied_at": now_iso(),
+            "last_applied_paths": unit_paths,
+            "last_revoked_at": "",
+            "last_source": "",
+        }
+        addons["display"] = addon_state
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.display.enabled",
+            f"Enabled display :{display_num} for {token}",
+            {
+                "agent_id": token,
+                "display_number": display_num,
+                "vnc_port": vnc_port,
+                "novnc_port": novnc_port,
+                "resolution": res,
+                "services": services,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "addon": "display",
+            "agent_id": token,
+            "already_enabled": False,
+            "display_number": display_num,
+            "resolution": res,
+            "vnc_port": vnc_port,
+            "novnc_port": novnc_port,
+            "services": services,
+            "unit_paths": unit_paths,
+        }
+
+    def disable_agent_display(self, agent_id: str) -> dict[str, Any]:
+        """Stop display services and remove systemd units for an agent."""
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        addons = agent.setdefault("addons", {})
+        display_data = addons.get("display", {})
+        if not isinstance(display_data, dict) or not display_data.get("display_number"):
+            raise SetupError(f"agent '{token}' does not have a display enabled")
+
+        display_num = int(display_data["display_number"])
+        stopped = stop_display_services(display_num)
+        removed = remove_systemd_units(display_num)
+
+        # ── Remove display awareness from agent's TOOLS.md and shell profile ──
+        home = self._agent_linux_home(agent)
+        provider = str(info.get("provider", "")).strip().lower()
+        linux_user = str(info.get("linux_user", "")).strip()
+        if home and provider:
+            self._remove_addon_agent_integration("display", provider=provider, home=home, linux_user=linux_user)
+
+        display_data["enabled"] = False
+        display_data["last_revoked_at"] = now_iso()
+        display_data["services"] = []
+        display_data["last_applied_paths"] = []
+        addons["display"] = display_data
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.display.disabled",
+            f"Disabled display :{display_num} for {token}",
+            {
+                "agent_id": token,
+                "display_number": display_num,
+                "stopped": stopped,
+                "removed": removed,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "addon": "display",
+            "agent_id": token,
+            "display_number": display_num,
+            "stopped": stopped,
+            "removed_units": removed,
+        }
+
+    # ── Generic addon tools / env injection helpers ─────────────────
+
+    def _apply_addon_agent_integration(
+        self,
+        addon_name: str,
+        provider: str,
+        home: Path,
+        linux_user: str,
+        context: dict[str, str],
+    ) -> None:
+        """Inject the addon's TOOLS.md snippet and env exports into the agent's home."""
+        spec = get_addon(addon_name)
+        # ── TOOLS.md snippet ──
+        if spec.tools_snippet:
+            rendered_snippet = spec.tools_snippet.format_map(context)
+            tools_path = self._core_prompt_path(provider, home, "TOOLS.md")
+            current = ""
+            if tools_path.exists():
+                current = tools_path.read_text(encoding="utf-8")
+            updated = inject_addon_tools_snippet(current, addon_name, rendered_snippet)
+            self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
+            if linux_user and os.geteuid() == 0:
+                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False)
+        # ── Shell env exports ──
+        if spec.env_exports:
+            exports = {var: val.format_map(context) for var, val in spec.env_exports}
+            block = render_addon_env_block(addon_name, exports)
+            for rel in (".bashrc", ".profile"):
+                path = home / rel
+                current = ""
+                if path.exists():
+                    current = path.read_text(encoding="utf-8")
+                updated = inject_addon_env_block(current, addon_name, block)
+                path.write_text(updated, encoding="utf-8")
+                if linux_user and os.geteuid() == 0:
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False)
+
+    def _remove_addon_agent_integration(
+        self,
+        addon_name: str,
+        provider: str,
+        home: Path,
+        linux_user: str,
+    ) -> None:
+        """Remove the addon's TOOLS.md snippet and env exports from the agent's home."""
+        spec = get_addon(addon_name)
+        # ── TOOLS.md snippet ──
+        if spec.tools_snippet:
+            tools_path = self._core_prompt_path(provider, home, "TOOLS.md")
+            if tools_path.exists():
+                current = tools_path.read_text(encoding="utf-8")
+                updated = remove_addon_tools_snippet(current, addon_name)
+                self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
+                if linux_user and os.geteuid() == 0:
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False)
+        # ── Shell env exports ──
+        if spec.env_exports:
+            for rel in (".bashrc", ".profile"):
+                path = home / rel
+                if not path.exists():
+                    continue
+                current = path.read_text(encoding="utf-8")
+                updated = remove_addon_env_block(current, addon_name)
+                path.write_text(updated, encoding="utf-8")
+                if linux_user and os.geteuid() == 0:
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False)
+
+    def agent_display_status(self, agent_id: str) -> dict[str, Any]:
+        """Return display status for an agent."""
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+        state = self.store.read_state()
+        agents = state.get("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        addons = agent.get("addons", {})
+        display_data = addons.get("display", {})
+        if not isinstance(display_data, dict) or not display_data.get("display_number"):
+            return {
+                "addon": "display",
+                "agent_id": token,
+                "enabled": False,
+            }
+        display_num = int(display_data["display_number"])
+        vnc_port = int(display_data.get("vnc_port", vnc_port_for_display(display_num)))
+        novnc_port = int(display_data.get("novnc_port", novnc_port_for_display(display_num)))
+        stack_status = _display_stack_status(display_num, vnc_port, novnc_port)
+        return {
+            "addon": "display",
+            "agent_id": token,
+            "enabled": bool(display_data.get("enabled", False)),
+            "display_number": display_num,
+            "resolution": str(display_data.get("resolution", "")),
+            "vnc_port": vnc_port,
+            "novnc_port": novnc_port,
+            "status": stack_status.get("status", "unknown"),
+            "services": stack_status.get("services", {}),
+        }
 
     def create_agent(
         self,
@@ -1168,7 +1631,7 @@ class ZeroClawService:
         )
 
         config = self.store.read_config()
-        default_provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        default_provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
         if provider:
             provider_spec = get_provider(provider)
         elif clone_from:
@@ -1178,9 +1641,12 @@ class ZeroClawService:
         else:
             provider_spec = get_provider(default_provider)
 
-        provider_auth = self._provider_auth(provider_spec.name)
-        if not self._is_provider_configured(provider_spec.name, provider_auth):
-            raise SetupError(f"provider '{provider_spec.name}' is not configured. Run 'clawie setup'.")
+        provider_auth = self._preferred_agent_provider_auth(
+            provider_spec.name,
+            agent=None,
+            current_auth_mode="",
+            allow_defaults=True,
+        )
 
         raw_plugins = source_agent_defaults.get("plugins", self._default_plugins_for_provider(provider_spec.name))
         if not isinstance(raw_plugins, dict):
@@ -1330,9 +1796,13 @@ class ZeroClawService:
         info = agent.setdefault("agent", {})
         current_provider = str(info.get("provider", "")).strip().lower()
         target_spec = get_provider(target_provider)
-        provider_auth = self._provider_auth(target_spec.name)
-        if not self._is_provider_configured(target_spec.name, provider_auth):
-            raise SetupError(f"provider '{target_spec.name}' is not configured. Run 'clawie config set'.")
+        auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
+        provider_auth = self._preferred_agent_provider_auth(
+            target_spec.name,
+            agent=agent,
+            current_auth_mode=str(info.get("auth_mode", "")),
+            allow_defaults=True,
+        )
 
         changed = current_provider != target_spec.name
         linux_user = str(info.get("linux_user", "")).strip()
@@ -1345,6 +1815,7 @@ class ZeroClawService:
         start_result: dict[str, Any] = {}
         reconnected_channels: list[dict[str, str]] = []
         old_running = False
+        target_running_before = False
         old_service_state = {
             "service_status": str(info.get("service_status", "unknown")),
             "service_mode": str(info.get("service_mode", "unknown")),
@@ -1364,26 +1835,27 @@ class ZeroClawService:
                 "stopped_services": [],
                 "reconnected_channels": [],
                 "auth": auth,
+                "auth_prepare": auth_prepare,
             }
 
         try:
             if linux_user:
                 self._require_linux_user_access(linux_user, "provider switching")
                 self.ensure_provider_runtime(target_spec.name)
+                target_running_before = self._managed_provider_is_running(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    agent_info=new_service_state,
+                )
                 if changed and current_provider:
                     self._resolve_provider_executable(current_provider)
                 if home:
                     self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
             if linux_user and changed and current_provider:
-                previous_status = self._run_managed_provider_service_action(
+                old_running = self._managed_provider_is_running(
                     provider=current_provider,
-                    action="status",
                     linux_user=linux_user,
                     agent_info=old_service_state,
-                )
-                old_running = (
-                    str(previous_status.get("service_status", "unknown")) == "running"
-                    or self._provider_process_live_ps_only(current_provider, linux_user)
                 )
                 if old_running or int(old_service_state.get("fallback_pid", 0) or 0) > 0:
                     stop_result = self._run_managed_provider_service_action(
@@ -1404,7 +1876,7 @@ class ZeroClawService:
                 )
                 start_result = self._run_managed_provider_service_action(
                     provider=target_spec.name,
-                    action="start",
+                    action="restart" if target_running_before else "start",
                     linux_user=linux_user,
                     agent_info=new_service_state,
                 )
@@ -1421,16 +1893,10 @@ class ZeroClawService:
                     except SetupError:
                         continue
                     other_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
-                    other_status = self._run_managed_provider_service_action(
+                    if self._managed_provider_is_running(
                         provider=other_provider,
-                        action="status",
                         linux_user=linux_user,
                         agent_info=other_state,
-                    )
-                    if (
-                        str(other_status.get("service_status", "unknown")) == "running"
-                        or self._provider_process_live_ps_only(other_provider, linux_user)
-                        or int(other_state.get("fallback_pid", 0) or 0) > 0
                     ):
                         stopped = self._run_managed_provider_service_action(
                             provider=other_provider,
@@ -1449,6 +1915,12 @@ class ZeroClawService:
                     raise SetupError(
                         f"provider switch to {target_spec.name} left other runtimes active: {', '.join(other_live)}"
                     )
+                self._assert_provider_postflight_ready(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    home=home,
+                    auth_mode=str(provider_auth.get("auth_mode", target_spec.default_auth_mode)),
+                )
         except Exception as exc:
             self._set_agent_provider_issue(
                 agent,
@@ -1540,6 +2012,7 @@ class ZeroClawService:
             "stopped_services": stopped_results,
             "reconnected_channels": reconnected_channels,
             "auth": auth,
+            "auth_prepare": auth_prepare,
         }
 
     def get_agent_credential_sync(self, agent_id: str) -> dict[str, Any]:
@@ -2096,6 +2569,25 @@ class ZeroClawService:
                 return "running" if (live or service_running) else "stopped"
             time.sleep(poll_seconds)
 
+    def _managed_provider_is_running(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        agent_info: dict[str, Any],
+    ) -> bool:
+        status = self._run_managed_provider_service_action(
+            provider=provider,
+            action="status",
+            linux_user=linux_user,
+            agent_info=agent_info,
+        )
+        return (
+            str(status.get("service_status", "unknown")) == "running"
+            or self._provider_process_live_ps_only(provider, linux_user)
+            or int(agent_info.get("fallback_pid", 0) or 0) > 0
+        )
+
     def _provider_process_live_ps_only(self, provider: str, linux_user: str) -> bool:
         token = str(linux_user).strip()
         if not token:
@@ -2140,10 +2632,12 @@ class ZeroClawService:
             ordered.append(provider)
         return ordered
 
-    def _provider_reports_running(self, provider: str, linux_user: str) -> bool:
+    def _provider_reports_running(self, provider: str, linux_user: str) -> bool | None:
         token = str(linux_user).strip()
         if not token:
             return False
+        if not self._can_manage_linux_user(token):
+            return None
         try:
             status = self._run_managed_provider_service_action(
                 provider=provider,
@@ -2152,7 +2646,7 @@ class ZeroClawService:
                 agent_info={"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0},
             )
         except Exception:
-            return False
+            return None
         return str(status.get("service_status", "")).strip().lower() == "running"
 
     def _force_stop_provider_processes(self, provider: str, linux_user: str) -> None:
@@ -2241,6 +2735,60 @@ class ZeroClawService:
             return f"{provider} foreground startup probe exited {result.returncode}:\n{output}".strip()
         return f"{provider} foreground startup probe exited {result.returncode}"
 
+    def _assert_provider_postflight_ready(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        home: Path | None,
+        auth_mode: str,
+    ) -> None:
+        spec = get_provider(provider)
+        command = tuple(str(part).strip() for part in spec.readiness_command if str(part).strip())
+        if command:
+            executable = self._resolve_provider_executable(provider)
+            cmd = self._wrap_user_command([executable, *command], linux_user, purpose="provider readiness probe")
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._service_env(linux_user),
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = self._join_process_output(exc.stdout, exc.stderr)
+                raise SetupError(
+                    f"{provider} readiness probe timed out after startup"
+                    + (f" for {linux_user}" if linux_user else "")
+                    + (f": {output}" if output else "")
+                ) from exc
+            if result.returncode != 0:
+                output = self._join_process_output(result.stdout, result.stderr)
+                raise SetupError(
+                    f"{provider} readiness probe failed after startup"
+                    + (f" for {linux_user}" if linux_user else "")
+                    + ": "
+                    + (output or f"exit {result.returncode}")
+                )
+
+        if str(auth_mode).strip().lower() == "linked" and home is not None:
+            status = self._inspect_provider_auth_state(
+                provider=provider,
+                auth_mode="linked",
+                linux_user=linux_user,
+                home=home,
+            )
+            if not self._auth_status_ready(status):
+                detail = str(status.get("detail", "")).strip()
+                suffix = f" ({detail})" if detail else ""
+                raise SetupError(
+                    f"{provider} linked auth is not ready after startup"
+                    + (f" for {linux_user}" if linux_user else "")
+                    + f": {status.get('auth_status', 'unknown')}{suffix}"
+                )
+
     @staticmethod
     def _join_process_output(stdout: Any, stderr: Any) -> str:
         parts: list[str] = []
@@ -2264,7 +2812,7 @@ class ZeroClawService:
         channels: list[dict[str, Any]],
     ) -> list[dict[str, str]]:
         reconnectable: list[dict[str, str]] = []
-        if str(provider).strip().lower() == "picoclaw":
+        if str(provider).strip().lower() in {"picoclaw", "openclaw"}:
             for channel in channels:
                 if not isinstance(channel, dict):
                     continue
@@ -2272,7 +2820,7 @@ class ZeroClawService:
                     continue
                 kind = str(channel.get("kind", "")).strip().lower()
                 name = str(channel.get("name", "")).strip()
-                if not kind or not name or kind == "cli":
+                if not kind or not name or kind == "cli" or kind != "telegram":
                     continue
                 reconnectable.append({"kind": kind, "name": name})
             return reconnectable
@@ -2381,6 +2929,8 @@ class ZeroClawService:
             return self._read_zeroclaw_channel_payloads(root)
         if name == "picoclaw":
             return self._read_picoclaw_channel_payloads(root)
+        if name == "openclaw":
+            return self._read_openclaw_channel_payloads(root)
         return {}
 
     def _read_zeroclaw_channel_payloads(self, root: Path) -> dict[tuple[str, str], dict[str, Any]]:
@@ -2446,6 +2996,54 @@ class ZeroClawService:
                 "provider": "picoclaw",
                 "settings": settings,
             }
+        return rows
+
+    def _read_openclaw_channel_payloads(self, root: Path) -> dict[tuple[str, str], dict[str, Any]]:
+        config_path = root / "openclaw.json"
+        payload = self._read_json_file(config_path)
+        channels_cfg = payload.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return {}
+
+        rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for key, value in channels_cfg.items():
+            kind = str(key).strip().lower()
+            if not kind or not isinstance(value, dict):
+                continue
+            if not bool(value.get("enabled", True)):
+                continue
+
+            settings = dict(value)
+            settings.pop("accounts", None)
+            name = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
+            rows[(kind, name)] = {
+                "kind": kind,
+                "name": name,
+                "provider": "openclaw",
+                "settings": settings,
+            }
+
+            accounts = value.get("accounts", {})
+            if not isinstance(accounts, dict):
+                continue
+            for account_id, account_value in accounts.items():
+                if not isinstance(account_value, dict):
+                    continue
+                if not bool(account_value.get("enabled", value.get("enabled", True))):
+                    continue
+                account_name = (
+                    str(account_value.get("name", account_id)).strip().lower().replace(" ", "-")
+                    or str(account_id).strip().lower()
+                    or kind
+                )
+                account_settings = dict(settings)
+                account_settings.update(account_value)
+                rows[(kind, account_name)] = {
+                    "kind": kind,
+                    "name": account_name,
+                    "provider": "openclaw",
+                    "settings": account_settings,
+                }
         return rows
 
     def _discover_live_channel_payloads(self, payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
@@ -2567,21 +3165,37 @@ class ZeroClawService:
         if not home:
             return
         name = str(provider).strip().lower()
-        if name != "picoclaw":
+        if name not in {"picoclaw", "openclaw"}:
             return
 
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
         use_shared_auth = "provider-auth" in set(sync.get("bundles", []))
-        self._ensure_picoclaw_native_auth(home=home, linux_user=linux_user, use_shared_auth=use_shared_auth)
-        if "provider-auth" in set(sync.get("bundles", [])):
+        if name == "picoclaw":
+            self._ensure_picoclaw_native_auth(home=home, linux_user=linux_user, use_shared_auth=use_shared_auth)
+        if use_shared_auth:
             self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
+        if name == "openclaw":
+            self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
 
-        auth = self._provider_auth(name)
-        auth_mode = str(agent.get("agent", {}).get("auth_mode", auth.get("auth_mode", ""))).strip().lower()
-        if not auth_mode:
-            auth_mode = str(auth.get("auth_mode", get_provider(name).default_auth_mode)).strip().lower()
+        auth = self._preferred_agent_provider_auth(
+            name,
+            agent=agent,
+            current_auth_mode=str(agent.get("agent", {}).get("auth_mode", "")),
+            allow_defaults=True,
+        )
+        auth_mode = str(auth.get("auth_mode", get_provider(name).default_auth_mode)).strip().lower()
         api_key = str(auth.get("api_key", "")).strip()
-        self._ensure_picoclaw_home_prepared(
+        if name == "picoclaw":
+            self._ensure_picoclaw_home_prepared(
+                home=home,
+                linux_user=linux_user,
+                channels=channels,
+                live_payloads=live_payloads,
+                auth_mode=auth_mode,
+                api_key=api_key,
+            )
+            return
+        self._ensure_openclaw_home_prepared(
             home=home,
             linux_user=linux_user,
             channels=channels,
@@ -2751,6 +3365,200 @@ class ZeroClawService:
         self._write_json_file(config_path, config)
         self._chown_tree(root, linux_user)
 
+    def _ensure_openclaw_home_prepared(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+        auth_mode: str,
+        api_key: str,
+    ) -> None:
+        root = home / ".openclaw"
+        root.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(root, linux_user)
+
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_path = root / "openclaw.json"
+        config = self._read_json_file(config_path)
+
+        gateway_cfg = config.get("gateway", {})
+        if not isinstance(gateway_cfg, dict):
+            gateway_cfg = {}
+        gateway_cfg["mode"] = "local"
+        config["gateway"] = gateway_cfg
+
+        agents_cfg = config.get("agents", {})
+        if not isinstance(agents_cfg, dict):
+            agents_cfg = {}
+        defaults = agents_cfg.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["workspace"] = str(workspace)
+
+        desired_model = ""
+        if auth_mode == "linked":
+            desired_model = "openai-codex/gpt-5.4"
+        elif auth_mode == "api_key":
+            if not api_key:
+                raise SetupError("openclaw API-key mode requires an API key before the runtime can start")
+            desired_model = "openai/gpt-5.2"
+
+        current_model = defaults.get("model")
+        if desired_model:
+            if isinstance(current_model, dict):
+                current_model["primary"] = desired_model
+                defaults["model"] = current_model
+            else:
+                defaults["model"] = desired_model
+        agents_cfg["defaults"] = defaults
+        config["agents"] = agents_cfg
+
+        if auth_mode == "linked":
+            auth_cfg = config.get("auth", {})
+            if not isinstance(auth_cfg, dict):
+                auth_cfg = {}
+            profiles = auth_cfg.get("profiles", {})
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles.setdefault(
+                "openai-codex:default",
+                {
+                    "provider": "openai-codex",
+                    "mode": "oauth",
+                },
+            )
+            auth_cfg["profiles"] = profiles
+            order = auth_cfg.get("order", {})
+            if not isinstance(order, dict):
+                order = {}
+            existing_order = order.get("openai-codex", [])
+            order["openai-codex"] = [
+                "openai-codex:default",
+                *[
+                    str(item).strip()
+                    for item in existing_order
+                    if str(item).strip() and str(item).strip() != "openai-codex:default"
+                ],
+            ]
+            auth_cfg["order"] = order
+            config["auth"] = auth_cfg
+        elif auth_mode == "api_key":
+            models_cfg = config.get("models", {})
+            if not isinstance(models_cfg, dict):
+                models_cfg = {}
+            providers_cfg = models_cfg.get("providers", {})
+            if not isinstance(providers_cfg, dict):
+                providers_cfg = {}
+            openai_cfg = providers_cfg.get("openai", {})
+            if not isinstance(openai_cfg, dict):
+                openai_cfg = {}
+            openai_cfg["apiKey"] = api_key
+            providers_cfg["openai"] = openai_cfg
+            models_cfg["providers"] = providers_cfg
+            config["models"] = models_cfg
+
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            channels_cfg = {}
+        login_env = self._login_shell_env(linux_user)
+        payload_by_kind: dict[str, dict[str, Any]] = {}
+        for payload in live_payloads.values():
+            kind = str(payload.get("kind", "")).strip().lower()
+            if kind and kind not in payload_by_kind:
+                payload_by_kind[kind] = payload
+
+        for channel in channels:
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or kind == "cli":
+                continue
+            payload = live_payloads.get((kind, name)) or payload_by_kind.get(kind, {})
+            settings = payload.get("settings", {}) if isinstance(payload, dict) else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings = self._resolve_shell_placeholders(settings, login_env)
+            if kind != "telegram":
+                continue
+
+            telegram_cfg = channels_cfg.get("telegram", {})
+            if not isinstance(telegram_cfg, dict):
+                telegram_cfg = {}
+            token = (
+                str(settings.get("botToken", "")).strip()
+                or str(settings.get("bot_token", "")).strip()
+                or str(settings.get("token", "")).strip()
+                or str(telegram_cfg.get("botToken", "")).strip()
+            )
+            if not token:
+                raise SetupError(
+                    "openclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                )
+            if self._looks_like_unresolved_secret(token):
+                raise SetupError(
+                    "openclaw telegram bootstrap found an unresolved token placeholder; "
+                    "export the bot token in the target user's login shell or re-link Telegram first"
+                )
+            if not self._looks_like_telegram_bot_token(token):
+                raise SetupError(
+                    "openclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
+                    "re-link Telegram or update the target user's Telegram token"
+                )
+            telegram_cfg["enabled"] = True
+            telegram_cfg["botToken"] = token
+            allow_from = self._coerce_string_list(
+                settings.get("allowFrom", settings.get("allow_from", telegram_cfg.get("allowFrom", [])))
+            )
+            existing_allow_from = self._coerce_string_list(telegram_cfg.get("allowFrom", []))
+            effective_allow_from = allow_from or existing_allow_from
+            explicit_dm_policy = str(
+                settings.get("dmPolicy", settings.get("dm_policy", telegram_cfg.get("dmPolicy", "")))
+            ).strip().lower()
+            if effective_allow_from:
+                telegram_cfg["allowFrom"] = effective_allow_from
+                telegram_cfg["dmPolicy"] = "open" if "*" in set(effective_allow_from) else "allowlist"
+            elif explicit_dm_policy in {"open", "allowlist", "disabled"}:
+                telegram_cfg["dmPolicy"] = explicit_dm_policy
+            else:
+                # Managed Telegram cutovers should stay reachable by default.
+                # Heal older Clawie-generated openclaw configs that inherited the runtime default
+                # pairing mode without an explicit allowlist.
+                telegram_cfg["allowFrom"] = ["*"]
+                telegram_cfg["dmPolicy"] = "open"
+            proxy = str(settings.get("proxy", telegram_cfg.get("proxy", ""))).strip()
+            if proxy:
+                telegram_cfg["proxy"] = proxy
+            webhook_url = str(
+                settings.get("webhookUrl", settings.get("webhook_url", telegram_cfg.get("webhookUrl", "")))
+            ).strip()
+            if webhook_url:
+                telegram_cfg["webhookUrl"] = webhook_url
+            webhook_secret = str(
+                settings.get("webhookSecret", settings.get("webhook_secret", telegram_cfg.get("webhookSecret", "")))
+            ).strip()
+            if webhook_secret:
+                telegram_cfg["webhookSecret"] = webhook_secret
+            group_trigger = settings.get("group_trigger", settings.get("groupTrigger", {}))
+            if isinstance(group_trigger, dict) and "mention_only" in group_trigger:
+                groups = telegram_cfg.get("groups", {})
+                if not isinstance(groups, dict):
+                    groups = {}
+                default_group = groups.get("*", {})
+                if not isinstance(default_group, dict):
+                    default_group = {}
+                default_group["requireMention"] = bool(group_trigger.get("mention_only"))
+                groups["*"] = default_group
+                telegram_cfg["groups"] = groups
+            channels_cfg["telegram"] = telegram_cfg
+
+        config["channels"] = channels_cfg
+        self._write_json_file(config_path, config)
+        if auth_mode == "linked":
+            self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
+        self._chown_tree(root, linux_user)
+
     def _remove_picoclaw_channel_from_home(
         self,
         *,
@@ -2769,6 +3577,25 @@ class ZeroClawService:
             config["channels"] = channels_cfg
             self._write_json_file(config_path, config)
             self._chown_tree(home / ".picoclaw", linux_user)
+
+    def _remove_openclaw_channel_from_home(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        kind: str,
+    ) -> None:
+        config_path = home / ".openclaw" / "openclaw.json"
+        config = self._read_json_file(config_path)
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return
+        token = str(kind).strip().lower()
+        if token in channels_cfg:
+            channels_cfg.pop(token, None)
+            config["channels"] = channels_cfg
+            self._write_json_file(config_path, config)
+            self._chown_tree(home / ".openclaw", linux_user)
 
     def agent_service_action(self, agent_id: str, action: str) -> dict[str, Any]:
         self._require_setup()
@@ -3210,7 +4037,7 @@ class ZeroClawService:
         provider = str(source.get("agent", {}).get("provider", "")).strip().lower()
         linux_user = str(source.get("agent", {}).get("linux_user", "")).strip()
         home = self._agent_linux_home(source)
-        if provider == "picoclaw" and linux_user and home:
+        if provider in {"picoclaw", "openclaw"} and linux_user and home:
             self._prepare_agent_provider_home(
                 provider=provider,
                 agent=source,
@@ -3219,7 +4046,10 @@ class ZeroClawService:
                 channels=self._effective_agent_channels(source),
                 live_payloads=self._discover_live_channel_payloads(source),
             )
-            self._remove_picoclaw_channel_from_home(home=home, linux_user=linux_user, kind=channel_kind)
+            if provider == "picoclaw":
+                self._remove_picoclaw_channel_from_home(home=home, linux_user=linux_user, kind=channel_kind)
+            else:
+                self._remove_openclaw_channel_from_home(home=home, linux_user=linux_user, kind=channel_kind)
             if self._provider_process_live(provider, linux_user):
                 result = self._run_managed_provider_service_action(
                     provider=provider,
@@ -3338,6 +4168,54 @@ class ZeroClawService:
                 "output": "configured provider channel",
                 "status": "connected",
             }
+        if provider == "openclaw":
+            home = self._agent_linux_home(agent)
+            effective_channels = self._effective_agent_channels(agent)
+            live_payloads = self._discover_live_channel_payloads(agent)
+            if channel_kind == "telegram" and (
+                live_payloads.get((channel_kind, channel_name))
+                or any(str(key[0]).strip().lower() == channel_kind for key in live_payloads)
+            ):
+                self._prepare_agent_provider_home(
+                    provider=provider,
+                    agent=agent,
+                    linux_user=linux_user,
+                    home=home,
+                    channels=effective_channels,
+                    live_payloads=live_payloads,
+                )
+                if self._provider_process_live(provider, linux_user):
+                    result = self._run_managed_provider_service_action(
+                        provider=provider,
+                        action="restart",
+                        linux_user=linux_user,
+                        agent_info=info,
+                    )
+                    info["service_status"] = str(result.get("service_status", "unknown"))
+                    info["service_mode"] = str(result.get("service_mode", "unknown"))
+                info["last_sync"] = now_iso()
+                self._event(
+                    state,
+                    "channels.connected",
+                    f"Connected channel {channel_kind}:{channel_name} for {target}",
+                    {
+                        "agent_id": target,
+                        "provider": provider,
+                        "kind": channel_kind,
+                        "name": channel_name,
+                        "command": "config-write",
+                    },
+                )
+                self.store.write_state(state)
+                return {
+                    "agent_id": target,
+                    "provider": provider,
+                    "kind": channel_kind,
+                    "name": channel_name,
+                    "command": [],
+                    "output": "configured provider channel",
+                    "status": "connected",
+                }
 
         commands = self._channel_connect_commands(provider, channel_kind, channel_name, linux_user)
         last_error = ""
@@ -3391,7 +4269,7 @@ class ZeroClawService:
         config = self.store.read_config()
         state = self.store.read_state()
 
-        provider = str(config.get("provider", "picoclaw"))
+        provider = str(config.get("provider", "openclaw"))
         provider_auth = self._provider_auth(provider)
         mode = provider_auth.get("auth_mode", get_provider(provider).default_auth_mode)
         if self._is_provider_configured(provider, provider_auth):
@@ -3488,6 +4366,8 @@ class ZeroClawService:
             self._refresh_managed_agent_provider_alignment(token)
             payload = copy.deepcopy(self.get_agent(token))
         payload = self._attach_agent_runtime_status(payload)
+        info = payload.setdefault("agent", {})
+        info["status"] = self._dashboard_status(str(info.get("status", "")), info)
         payload = self._attach_agent_auth_status(payload)
         payload = self._attach_agent_addon_status(payload)
         return self._attach_agent_channel_view(payload)
@@ -3705,7 +4585,7 @@ class ZeroClawService:
             raise ValueError("provider is required")
         spec = get_provider(name)
         shared_home = self._ensure_shared_provider_auth_root()
-        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        auth_mode = str(self._preferred_shared_provider_auth(spec.name, allow_defaults=True).get("auth_mode", spec.default_auth_mode))
         payload = self._inspect_provider_auth_state(
             provider=spec.name,
             auth_mode=auth_mode,
@@ -3727,7 +4607,7 @@ class ZeroClawService:
         providers = self.configured_provider_names()
         if not providers:
             config = self.store.read_config()
-            providers = [str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"]
+            providers = [str(config.get("provider", "openclaw")).strip().lower() or "openclaw"]
         return [self.shared_auth_status(provider) for provider in providers]
 
     def shared_auth_login(self, provider: str) -> dict[str, Any]:
@@ -3737,7 +4617,7 @@ class ZeroClawService:
             raise ValueError("provider is required")
         spec = get_provider(name)
         shared_home = self._ensure_shared_provider_auth_root()
-        auth_mode = str(self._provider_auth(spec.name).get("auth_mode", spec.default_auth_mode))
+        auth_mode = str(self._preferred_shared_provider_auth(spec.name, allow_defaults=True).get("auth_mode", spec.default_auth_mode))
         payload = self._refresh_or_login_linked_auth(
             provider=spec.name,
             auth_mode=auth_mode,
@@ -3888,6 +4768,8 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            return self._get_service_addon_status(spec)
         auth = self.shared_addon_auth_status(spec.name)
         executable = self._resolve_executable_in_service_env(spec.executable)
         return {
@@ -3905,13 +4787,81 @@ class ZeroClawService:
             "linked_agents": list(auth.get("linked_agents", [])),
         }
 
+    def _get_service_addon_status(self, spec: ServiceAddonSpec) -> dict[str, Any]:
+        """Status for a service-type addon (e.g. display)."""
+        installed = check_display_installed(spec.check_executables)
+        linked_agents = self._shared_addon_agent_ids(spec.name)
+        active_displays: list[dict[str, Any]] = []
+        state = self.store.read_state()
+        agents = state.get("agents", state.get("users", {}))
+        for aid, agent_data in sorted(agents.items()):
+            addons = agent_data.get("addons", {})
+            display_data = addons.get("display", {})
+            if isinstance(display_data, dict) and display_data.get("enabled") and display_data.get("display_number"):
+                active_displays.append({
+                    "agent_id": aid,
+                    "display_number": display_data["display_number"],
+                    "vnc_port": display_data.get("vnc_port"),
+                    "novnc_port": display_data.get("novnc_port"),
+                    "resolution": display_data.get("resolution", spec.default_resolution),
+                })
+        return {
+            "addon": spec.name,
+            "label": spec.label,
+            "description": spec.description,
+            "installed": installed,
+            "executable": spec.check_executables[0] if spec.check_executables else "",
+            "install_method": spec.install_method,
+            "install_package": ", ".join(spec.apt_packages[:4]) + "...",
+            "auth_status": "n/a",
+            "auth_detail": "service addon (no auth required)",
+            "config_dir": "",
+            "shared_scope": "system",
+            "linked_agents": linked_agents,
+            "active_displays": active_displays,
+        }
+
     def shared_addon_auth_status(self, addon: str) -> dict[str, Any]:
         name = self._canonical_addon(addon)
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            return {
+                "addon": spec.name,
+                "label": spec.label,
+                "auth_status": "n/a",
+                "detail": "service addon (no auth required)",
+                "login_required": False,
+                "config_dir": "",
+                "shared_scope": "system",
+                "linked_agents": self._shared_addon_agent_ids(spec.name),
+            }
         config_dir = self._ensure_shared_addon_config_dir(spec.name)
-        payload = inspect_addon_auth(spec.name, config_dir)
+        payload: dict[str, Any] = {}
+        executable = self._resolve_executable_in_service_env(spec.executable)
+        if executable and spec.auth_status_command:
+            try:
+                result = subprocess.run(
+                    self._addon_shell_command(spec.name, spec.auth_status_command, linux_user="", config_dir=config_dir),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._service_env(""),
+                )
+            except Exception:
+                result = None
+            raw = ""
+            if result is not None:
+                raw = str(result.stdout or "").strip() or str(result.stderr or "").strip()
+            if raw:
+                try:
+                    if spec.name == "gws":
+                        payload = parse_gws_status_output(raw, config_dir=config_dir)
+                except ValueError:
+                    payload = {}
+        if not payload:
+            payload = inspect_addon_auth(spec.name, config_dir)
         payload.update(
             {
                 "addon": spec.name,
@@ -3930,6 +4880,15 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            return {
+                "addon": spec.name,
+                "auth_status": "n/a",
+                "detail": "service addon (no auth required)",
+                "action_performed": "status",
+                "login_required": False,
+                "linked_agents": self._shared_addon_agent_ids(spec.name),
+            }
         self.ensure_addon_installed(spec.name)
         status = self.shared_addon_auth_status(spec.name)
         if str(status.get("auth_status", "")).strip().lower() == "ready":
@@ -3938,7 +4897,8 @@ class ZeroClawService:
 
         config_dir = self._ensure_shared_addon_config_dir(spec.name)
         command = spec.auth_login_command
-        if spec.name == "gws" and not (config_dir / "client_secret.json").exists():
+        client_error = str(status.get("client_config_error", "")).strip()
+        if spec.name == "gws" and (not bool(status.get("client_secret_present", False)) or client_error):
             try:
                 self.ensure_support_tool_installed("gcloud")
             except SetupError as exc:
@@ -3977,6 +4937,8 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            raise ValueError(f"addon '{spec.name}' is a service addon and does not use credential import")
         self.ensure_addon_installed(spec.name)
         src_home, src_linux_user, source_label = self._resolve_addon_source(source_home=source_home, source_agent=source_agent)
         src_config = src_home / spec.target_config_rel
@@ -4017,6 +4979,14 @@ class ZeroClawService:
         name = self._canonical_addon(addon)
         if not name:
             raise ValueError("addon is required")
+        if is_service_addon(name):
+            return {
+                "addon": name,
+                "home": "",
+                "updated_agents": [],
+                "skipped_agents": [],
+                "linked_paths": [],
+            }
         status = self.shared_addon_auth_status(name)
         if str(status.get("auth_status", "")).strip().lower() != "ready":
             raise SetupError(
@@ -4100,8 +5070,36 @@ class ZeroClawService:
         for addon_name in addon_names():
             spec = get_addon(addon_name)
             addon_state = dict(addons.get(spec.name, {}))
+
+            if isinstance(spec, ServiceAddonSpec):
+                installed = check_display_installed(spec.check_executables)
+                display_status = self.agent_display_status(token) if spec.name == "display" else {}
+                row: dict[str, Any] = {
+                    "addon": spec.name,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "enabled": bool(addon_state.get("enabled", False)),
+                    "installed": installed,
+                    "auth_status": "n/a",
+                    "auth_detail": "service addon",
+                    "applied": bool(addon_state.get("enabled", False)) and bool(addon_state.get("display_number")),
+                    "access_status": "ok" if bool(addon_state.get("enabled", False)) else "",
+                    "access_detail": "",
+                    "target_path": "",
+                    "last_applied_at": str(addon_state.get("last_applied_at", "")),
+                    "last_revoked_at": str(addon_state.get("last_revoked_at", "")),
+                }
+                if display_status.get("enabled"):
+                    row["display_number"] = display_status.get("display_number")
+                    row["vnc_port"] = display_status.get("vnc_port")
+                    row["novnc_port"] = display_status.get("novnc_port")
+                    row["resolution"] = display_status.get("resolution")
+                    row["display_status"] = display_status.get("status")
+                rows.append(row)
+                continue
+
             shared_auth = self.shared_addon_auth_status(spec.name)
-            link = self._agent_addon_link_status(spec.name, home)
+            link = self._agent_addon_link_status(spec.name, home, linux_user=info.get("linux_user", ""))
             rows.append(
                 {
                     "addon": spec.name,
@@ -4112,6 +5110,8 @@ class ZeroClawService:
                     "auth_status": str(shared_auth.get("auth_status", "unknown")),
                     "auth_detail": str(shared_auth.get("detail", "")),
                     "applied": bool(link.get("applied", False)),
+                    "access_status": str(link.get("access_status", "unknown")),
+                    "access_detail": str(link.get("access_detail", "")),
                     "target_path": str(link.get("target_path", "")),
                     "last_applied_at": str(addon_state.get("last_applied_at", "")),
                     "last_revoked_at": str(addon_state.get("last_revoked_at", "")),
@@ -4141,6 +5141,10 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            result = self.enable_agent_display(token)
+            result["agent"] = self.get_dashboard_agent(token)
+            return result
         self.ensure_addon_installed(spec.name)
         if source_home or source_agent:
             self.import_shared_addon_auth(spec.name, source_home=source_home, source_agent=source_agent)
@@ -4180,6 +5184,17 @@ class ZeroClawService:
             )
             addon_state["last_source"] = str(self._shared_addon_config_dir(spec.name))
             pending = False
+            # ── Inject addon tools/env into agent home ──
+            provider = str(info.get("provider", "")).strip().lower()
+            if provider and (spec.tools_snippet or spec.env_exports):
+                context = {"config_dir": str(home / spec.target_config_rel)}
+                self._apply_addon_agent_integration(
+                    spec.name,
+                    provider=provider,
+                    home=home,
+                    linux_user=linux_user,
+                    context=context,
+                )
         addons[spec.name] = addon_state
         agent["addons"] = addons
         info["last_sync"] = now_iso()
@@ -4212,6 +5227,10 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
+        if isinstance(spec, ServiceAddonSpec):
+            result = self.disable_agent_display(token)
+            result["agent"] = self.get_dashboard_agent(token)
+            return result
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
         agent = agents.get(token)
@@ -4226,6 +5245,12 @@ class ZeroClawService:
         removed: list[str] = []
         if linux_user and home is not None and home.exists() and self._can_manage_linux_user(linux_user):
             removed = self._revoke_addon_from_home(spec.name, home)
+            # ── Remove addon tools/env from agent home ──
+            provider = str(info.get("provider", "")).strip().lower()
+            if provider and (spec.tools_snippet or spec.env_exports):
+                self._remove_addon_agent_integration(
+                    spec.name, provider=provider, home=home, linux_user=linux_user
+                )
         addon_state["enabled"] = False
         addon_state["last_revoked_at"] = now_iso()
         addon_state["last_applied_paths"] = []
@@ -4273,6 +5298,8 @@ class ZeroClawService:
         updated: list[str] = []
         addon_state_map = self._normalize_agent_addons(agent.get("addons"))
         for name in selected:
+            if is_service_addon(name):
+                continue
             if str(self.shared_addon_auth_status(name).get("auth_status", "")).strip().lower() != "ready":
                 raise SetupError(
                     f"shared {name} credentials are missing. Run 'clawie addon auth login {name}' first."
@@ -4447,21 +5474,61 @@ class ZeroClawService:
             shutil.rmtree(target)
         return [str(target)]
 
-    def _agent_addon_link_status(self, addon: str, home: Path | None) -> dict[str, Any]:
+    def _agent_addon_link_status(self, addon: str, home: Path | None, *, linux_user: str = "") -> dict[str, Any]:
         spec = get_addon(addon)
         target = (home / spec.target_config_rel) if home else Path(spec.target_config_rel)
+        if home is None:
+            return {
+                "applied": False,
+                "access_status": "missing",
+                "access_detail": "agent has no Linux home",
+                "target_path": "",
+            }
+        if linux_user and not self._can_manage_linux_user(str(linux_user)):
+            return {
+                "applied": False,
+                "access_status": "permission",
+                "access_detail": "inspecting addon links for managed agents owned by another Linux user requires root",
+                "target_path": str(target),
+            }
         applied = False
-        if home is not None and (target.exists() or target.is_symlink()):
+        access_status = "ok"
+        access_detail = ""
+        try:
+            present = target.exists() or target.is_symlink()
+        except PermissionError:
+            return {
+                "applied": False,
+                "access_status": "permission",
+                "access_detail": "inspecting addon link paths requires root for this agent home",
+                "target_path": str(target),
+            }
+        except OSError as exc:
+            return {
+                "applied": False,
+                "access_status": "error",
+                "access_detail": str(exc),
+                "target_path": str(target),
+            }
+        if present:
             if target.is_symlink():
                 try:
                     applied = target.resolve() == self._shared_addon_config_dir(spec.name).resolve()
-                except OSError:
+                except PermissionError:
+                    access_status = "permission"
+                    access_detail = "resolving addon link target requires root for this agent home"
+                    applied = False
+                except OSError as exc:
+                    access_status = "error"
+                    access_detail = str(exc)
                     applied = False
             else:
                 applied = True
         return {
             "applied": applied,
-            "target_path": str(target) if home is not None else "",
+            "access_status": access_status,
+            "access_detail": access_detail,
+            "target_path": str(target),
         }
 
     def local_claw_service_action(self, provider: str, action: str) -> dict[str, Any]:
@@ -4709,11 +5776,17 @@ class ZeroClawService:
         provider = str(info.get("provider", "")).strip().lower()
         if not provider:
             raise SetupError(f"agent '{token}' has no provider configured")
-        auth_mode = str(info.get("auth_mode", get_provider(provider).default_auth_mode))
         linux_user = str(info.get("linux_user", "")).strip()
         home = self._agent_linux_home(agent)
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
         shared_provider_auth = bool(sync.get("shared_provider_auth", False))
+        auth = self._preferred_agent_provider_auth(
+            provider,
+            agent=agent,
+            current_auth_mode=str(info.get("auth_mode", "")),
+            allow_defaults=True,
+        )
+        auth_mode = str(auth.get("auth_mode", get_provider(provider).default_auth_mode))
         inspect_linux_user = "" if shared_provider_auth else linux_user
         inspect_home = self._shared_provider_auth_home() if shared_provider_auth else home
         payload = self._inspect_provider_auth_state(
@@ -4863,7 +5936,7 @@ class ZeroClawService:
         return {
             "generated_at": now_iso(),
             "workspace": config.get("workspace", ""),
-            "provider": config.get("provider", "picoclaw"),
+            "provider": config.get("provider", "openclaw"),
             "totals": {
                 "agents": len(rows),
                 "channels": channel_total,
@@ -4948,7 +6021,7 @@ class ZeroClawService:
             )
 
         config = self.store.read_config()
-        resolved_provider = str(provider or config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        resolved_provider = str(provider or config.get("provider", "openclaw")).strip().lower() or "openclaw"
         self.ensure_provider_runtime(resolved_provider)
 
         target_home = Path("/home") / target_user
@@ -5153,7 +6226,7 @@ class ZeroClawService:
 
     def _require_setup(self) -> None:
         config = self.store.read_config()
-        provider = str(config.get("provider", "picoclaw")).strip().lower() or "picoclaw"
+        provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
         credentials = self._provider_auth(provider)
         if not self._is_provider_configured(provider, credentials):
             raise SetupError("setup is incomplete. Run 'clawie setup'.")
@@ -5197,6 +6270,222 @@ class ZeroClawService:
                 if api_key:
                     provider_auth["api_key"] = api_key
         return provider_auth
+
+    def _effective_provider_auth(self, provider: str, *, allow_defaults: bool) -> dict[str, Any]:
+        spec = get_provider(provider)
+        auth = self._provider_auth(spec.name)
+        if allow_defaults and not str(auth.get("auth_mode", "")).strip():
+            auth["auth_mode"] = spec.default_auth_mode
+        return auth
+
+    def _agent_prefers_shared_provider_auth(self, agent: dict[str, Any]) -> bool:
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        bundles = {str(item).strip() for item in sync.get("bundles", [])}
+        return bool(sync.get("shared_provider_auth", False) or "provider-auth" in bundles)
+
+    def _shared_linked_auth_status(self, provider: str) -> dict[str, Any]:
+        return self._inspect_provider_auth_state(
+            provider=provider,
+            auth_mode="linked",
+            linux_user="",
+            home=self._ensure_shared_provider_auth_root(),
+        )
+
+    def _shared_linked_auth_available(self, provider: str) -> bool:
+        try:
+            payload = self._shared_linked_auth_status(provider)
+        except Exception:
+            return False
+        status = str(payload.get("auth_status", "")).strip().lower()
+        return status in {"ready", "expired"}
+
+    def _shared_linked_auth_ready(self, provider: str) -> bool:
+        try:
+            payload = self._shared_linked_auth_status(provider)
+        except Exception:
+            return False
+        return str(payload.get("auth_status", "")).strip().lower() == "ready"
+
+    @staticmethod
+    def _auth_status_ready(status: dict[str, Any]) -> bool:
+        return str(status.get("auth_status", "")).strip().lower() == "ready"
+
+    @staticmethod
+    def _auth_status_usable(status: dict[str, Any]) -> bool:
+        return str(status.get("auth_status", "")).strip().lower() in {"ready", "expired"}
+
+    def _source_home_has_codex_auth(self, source_home: Path) -> bool:
+        try:
+            load_codex_auth(source_home)
+        except Exception:
+            return False
+        return True
+
+    def _source_home_has_provider_auth(self, provider: str, source_home: Path) -> bool:
+        spec = get_provider(provider)
+        for rel in spec.shared_auth_paths:
+            if self._path_exists(source_home / rel):
+                return True
+        return False
+
+    def _prepare_linked_auth_for_provider_switch(
+        self,
+        *,
+        provider: str,
+        agent: dict[str, Any],
+    ) -> dict[str, Any]:
+        spec = get_provider(provider)
+        result = {
+            "provider": spec.name,
+            "required": False,
+            "prepared": False,
+            "action": "",
+            "source": "",
+            "source_home": "",
+            "auth": {},
+        }
+        if not spec.supports_auth_mode("linked") or not self._agent_prefers_shared_provider_auth(agent):
+            return result
+
+        result["required"] = True
+        status = self.shared_auth_status(spec.name)
+        result["auth"] = status
+        if self._auth_status_ready(status):
+            return result
+
+        source_home = self._default_source_home()
+        result["source_home"] = str(source_home)
+        last_error = ""
+
+        if self._source_home_has_codex_auth(source_home):
+            try:
+                imported = self.import_shared_auth(spec.name, source="codex", source_home=source_home)
+                status = dict(imported.get("auth", {}))
+                result.update(
+                    {
+                        "prepared": True,
+                        "action": "import",
+                        "source": "codex",
+                        "auth": status,
+                    }
+                )
+                if self._auth_status_ready(status):
+                    return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+
+        if not self._auth_status_ready(status) and self._source_home_has_provider_auth(spec.name, source_home):
+            try:
+                imported = self.import_shared_auth(spec.name, source="provider", source_home=source_home)
+                status = dict(imported.get("auth", {}))
+                result.update(
+                    {
+                        "prepared": True,
+                        "action": "import",
+                        "source": "provider",
+                        "auth": status,
+                    }
+                )
+                if self._auth_status_ready(status):
+                    return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+
+        if spec.name != "openclaw" and not self._auth_status_ready(status):
+            try:
+                logged_in = self.shared_auth_login(spec.name)
+                status = dict(logged_in)
+                result.update(
+                    {
+                        "prepared": True,
+                        "action": "login",
+                        "source": "shared",
+                        "auth": status,
+                    }
+                )
+                if self._auth_status_ready(status):
+                    return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+
+        result["auth"] = status
+        auth_status = str(status.get("auth_status", "")).strip().lower() or "missing"
+        if self._source_home_has_codex_auth(source_home):
+            raise SetupError(
+                f"linked auth for {spec.name} is {auth_status} after importing Codex auth from {source_home}. "
+                "Refresh the Codex session first, then retry the provider switch."
+            )
+        if self._source_home_has_provider_auth(spec.name, source_home):
+            raise SetupError(
+                f"linked auth for {spec.name} is {auth_status} after importing provider auth from {source_home}. "
+                f"Refresh that source session first, then retry the provider switch."
+            )
+        if last_error:
+            raise SetupError(
+                f"linked auth for {spec.name} is unavailable and automatic login/import failed: {last_error}"
+            )
+        raise SetupError(
+            f"linked auth for {spec.name} is missing. "
+            f"Sign in to Codex first or run 'clawie auth login {spec.name}', then retry the provider switch."
+        )
+
+    def _preferred_shared_provider_auth(
+        self,
+        provider: str,
+        *,
+        allow_defaults: bool,
+    ) -> dict[str, Any]:
+        spec = get_provider(provider)
+        auth = self._provider_auth(spec.name)
+        explicit_mode = str(auth.get("auth_mode", "")).strip().lower()
+        if explicit_mode:
+            if explicit_mode == "none" and spec.supports_auth_mode("linked") and self._shared_linked_auth_available(spec.name):
+                auth["auth_mode"] = "linked"
+            return auth
+
+        if spec.supports_auth_mode("linked") and self._shared_linked_auth_available(spec.name):
+            auth["auth_mode"] = "linked"
+            return auth
+
+        if allow_defaults:
+            auth["auth_mode"] = spec.default_auth_mode
+        return auth
+
+    def _preferred_agent_provider_auth(
+        self,
+        provider: str,
+        *,
+        agent: dict[str, Any] | None = None,
+        current_auth_mode: str = "",
+        allow_defaults: bool,
+    ) -> dict[str, Any]:
+        spec = get_provider(provider)
+        auth = self._provider_auth(spec.name)
+        explicit_mode = str(auth.get("auth_mode", "")).strip().lower()
+        if explicit_mode:
+            if (
+                explicit_mode == "none"
+                and agent is not None
+                and spec.supports_auth_mode("linked")
+                and self._agent_prefers_shared_provider_auth(agent)
+                and self._shared_linked_auth_available(spec.name)
+            ):
+                auth["auth_mode"] = "linked"
+            return auth
+
+        if agent is not None and spec.supports_auth_mode("linked"):
+            current_mode = str(current_auth_mode).strip().lower()
+            if current_mode == "linked" and self._agent_prefers_shared_provider_auth(agent):
+                if self._shared_linked_auth_available(spec.name):
+                    auth["auth_mode"] = "linked"
+                    return auth
+            if self._agent_prefers_shared_provider_auth(agent) and self._shared_linked_auth_available(spec.name):
+                auth["auth_mode"] = "linked"
+                return auth
+
+        if allow_defaults:
+            auth["auth_mode"] = spec.default_auth_mode
+        return auth
 
     def _is_provider_configured(self, provider: str, auth: dict[str, Any]) -> bool:
         spec = get_provider(provider)
@@ -5483,16 +6772,45 @@ class ZeroClawService:
             if self._write_managed_text(path, content, 0o644):
                 updated.append(str(path))
 
+        # Directories that benefit from the sticky bit (any user can create
+        # their own entries but cannot delete other users' entries).
+        sticky_dirs = {"session-env", "projects", "tasks", "plans", "file-history", "todos"}
+
         shared_paths = [self.SHARED_CLAUDE_DIR]
         for token in self.SHARED_CLAUDE_SUBDIRS:
             shared_paths.append(self.SHARED_CLAUDE_DIR / token)
         for path in shared_paths:
             existed = path.exists()
             path.mkdir(parents=True, exist_ok=True)
-            current_mode = int(path.stat().st_mode) & 0o777
-            if (not existed) or current_mode != 0o777:
-                os.chmod(path, 0o777)
+            target_mode = 0o1777 if path.name in sticky_dirs else 0o777
+            current_mode = int(path.stat().st_mode) & 0o1777
+            if (not existed) or current_mode != target_mode:
+                os.chmod(path, target_mode)
                 updated.append(str(path))
+
+        # Sweep all existing children to fix dirs created by Claude Code at runtime.
+        if self.SHARED_CLAUDE_DIR.is_dir():
+            for child in self.SHARED_CLAUDE_DIR.iterdir():
+                if child.is_dir():
+                    try:
+                        target_mode = 0o1777 if child.name in sticky_dirs else 0o777
+                        current_mode = int(child.stat().st_mode) & 0o1777
+                        if current_mode != target_mode:
+                            os.chmod(child, target_mode)
+                            if str(child) not in updated:
+                                updated.append(str(child))
+                    except OSError:
+                        pass
+            for child in self.SHARED_CLAUDE_DIR.iterdir():
+                if child.is_file() and not child.name.startswith("."):
+                    try:
+                        current_mode = int(child.stat().st_mode) & 0o777
+                        if current_mode != 0o666:
+                            os.chmod(child, 0o666)
+                            if str(child) not in updated:
+                                updated.append(str(child))
+                    except OSError:
+                        pass
 
         for path in self._seed_shared_claude_state(source_home):
             if path not in updated:
@@ -5984,6 +7302,8 @@ class ZeroClawService:
     @staticmethod
     def _provider_uses_generated_user_unit(provider: str) -> bool:
         spec = get_provider(provider)
+        if spec.name == "openclaw":
+            return True
         return not bool(spec.service_group) and bool(spec.background_command)
 
     def _generated_user_service_unit_path(self, provider: str, linux_user: str) -> Path | None:
@@ -6388,6 +7708,7 @@ class ZeroClawService:
         live_entries = list(daemon_map.get(linux_user, []))
         live_providers: list[str] = []
         chosen_entry: dict[str, Any] | None = None
+        reported_running = self._provider_reports_running(provider, linux_user) if provider else False
         for entry in live_entries:
             entry_provider = str(entry.get("provider", "")).strip().lower()
             if not entry_provider:
@@ -6410,6 +7731,17 @@ class ZeroClawService:
             info["service_status"] = "running"
             if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
                 info["service_mode"] = "process"
+        elif reported_running is True:
+            if provider:
+                info["live_provider"] = provider
+                info["live_providers"] = [provider]
+            info["service_status"] = "running"
+            if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
+                info["service_mode"] = "systemd"
+        elif reported_running is None:
+            info["service_status"] = "unknown"
+            if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
+                info["service_mode"] = "systemd"
         else:
             info["service_status"] = "stopped"
             if not str(info.get("service_mode", "")).strip() or str(info.get("service_mode", "")).strip() == "unknown":
@@ -6646,7 +7978,12 @@ class ZeroClawService:
             return ""
         known = set(provider_names())
         for idx, token in enumerate(tokens):
-            candidate = Path(token).name.strip().lower()
+            name = Path(token).name.strip().lower()
+            candidate = name
+            if candidate not in known and "." in candidate:
+                stem = Path(token).stem.strip().lower()
+                if stem in known:
+                    candidate = stem
             if candidate not in known:
                 continue
             expected = [str(item).strip().lower() for item in get_provider(candidate).background_command]
@@ -7531,7 +8868,7 @@ class ZeroClawService:
         if requested_provider:
             providers.append(str(requested_provider).strip().lower())
         config = self.store.read_config()
-        providers.append(str(config.get("provider", "picoclaw")).strip().lower())
+        providers.append(str(config.get("provider", "openclaw")).strip().lower())
 
         channels: list[dict[str, str]] = []
         for provider in providers:

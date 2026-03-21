@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawie"
-version = "0.1.1"
+version = "0.1.2"
 description = "CLI + TUI control plane for ZeroClaw provisioning and channel operations"
 readme = "README.md"
 requires-python = ">=3.10"

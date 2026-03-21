@@ -77,9 +77,13 @@ def load_claude_auth(source_home: Path) -> dict[str, str]:
 
 def merge_provider_auth_profile(existing: dict[str, Any], imported: dict[str, str]) -> dict[str, Any]:
     payload = dict(existing) if isinstance(existing, dict) else {}
+    payload["version"] = int(payload.get("version", 1) or 1)
     active_profiles = payload.get("active_profiles", {})
     if not isinstance(active_profiles, dict):
         active_profiles = {}
+    order = payload.get("order", {})
+    if not isinstance(order, dict):
+        order = {}
     profiles = payload.get("profiles", {})
     if not isinstance(profiles, dict):
         profiles = {}
@@ -93,22 +97,43 @@ def merge_provider_auth_profile(existing: dict[str, Any], imported: dict[str, st
         "profile_name": str(imported.get("profile_name", "default")).strip() or "default",
         "provider": upstream_provider,
         "account_id": str(imported.get("account_id", "")).strip(),
+        "accountId": str(imported.get("account_id", "")).strip(),
         "kind": str(imported.get("kind", "oauth")).strip() or "oauth",
+        "type": "oauth" if str(imported.get("kind", "oauth")).strip().lower() == "oauth" else "token",
         "access_token": str(imported.get("access_token", "")).strip(),
         "refresh_token": str(imported.get("refresh_token", "")).strip(),
         "updated_at": str(imported.get("updated_at", "")).strip(),
     }
+    if profile_payload["access_token"]:
+        profile_payload["access"] = profile_payload["access_token"]
+    if profile_payload["refresh_token"]:
+        profile_payload["refresh"] = profile_payload["refresh_token"]
     id_token = str(imported.get("id_token", "")).strip()
     expires_at = str(imported.get("expires_at", "")).strip()
     if id_token:
         profile_payload["id_token"] = id_token
     if expires_at:
         profile_payload["expires_at"] = expires_at
+        expires_ms = _iso_to_epoch_millis(expires_at)
+        if expires_ms > 0:
+            profile_payload["expires"] = expires_ms
 
     active_profiles[upstream_provider] = profile_id
+    existing_order = order.get(upstream_provider, [])
+    if not isinstance(existing_order, list):
+        existing_order = []
+    order[upstream_provider] = [
+        profile_id,
+        *[
+            str(item).strip()
+            for item in existing_order
+            if str(item).strip() and str(item).strip() != profile_id
+        ],
+    ]
     profiles[profile_id] = profile_payload
     payload["active_profiles"] = active_profiles
     payload["profiles"] = profiles
+    payload["order"] = order
     payload["updated_at"] = profile_payload["updated_at"]
     return payload
 
@@ -174,6 +199,19 @@ def _jwt_expiry(token: str) -> str:
     except (TypeError, ValueError, OSError):
         return ""
     return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _iso_to_epoch_millis(value: str) -> int:
+    token = str(value or "").strip()
+    if not token:
+        return 0
+    try:
+        stamp = datetime.fromisoformat(token.replace("Z", "+00:00"))
+    except ValueError:
+        return 0
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return int(stamp.timestamp() * 1000)
 
 
 def _mtime_iso(path: Path) -> str:

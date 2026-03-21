@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "api_url": "https://api.picoclaw.example/v1",
+    "api_url": "https://api.openclaw.example/v1",
     "api_key": "",
-    "provider": "picoclaw",
-    "auth_mode": "linked",
+    "provider": "openclaw",
+    "auth_mode": "none",
     "schema_version": 1,
     "provider_credentials": {},
     "local_service_state": {},
@@ -31,7 +31,7 @@ DEFAULT_STATE: dict[str, Any] = {
         "baseline": {
             "channels": [],
             "agent_defaults": {
-                "runtime": "picoclaw-agent",
+                "runtime": "openclaw-agent",
                 "autostart": True,
                 "heartbeat_seconds": 30,
             },

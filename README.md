@@ -192,14 +192,38 @@ clawie backup import backup.json
 
 ## Provider Switching
 
+- Single-line managed cutover:
+
+```bash
+sudo clawie agent provider set AGENT_ID openclaw
+sudo clawie agent provider set AGENT_ID picoclaw
+sudo clawie agent provider set AGENT_ID zeroclaw
+```
+
 - `agent provider set` is a real cutover for managed agents with a Linux user:
   it validates the target provider, writes provider-specific prompt files,
   installs the target runtime when needed, bootstraps provider-native config,
   migrates live channel settings into the target home before start, stops the
   old provider service, starts the new one, and replays enabled non-CLI channels.
+- The same single command also handles the failure cases that previously needed
+  manual cleanup:
+  - auto-import shared linked auth from the invoking user's Codex/provider
+    session when possible
+  - repair stale shared auth store formats and relink native provider auth files
+  - repair ownership and symlinks under the target agent home
+  - migrate Telegram bot config and heal legacy reachability defaults
+  - restart the target provider if it is already running so repaired config/auth
+    is actually applied to the live process
+  - stop lingering runtimes from other providers before declaring success
+  - verify the target provider is both live and post-start ready before success
 - If state already says the target provider, the same command still reconciles
-  runtime drift by starting the target provider and stopping other installed
-  provider services for that agent user.
+  runtime drift by restarting the target provider when it is already live, or
+  starting it when it is not, and then stopping other installed provider
+  services for that agent user.
+- Provider-specific post-start checks are built in:
+  - `openclaw`: `openclaw models status`
+  - `picoclaw`: `picoclaw auth status`
+  - `zeroclaw`: `zeroclaw auth status`
 - `runtime create` and runtime `start|restart` actions also ensure the selected
   provider runtime is installed before trying to attach it to an agent or user.
 - Managed-agent cutovers require `sudo/root` when the agent Linux user differs
@@ -207,6 +231,11 @@ clawie backup import backup.json
 - Linked auth remains on disk in the agent home. Use `clawie agent auth show`
   to inspect it and `sudo clawie agent auth login AGENT_ID` if the new provider
   needs a fresh login.
+- Fail-fast cases are explicit. `agent provider set` will stop before a partial
+  success if the target runtime cannot be installed, the available linked auth
+  is stale/missing and cannot be auto-imported, the migrated Telegram token is
+  unresolved/invalid, or the target provider fails its post-start readiness
+  probe.
 
 ## Shared Auth
 

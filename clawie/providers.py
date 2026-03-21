@@ -23,6 +23,7 @@ class ProviderSpec:
     auth_login_command: tuple[str, ...] = ("auth", "login")
     auth_refresh_command: tuple[str, ...] = ("auth", "refresh")
     auth_status_command: tuple[str, ...] = ("auth", "status")
+    readiness_command: tuple[str, ...] = ()
 
     def supports_auth_mode(self, mode: str) -> bool:
         return mode in self.auth_modes
@@ -62,6 +63,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         install_package="zeroclaw",
         service_group="service",
         background_command=("daemon",),
+        readiness_command=("auth", "status"),
     ),
     "picoclaw": ProviderSpec(
         name="picoclaw",
@@ -100,6 +102,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_login_command=("auth", "login", "--provider", "openai"),
         auth_refresh_command=("auth", "status"),
         auth_status_command=("auth", "status"),
+        readiness_command=("auth", "status"),
     ),
     "openclaw": ProviderSpec(
         name="openclaw",
@@ -138,6 +141,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         install_package="openclaw",
         service_group="daemon",
         background_command=("gateway", "run"),
+        readiness_command=("models", "status"),
     ),
 }
 

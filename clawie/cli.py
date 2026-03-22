@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{config,agent,channel,runtime,auth,addon,dashboard,health,event,backup}",
+        metavar="{config,agent,channel,runtime,auth,addon,delegation,dashboard,health,event,backup}",
     )
 
     _build_config_parser(subparsers)
@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_runtime_parser(subparsers)
     _build_auth_parser(subparsers)
     _build_addon_parser(subparsers)
+    _build_delegation_parser(subparsers)
 
     dashboard = subparsers.add_parser(
         "dashboard",
@@ -330,6 +331,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         choices=provider_names(),
         help="Override provider for this agent",
     )
+    create.add_argument(
+        "--no-delegation",
+        action="store_true",
+        help="Disable the delegation skill for this agent",
+    )
     create.set_defaults(func=cmd_agents_create)
 
     clone = agent_sub.add_parser("clone", help="Clone an existing agent into a new one")
@@ -368,6 +374,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "--provider",
         choices=provider_names(),
         help="Override provider for this cloned agent",
+    )
+    clone.add_argument(
+        "--no-delegation",
+        action="store_true",
+        help="Disable the delegation skill for this cloned agent",
     )
     clone.set_defaults(func=cmd_agents_clone)
 
@@ -851,6 +862,11 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         action="store_true",
         help="Do not include default credential bundles when syncing on create",
     )
+    create.add_argument(
+        "--no-delegation",
+        action="store_true",
+        help="Disable the delegation skill for the spawned agent",
+    )
     create.set_defaults(func=cmd_spawn)
 
     detect = runtime_sub.add_parser(
@@ -914,6 +930,63 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
             help_text="Installed local provider name",
         )
         action_parser.set_defaults(func=cmd_runtime_service)
+
+
+def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    delegation = subparsers.add_parser("delegation", help="Recursive agent delegation")
+    delegation_sub = delegation.add_subparsers(
+        dest="delegation_command",
+        required=True,
+        metavar="{submit,repl,tree,tasks,spawn-session,stop-session,session-agents,cleanup,status}",
+    )
+
+    deleg_submit = delegation_sub.add_parser("submit", help="Delegate a task")
+    deleg_submit.add_argument("--parent", required=True, help="Parent agent ID")
+    deleg_submit.add_argument("--child", required=True, help="Child agent ID")
+    deleg_submit.add_argument("--payload", default="{}", help="JSON payload")
+    deleg_submit.add_argument("--timeout", type=float, default=300.0, help="Timeout seconds")
+    deleg_submit.set_defaults(func=cmd_delegation_submit)
+
+    deleg_repl = delegation_sub.add_parser("repl", help="Start agent REPL (blocks)")
+    deleg_repl.add_argument("--agent-id", required=True, help="Agent ID")
+    deleg_repl.set_defaults(func=cmd_delegation_repl)
+
+    deleg_tree = delegation_sub.add_parser("tree", help="Print delegation tree")
+    deleg_tree.add_argument("--agent-id", required=True, help="Root agent ID")
+    deleg_tree.set_defaults(func=cmd_delegation_tree)
+
+    deleg_tasks = delegation_sub.add_parser("tasks", help="List delegation tasks")
+    deleg_tasks.add_argument("--agent-id", help="Filter by parent agent ID")
+    deleg_tasks.add_argument("--status", help="Filter by status")
+    deleg_tasks.add_argument("--limit", type=int, default=20)
+    deleg_tasks.set_defaults(func=cmd_delegation_tasks)
+
+    deleg_spawn = delegation_sub.add_parser(
+        "spawn-session", help="Spawn a lightweight session sub-agent (no root needed)"
+    )
+    deleg_spawn.add_argument("--parent", required=True, help="Parent agent ID")
+    deleg_spawn.add_argument("--child", required=True, help="Child agent ID to spawn")
+    deleg_spawn.add_argument("--timeout", type=float, default=300.0, help="Handler timeout")
+    deleg_spawn.set_defaults(func=cmd_delegation_spawn_session)
+
+    deleg_stop = delegation_sub.add_parser(
+        "stop-session", help="Stop a session sub-agent"
+    )
+    deleg_stop.add_argument("--parent", required=True, help="Parent agent ID")
+    deleg_stop.add_argument("--child", required=True, help="Child agent ID to stop")
+    deleg_stop.set_defaults(func=cmd_delegation_stop_session)
+
+    deleg_session_list = delegation_sub.add_parser(
+        "session-agents", help="List session sub-agents"
+    )
+    deleg_session_list.add_argument("--parent", required=True, help="Parent agent ID")
+    deleg_session_list.set_defaults(func=cmd_delegation_session_agents)
+
+    deleg_cleanup = delegation_sub.add_parser("cleanup", help="Remove stale sockets")
+    deleg_cleanup.set_defaults(func=cmd_delegation_cleanup)
+
+    deleg_status = delegation_sub.add_parser("status", help="Show active REPL agents")
+    deleg_status.set_defaults(func=cmd_delegation_status)
 
 
 def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1260,6 +1333,9 @@ def cmd_addon_auth_import(args: argparse.Namespace, service: ZeroClawService) ->
 def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
+    plugin_overrides = {}
+    if getattr(args, "no_delegation", False):
+        plugin_overrides["delegation"] = False
     agent = service.create_agent(
         agent_id=agent_id,
         display_name=args.display_name,
@@ -1269,6 +1345,7 @@ def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int
         channels=channels,
         agent_version=args.agent_version,
         provider=args.provider,
+        plugin_overrides=plugin_overrides or None,
     )
     print_success(f"Provisioned agent {agent['agent_id']}")
     _print_agent(agent)
@@ -1279,6 +1356,9 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
+    plugin_overrides = {}
+    if getattr(args, "no_delegation", False):
+        plugin_overrides["delegation"] = False
     agent = service.create_agent(
         agent_id=agent_id,
         display_name=args.display_name,
@@ -1288,6 +1368,7 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
         channels=channels,
         agent_version=args.agent_version,
         provider=args.provider,
+        plugin_overrides=plugin_overrides or None,
     )
     print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
     _print_agent(agent)
@@ -1728,6 +1809,9 @@ def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> 
 
 def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
+    plugin_overrides = {}
+    if getattr(args, "no_delegation", False):
+        plugin_overrides["delegation"] = False
     result = service.spawn_linux_user(
         agent_id=agent_id,
         linux_user=args.linux_user,
@@ -1742,6 +1826,7 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
         clone_from_agent=args.clone_from_agent,
         credential_bundles=list(args.credential_bundle or []),
         include_default_credentials=not bool(args.no_default_credentials),
+        plugin_overrides=plugin_overrides or None,
     )
     print_success(
         f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
@@ -2216,6 +2301,132 @@ def _prompt_yes_no(label: str, *, default: bool) -> bool:
     if not value:
         return default
     return value in {"y", "yes"}
+
+
+# ── Delegation handlers ─────────────────────────────────────────────────────
+
+
+def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) -> int:
+    import json as _json
+
+    payload = _json.loads(args.payload)
+    result = service.delegate_task(
+        parent_id=args.parent,
+        child_id=args.child,
+        payload=payload,
+        timeout=args.timeout,
+    )
+    print_panel(
+        "Delegation Result",
+        [
+            f"task_id: {result.get('task_id', '')}",
+            f"status: {result.get('status', '')}",
+            f"result: {_json.dumps(result.get('result', {}), indent=2)[:200]}",
+        ],
+    )
+    return 0
+
+
+def cmd_delegation_repl(args: argparse.Namespace, service: ZeroClawService) -> int:
+    service.start_agent_repl(args.agent_id)
+    return 0
+
+
+def cmd_delegation_tree(args: argparse.Namespace, service: ZeroClawService) -> int:
+    lines = service.delegation_tree_lines(args.agent_id)
+    if not lines:
+        print_info("No delegation tree found.")
+        return 0
+    print_panel("Delegation Tree", lines)
+    return 0
+
+
+def cmd_delegation_tasks(args: argparse.Namespace, service: ZeroClawService) -> int:
+    tasks = service.delegation_tasks(
+        agent_id=getattr(args, "agent_id", None),
+        status=getattr(args, "status", None),
+        limit=args.limit,
+    )
+    if not tasks:
+        print_info("No delegation tasks found.")
+        return 0
+    for t in tasks:
+        print(
+            f"  {t['task_id'][:12]}  {t['parent_agent_id']:12} -> {t['child_agent_id']:15}"
+            f"  status={t['status']:10} depth={t['depth']}"
+        )
+    return 0
+
+
+def cmd_delegation_spawn_session(args: argparse.Namespace, service: ZeroClawService) -> int:
+    info = service.spawn_session_agent(
+        parent_id=args.parent,
+        child_id=args.child,
+        timeout=getattr(args, "timeout", 300.0),
+    )
+    print_success(f"Session agent {info['agent_id']} spawned under {args.parent}")
+    print_panel(
+        "Session Agent",
+        [
+            f"agent_id: {info.get('agent_id', '')}",
+            f"parent: {info.get('parent_id', '')}",
+            f"status: {info.get('status', '')}",
+            f"depth: {info.get('depth', '')}",
+        ],
+    )
+    return 0
+
+
+def cmd_delegation_stop_session(args: argparse.Namespace, service: ZeroClawService) -> int:
+    service.stop_session_agent(parent_id=args.parent, child_id=args.child)
+    print_success(f"Stopped session agent {args.child}")
+    return 0
+
+
+def cmd_delegation_session_agents(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agents = service.list_session_agents(parent_id=args.parent)
+    if not agents:
+        print_info("No session agents found.")
+        return 0
+    for a in agents:
+        print(
+            f"  {a['agent_id']:20} status={a['status']:10} "
+            f"running={a['running']}  depth={a['depth']}"
+        )
+    tree_lines = service.session_tree_lines(args.parent)
+    if tree_lines:
+        print()
+        print_panel("Session Tree", tree_lines)
+    return 0
+
+
+def cmd_delegation_cleanup(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.cleanup_delegation()
+    removed = result.get("removed_sockets", [])
+    active = result.get("active_agents", [])
+    if removed:
+        print_info(f"Removed {len(removed)} stale socket(s).")
+    if active:
+        for a in active:
+            print(f"  {a['agent_id']:20} alive={a['alive']}  age={a['age_seconds']}s")
+    else:
+        print_info("No active REPL agents.")
+    return 0
+
+
+def cmd_delegation_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+    from clawie.delegation import list_active_agents
+
+    active = list_active_agents()
+    if not active:
+        print_info("No active REPL agents.")
+        return 0
+    for a in active:
+        print(
+            f"  {a['agent_id']:20} alive={a['alive']}  "
+            f"age={a['age_seconds']}s  {a['socket']}"
+        )
+    return 0
 
 
 if __name__ == "__main__":

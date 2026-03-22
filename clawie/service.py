@@ -160,6 +160,7 @@ class ZeroClawService:
         "gateway": True,
         "memory": True,
         "web_search": True,
+        "delegation": True,
     }
     CREDENTIAL_BUNDLE_SPECS: tuple[dict[str, Any], ...] = (
         {
@@ -1571,6 +1572,7 @@ class ZeroClawService:
         agent_version: str,
         provider: str | None = None,
         core_prompts: dict[str, str] | None = None,
+        plugin_overrides: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
         self._require_setup()
 
@@ -1652,6 +1654,9 @@ class ZeroClawService:
         if not isinstance(raw_plugins, dict):
             raw_plugins = self._default_plugins_for_provider(provider_spec.name)
         plugins = self._normalize_plugins(raw_plugins)
+        if plugin_overrides:
+            for key, value in plugin_overrides.items():
+                plugins[str(key).strip().lower()] = bool(value)
         runtime = provider_spec.runtime
         if clone_from:
             runtime = str(source_agent_defaults.get("runtime", provider_spec.runtime)).strip() or provider_spec.runtime
@@ -6000,6 +6005,7 @@ class ZeroClawService:
         clone_from_agent: str | None = None,
         credential_bundles: list[str] | None = None,
         include_default_credentials: bool = True,
+        plugin_overrides: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
         self._require_setup()
         agent_id = agent_id.strip()
@@ -6099,6 +6105,7 @@ class ZeroClawService:
             agent_version=agent_version,
             provider=resolved_provider,
             core_prompts=cloned_prompts,
+            plugin_overrides=plugin_overrides,
         )
         agent_state["agent"]["linux_user"] = target_user
         agent_state["agent"]["ssh_login_disabled"] = bool(ssh_login_disabled)
@@ -8858,6 +8865,24 @@ class ZeroClawService:
             default_when_missing=True,
         )
         agent_state["addons"] = self._normalize_agent_addons(agent_state.get("addons"))
+        self._seed_delegation_skill(agent_state["core_prompts"], agent["plugins"])
+
+    @staticmethod
+    def _seed_delegation_skill(
+        core_prompts: dict[str, str],
+        plugins: dict[str, bool],
+    ) -> None:
+        if not plugins.get("delegation", False):
+            core_prompts.pop("DELEGATION.md", None)
+            return
+        if core_prompts.get("DELEGATION.md"):
+            return
+        try:
+            from clawie.delegation import DELEGATION_SKILL_CONTENT
+
+            core_prompts["DELEGATION.md"] = DELEGATION_SKILL_CONTENT
+        except ImportError:
+            pass
 
     def _discover_channels_from_source_home(
         self,
@@ -8879,3 +8904,172 @@ class ZeroClawService:
             adapter = get_channel_adapter(provider)
             channels.extend(adapter.discover_channels(source_home / state_dir))
         return dedupe_channels(channels)
+
+    # ── Delegation methods ────────────────────────────────────────────────
+
+    def delegate_task(
+        self,
+        parent_id: str,
+        child_id: str,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        from clawie.delegation import DelegationCoordinator, DelegationBus, DelegationTree
+
+        task_id = str(__import__("uuid").uuid4().hex)
+        self.store.write_delegation_task(
+            task_id=task_id,
+            parent_agent_id=parent_id,
+            child_agent_id=child_id,
+            payload=payload or {},
+            depth=0,
+            timeout_seconds=timeout,
+        )
+        bus = DelegationBus(parent_id)
+        tree = DelegationTree()
+        coordinator = DelegationCoordinator(parent_id, bus, tree)
+        try:
+            result = coordinator.delegate(child_id, payload or {}, timeout=timeout)
+        except Exception as exc:
+            self.store.write_delegation_task(
+                task_id=task_id,
+                parent_agent_id=parent_id,
+                child_agent_id=child_id,
+                payload=payload or {},
+                depth=0,
+                timeout_seconds=timeout,
+                status="failed",
+                error=str(exc),
+            )
+            state = self.store.read_state()
+            self._event(
+                state,
+                "delegation.failed",
+                f"Delegation {parent_id}->{child_id} failed: {exc}",
+                {"task_id": task_id, "parent": parent_id, "child": child_id},
+            )
+            self.store.write_state(state)
+            return {"task_id": task_id, "status": "failed", "error": str(exc)}
+        self.store.write_delegation_task(
+            task_id=task_id,
+            parent_agent_id=parent_id,
+            child_agent_id=child_id,
+            payload=payload or {},
+            depth=0,
+            timeout_seconds=timeout,
+            status="completed",
+            result=result,
+        )
+        tree_data = tree.to_dict()
+        self.store.write_delegation_tree(parent_id, tree_data)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "delegation.completed",
+            f"Delegation {parent_id}->{child_id} completed",
+            {"task_id": task_id, "parent": parent_id, "child": child_id},
+        )
+        self.store.write_state(state)
+        return {"task_id": task_id, "status": "completed", "result": result}
+
+    def start_agent_repl(self, agent_id: str, handler: Any = None) -> None:
+        from clawie.delegation import AgentREPL
+
+        def _default_handler(msg: Any, repl: Any) -> dict[str, Any]:
+            return {"echo": msg.payload, "agent": agent_id}
+
+        repl = AgentREPL(agent_id, handler=handler or _default_handler)
+        import signal
+
+        def _shutdown(*_a: Any) -> None:
+            repl.stop()
+
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+        repl.start()
+
+    def delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
+        return self.store.read_delegation_tree(root_agent_id) or {}
+
+    def delegation_tree_lines(self, root_agent_id: str) -> list[str]:
+        from clawie.delegation import render_tree_ascii
+
+        tree_data = self.store.read_delegation_tree(root_agent_id) or {}
+        if not tree_data:
+            return []
+        return render_tree_ascii(tree_data, root_agent_id)
+
+    def delegation_tasks(
+        self,
+        agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        return self.store.read_delegation_tasks(
+            parent_agent_id=agent_id,
+            status=status,
+            limit=limit,
+        )
+
+    def cleanup_delegation(self) -> dict[str, Any]:
+        from clawie.delegation import cleanup_stale_sockets, list_active_agents
+
+        removed = cleanup_stale_sockets()
+        active = list_active_agents()
+        return {"removed_sockets": removed, "active_agents": active}
+
+    # ── Session agent methods ─────────────────────────────────────────────
+
+    _session_managers: dict[str, Any] = {}
+
+    def _get_session_manager(self, parent_id: str) -> Any:
+        if parent_id not in self._session_managers:
+            from clawie.delegation import SessionAgentManager
+
+            self._session_managers[parent_id] = SessionAgentManager(parent_id)
+        return self._session_managers[parent_id]
+
+    def spawn_session_agent(
+        self,
+        parent_id: str,
+        child_id: str,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        mgr = self._get_session_manager(parent_id)
+        mgr.spawn(child_id, timeout=timeout)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "session.agent.spawned",
+            f"Session agent {child_id} spawned under {parent_id}",
+            {"parent": parent_id, "child": child_id},
+        )
+        self.store.write_state(state)
+        return {"agent_id": child_id, "parent_id": parent_id, "status": "running", "depth": 1}
+
+    def stop_session_agent(self, parent_id: str, child_id: str) -> None:
+        mgr = self._get_session_manager(parent_id)
+        mgr.stop_agent(child_id)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "session.agent.stopped",
+            f"Session agent {child_id} stopped under {parent_id}",
+            {"parent": parent_id, "child": child_id},
+        )
+        self.store.write_state(state)
+
+    def stop_all_session_agents(self, parent_id: str) -> None:
+        if parent_id in self._session_managers:
+            self._session_managers[parent_id].stop_all()
+            del self._session_managers[parent_id]
+
+    def list_session_agents(self, parent_id: str) -> list[dict[str, Any]]:
+        if parent_id not in self._session_managers:
+            return []
+        return self._session_managers[parent_id].list_agents()
+
+    def session_tree_lines(self, parent_id: str) -> list[str]:
+        if parent_id not in self._session_managers:
+            return []
+        return self._session_managers[parent_id].tree_lines()

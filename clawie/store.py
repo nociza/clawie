@@ -90,6 +90,24 @@ class StateStore:
                     rss_kb INTEGER NOT NULL,
                     status TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS delegation_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    parent_agent_id TEXT NOT NULL,
+                    child_agent_id TEXT NOT NULL,
+                    depth INTEGER DEFAULT 0,
+                    status TEXT DEFAULT 'pending',
+                    payload TEXT DEFAULT '{}',
+                    result TEXT DEFAULT '{}',
+                    error TEXT DEFAULT '',
+                    created_at TEXT,
+                    completed_at TEXT,
+                    timeout_seconds REAL DEFAULT 300.0
+                );
+                CREATE TABLE IF NOT EXISTS delegation_trees (
+                    root_agent_id TEXT PRIMARY KEY,
+                    tree_data TEXT DEFAULT '{}',
+                    updated_at TEXT
+                );
                 """
             )
             conn.commit()
@@ -239,6 +257,124 @@ class StateStore:
                 }
             )
         return grouped
+
+    # ------------------------------------------------------------------
+    # Delegation task CRUD
+    # ------------------------------------------------------------------
+
+    def write_delegation_task(
+        self,
+        task_id: str,
+        parent_agent_id: str,
+        child_agent_id: str,
+        depth: int = 0,
+        status: str = "pending",
+        payload: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+        created_at: str = "",
+        completed_at: str = "",
+        timeout_seconds: float = 300.0,
+    ) -> None:
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO delegation_tasks
+                (task_id, parent_agent_id, child_agent_id, depth, status,
+                 payload, result, error, created_at, completed_at, timeout_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    parent_agent_id,
+                    child_agent_id,
+                    depth,
+                    status,
+                    json.dumps(payload or {}, sort_keys=True),
+                    json.dumps(result or {}, sort_keys=True),
+                    error,
+                    created_at,
+                    completed_at,
+                    timeout_seconds,
+                ),
+            )
+            conn.commit()
+
+    def read_delegation_tasks(
+        self,
+        parent_agent_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        self.ensure()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_agent_id:
+            clauses.append("parent_agent_id = ?")
+            params.append(parent_agent_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM delegation_tasks{where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            results.append({
+                "task_id": str(row["task_id"]),
+                "parent_agent_id": str(row["parent_agent_id"]),
+                "child_agent_id": str(row["child_agent_id"]),
+                "depth": int(row["depth"]),
+                "status": str(row["status"]),
+                "payload": self._decode_json_obj(str(row["payload"])),
+                "result": self._decode_json_obj(str(row["result"])),
+                "error": str(row["error"]),
+                "created_at": str(row["created_at"]),
+                "completed_at": str(row["completed_at"]),
+                "timeout_seconds": float(row["timeout_seconds"]),
+            })
+        return results
+
+    def write_delegation_tree(
+        self, root_agent_id: str, tree_data: dict[str, Any]
+    ) -> None:
+        self.ensure()
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO delegation_trees
+                (root_agent_id, tree_data, updated_at) VALUES (?, ?, ?)
+                """,
+                (root_agent_id, json.dumps(tree_data, sort_keys=True), now),
+            )
+            conn.commit()
+
+    def read_delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
+        self.ensure()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tree_data FROM delegation_trees WHERE root_agent_id = ?",
+                (root_agent_id,),
+            ).fetchone()
+        if row:
+            return self._decode_json_obj(str(row["tree_data"]))
+        return {}
+
+    def delete_delegation_tree(self, root_agent_id: str) -> None:
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM delegation_trees WHERE root_agent_id = ?",
+                (root_agent_id,),
+            )
+            conn.commit()
 
     @staticmethod
     def _read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:

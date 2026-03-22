@@ -219,16 +219,16 @@ def _handle_overview_key(key: int, state: DashboardState, snapshot: dict[str, An
     if key in (ord("v"), ord("V")):
         state.notice = ""
         state.notice_error = False
-        if state.overview_mode == "agents":
-            state.overview_mode = "channels"
-            state.overview_focus_idx = 0
-        else:
-            state.overview_mode = "agents"
-            state.overview_focus_idx = 0
+        _cycle = {"agents": "channels", "channels": "delegation", "delegation": "agents"}
+        state.overview_mode = _cycle.get(state.overview_mode, "agents")
+        state.overview_focus_idx = 0
         return False
 
     if state.overview_mode == "channels":
         return _handle_channels_overview_key(key, state, snapshot, service)
+
+    if state.overview_mode == "delegation":
+        return False
 
     rows = snapshot.get("rows", [])
     if key in (curses.KEY_DOWN, ord("j")):
@@ -617,11 +617,15 @@ def _draw(stdscr: Any, snapshot: dict[str, Any], state: DashboardState, service:
                 f"j/k navigate {ICON_DOT} Enter open {ICON_DOT} d purge {ICON_DOT} "
                 f"v channels {ICON_DOT} Esc/q quit"
             )
+        elif state.overview_mode == "delegation":
+            footer = (
+                f"q quit {ICON_DOT} v agents {ICON_DOT} r refresh"
+            )
         else:
             footer = (
                 f"j/k navigate {ICON_DOT} Tab/\u2190\u2192 pane {ICON_DOT} "
                 f"a assign {ICON_DOT} u unassign {ICON_DOT} c connect {ICON_DOT} "
-                f"Esc back {ICON_DOT} v agents {ICON_DOT} q quit"
+                f"Esc back {ICON_DOT} v delegation {ICON_DOT} q quit"
             )
     else:
         _draw_detail(stdscr, service, state, height, width)
@@ -712,6 +716,9 @@ def _draw_overview(
 ) -> None:
     if state.overview_mode == "channels":
         _draw_overview_channels(stdscr, snapshot, state, service, height, width)
+        return
+    if state.overview_mode == "delegation":
+        _draw_overview_delegation(stdscr, snapshot, state, service, height, width)
         return
     _draw_overview_agents(stdscr, snapshot, state, height, width)
 
@@ -831,6 +838,78 @@ def _draw_overview_agents(
             etype = str(event.get("type", ""))
             _add(stdscr, ev_line, right_x, _fit(f"{ts} {etype}", right_w), _color(C_DEFAULT, dim=True))
             ev_line += 1
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Overview – Delegation
+# ═════════════════════════════════════════════════════════════════════
+
+
+def _draw_overview_delegation(
+    stdscr: Any,
+    snapshot: dict[str, Any],
+    state: DashboardState,
+    service: Any,
+    height: int,
+    width: int,
+) -> None:
+    start_y = 5
+    mid = width // 2
+
+    # Left panel: delegation trees
+    try:
+        from clawie.delegation import list_active_agents
+
+        active = list_active_agents()
+    except ImportError:
+        active = []
+
+    tree_lines: list[str] = []
+    rows = snapshot.get("rows", [])
+    seen_roots: set[str] = set()
+    for row in rows:
+        agent_id = str(row.get("agent_id", ""))
+        if agent_id and agent_id not in seen_roots:
+            seen_roots.add(agent_id)
+            try:
+                lines = service.delegation_tree_lines(agent_id)
+                if lines:
+                    tree_lines.extend(lines)
+                    tree_lines.append("")
+            except Exception:
+                pass
+
+    _safe_addstr(stdscr, start_y, 1, "Delegation Trees", curses.A_BOLD)
+    if tree_lines:
+        for i, line in enumerate(tree_lines[: height - start_y - 4]):
+            _safe_addstr(stdscr, start_y + 1 + i, 2, line[: mid - 3])
+    else:
+        _safe_addstr(stdscr, start_y + 1, 2, "(no delegation trees)")
+
+    # Right panel: active sockets + recent tasks
+    _safe_addstr(stdscr, start_y, mid + 1, "Active Sockets", curses.A_BOLD)
+    if active:
+        for i, a in enumerate(active[: (height - start_y - 4) // 2]):
+            text = f"{a['agent_id']:16} alive={a['alive']}  age={a['age_seconds']}s"
+            _safe_addstr(stdscr, start_y + 1 + i, mid + 2, text[: width - mid - 3])
+    else:
+        _safe_addstr(stdscr, start_y + 1, mid + 2, "(none)")
+
+    task_y = start_y + max(len(active), 1) + 2
+    _safe_addstr(stdscr, task_y, mid + 1, "Recent Tasks", curses.A_BOLD)
+    try:
+        tasks = service.delegation_tasks(limit=10)
+    except Exception:
+        tasks = []
+    if tasks:
+        for i, t in enumerate(tasks[: height - task_y - 3]):
+            text = (
+                f"{t['task_id'][:8]} {t['parent_agent_id']:10}->"
+                f"{t['child_agent_id']:10} {t['status']}"
+            )
+            _safe_addstr(stdscr, task_y + 1 + i, mid + 2, text[: width - mid - 3])
+    else:
+        _safe_addstr(stdscr, task_y + 1, mid + 2, "(no tasks)")
 
 
 # ═════════════════════════════════════════════════════════════════════

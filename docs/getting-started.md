@@ -1,5 +1,13 @@
 # Getting Started
 
+## Prerequisites
+
+- **Linux** (Debian/Ubuntu recommended) — clawie uses Linux users, systemd, and Unix domain sockets. Not compatible with macOS or Windows.
+- **Python 3.10+**
+- **Root/sudo** for runtime isolation (optional — agent creation and the dashboard work without it)
+
+See [Requirements & Limitations](requirements.md) for full details.
+
 ## Install
 
 ```bash
@@ -10,7 +18,7 @@ uv tool install clawie
 uv tool install -e .
 ```
 
-Requires Python 3.10+. No external dependencies.
+No external Python dependencies — stdlib only.
 
 ## Configure
 

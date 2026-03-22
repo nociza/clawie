@@ -24,11 +24,16 @@ clawie agent create alice --template baseline
 clawie dashboard
 ```
 
+## Requirements
+
+Linux with Python 3.10+. No external Python dependencies. Root/sudo needed for runtime isolation. See [Requirements & Limitations](requirements.md) for full details.
+
 ## Documentation
 
 | Guide | Description |
 |-------|-------------|
 | [Getting Started](getting-started.md) | Install, configure, create your first agent |
+| [Requirements & Limitations](requirements.md) | System requirements, root needs, constraints |
 | [Agent Management](agents.md) | Create, clone, configure, delete agents |
 | [Delegation & Orchestration](delegation.md) | Task delegation, model tiers, context budgets |
 | [Providers & Auth](providers.md) | Provider setup, auth modes, shared credentials |

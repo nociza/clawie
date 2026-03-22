@@ -85,3 +85,15 @@ clawie runtime service restart zeroclaw
 ## sudo behavior
 
 When run with `sudo`, clawie uses the invoking user's state directory (`~/.clawie`) instead of `/root/.clawie`, so you don't end up with split state.
+
+## Security model
+
+Runtime isolation is **user-level, not container-level**. Each agent gets a separate Linux user and home directory, and file permissions prevent cross-agent access.
+
+What is **not** isolated:
+- Agents share the same kernel, network stack, and hardware
+- `/tmp/clawie-delegation/` is world-accessible for IPC sockets
+- Any root process can access all agent files
+- No network namespace, cgroup, seccomp, or container boundary
+
+This provides defense-in-depth at the OS user level, not a security sandbox. If you need stronger isolation, run clawie inside a VM or container.

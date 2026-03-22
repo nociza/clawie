@@ -18,6 +18,15 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Terminal dashboard** — Real-time TUI showing agent status, delegation trees, channels, and health across your entire fleet.
 
+## Requirements
+
+- **Linux** (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, and `/tmp` — no macOS or Windows support.
+- **Python 3.10+**
+- **No external Python dependencies** — stdlib only.
+- **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and the dashboard work without root.
+- **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
+- **Terminal**: UTF-8 with color support for the dashboard.
+
 ## Install
 
 ```bash
@@ -90,11 +99,23 @@ Launch with `clawie dashboard`. Press `v` to cycle views:
 
 Navigate with arrow keys, `Enter` to drill into an agent, `Tab` to switch sections, `q` to quit.
 
+## Limitations
+
+- **Linux only** — no macOS or Windows. Relies on Linux users, systemd, and Unix sockets.
+- **Single machine** — all agent communication is over localhost Unix sockets. No network/multi-host delegation.
+- **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
+- **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout.
+- **SQLite storage** — single-writer, not designed for concurrent multi-process access to the same state directory.
+- **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
+
+See [docs/requirements.md](docs/requirements.md) for full details.
+
 ## Documentation
 
 Full documentation is in [`docs/`](docs/), deployable to GitHub Pages:
 
 - [Getting Started](docs/getting-started.md)
+- [Requirements & Limitations](docs/requirements.md)
 - [Agent Management](docs/agents.md)
 - [Delegation & Orchestration](docs/delegation.md)
 - [Providers & Auth](docs/providers.md)

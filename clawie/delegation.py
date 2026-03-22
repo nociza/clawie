@@ -28,7 +28,8 @@ DELEGATION_SKILL_CONTENT = r"""# Delegation Skill
 
 You have access to a **recursive task delegation system** that lets you hand
 off work to other agents and receive results, to any depth.  This document
-explains the concepts, the CLI commands, and the REPL loop you can use.
+explains the concepts, model tiers, context management, the CLI commands,
+and the REPL loop you can use.
 
 ---
 
@@ -41,6 +42,8 @@ explains the concepts, the CLI commands, and the REPL loop you can use.
 | **REPL** | A long-running loop on a Unix domain socket that listens for incoming tasks. An agent must be running a REPL to accept delegations. |
 | **Delegation tree** | The hierarchy of parent → child relationships. Tracked to prevent infinite recursion (max depth 10) and cycles. |
 | **Payload** | A JSON object describing what the child should do. |
+| **Model tier** | The capability level assigned to an agent: fast, balanced, or power. Determines context budget and intended task complexity. |
+| **Context budget** | The token budget allocated to an agent based on its tier. Tracks usage and triggers compaction warnings. |
 | **Result** | A JSON object the child returns when the task is complete. |
 
 ### How It Works
@@ -64,18 +67,99 @@ with a 4-byte length-prefixed JSON wire protocol.  If sockets are unavailable
 
 ---
 
-## 2. CLI Commands
+## 2. Model Tiers
+
+Each agent or delegation task can be assigned a **model tier** that controls
+the capability level and context budget.
+
+| Tier | Icon | Context Window | Budget | Speed | Capability | Best For |
+|---|---|---|---|---|---|---|
+| **fast** | ⚡ | 8K | 4K tokens | 9/10 | 4/10 | Status checks, lookups, validation, simple transforms |
+| **balanced** | ⚖ | 32K | 16K tokens | 6/10 | 7/10 | Most tasks — summarization, code generation, moderate analysis |
+| **power** | ⭐ | 128K | 64K tokens | 3/10 | 10/10 | Architecture, deep analysis, refactoring, large-payload tasks |
+
+### When to Use Each Tier
+
+- **fast**: The task can be answered in a few sentences, requires no deep reasoning,
+  and the payload is small (<1K tokens). Examples: health checks, simple lookups,
+  echoing status.
+- **balanced** (default): The task requires moderate reasoning, produces a paragraph
+  or two, and the payload is medium-sized. This is the default for most work.
+- **power**: The task involves complex multi-step reasoning, large inputs, code
+  review, architectural decisions, or comprehensive analysis.
+
+### Setting Tiers via CLI
+
+```bash
+# Delegate with a specific tier
+clawie delegation submit --parent p --child c --tier fast --payload '{}'
+
+# Start a REPL with a tier
+clawie delegation repl --agent-id worker --tier power
+
+# Spawn a session agent with a tier
+clawie delegation spawn-session --parent p --child c --tier fast
+
+# Set tier on agent creation
+clawie agents create my-agent --model-tier fast
+```
+
+---
+
+## 3. Context Management
+
+Each agent has a **context budget** based on its tier.  The budget tracks token
+usage and prevents context rot in long delegation chains.
+
+### Budget Thresholds
+
+| Threshold | Trigger | Action |
+|---|---|---|
+| < 75% used | Normal | No action needed |
+| ≥ 75% used | Warning | Summarize results more aggressively |
+| ≥ 90% used | Compaction | Compact context — drop intermediate detail |
+
+### 4 Rules for Preventing Context Rot
+
+1. **Summarize at depth**: The deeper in the delegation tree, the shorter the result.
+2. **Never forward raw results**: Always extract only the fields you need.
+3. **Compact early**: If `needs_warning` is true, summarize before delegating more.
+4. **Budget children**: Never allocate >50% of your remaining budget to a single child.
+
+### Summarization Depth Rules
+
+| Depth | Result Detail Level |
+|---|---|
+| 0 (root) | Full detail — complete results |
+| 1 | 1–2 paragraphs — key findings and data |
+| 2 | 3–5 bullet points — essential facts only |
+| 3+ | Single sentence — one-line summary |
+
+### Warning Signs of Context Rot
+
+- Results are getting truncated or lost
+- Child agents are returning errors about payload size
+- The delegation tree is more than 4 levels deep with full results bubbling up
+
+### Recovery Steps
+
+1. Use `ContextBudget.compact(tokens_freed)` to reclaim space
+2. Switch deeper children to the `fast` tier
+3. Increase summarization aggressiveness at each depth level
+
+---
+
+## 4. CLI Commands
 
 All delegation commands live under the `clawie delegation` subcommand group.
 
 ### Start a REPL (make yourself available for tasks)
 
 ```bash
-clawie delegation repl --agent-id <your-agent-id>
+clawie delegation repl --agent-id <your-agent-id> [--tier balanced]
 ```
 
 This blocks and listens for incoming tasks.  Press **Ctrl+C** to stop.
-While the REPL is running, other agents can delegate tasks to you.
 
 ### Delegate a task to another agent
 
@@ -83,6 +167,7 @@ While the REPL is running, other agents can delegate tasks to you.
 clawie delegation submit \
   --parent <your-agent-id> \
   --child  <target-agent-id> \
+  --tier fast \
   --payload '{"task": "summarize", "input": "..."}'
 ```
 
@@ -91,6 +176,7 @@ the child returns a result or the timeout expires.
 
 Options:
 - `--timeout <seconds>` — max wait time (default 300).
+- `--tier fast|balanced|power` — model tier for this task.
 
 ### View the delegation tree
 
@@ -98,7 +184,7 @@ Options:
 clawie delegation tree --agent-id <root-agent-id>
 ```
 
-Shows the persisted parent → child hierarchy as nested JSON.
+Shows the hierarchy with tier icons: ⚡fast, ⚖balanced, ⭐power.
 
 ### List delegation task history
 
@@ -112,91 +198,99 @@ clawie delegation tasks [--agent-id <id>] [--status pending|running|completed|fa
 clawie delegation status
 ```
 
-Lists agents with active Unix sockets and whether they are alive.
-
 ### Clean up stale sockets
 
 ```bash
 clawie delegation cleanup
 ```
 
-Removes socket files older than 10 minutes whose agent is no longer running.
+---
+
+## 5. Parallel Delegation and Orchestration
+
+### Automatic Tier-Based Orchestration
+
+When decomposing a complex task, assign tiers based on sub-task complexity:
+
+```python
+from clawie.delegation import DelegationCoordinator, recommend_tier
+
+coord = DelegationCoordinator("planner-agent", model_tier="power")
+
+# Auto-recommend tiers for sub-tasks
+tasks = [
+    {"child_id": "w1", "payload": {"task": "check status"}, "model_tier": "fast"},
+    {"child_id": "w2", "payload": {"task": "analyze codebase"}, "model_tier": "power"},
+    {"child_id": "w3", "payload": {"task": "format output"}, "model_tier": "fast"},
+]
+results = coord.delegate_many(tasks, timeout=120.0)
+```
+
+### Context Budget Allocation Rules
+
+- **Never allocate >50% of remaining budget to a single child**
+- For fan-out with N children, budget each child at `remaining / (N + 1)` tokens
+- Reserve at least 25% of budget for aggregating results
+
+### Fan-Out with Mixed Tiers
+
+Use `recommend_tier(description, payload)` to automatically select:
+
+```python
+from clawie.delegation import recommend_tier
+
+tier = recommend_tier("check health status", {"target": "api"})  # -> "fast"
+tier = recommend_tier("refactor authentication module", {})       # -> "power"
+```
 
 ---
 
-## 3. Using the REPL Loop
+## 6. Using the REPL Loop
 
-When you run `clawie delegation repl --agent-id <id>`, an **AgentREPL** starts
-that:
+When you run `clawie delegation repl --agent-id <id> [--tier balanced]`, an
+**AgentREPL** starts that:
 
 1. Binds a Unix domain socket at `/tmp/clawie-delegation/<id>.sock`.
 2. Loops: accepts a connection → reads a `task_submit` message → dispatches to
    the handler → sends back `task_accepted` then `task_result` or `task_error`.
-3. The default handler **echoes the payload back** as the result — useful for
-   testing connectivity.
+3. Tracks token usage in its context budget.
 
-### Custom handlers
-
-When using the delegation system programmatically (from Python), you can supply
-a custom handler:
+### Custom handlers with tier awareness
 
 ```python
 from clawie.delegation import AgentREPL, Message
 
 def my_handler(msg: Message, repl: AgentREPL) -> dict:
+    # Access the tier and budget
+    print(f"Running at tier: {repl.model_tier}")
+    print(f"Budget remaining: {repl.context_budget.tokens_remaining}")
+
     task = msg.payload.get("task")
     if task == "analyze":
-        # Do work ...
         return {"analysis": "result data"}
     return {"error": "unknown task"}
 
-repl = AgentREPL("worker-agent", handler=my_handler)
-repl.start()          # blocking
-# repl.start_background()  # non-blocking (daemon thread)
+repl = AgentREPL("worker-agent", handler=my_handler, model_tier="fast")
+repl.start()
 ```
 
-### Recursive delegation from inside a handler
-
-A handler can itself delegate to sub-agents, creating a recursive tree:
+### Recursive delegation with tiers
 
 ```python
 def planning_handler(msg: Message, repl: AgentREPL) -> dict:
-    # Delegate sub-task to a deeper worker
     sub_result = repl.delegate(
         child_id="leaf-worker",
         payload={"task": "sub-analyze", "data": msg.payload.get("data")},
-        depth=msg.depth + 1,    # increment depth to track recursion
+        depth=msg.depth + 1,
         timeout=60.0,
+        model_tier="fast",     # sub-task uses a lighter tier
     )
     return {"combined": sub_result}
 ```
 
-The system enforces a **maximum recursion depth of 10** and detects cycles
-(A → B → A) to prevent infinite loops.
-
 ---
 
-## 4. Parallel Delegation (Fan-Out)
-
-For planning agents that need to farm out work to multiple children at once:
-
-```python
-from clawie.delegation import DelegationCoordinator
-
-coord = DelegationCoordinator("planner-agent")
-results = coord.delegate_many([
-    {"child_id": "worker-1", "payload": {"task": "part-a"}},
-    {"child_id": "worker-2", "payload": {"task": "part-b"}},
-    {"child_id": "worker-3", "payload": {"task": "part-c"}},
-], timeout=120.0)
-# results is a list of dicts, one per child, in order.
-```
-
-Each delegation runs in a separate thread for true parallelism.
-
----
-
-## 5. Error Handling
+## 7. Error Handling
 
 | Scenario | What happens |
 |---|---|
@@ -206,43 +300,17 @@ Each delegation runs in a separate thread for true parallelism.
 | Timeout exceeded | Parent receives a timeout error; task marked `failed`. |
 | Recursion too deep (>10) | `ValueError` raised before delegation starts. |
 | Cycle detected (A→B→A) | `ValueError` raised before delegation starts. |
+| Context budget exceeded | Warning at 75%, compaction triggered at 90%. Results summarized. |
 
 ---
 
-## 6. Quick-Start Checklist
+## 8. Session Sub-Agents (No Root Required)
 
-1. **Start the child REPL** in one terminal:
-   ```bash
-   clawie delegation repl --agent-id worker
-   ```
-
-2. **Delegate from the parent** in another terminal:
-   ```bash
-   clawie delegation submit --parent planner --child worker --payload '{"task":"hello"}'
-   ```
-
-3. **Check the result** — with the default echo handler, you get the payload
-   back as the result.
-
-4. **Verify history**:
-   ```bash
-   clawie delegation tasks
-   ```
-
----
-
-## 7. Session Sub-Agents (No Root Required)
-
-You can spawn lightweight sub-agents **within your current session** without
-needing root privileges or separate Linux users.  Session agents run as
-background threads in the same process, each with its own AgentREPL and Unix
-socket.
-
-### CLI Commands
+Spawn lightweight sub-agents **within your current session**:
 
 ```bash
-# Spawn a session sub-agent
-clawie delegation spawn-session --parent <your-id> --child <child-id>
+# Spawn with a specific tier
+clawie delegation spawn-session --parent <your-id> --child <child-id> --tier fast
 
 # Delegate to the session agent
 clawie delegation submit --parent <your-id> --child <child-id> --payload '{"task":"work"}'
@@ -260,41 +328,36 @@ clawie delegation stop-session --parent <your-id> --child <child-id>
 from clawie.delegation import SessionAgentManager
 
 mgr = SessionAgentManager("my-agent")
-mgr.spawn("worker-1")
-mgr.spawn("worker-2")
+mgr.spawn("worker-1", model_tier="fast")
+mgr.spawn("worker-2", model_tier="power")
 
 result = mgr.delegate("worker-1", {"task": "analyze"})
-print(result)
 
-# View the tree
 for line in mgr.tree_lines():
-    print(line)
+    print(line)  # Shows tier icons in the tree
 
 mgr.stop_all()
 ```
 
-This is ideal when a single agent needs to fan out work to multiple
-sub-agents dynamically during a session.
-
 ---
 
-## 8. Dashboard Delegation View
+## 9. Dashboard Delegation View
 
 The clawie dashboard (``clawie dashboard``) has a **delegation** overview mode.
 Press **v** to cycle through: agents → channels → delegation.
 
 The delegation view shows:
-- **Left panel**: ASCII tree of all active delegation hierarchies
-- **Right panel**: Active REPL sockets and recent delegation tasks
+- **Left panel**: ASCII tree with tier icons (⚡⚖⭐) next to each node
+- **Right panel**: Active REPL sockets and recent delegation tasks with tier column
+- **Settings**: Model tier setting cycles through fast → balanced → power
 
 ---
 
-## 9. Disabling This Skill
+## 10. Disabling This Skill
 
 If you do not need delegation capabilities, you can disable this skill:
 
 ```bash
-# Toggle the delegation plugin off for an agent (via dashboard or CLI)
 # When creating an agent:
 clawie agents create --agent-id <id> --no-delegation
 
@@ -314,6 +377,184 @@ MSG_HEADER_SIZE = 4  # 4-byte big-endian length prefix
 
 
 # ---------------------------------------------------------------------------
+# Model Tiers & Context Budgets
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ModelTier:
+    """Describes a model tier's capabilities and resource constraints."""
+
+    name: str
+    model_id: str
+    context_window: int
+    cost_per_1k_input: float
+    cost_per_1k_output: float
+    speed_rating: int  # 1-10
+    capability_rating: int  # 1-10
+    default_context_budget: int
+
+
+DEFAULT_MODEL_TIERS: dict[str, ModelTier] = {
+    "fast": ModelTier(
+        name="fast",
+        model_id="fast",
+        context_window=8_000,
+        cost_per_1k_input=0.001,
+        cost_per_1k_output=0.002,
+        speed_rating=9,
+        capability_rating=4,
+        default_context_budget=4_000,
+    ),
+    "balanced": ModelTier(
+        name="balanced",
+        model_id="balanced",
+        context_window=32_000,
+        cost_per_1k_input=0.003,
+        cost_per_1k_output=0.015,
+        speed_rating=6,
+        capability_rating=7,
+        default_context_budget=16_000,
+    ),
+    "power": ModelTier(
+        name="power",
+        model_id="power",
+        context_window=128_000,
+        cost_per_1k_input=0.015,
+        cost_per_1k_output=0.075,
+        speed_rating=3,
+        capability_rating=10,
+        default_context_budget=64_000,
+    ),
+}
+
+VALID_TIER_NAMES: tuple[str, ...] = ("fast", "balanced", "power")
+DEFAULT_TIER: str = "balanced"
+
+
+def get_model_tier(name: str) -> ModelTier:
+    """Return the ``ModelTier`` for *name*, raising ``ValueError`` if unknown."""
+    tier = DEFAULT_MODEL_TIERS.get(name)
+    if tier is None:
+        raise ValueError(
+            f"unknown model tier {name!r}; valid tiers: {', '.join(VALID_TIER_NAMES)}"
+        )
+    return tier
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: len(text) / 4."""
+    return max(0, len(text) // 4)
+
+
+def estimate_payload_tokens(payload: dict[str, Any] | Any) -> int:
+    """Estimate token count for a JSON-serializable payload."""
+    try:
+        raw = json.dumps(payload, sort_keys=True)
+    except (TypeError, ValueError):
+        raw = str(payload)
+    return estimate_tokens(raw)
+
+
+@dataclass
+class ContextBudget:
+    """Tracks token usage against a budget for a single agent."""
+
+    total_budget: int = 16_000
+    tokens_used: int = 0
+    payload_tokens: int = 0
+    result_tokens: int = 0
+    compaction_count: int = 0
+    tier: str = DEFAULT_TIER
+
+    @property
+    def tokens_remaining(self) -> int:
+        return max(0, self.total_budget - self.tokens_used)
+
+    @property
+    def usage_ratio(self) -> float:
+        if self.total_budget <= 0:
+            return 1.0
+        return self.tokens_used / self.total_budget
+
+    @property
+    def needs_warning(self) -> bool:
+        return self.usage_ratio >= 0.75
+
+    @property
+    def needs_compaction(self) -> bool:
+        return self.usage_ratio >= 0.90
+
+    def record_payload(self, tokens: int) -> None:
+        self.payload_tokens += tokens
+        self.tokens_used += tokens
+
+    def record_result(self, tokens: int) -> None:
+        self.result_tokens += tokens
+        self.tokens_used += tokens
+
+    def compact(self, tokens_freed: int) -> None:
+        freed = min(tokens_freed, self.tokens_used)
+        self.tokens_used -= freed
+        self.compaction_count += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total_budget": self.total_budget,
+            "tokens_used": self.tokens_used,
+            "payload_tokens": self.payload_tokens,
+            "result_tokens": self.result_tokens,
+            "compaction_count": self.compaction_count,
+            "tier": self.tier,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ContextBudget":
+        return cls(
+            total_budget=int(data.get("total_budget", 16_000)),
+            tokens_used=int(data.get("tokens_used", 0)),
+            payload_tokens=int(data.get("payload_tokens", 0)),
+            result_tokens=int(data.get("result_tokens", 0)),
+            compaction_count=int(data.get("compaction_count", 0)),
+            tier=str(data.get("tier", DEFAULT_TIER)),
+        )
+
+    @classmethod
+    def for_tier(cls, tier_name: str) -> "ContextBudget":
+        tier = DEFAULT_MODEL_TIERS.get(tier_name)
+        budget = tier.default_context_budget if tier else 16_000
+        return cls(total_budget=budget, tier=tier_name)
+
+
+def recommend_tier(task_description: str, payload: dict[str, Any] | None = None) -> str:
+    """Heuristic tier selection based on task description and payload size."""
+    desc = task_description.lower()
+    payload_tokens = estimate_payload_tokens(payload or {})
+
+    # Large payloads need power tier
+    if payload_tokens > 8000:
+        return "power"
+
+    # Keywords suggesting simple/fast tasks
+    fast_keywords = (
+        "check", "status", "ping", "list", "count", "echo", "health",
+        "version", "simple", "quick", "lookup", "validate",
+    )
+    if any(kw in desc for kw in fast_keywords) and payload_tokens < 1000:
+        return "fast"
+
+    # Keywords suggesting complex/power tasks
+    power_keywords = (
+        "analyze", "refactor", "architect", "design", "review", "plan",
+        "migrate", "optimize", "debug", "investigate", "comprehensive",
+    )
+    if any(kw in desc for kw in power_keywords):
+        return "power"
+
+    # Medium payload or no strong signal → balanced
+    return "balanced"
+
+
+# ---------------------------------------------------------------------------
 # Message protocol
 # ---------------------------------------------------------------------------
 
@@ -329,6 +570,8 @@ class Message:
     depth: int = 0
     timestamp: float = 0.0
     payload: dict[str, Any] = field(default_factory=dict)
+    model_tier: str = ""
+    context_budget: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.msg_id:
@@ -545,6 +788,7 @@ class TreeNode:
     depth: int = 0
     status: str = "pending"
     children: list[str] = field(default_factory=list)
+    model_tier: str = ""
 
 
 class DelegationTree:
@@ -560,6 +804,7 @@ class DelegationTree:
         parent_id: str,
         task_id: str,
         depth: int = 0,
+        model_tier: str = "",
     ) -> TreeNode:
         """Add a delegation node. Raises on depth overflow or cycle."""
         if depth >= MAX_RECURSION_DEPTH:
@@ -593,6 +838,7 @@ class DelegationTree:
                 task_id=task_id,
                 depth=depth,
                 status="pending",
+                model_tier=model_tier,
             )
             self._nodes[agent_id] = node
             if parent_node:
@@ -649,6 +895,7 @@ class DelegationTree:
                     "depth": n.depth,
                     "status": n.status,
                     "children": list(n.children),
+                    "model_tier": n.model_tier,
                 }
                 for aid, n in self._nodes.items()
             }
@@ -664,6 +911,7 @@ class DelegationTree:
                 depth=raw.get("depth", 0),
                 status=raw.get("status", "pending"),
                 children=list(raw.get("children", [])),
+                model_tier=raw.get("model_tier", ""),
             )
             tree._nodes[aid] = node
         return tree
@@ -694,12 +942,15 @@ class AgentREPL:
         agent_id: str,
         handler: TaskHandler | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        model_tier: str = DEFAULT_TIER,
     ) -> None:
         self.agent_id = agent_id
         self.handler = handler or _default_handler
         self.timeout = timeout
+        self.model_tier = model_tier
         self.bus = DelegationBus(agent_id)
         self.tree = DelegationTree()
+        self.context_budget = ContextBudget.for_tier(model_tier)
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -766,6 +1017,9 @@ class AgentREPL:
 
     def _handle_task(self, conn: socket.socket, msg: Message) -> None:
         """Send TASK_ACCEPTED, run handler with timeout, send result/error."""
+        # Track inbound payload tokens
+        self.context_budget.record_payload(estimate_payload_tokens(msg.payload))
+
         # Send acceptance
         accepted = Message(
             msg_type="task_accepted",
@@ -810,13 +1064,15 @@ class AgentREPL:
                 payload={"error": error_holder[0]},
             )
         else:
+            result_payload = result_holder[0] or {}
+            self.context_budget.record_result(estimate_payload_tokens(result_payload))
             response = Message(
                 msg_type="task_result",
                 task_id=msg.task_id,
                 parent_agent_id=self.agent_id,
                 child_agent_id=msg.parent_agent_id,
                 depth=msg.depth,
-                payload=result_holder[0] or {},
+                payload=result_payload,
             )
 
         send_message(conn, response)
@@ -827,14 +1083,16 @@ class AgentREPL:
         payload: dict[str, Any],
         depth: int = 0,
         timeout: float | None = None,
+        model_tier: str = "",
     ) -> dict[str, Any]:
         """
         Delegate a sub-task to *child_id* (the RLM llm_query() equivalent).
 
         Can be called from within a handler for recursive delegation.
         """
+        tier = model_tier or self.model_tier
         task_id = uuid.uuid4().hex
-        self.tree.register(child_id, self.agent_id, task_id, depth=depth)
+        self.tree.register(child_id, self.agent_id, task_id, depth=depth, model_tier=tier)
 
         msg = Message(
             msg_type="task_submit",
@@ -843,6 +1101,7 @@ class AgentREPL:
             child_agent_id=child_id,
             depth=depth,
             payload=payload,
+            model_tier=tier,
         )
 
         try:
@@ -884,10 +1143,18 @@ class AgentREPL:
 class DelegationCoordinator:
     """Orchestrates delegation from a planning agent to workers."""
 
-    def __init__(self, agent_id: str) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        bus: DelegationBus | None = None,
+        tree: DelegationTree | None = None,
+        model_tier: str = DEFAULT_TIER,
+    ) -> None:
         self.agent_id = agent_id
-        self.bus = DelegationBus(agent_id)
-        self.tree = DelegationTree()
+        self.bus = bus or DelegationBus(agent_id)
+        self.tree = tree or DelegationTree()
+        self.model_tier = model_tier
+        self.context_budget = ContextBudget.for_tier(model_tier)
 
     def delegate(
         self,
@@ -895,11 +1162,16 @@ class DelegationCoordinator:
         payload: dict[str, Any],
         depth: int = 0,
         timeout: float = DEFAULT_TIMEOUT,
+        model_tier: str = "",
     ) -> dict[str, Any]:
         """Register in tree, connect, send task, wait for result."""
+        tier = model_tier or self.model_tier
         task_id = uuid.uuid4().hex
-        self.tree.register(child_id, self.agent_id, task_id, depth=depth)
+        self.tree.register(child_id, self.agent_id, task_id, depth=depth, model_tier=tier)
         self.tree.update_status(child_id, "connecting")
+
+        payload_tokens = estimate_payload_tokens(payload)
+        self.context_budget.record_payload(payload_tokens)
 
         msg = Message(
             msg_type="task_submit",
@@ -908,6 +1180,7 @@ class DelegationCoordinator:
             child_agent_id=child_id,
             depth=depth,
             payload=payload,
+            model_tier=tier,
         )
 
         try:
@@ -941,24 +1214,26 @@ class DelegationCoordinator:
         self,
         tasks: list[dict[str, Any]],
         timeout: float = DEFAULT_TIMEOUT,
+        model_tier: str = "",
     ) -> list[dict[str, Any]]:
         """
         Parallel delegation via threads.
 
         Each entry in *tasks* must have 'child_id' and 'payload' keys,
-        and optionally 'depth'.
+        and optionally 'depth' and 'model_tier'.
         """
         results: list[dict[str, Any]] = [{}] * len(tasks)
         threads: list[threading.Thread] = []
 
-        def _run(idx: int, child_id: str, payload: dict[str, Any], depth: int) -> None:
-            results[idx] = self.delegate(child_id, payload, depth=depth, timeout=timeout)
+        def _run(idx: int, child_id: str, payload: dict[str, Any], depth: int, tier: str) -> None:
+            results[idx] = self.delegate(child_id, payload, depth=depth, timeout=timeout, model_tier=tier)
 
         for i, task in enumerate(tasks):
             child_id = str(task["child_id"])
             payload = dict(task.get("payload", {}))
             depth = int(task.get("depth", 0))
-            t = threading.Thread(target=_run, args=(i, child_id, payload, depth), daemon=True)
+            tier = str(task.get("model_tier", model_tier or self.model_tier))
+            t = threading.Thread(target=_run, args=(i, child_id, payload, depth, tier), daemon=True)
             threads.append(t)
             t.start()
 
@@ -1071,6 +1346,12 @@ _STATUS_ICONS: dict[str, str] = {
     "connecting": "\u2026",# …
 }
 
+_TIER_ICONS: dict[str, str] = {
+    "fast": "\u26a1",      # ⚡
+    "balanced": "\u2696",  # ⚖
+    "power": "\u2b50",     # ⭐
+}
+
 
 def render_tree_ascii(
     tree_data: dict[str, Any],
@@ -1100,13 +1381,16 @@ def _render_nested(node: dict[str, Any], prefix: str = "", is_last: bool = True)
     status = node.get("status", "pending")
     depth = node.get("depth", 0)
     icon = _STATUS_ICONS.get(status, "?")
+    tier = node.get("model_tier", "")
+    tier_icon = _TIER_ICONS.get(tier, "")
     children = node.get("children", [])
 
     connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "  # └── or ├──
     if not prefix:
         connector = ""
 
-    label = f"{connector}{icon} {agent_id}  [{status}] d={depth}"
+    tier_part = f" {tier_icon}{tier}" if tier else ""
+    label = f"{connector}{icon} {agent_id}  [{status}] d={depth}{tier_part}"
     lines = [f"{prefix}{label}"]
 
     child_prefix = prefix + ("    " if is_last else "\u2502   ")  # │
@@ -1150,13 +1434,16 @@ def _render_flat_node(
     status = node.get("status", "pending")
     depth = node.get("depth", 0)
     icon = _STATUS_ICONS.get(status, "?")
+    tier = node.get("model_tier", "")
+    tier_icon = _TIER_ICONS.get(tier, "")
     children = node.get("children", [])
 
     connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
     if not prefix:
         connector = ""
 
-    label = f"{connector}{icon} {agent_id}  [{status}] d={depth}"
+    tier_part = f" {tier_icon}{tier}" if tier else ""
+    label = f"{connector}{icon} {agent_id}  [{status}] d={depth}{tier_part}"
     lines = [f"{prefix}{label}"]
 
     child_prefix = prefix + ("    " if is_last else "\u2502   ")
@@ -1194,6 +1481,7 @@ class SessionAgentManager:
         child_id: str,
         handler: TaskHandler | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        model_tier: str = DEFAULT_TIER,
     ) -> dict[str, Any]:
         """
         Spawn a lightweight sub-agent with its own REPL.
@@ -1205,7 +1493,7 @@ class SessionAgentManager:
             if child_id in self._agents:
                 raise ValueError(f"session agent already exists: {child_id}")
 
-        repl = AgentREPL(child_id, handler=handler, timeout=timeout)
+        repl = AgentREPL(child_id, handler=handler, timeout=timeout, model_tier=model_tier)
         thread = repl.start_background()
 
         with self._lock:
@@ -1220,6 +1508,7 @@ class SessionAgentManager:
         try:
             self.coordinator.tree.register(
                 child_id, self.parent_agent_id, task_id, depth=depth,
+                model_tier=model_tier,
             )
             self.coordinator.tree.update_status(child_id, "running")
         except ValueError:
@@ -1234,6 +1523,7 @@ class SessionAgentManager:
             "depth": depth,
             "status": "running",
             "session": True,
+            "model_tier": model_tier,
         }
 
     def delegate(
@@ -1309,6 +1599,7 @@ class SessionAgentManager:
                     "status": node.status if node else "unknown",
                     "running": repl._running,
                     "session": True,
+                    "model_tier": node.model_tier if node else repl.model_tier,
                 })
             return result
 

@@ -37,6 +37,10 @@ ICON_BACK = "\u25c2"  # ◂
 ICON_WARN = "\u25b2"  # ▲
 BAR_FILL = "\u25b0"  # ▰
 BAR_EMPTY = "\u25b1"  # ▱
+ICON_TIER_FAST = "\u26a1"      # ⚡
+ICON_TIER_BALANCED = "\u2696"  # ⚖
+ICON_TIER_POWER = "\u2b50"     # ⭐
+_TIER_ICON_MAP: dict[str, str] = {"fast": ICON_TIER_FAST, "balanced": ICON_TIER_BALANCED, "power": ICON_TIER_POWER}
 
 # ── Color Pair IDs ───────────────────────────────────────────────────
 C_DEFAULT = 0
@@ -903,9 +907,11 @@ def _draw_overview_delegation(
         tasks = []
     if tasks:
         for i, t in enumerate(tasks[: height - task_y - 3]):
+            tier_str = t.get("model_tier", "")
+            tier_icon = _TIER_ICON_MAP.get(tier_str, " ")
             text = (
                 f"{t['task_id'][:8]} {t['parent_agent_id']:10}->"
-                f"{t['child_agent_id']:10} {t['status']}"
+                f"{t['child_agent_id']:10} {tier_icon}{t['status']}"
             )
             _safe_addstr(stdscr, task_y + 1 + i, mid + 2, text[: width - mid - 3])
     else:
@@ -1065,12 +1071,15 @@ def _draw_detail(stdscr: Any, service: Any, state: DashboardState, height: int, 
     provider_summary = str(agent_info.get("provider", ""))
     if str(agent_info.get("provider_status", "ok")) != "ok" and provider_summary:
         provider_summary = f"{provider_summary}!"
+    agent_tier = str(agent_info.get("model_tier", ""))
+    tier_display = f" {ICON_DOT} {_TIER_ICON_MAP.get(agent_tier, '')}{agent_tier}" if agent_tier else ""
     info_line = (
         f" {ICON_BACK} {_display_agent_id(state.selected_agent_id)}"
         f"   {provider_summary}"
         f" {ICON_DOT} {icon} {status}"
         f" {ICON_DOT} auth {auth_status}"
         f" {ICON_DOT} v{agent_info.get('version', '')}"
+        f"{tier_display}"
     )
     _add(stdscr, 1, 0, _fit(info_line, width), _color(C_TITLE))
 
@@ -1627,6 +1636,15 @@ def _settings_items(
                 "label": f"{prefix}autostart: {'on' if bool(info.get('autostart', True)) else 'off'}",
             }
         )
+    # Model tier
+    current_tier = str(info.get("model_tier", "balanced"))
+    tier_icon = _TIER_ICON_MAP.get(current_tier, "")
+    rows.append(
+        {
+            "kind": "model_tier",
+            "label": f"{prefix}model tier: {tier_icon}{current_tier}",
+        }
+    )
     rows.extend(_prompt_items(agent))
     if is_local:
         return rows
@@ -1751,6 +1769,10 @@ def _run_setting_action(service: Any, state: DashboardState, item: dict[str, str
                 return _run_channel_detail_action(service, state, action, channel)
         if kind.startswith("prompt_"):
             return _run_prompt_action(service, state, item)
+        if kind == "model_tier":
+            new_tier = service.set_agent_model_tier(state.selected_agent_id, "")
+            state.notice = f"model tier changed to {new_tier}"
+            return True
         if kind == "autostart":
             if is_local:
                 state.notice = "autostart not applicable for local-user claw"

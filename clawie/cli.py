@@ -336,6 +336,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         action="store_true",
         help="Disable the delegation skill for this agent",
     )
+    create.add_argument(
+        "--model-tier",
+        choices=["fast", "balanced", "power"],
+        help="Default model tier for this agent",
+    )
     create.set_defaults(func=cmd_agents_create)
 
     clone = agent_sub.add_parser("clone", help="Clone an existing agent into a new one")
@@ -379,6 +384,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "--no-delegation",
         action="store_true",
         help="Disable the delegation skill for this cloned agent",
+    )
+    clone.add_argument(
+        "--model-tier",
+        choices=["fast", "balanced", "power"],
+        help="Default model tier for this cloned agent",
     )
     clone.set_defaults(func=cmd_agents_clone)
 
@@ -945,10 +955,12 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
     deleg_submit.add_argument("--child", required=True, help="Child agent ID")
     deleg_submit.add_argument("--payload", default="{}", help="JSON payload")
     deleg_submit.add_argument("--timeout", type=float, default=300.0, help="Timeout seconds")
+    deleg_submit.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
     deleg_submit.set_defaults(func=cmd_delegation_submit)
 
     deleg_repl = delegation_sub.add_parser("repl", help="Start agent REPL (blocks)")
     deleg_repl.add_argument("--agent-id", required=True, help="Agent ID")
+    deleg_repl.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
     deleg_repl.set_defaults(func=cmd_delegation_repl)
 
     deleg_tree = delegation_sub.add_parser("tree", help="Print delegation tree")
@@ -967,6 +979,7 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
     deleg_spawn.add_argument("--parent", required=True, help="Parent agent ID")
     deleg_spawn.add_argument("--child", required=True, help="Child agent ID to spawn")
     deleg_spawn.add_argument("--timeout", type=float, default=300.0, help="Handler timeout")
+    deleg_spawn.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
     deleg_spawn.set_defaults(func=cmd_delegation_spawn_session)
 
     deleg_stop = delegation_sub.add_parser(
@@ -1347,6 +1360,9 @@ def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int
         provider=args.provider,
         plugin_overrides=plugin_overrides or None,
     )
+    tier = getattr(args, "model_tier", None)
+    if tier:
+        service.set_agent_model_tier(agent_id, tier)
     print_success(f"Provisioned agent {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -1370,6 +1386,9 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
         provider=args.provider,
         plugin_overrides=plugin_overrides or None,
     )
+    tier = getattr(args, "model_tier", None)
+    if tier:
+        service.set_agent_model_tier(agent_id, tier)
     print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -2315,6 +2334,7 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) ->
         child_id=args.child,
         payload=payload,
         timeout=args.timeout,
+        model_tier=getattr(args, "tier", "") or "",
     )
     print_panel(
         "Delegation Result",
@@ -2328,7 +2348,7 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) ->
 
 
 def cmd_delegation_repl(args: argparse.Namespace, service: ZeroClawService) -> int:
-    service.start_agent_repl(args.agent_id)
+    service.start_agent_repl(args.agent_id, model_tier=getattr(args, "tier", "") or "")
     return 0
 
 
@@ -2363,6 +2383,7 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ZeroClawServ
         parent_id=args.parent,
         child_id=args.child,
         timeout=getattr(args, "timeout", 300.0),
+        model_tier=getattr(args, "tier", "") or "",
     )
     print_success(f"Session agent {info['agent_id']} spawned under {args.parent}")
     print_panel(
@@ -2372,6 +2393,7 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ZeroClawServ
             f"parent: {info.get('parent_id', '')}",
             f"status: {info.get('status', '')}",
             f"depth: {info.get('depth', '')}",
+            f"model_tier: {info.get('model_tier', '')}",
         ],
     )
     return 0

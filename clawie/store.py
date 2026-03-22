@@ -114,6 +114,7 @@ class StateStore:
         self._seed_defaults()
         self._migrate_legacy_json()
         self._migrate_schema()
+        self._migrate_delegation_schema()
 
     def read_config(self) -> dict[str, Any]:
         self.ensure()
@@ -258,6 +259,23 @@ class StateStore:
             )
         return grouped
 
+    def _migrate_delegation_schema(self) -> None:
+        """Add model_tier and context_budget columns if missing."""
+        with self._connect() as conn:
+            cols = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(delegation_tasks)").fetchall()
+            }
+            if "model_tier" not in cols:
+                conn.execute(
+                    "ALTER TABLE delegation_tasks ADD COLUMN model_tier TEXT DEFAULT ''"
+                )
+            if "context_budget" not in cols:
+                conn.execute(
+                    "ALTER TABLE delegation_tasks ADD COLUMN context_budget TEXT DEFAULT '{}'"
+                )
+            conn.commit()
+
     # ------------------------------------------------------------------
     # Delegation task CRUD
     # ------------------------------------------------------------------
@@ -275,6 +293,8 @@ class StateStore:
         created_at: str = "",
         completed_at: str = "",
         timeout_seconds: float = 300.0,
+        model_tier: str = "",
+        context_budget: dict[str, Any] | None = None,
     ) -> None:
         self.ensure()
         with self._connect() as conn:
@@ -282,8 +302,9 @@ class StateStore:
                 """
                 INSERT OR REPLACE INTO delegation_tasks
                 (task_id, parent_agent_id, child_agent_id, depth, status,
-                 payload, result, error, created_at, completed_at, timeout_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 payload, result, error, created_at, completed_at, timeout_seconds,
+                 model_tier, context_budget)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -297,6 +318,8 @@ class StateStore:
                     created_at,
                     completed_at,
                     timeout_seconds,
+                    model_tier,
+                    json.dumps(context_budget or {}, sort_keys=True),
                 ),
             )
             conn.commit()
@@ -325,7 +348,7 @@ class StateStore:
             ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
-            results.append({
+            d: dict[str, Any] = {
                 "task_id": str(row["task_id"]),
                 "parent_agent_id": str(row["parent_agent_id"]),
                 "child_agent_id": str(row["child_agent_id"]),
@@ -337,7 +360,17 @@ class StateStore:
                 "created_at": str(row["created_at"]),
                 "completed_at": str(row["completed_at"]),
                 "timeout_seconds": float(row["timeout_seconds"]),
-            })
+            }
+            # Safe accessor for columns added by migration
+            try:
+                d["model_tier"] = str(row["model_tier"] or "")
+            except (IndexError, KeyError):
+                d["model_tier"] = ""
+            try:
+                d["context_budget"] = self._decode_json_obj(str(row["context_budget"] or "{}"))
+            except (IndexError, KeyError):
+                d["context_budget"] = {}
+            results.append(d)
         return results
 
     def write_delegation_tree(

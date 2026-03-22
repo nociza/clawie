@@ -14,16 +14,25 @@ import pytest
 from clawie.cli import main
 from clawie.delegation import (
     DELEGATION_DIR,
+    DEFAULT_MODEL_TIERS,
+    DEFAULT_TIER,
     MAX_RECURSION_DEPTH,
+    VALID_TIER_NAMES,
     AgentREPL,
+    ContextBudget,
     DelegationBus,
     DelegationCoordinator,
     DelegationTree,
     FileMailbox,
     Message,
+    ModelTier,
     SessionAgentManager,
     cleanup_stale_sockets,
+    estimate_payload_tokens,
+    estimate_tokens,
+    get_model_tier,
     list_active_agents,
+    recommend_tier,
     recv_message,
     render_tree_ascii,
     send_message,
@@ -618,12 +627,27 @@ class TestDelegationSkill:
     def test_skill_content_includes_key_sections(self) -> None:
         from clawie.delegation import DELEGATION_SKILL_CONTENT
         assert "## 1. Core Concepts" in DELEGATION_SKILL_CONTENT
-        assert "## 2. CLI Commands" in DELEGATION_SKILL_CONTENT
-        assert "## 3. Using the REPL Loop" in DELEGATION_SKILL_CONTENT
-        assert "## 4. Parallel Delegation" in DELEGATION_SKILL_CONTENT
-        assert "## 5. Error Handling" in DELEGATION_SKILL_CONTENT
-        assert "## 6. Quick-Start Checklist" in DELEGATION_SKILL_CONTENT
-        assert "## 9. Disabling This Skill" in DELEGATION_SKILL_CONTENT
+        assert "## 2. Model Tiers" in DELEGATION_SKILL_CONTENT
+        assert "## 3. Context Management" in DELEGATION_SKILL_CONTENT
+        assert "## 4. CLI Commands" in DELEGATION_SKILL_CONTENT
+        assert "## 5. Parallel Delegation" in DELEGATION_SKILL_CONTENT
+        assert "## 6. Using the REPL Loop" in DELEGATION_SKILL_CONTENT
+        assert "## 7. Error Handling" in DELEGATION_SKILL_CONTENT
+        assert "## 10. Disabling This Skill" in DELEGATION_SKILL_CONTENT
+
+    def test_skill_content_includes_tier_sections(self) -> None:
+        from clawie.delegation import DELEGATION_SKILL_CONTENT
+        assert "Model Tiers" in DELEGATION_SKILL_CONTENT
+        assert "Context Management" in DELEGATION_SKILL_CONTENT
+        assert "--tier" in DELEGATION_SKILL_CONTENT
+        assert "recommend_tier" in DELEGATION_SKILL_CONTENT
+        assert "context budget" in DELEGATION_SKILL_CONTENT.lower()
+
+    def test_skill_content_includes_orchestration_rules(self) -> None:
+        from clawie.delegation import DELEGATION_SKILL_CONTENT
+        assert "Orchestration" in DELEGATION_SKILL_CONTENT
+        assert "50%" in DELEGATION_SKILL_CONTENT
+        assert "fan-out" in DELEGATION_SKILL_CONTENT.lower()
 
     def test_delegation_md_in_provider_core_prompts(self) -> None:
         from clawie.providers import get_provider
@@ -677,10 +701,10 @@ class TestDelegationSkill:
 
     def test_skill_includes_session_agent_docs(self) -> None:
         from clawie.delegation import DELEGATION_SKILL_CONTENT
-        assert "## 7. Session Sub-Agents" in DELEGATION_SKILL_CONTENT
+        assert "## 8. Session Sub-Agents" in DELEGATION_SKILL_CONTENT
         assert "spawn-session" in DELEGATION_SKILL_CONTENT
         assert "SessionAgentManager" in DELEGATION_SKILL_CONTENT
-        assert "## 8. Dashboard Delegation View" in DELEGATION_SKILL_CONTENT
+        assert "## 9. Dashboard Delegation View" in DELEGATION_SKILL_CONTENT
 
 
 # ---------------------------------------------------------------------------
@@ -880,3 +904,421 @@ class TestSessionCLI:
         assert "child" in output
         # Should NOT be raw JSON
         assert '"agent_id"' not in output
+
+
+# ---------------------------------------------------------------------------
+# ModelTier tests
+# ---------------------------------------------------------------------------
+
+
+class TestModelTiers:
+    def test_tiers_exist(self) -> None:
+        assert "fast" in DEFAULT_MODEL_TIERS
+        assert "balanced" in DEFAULT_MODEL_TIERS
+        assert "power" in DEFAULT_MODEL_TIERS
+
+    def test_get_model_tier_valid(self) -> None:
+        tier = get_model_tier("fast")
+        assert tier.name == "fast"
+        assert tier.speed_rating == 9
+        assert tier.capability_rating == 4
+        assert tier.default_context_budget == 4_000
+
+    def test_get_model_tier_invalid(self) -> None:
+        with pytest.raises(ValueError, match="unknown model tier"):
+            get_model_tier("super-duper")
+
+    def test_tier_properties_ordering(self) -> None:
+        fast = get_model_tier("fast")
+        balanced = get_model_tier("balanced")
+        power = get_model_tier("power")
+        # Speed decreases as capability increases
+        assert fast.speed_rating > balanced.speed_rating > power.speed_rating
+        assert fast.capability_rating < balanced.capability_rating < power.capability_rating
+        # Budget increases with capability
+        assert fast.default_context_budget < balanced.default_context_budget < power.default_context_budget
+
+    def test_tier_is_frozen(self) -> None:
+        tier = get_model_tier("fast")
+        with pytest.raises(AttributeError):
+            tier.name = "modified"  # type: ignore[misc]
+
+    def test_valid_tier_names(self) -> None:
+        assert VALID_TIER_NAMES == ("fast", "balanced", "power")
+
+    def test_default_tier(self) -> None:
+        assert DEFAULT_TIER == "balanced"
+
+
+# ---------------------------------------------------------------------------
+# ContextBudget tests
+# ---------------------------------------------------------------------------
+
+
+class TestContextBudget:
+    def test_for_tier_fast(self) -> None:
+        b = ContextBudget.for_tier("fast")
+        assert b.total_budget == 4_000
+        assert b.tier == "fast"
+        assert b.tokens_used == 0
+        assert b.tokens_remaining == 4_000
+
+    def test_for_tier_balanced(self) -> None:
+        b = ContextBudget.for_tier("balanced")
+        assert b.total_budget == 16_000
+
+    def test_for_tier_power(self) -> None:
+        b = ContextBudget.for_tier("power")
+        assert b.total_budget == 64_000
+
+    def test_for_tier_unknown_fallback(self) -> None:
+        b = ContextBudget.for_tier("nonexistent")
+        assert b.total_budget == 16_000  # fallback
+
+    def test_record_payload(self) -> None:
+        b = ContextBudget.for_tier("fast")
+        b.record_payload(1000)
+        assert b.payload_tokens == 1000
+        assert b.tokens_used == 1000
+        assert b.tokens_remaining == 3000
+
+    def test_record_result(self) -> None:
+        b = ContextBudget.for_tier("fast")
+        b.record_result(500)
+        assert b.result_tokens == 500
+        assert b.tokens_used == 500
+
+    def test_usage_ratio(self) -> None:
+        b = ContextBudget.for_tier("fast")  # budget 4000
+        b.record_payload(2000)
+        assert b.usage_ratio == pytest.approx(0.5)
+
+    def test_needs_warning(self) -> None:
+        b = ContextBudget.for_tier("fast")  # budget 4000
+        assert not b.needs_warning
+        b.record_payload(3000)  # 75%
+        assert b.needs_warning
+
+    def test_needs_compaction(self) -> None:
+        b = ContextBudget.for_tier("fast")  # budget 4000
+        assert not b.needs_compaction
+        b.record_payload(3600)  # 90%
+        assert b.needs_compaction
+
+    def test_compact(self) -> None:
+        b = ContextBudget.for_tier("fast")
+        b.record_payload(3000)
+        b.compact(1000)
+        assert b.tokens_used == 2000
+        assert b.compaction_count == 1
+        assert b.tokens_remaining == 2000
+
+    def test_compact_cannot_free_more_than_used(self) -> None:
+        b = ContextBudget.for_tier("fast")
+        b.record_payload(500)
+        b.compact(10000)
+        assert b.tokens_used == 0
+        assert b.compaction_count == 1
+
+    def test_to_from_dict(self) -> None:
+        b = ContextBudget.for_tier("power")
+        b.record_payload(5000)
+        b.record_result(2000)
+        b.compact(1000)
+        d = b.to_dict()
+        restored = ContextBudget.from_dict(d)
+        assert restored.total_budget == b.total_budget
+        assert restored.tokens_used == b.tokens_used
+        assert restored.payload_tokens == b.payload_tokens
+        assert restored.result_tokens == b.result_tokens
+        assert restored.compaction_count == b.compaction_count
+        assert restored.tier == "power"
+
+    def test_tokens_remaining_never_negative(self) -> None:
+        b = ContextBudget(total_budget=100)
+        b.record_payload(200)
+        assert b.tokens_remaining == 0
+
+    def test_zero_budget_usage_ratio(self) -> None:
+        b = ContextBudget(total_budget=0)
+        assert b.usage_ratio == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Estimation function tests
+# ---------------------------------------------------------------------------
+
+
+class TestEstimation:
+    def test_estimate_tokens(self) -> None:
+        assert estimate_tokens("") == 0
+        assert estimate_tokens("hello world") > 0
+        # ~11 chars -> ~2 tokens
+        assert estimate_tokens("hello world") == 2
+
+    def test_estimate_tokens_long(self) -> None:
+        text = "a" * 400
+        assert estimate_tokens(text) == 100
+
+    def test_estimate_payload_tokens(self) -> None:
+        payload = {"key": "value", "number": 42}
+        tokens = estimate_payload_tokens(payload)
+        assert tokens > 0
+
+    def test_estimate_payload_tokens_empty(self) -> None:
+        assert estimate_payload_tokens({}) >= 0
+
+    def test_recommend_tier_fast(self) -> None:
+        assert recommend_tier("check status", {"task": "status"}) == "fast"
+        assert recommend_tier("ping service", {}) == "fast"
+        assert recommend_tier("list items", {}) == "fast"
+
+    def test_recommend_tier_power(self) -> None:
+        assert recommend_tier("analyze codebase", {}) == "power"
+        assert recommend_tier("refactor authentication", {}) == "power"
+        assert recommend_tier("architect new system", {}) == "power"
+
+    def test_recommend_tier_balanced(self) -> None:
+        assert recommend_tier("process data", {}) == "balanced"
+        assert recommend_tier("generate report", {}) == "balanced"
+
+    def test_recommend_tier_large_payload(self) -> None:
+        large_payload = {"data": "x" * 40000}
+        assert recommend_tier("simple task", large_payload) == "power"
+
+
+# ---------------------------------------------------------------------------
+# Tier in delegation data structures
+# ---------------------------------------------------------------------------
+
+
+class TestTierInDelegation:
+    def test_message_carries_tier(self) -> None:
+        msg = Message(msg_type="task_submit", model_tier="fast")
+        assert msg.model_tier == "fast"
+        # Round-trip
+        decoded = Message.decode(msg.encode()[4:])
+        assert decoded.model_tier == "fast"
+
+    def test_message_carries_context_budget(self) -> None:
+        budget = {"total_budget": 4000, "tokens_used": 100}
+        msg = Message(msg_type="task_submit", context_budget=budget)
+        decoded = Message.decode(msg.encode()[4:])
+        assert decoded.context_budget == budget
+
+    def test_message_default_tier_empty(self) -> None:
+        msg = Message(msg_type="heartbeat")
+        assert msg.model_tier == ""
+        assert msg.context_budget == {}
+
+    def test_tree_node_has_tier(self) -> None:
+        tree = DelegationTree()
+        node = tree.register("worker", "planner", "t1", depth=0, model_tier="fast")
+        assert node.model_tier == "fast"
+
+    def test_tree_to_from_dict_with_tier(self) -> None:
+        tree = DelegationTree()
+        tree.register("root", "", "t0", depth=0, model_tier="power")
+        tree.register("child", "root", "t1", depth=1, model_tier="fast")
+        data = tree.to_dict()
+        assert data["root"]["model_tier"] == "power"
+        assert data["child"]["model_tier"] == "fast"
+        # Round-trip
+        restored = DelegationTree.from_dict(data)
+        assert restored.get_node("root").model_tier == "power"
+        assert restored.get_node("child").model_tier == "fast"
+
+    def test_render_includes_tier_icon(self) -> None:
+        tree = DelegationTree()
+        tree.register("root", "", "t0", depth=0, model_tier="power")
+        tree.register("child", "root", "t1", depth=1, model_tier="fast")
+        tree.update_status("root", "running")
+        lines = render_tree_ascii(tree.to_dict(), root_id="root")
+        text = "\n".join(lines)
+        assert "\u2b50" in text  # ⭐ power
+        assert "\u26a1" in text  # ⚡ fast
+
+    def test_render_nested_includes_tier(self) -> None:
+        nested = {
+            "agent_id": "root",
+            "status": "running",
+            "depth": 0,
+            "model_tier": "balanced",
+            "children": [],
+        }
+        lines = render_tree_ascii(nested)
+        text = "\n".join(lines)
+        assert "\u2696" in text  # ⚖ balanced
+
+
+# ---------------------------------------------------------------------------
+# Session agent tier tests
+# ---------------------------------------------------------------------------
+
+
+class TestSessionAgentTiers:
+    def test_spawn_with_tier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        mgr = SessionAgentManager("parent")
+        try:
+            info = mgr.spawn("child-1", model_tier="fast")
+            assert info["model_tier"] == "fast"
+            agents = mgr.list_agents()
+            assert len(agents) == 1
+            assert agents[0]["model_tier"] == "fast"
+        finally:
+            mgr.stop_all()
+
+    def test_spawn_default_tier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        mgr = SessionAgentManager("parent")
+        try:
+            info = mgr.spawn("child-1")
+            assert info["model_tier"] == "balanced"
+        finally:
+            mgr.stop_all()
+
+
+# ---------------------------------------------------------------------------
+# Store delegation with tiers
+# ---------------------------------------------------------------------------
+
+
+class TestStoreDelegationTiers:
+    def test_write_and_read_task_with_tier(self, tmp_path: Path) -> None:
+        store = StateStore(config_dir=tmp_path)
+        store.ensure()
+        store.write_delegation_task(
+            task_id="t-tier",
+            parent_agent_id="planner",
+            child_agent_id="worker",
+            depth=1,
+            status="completed",
+            payload={"data": 1},
+            result={"out": 2},
+            created_at="2025-01-01T00:00:00Z",
+            model_tier="fast",
+            context_budget={"total_budget": 4000, "tokens_used": 100},
+        )
+        tasks = store.read_delegation_tasks(parent_agent_id="planner")
+        assert len(tasks) == 1
+        assert tasks[0]["model_tier"] == "fast"
+        assert tasks[0]["context_budget"]["total_budget"] == 4000
+
+    def test_read_task_default_tier(self, tmp_path: Path) -> None:
+        store = StateStore(config_dir=tmp_path)
+        store.ensure()
+        store.write_delegation_task(
+            task_id="t-default",
+            parent_agent_id="p",
+            child_agent_id="c",
+            created_at="2025-01-01T00:00:00Z",
+        )
+        tasks = store.read_delegation_tasks()
+        assert tasks[0]["model_tier"] == ""
+        assert tasks[0]["context_budget"] == {}
+
+
+# ---------------------------------------------------------------------------
+# CLI tier argument tests
+# ---------------------------------------------------------------------------
+
+
+class TestDelegationCLITier:
+    def test_submit_parser_accepts_tier(self, tmp_path: Path) -> None:
+        import argparse
+        # Just verify the parser doesn't reject --tier
+        code = run_cli(tmp_path, "delegation", "tasks")
+        assert code == 0
+
+    def test_parser_has_tier_on_submit(self) -> None:
+        """Verify that the submit subparser includes --tier."""
+        import argparse
+        from clawie.cli import build_parser
+        parser = build_parser()
+        # Parse a valid submit command
+        args = parser.parse_args([
+            "--config-dir", "/tmp",
+            "delegation", "submit",
+            "--parent", "p",
+            "--child", "c",
+            "--tier", "fast",
+            "--payload", "{}",
+        ])
+        assert args.tier == "fast"
+
+    def test_parser_has_tier_on_spawn(self) -> None:
+        from clawie.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args([
+            "--config-dir", "/tmp",
+            "delegation", "spawn-session",
+            "--parent", "p",
+            "--child", "c",
+            "--tier", "power",
+        ])
+        assert args.tier == "power"
+
+    def test_parser_has_tier_on_repl(self) -> None:
+        from clawie.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args([
+            "--config-dir", "/tmp",
+            "delegation", "repl",
+            "--agent-id", "w",
+            "--tier", "balanced",
+        ])
+        assert args.tier == "balanced"
+
+    def test_parser_has_model_tier_on_create(self) -> None:
+        from clawie.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args([
+            "--config-dir", "/tmp",
+            "agent", "create", "test-agent",
+            "--model-tier", "fast",
+        ])
+        assert args.model_tier == "fast"
+
+    def test_parser_has_model_tier_on_clone(self) -> None:
+        from clawie.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args([
+            "--config-dir", "/tmp",
+            "agent", "clone", "source", "target",
+            "--model-tier", "power",
+        ])
+        assert args.model_tier == "power"
+
+
+# ---------------------------------------------------------------------------
+# DelegationCoordinator tier tests
+# ---------------------------------------------------------------------------
+
+
+class TestCoordinatorTier:
+    def test_coordinator_default_tier(self) -> None:
+        coord = DelegationCoordinator("test-agent")
+        assert coord.model_tier == "balanced"
+        assert coord.context_budget.total_budget == 16_000
+        coord.bus.close()
+
+    def test_coordinator_custom_tier(self) -> None:
+        coord = DelegationCoordinator("test-agent", model_tier="fast")
+        assert coord.model_tier == "fast"
+        assert coord.context_budget.total_budget == 4_000
+        coord.bus.close()
+
+    def test_coordinator_accepts_bus_and_tree(self) -> None:
+        from clawie.delegation import DelegationBus, DelegationTree
+        bus = DelegationBus("test")
+        tree = DelegationTree()
+        coord = DelegationCoordinator("test", bus=bus, tree=tree, model_tier="power")
+        assert coord.bus is bus
+        assert coord.tree is tree
+        assert coord.model_tier == "power"
+        bus.close()

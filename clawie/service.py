@@ -1673,6 +1673,7 @@ class ZeroClawService:
             "heartbeat_seconds": int(source_agent_defaults.get("heartbeat_seconds", 30)),
             "pid": int(source_agent_defaults.get("pid", 0)),
             "plugins": plugins,
+            "model_tier": "balanced",
         }
         if clone_from and not core_prompts:
             core_prompts = copy.deepcopy(agents.get(clone_from, {}).get("core_prompts", {}))
@@ -8859,6 +8860,8 @@ class ZeroClawService:
         if not isinstance(raw_plugins, dict):
             raw_plugins = self._default_plugins_for_provider(str(agent.get("provider", "")))
         agent["plugins"] = self._normalize_plugins(raw_plugins)
+        if "model_tier" not in agent:
+            agent["model_tier"] = "balanced"
         agent_state["core_prompts"] = self._normalize_core_prompts(provider, agent_state.get("core_prompts", {}))
         agent_state["credential_sync"] = self._normalize_credential_sync_state(
             agent_state.get("credential_sync"),
@@ -8905,6 +8908,41 @@ class ZeroClawService:
             channels.extend(adapter.discover_channels(source_home / state_dir))
         return dedupe_channels(channels)
 
+    def set_agent_model_tier(self, agent_id: str, tier: str = "") -> str:
+        """Set or cycle the model tier for *agent_id*. Returns the new tier."""
+        from clawie.delegation import VALID_TIER_NAMES
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        state["users"] = agents
+        agent_state = agents.get(agent_id)
+        if not agent_state:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+
+        agent = agent_state.setdefault("agent", {})
+        current = str(agent.get("model_tier", "balanced"))
+
+        if tier:
+            if tier not in VALID_TIER_NAMES:
+                raise ValueError(
+                    f"unknown tier {tier!r}; valid: {', '.join(VALID_TIER_NAMES)}"
+                )
+            new_tier = tier
+        else:
+            # Cycle: fast -> balanced -> power -> fast
+            idx = list(VALID_TIER_NAMES).index(current) if current in VALID_TIER_NAMES else 0
+            new_tier = VALID_TIER_NAMES[(idx + 1) % len(VALID_TIER_NAMES)]
+
+        agent["model_tier"] = new_tier
+        self._event(
+            state,
+            "agent.model_tier.changed",
+            f"Agent {agent_id} model tier changed to {new_tier}",
+            {"agent_id": agent_id, "old_tier": current, "new_tier": new_tier},
+        )
+        self.store.write_state(state)
+        return new_tier
+
     # ── Delegation methods ────────────────────────────────────────────────
 
     def delegate_task(
@@ -8913,9 +8951,11 @@ class ZeroClawService:
         child_id: str,
         payload: dict[str, Any] | None = None,
         timeout: float = 300.0,
+        model_tier: str = "",
     ) -> dict[str, Any]:
-        from clawie.delegation import DelegationCoordinator, DelegationBus, DelegationTree
+        from clawie.delegation import DelegationCoordinator, DelegationBus, DelegationTree, DEFAULT_TIER
 
+        tier = model_tier or DEFAULT_TIER
         task_id = str(__import__("uuid").uuid4().hex)
         self.store.write_delegation_task(
             task_id=task_id,
@@ -8924,10 +8964,11 @@ class ZeroClawService:
             payload=payload or {},
             depth=0,
             timeout_seconds=timeout,
+            model_tier=tier,
         )
         bus = DelegationBus(parent_id)
         tree = DelegationTree()
-        coordinator = DelegationCoordinator(parent_id, bus, tree)
+        coordinator = DelegationCoordinator(parent_id, bus, tree, model_tier=tier)
         try:
             result = coordinator.delegate(child_id, payload or {}, timeout=timeout)
         except Exception as exc:
@@ -8940,6 +8981,7 @@ class ZeroClawService:
                 timeout_seconds=timeout,
                 status="failed",
                 error=str(exc),
+                model_tier=tier,
             )
             state = self.store.read_state()
             self._event(
@@ -8959,6 +9001,7 @@ class ZeroClawService:
             timeout_seconds=timeout,
             status="completed",
             result=result,
+            model_tier=tier,
         )
         tree_data = tree.to_dict()
         self.store.write_delegation_tree(parent_id, tree_data)
@@ -8972,13 +9015,15 @@ class ZeroClawService:
         self.store.write_state(state)
         return {"task_id": task_id, "status": "completed", "result": result}
 
-    def start_agent_repl(self, agent_id: str, handler: Any = None) -> None:
-        from clawie.delegation import AgentREPL
+    def start_agent_repl(self, agent_id: str, handler: Any = None, model_tier: str = "") -> None:
+        from clawie.delegation import AgentREPL, DEFAULT_TIER
+
+        tier = model_tier or DEFAULT_TIER
 
         def _default_handler(msg: Any, repl: Any) -> dict[str, Any]:
             return {"echo": msg.payload, "agent": agent_id}
 
-        repl = AgentREPL(agent_id, handler=handler or _default_handler)
+        repl = AgentREPL(agent_id, handler=handler or _default_handler, model_tier=tier)
         import signal
 
         def _shutdown(*_a: Any) -> None:
@@ -9034,9 +9079,13 @@ class ZeroClawService:
         parent_id: str,
         child_id: str,
         timeout: float = 300.0,
+        model_tier: str = "",
     ) -> dict[str, Any]:
+        from clawie.delegation import DEFAULT_TIER
+
+        tier = model_tier or DEFAULT_TIER
         mgr = self._get_session_manager(parent_id)
-        mgr.spawn(child_id, timeout=timeout)
+        mgr.spawn(child_id, timeout=timeout, model_tier=tier)
         state = self.store.read_state()
         self._event(
             state,

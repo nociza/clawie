@@ -3756,6 +3756,7 @@ class ZeroClawService:
         manager = (
             str(manager_user).strip()
             or str(agent_info.get("manager_user", "")).strip()
+            or os.environ.get("SUDO_USER", "").strip()
             or self._current_linux_user()
         )
         changes: list[str] = []
@@ -7562,7 +7563,7 @@ class ZeroClawService:
             f'  for f in "$STAGE_DIR"/{provider}--*; do '
             f'    [ -f "$f" ] || continue; '
             f'    name="${{f##*--}}"; '
-            f'    cp "$f" "$WS/$name" && rm -f "$f"; '
+            f'    cp "$f" "$WS/$name" && rm -f "$f" 2>/dev/null; '
             f'  done; '
             f'fi'
         )
@@ -8717,11 +8718,23 @@ class ZeroClawService:
     def _stage_prompt_file(
         self, linux_user: str, provider: str, prompt_name: str, content: str,
     ) -> Path:
+        root = self._PROMPT_STAGE_ROOT
+        root.mkdir(parents=True, exist_ok=True, mode=0o1777)
+        try:
+            os.chmod(str(root), 0o1777)
+        except OSError:
+            pass
         stage = self._prompt_stage_dir(linux_user)
-        stage.mkdir(parents=True, exist_ok=True, mode=0o755)
+        # Per-user dir is 777 (no sticky) so the target user can delete files
+        # written by the manager user after copying them to the workspace.
+        stage.mkdir(parents=True, exist_ok=True, mode=0o777)
+        try:
+            os.chmod(str(stage), 0o777)
+        except OSError:
+            pass
         target = stage / f"{provider}--{prompt_name}"
         target.write_text(str(content), encoding="utf-8")
-        os.chmod(str(target), 0o644)
+        os.chmod(str(target), 0o666)
         return target
 
     def _apply_staged_prompts_if_possible(
@@ -8798,7 +8811,11 @@ class ZeroClawService:
 
             # Add the manager (spawner) user to the agent's group so it can
             # traverse home and write to state/workspace via group bits.
-            spawner = self._current_linux_user()
+            # Prefer SUDO_USER over current user (root) when running under sudo.
+            spawner = (
+                os.environ.get("SUDO_USER", "").strip()
+                or self._current_linux_user()
+            )
             if spawner and spawner != linux_user:
                 subprocess.run(
                     ["usermod", "-a", "-G", linux_user, spawner],

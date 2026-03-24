@@ -1707,6 +1707,13 @@ def cmd_agents_apply_prompts(args: argparse.Namespace, service: ZeroClawService)
     applied = result.get("applied", [])
     if applied:
         print_success(f"Applied {len(applied)} prompt(s) for {agent_id}: {', '.join(applied)}")
+        # Restart the service so the gateway picks up updated workspace files.
+        try:
+            restart = service.agent_service_action(agent_id, "restart")
+            print_success(f"Restarted service for {agent_id} ({restart.get('service_status', 'unknown')})")
+        except Exception as exc:
+            print_info(f"Could not restart service: {exc}")
+            print_info("Run 'clawie agent service restart " + agent_id + "' manually.")
     else:
         print_info(f"No staged prompts to apply for {agent_id}")
     return 0

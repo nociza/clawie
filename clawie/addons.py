@@ -42,6 +42,22 @@ class ServiceAddonSpec:
     env_exports: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class ToolAddonSpec:
+    """Lightweight addon that only injects tool documentation into TOOLS.md.
+
+    No auth, no systemd services, no package installation — just documentation
+    for tools already available on the system (curl, jq, etc.).
+    """
+
+    name: str
+    label: str
+    description: str
+    check_executables: tuple[str, ...] = ()
+    tools_snippet: str = ""
+    env_exports: tuple[tuple[str, str], ...] = ()
+
+
 # ── Tools snippet templates ──────────────────────────────────────────
 
 _DISPLAY_TOOLS_TEMPLATE = """\
@@ -132,10 +148,55 @@ gws calendar events create --summary "Meeting" --start "2024-01-15T10:00:00" --e
 
 Authentication is pre-configured. Use `gws auth status` to verify."""
 
+_WEB_FETCH_TOOLS_TEMPLATE = """\
+## Headless Web Fetch
+
+Fetch web content, APIs, and files without a browser or display server.
+
+### Available tools
+
+| Tool | Usage | Description |
+|------|-------|-------------|
+| **curl** | `curl -sL <url>` | Fetch URLs, APIs, download files |
+| **wget** | `wget -qO- <url>` | Download files and pages |
+| **jq** | `echo '{{}}' \\| jq '.key'` | Parse and transform JSON |
+
+### Common patterns
+
+```bash
+# Fetch a web page as text (strip HTML tags for readability)
+curl -sL "https://example.com" | sed 's/<[^>]*>//g' | head -200
+
+# Fetch JSON API response and extract fields
+curl -sL "https://api.example.com/data" | jq '.results[] | {{name, value}}'
+
+# POST JSON to an API
+curl -sX POST "https://api.example.com/endpoint" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"key": "value"}}'
+
+# Download a file
+curl -sLo /tmp/file.pdf "https://example.com/document.pdf"
+
+# Follow redirects and show final URL
+curl -sLo /dev/null -w '%{{url_effective}}' "https://short.url/abc"
+
+# Fetch with timeout and retry
+curl -sL --connect-timeout 10 --retry 3 "https://example.com"
+```
+
+### Tips
+
+- Use `-s` (silent) to suppress progress bars
+- Use `-L` to follow redirects
+- Pipe HTML through `sed 's/<[^>]*>//g'` for quick text extraction
+- Use `jq` for all JSON processing — never parse JSON with grep/sed
+- Set `--connect-timeout` to avoid hanging on slow servers"""
+
 
 # ── Addon registry ───────────────────────────────────────────────────
 
-ADDONS: dict[str, Union[AddonSpec, ServiceAddonSpec]] = {
+ADDONS: dict[str, Union[AddonSpec, ServiceAddonSpec, ToolAddonSpec]] = {
     "gws": AddonSpec(
         name="gws",
         label="Google Workspace CLI",
@@ -180,6 +241,13 @@ ADDONS: dict[str, Union[AddonSpec, ServiceAddonSpec]] = {
         tools_snippet=_DISPLAY_TOOLS_TEMPLATE,
         env_exports=(("DISPLAY", ":{display_number}"),),
     ),
+    "web-fetch": ToolAddonSpec(
+        name="web-fetch",
+        label="Headless Web Fetch",
+        description="curl + jq for headless web fetching, API calls, and JSON processing",
+        check_executables=("curl", "jq"),
+        tools_snippet=_WEB_FETCH_TOOLS_TEMPLATE,
+    ),
 }
 
 
@@ -187,12 +255,18 @@ def addon_names() -> list[str]:
     return sorted(ADDONS)
 
 
-def get_addon(name: str) -> Union[AddonSpec, ServiceAddonSpec]:
+def get_addon(name: str) -> Union[AddonSpec, ServiceAddonSpec, ToolAddonSpec]:
     token = str(name or "").strip().lower()
     if token not in ADDONS:
         choices = ", ".join(addon_names())
         raise ValueError(f"addon must be one of: {choices}")
     return ADDONS[token]
+
+
+def is_tool_addon(name: str) -> bool:
+    token = str(name or "").strip().lower()
+    spec = ADDONS.get(token)
+    return isinstance(spec, ToolAddonSpec)
 
 
 def is_service_addon(name: str) -> bool:

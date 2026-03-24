@@ -37,7 +37,7 @@ from clawie.addon_integration import (
     remove_addon_tools_snippet,
     render_addon_env_block,
 )
-from clawie.addons import AddonSpec, ServiceAddonSpec, addon_names, get_addon, is_service_addon
+from clawie.addons import AddonSpec, ServiceAddonSpec, ToolAddonSpec, addon_names, get_addon, is_service_addon
 from clawie.display import (
     allocate_display_number,
     check_display_installed,
@@ -3625,6 +3625,12 @@ class ZeroClawService:
         home = self._agent_linux_home(agent)
         if command in {"start", "restart"}:
             self.ensure_provider_runtime(provider)
+            if home and linux_user:
+                self._apply_staged_prompts_if_possible(provider, home, linux_user)
+            if home:
+                self._write_prompt_files_for_home(
+                    provider, home, agent.get("core_prompts", {}), linux_user,
+                )
             self._prepare_agent_provider_home(
                 provider=provider,
                 agent=agent,
@@ -3667,6 +3673,135 @@ class ZeroClawService:
             "service_status": str(result.get("service_status", "unknown")),
             "service_mode": str(result.get("service_mode", "unknown")),
             "output": str(result.get("output", "")),
+        }
+
+    def apply_staged_prompts(self, agent_id: str) -> dict[str, Any]:
+        """Apply staged prompt files to an agent workspace.
+
+        Runs the pickup shell snippet as the agent's linux_user so it has
+        write access to the workspace.  Requires root when linux_user differs
+        from the current user.
+        """
+        self._require_setup()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        agent_info = agent.setdefault("agent", {})
+        provider = str(agent_info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{agent_id}' has no provider configured")
+        linux_user = str(agent_info.get("linux_user", "")).strip()
+        spec = get_provider(provider)
+        pickup = self._staged_prompt_pickup_shell(provider, spec.state_dir, spec.workspace_dir)
+        cmd = self._user_shell_command(linux_user, pickup)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout or "").strip()
+            raise SetupError(f"apply staged prompts failed: {output or f'exit {result.returncode}'}")
+        # Check what was applied by looking at what's no longer in staging
+        stage_dir = self._prompt_stage_dir(linux_user) if linux_user else None
+        remaining: list[str] = []
+        if stage_dir and stage_dir.is_dir():
+            remaining = [f.name for f in stage_dir.iterdir() if f.name.startswith(f"{provider}--")]
+        # Also write from DB to disk (may succeed now that workspace exists)
+        home = self._agent_linux_home(agent)
+        if home:
+            self._write_prompt_files_for_home(provider, home, agent.get("core_prompts", {}), linux_user)
+        applied = [
+            name.split("--", 1)[1] for name in
+            [f.name for f in (stage_dir.iterdir() if stage_dir and stage_dir.is_dir() else [])]
+            if name.startswith(f"{provider}--")
+        ]
+        # If staging dir is now empty or doesn't exist, all were applied
+        prompts = agent.get("core_prompts", {})
+        prompt_names = [k for k in prompts if prompts[k]]
+        if not remaining:
+            applied = prompt_names
+        return {"agent_id": agent_id, "applied": applied, "remaining": remaining}
+
+    def ensure_agent_permissions(self, agent_id: str, manager_user: str = "") -> dict[str, Any]:
+        """Set up group-based access so the manager user can manage the agent without sudo.
+
+        Requires root.  Adds *manager_user* (default: current user) to the
+        agent's Linux group and sets the provider state/workspace directories
+        to setgid-group-writable (2775).  The agent user's permissions are
+        unaffected—only group bits are widened.
+
+        After running this once (with sudo), the manager can write prompt
+        files, update configs, and apply staged prompts without root.
+        """
+        self._require_setup()
+        if os.geteuid() != 0:
+            raise SetupError("ensure_agent_permissions requires root. Re-run with sudo.")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        agent_info = agent.setdefault("agent", {})
+        provider = str(agent_info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{agent_id}' has no provider configured")
+        linux_user = str(agent_info.get("linux_user", "")).strip()
+        if not linux_user:
+            raise SetupError(f"agent '{agent_id}' has no linux_user")
+        home = self._agent_linux_home(agent)
+        if not home:
+            raise SetupError(f"cannot resolve home directory for {linux_user}")
+
+        manager = (
+            str(manager_user).strip()
+            or str(agent_info.get("manager_user", "")).strip()
+            or self._current_linux_user()
+        )
+        changes: list[str] = []
+
+        spec = get_provider(provider)
+        state_dir = home / spec.state_dir
+        ws = state_dir / spec.workspace_dir
+
+        # Home dir: ensure group r-x for traversal.
+        if home.is_dir():
+            subprocess.run(["chmod", "g+rx", str(home)], check=False)
+            changes.append(f"{home}: g+rx")
+
+        # State dir: setgid + group-writable.
+        if state_dir.is_dir():
+            subprocess.run(["chmod", "2775", str(state_dir)], check=False)
+            changes.append(f"{state_dir}: 2775")
+            for child in state_dir.iterdir():
+                if child.is_file():
+                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
+
+        # Workspace: setgid + group-writable.
+        if ws.is_dir():
+            subprocess.run(["chmod", "2775", str(ws)], check=False)
+            changes.append(f"{ws}: 2775")
+            for child in ws.iterdir():
+                if child.is_file():
+                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
+                    changes.append(f"{child.name}: g+rw")
+
+        # Add manager to agent group.
+        if manager and manager != linux_user:
+            result = subprocess.run(
+                ["usermod", "-a", "-G", linux_user, manager],
+                check=False, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                changes.append(f"added {manager} to group {linux_user}")
+            else:
+                changes.append(f"usermod failed: {(result.stderr or '').strip()}")
+
+        return {
+            "agent_id": agent_id,
+            "linux_user": linux_user,
+            "manager": manager,
+            "changes": changes,
         }
 
     def delete_agent(self, agent_id: str) -> None:
@@ -4134,6 +4269,10 @@ class ZeroClawService:
             home = self._agent_linux_home(agent)
             effective_channels = self._effective_agent_channels(agent)
             live_payloads = self._discover_live_channel_payloads(agent)
+            if home:
+                self._write_prompt_files_for_home(
+                    provider, home, agent.get("core_prompts", {}), linux_user,
+                )
             self._prepare_agent_provider_home(
                 provider=provider,
                 agent=agent,
@@ -4182,6 +4321,10 @@ class ZeroClawService:
                 live_payloads.get((channel_kind, channel_name))
                 or any(str(key[0]).strip().lower() == channel_kind for key in live_payloads)
             ):
+                if home:
+                    self._write_prompt_files_for_home(
+                        provider, home, agent.get("core_prompts", {}), linux_user,
+                    )
                 self._prepare_agent_provider_home(
                     provider=provider,
                     agent=agent,
@@ -4832,12 +4975,12 @@ class ZeroClawService:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
-        if isinstance(spec, ServiceAddonSpec):
+        if isinstance(spec, (ServiceAddonSpec, ToolAddonSpec)):
             return {
                 "addon": spec.name,
                 "label": spec.label,
                 "auth_status": "n/a",
-                "detail": "service addon (no auth required)",
+                "detail": "tool addon (no auth required)" if isinstance(spec, ToolAddonSpec) else "service addon (no auth required)",
                 "login_required": False,
                 "config_dir": "",
                 "shared_scope": "system",
@@ -5104,6 +5247,25 @@ class ZeroClawService:
                 rows.append(row)
                 continue
 
+            if isinstance(spec, ToolAddonSpec):
+                tool_installed = all(shutil.which(exe) for exe in spec.check_executables) if spec.check_executables else True
+                rows.append({
+                    "addon": spec.name,
+                    "label": spec.label,
+                    "description": spec.description,
+                    "enabled": bool(addon_state.get("enabled", False)),
+                    "installed": tool_installed,
+                    "auth_status": "n/a",
+                    "auth_detail": "tool addon (no auth required)",
+                    "applied": bool(addon_state.get("enabled", False)),
+                    "access_status": "ok",
+                    "access_detail": "",
+                    "target_path": "",
+                    "last_applied_at": str(addon_state.get("last_applied_at", "")),
+                    "last_revoked_at": str(addon_state.get("last_revoked_at", "")),
+                })
+                continue
+
             shared_auth = self.shared_addon_auth_status(spec.name)
             link = self._agent_addon_link_status(spec.name, home, linux_user=info.get("linux_user", ""))
             rows.append(
@@ -5151,6 +5313,8 @@ class ZeroClawService:
             result = self.enable_agent_display(token)
             result["agent"] = self.get_dashboard_agent(token)
             return result
+        if isinstance(spec, ToolAddonSpec):
+            return self._enable_tool_addon(token, spec)
         self.ensure_addon_installed(spec.name)
         if source_home or source_agent:
             self.import_shared_addon_auth(spec.name, source_home=source_home, source_agent=source_agent)
@@ -5223,6 +5387,60 @@ class ZeroClawService:
             "pending": pending,
             "shared_auth": status,
         }
+
+    def _enable_tool_addon(self, agent_id: str, spec: ToolAddonSpec) -> dict[str, Any]:
+        """Enable a lightweight tool addon (no auth, no service — just TOOLS.md injection)."""
+        for exe in spec.check_executables:
+            if not shutil.which(exe):
+                raise SetupError(f"required executable '{exe}' not found in PATH")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        provider = str(info.get("provider", "")).strip().lower()
+        addons = self._normalize_agent_addons(agent.get("addons"))
+        addon_state = dict(addons.get(spec.name, {}))
+        addon_state["enabled"] = True
+        pending = True
+        if provider and home is not None and spec.tools_snippet:
+            context: dict[str, str] = {}
+            try:
+                self._apply_addon_agent_integration(
+                    spec.name,
+                    provider=provider,
+                    home=home,
+                    linux_user=linux_user,
+                    context=context,
+                )
+                addon_state["last_applied_at"] = now_iso()
+                pending = False
+            except PermissionError:
+                pass
+        # Also inject into DB core_prompts so staging/future writes include it
+        prompts = agent.setdefault("core_prompts", {})
+        tools_md = str(prompts.get("TOOLS.md", ""))
+        if spec.tools_snippet and spec.name not in tools_md:
+            from clawie.addon_integration import inject_addon_tools_snippet
+            prompts["TOOLS.md"] = inject_addon_tools_snippet(
+                tools_md, spec.name, spec.tools_snippet,
+            )
+        addons[spec.name] = addon_state
+        agent["addons"] = addons
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "addons.enabled",
+            f"Enabled addon {spec.name} for {agent_id}",
+            {"agent_id": agent_id, "addon": spec.name, "pending": pending},
+        )
+        self.store.write_state(state)
+        return {"agent": agent, "addon": spec.name, "linked_paths": [], "pending": pending}
 
     def disable_agent_addon(self, agent_id: str, addon: str) -> dict[str, Any]:
         self._require_setup()
@@ -5482,6 +5700,13 @@ class ZeroClawService:
 
     def _agent_addon_link_status(self, addon: str, home: Path | None, *, linux_user: str = "") -> dict[str, Any]:
         spec = get_addon(addon)
+        if isinstance(spec, (ServiceAddonSpec, ToolAddonSpec)):
+            return {
+                "applied": True,
+                "access_status": "ok",
+                "access_detail": "",
+                "target_path": "",
+            }
         target = (home / spec.target_config_rel) if home else Path(spec.target_config_rel)
         if home is None:
             return {
@@ -6109,6 +6334,7 @@ class ZeroClawService:
             plugin_overrides=plugin_overrides,
         )
         agent_state["agent"]["linux_user"] = target_user
+        agent_state["agent"]["manager_user"] = self._current_linux_user()
         agent_state["agent"]["ssh_login_disabled"] = bool(ssh_login_disabled)
         agent_state["agent"]["login_shell"] = spawn_shell
         credential_sync = self._normalize_credential_sync_state({}, default_when_missing=False)
@@ -6124,6 +6350,7 @@ class ZeroClawService:
                 self._write_prompt_files_for_home(resolved_provider, target_home, cloned_prompts, target_user)
             except PermissionError:
                 pass
+        self._ensure_workspace_accessible(resolved_provider, target_home, target_user)
         state = self.store.read_state()
         self._event(
             state,
@@ -7320,12 +7547,33 @@ class ZeroClawService:
             return None
         return home / ".config" / "systemd" / "user" / f"{provider}.service"
 
+    @staticmethod
+    def _staged_prompt_pickup_shell(provider: str, state_dir: str, workspace_dir: str) -> str:
+        """Shell snippet that copies staged prompt files into the workspace.
+
+        Runs as the target user so it has write access to $HOME.
+        Staged files live at /tmp/clawie-prompt-stage/$USER/<provider>--<name>.
+        """
+        return (
+            f'STAGE_DIR="/tmp/clawie-prompt-stage/$USER"; '
+            f'WS="$HOME/{state_dir}/{workspace_dir}"; '
+            f'if [ -d "$STAGE_DIR" ]; then '
+            f'  mkdir -p "$WS"; '
+            f'  for f in "$STAGE_DIR"/{provider}--*; do '
+            f'    [ -f "$f" ] || continue; '
+            f'    name="${{f##*--}}"; '
+            f'    cp "$f" "$WS/$name" && rm -f "$f"; '
+            f'  done; '
+            f'fi'
+        )
+
     def _generated_user_service_unit_contents(self, provider: str, executable: str) -> str:
         spec = get_provider(provider)
         command = " ".join([shlex.quote(executable), *[shlex.quote(part) for part in spec.background_command]])
         state_dir = spec.state_dir
         workspace_dir = spec.workspace_dir
         path_entries = self._service_env("").get("PATH", "")
+        pickup = self._staged_prompt_pickup_shell(provider, state_dir, workspace_dir)
         shell = (
             f'mkdir -p "$HOME/{state_dir}" "$HOME/{state_dir}/{workspace_dir}"; '
             f'cd "$HOME/{state_dir}/{workspace_dir}"; '
@@ -7343,6 +7591,7 @@ class ZeroClawService:
             "Environment=USER=%u",
             "Environment=LOGNAME=%u",
             f"Environment=PATH={path_entries}",
+            f"ExecStartPre=/bin/bash -c {shlex.quote(pickup)}",
             f"ExecStart=/bin/bash -lc {shlex.quote(shell)}",
             "Restart=always",
             "RestartSec=2",
@@ -8059,8 +8308,11 @@ class ZeroClawService:
     def _start_fallback_daemon(self, provider: str, executable: str, linux_user: str) -> int:
         spec = get_provider(provider)
         state_dir = spec.state_dir
+        workspace_dir = spec.workspace_dir
+        pickup = self._staged_prompt_pickup_shell(provider, state_dir, workspace_dir)
         background = " ".join([f'"{executable}"', *[shlex.quote(part) for part in spec.background_command]])
         script = (
+            f'{pickup}; '
             f'mkdir -p "$HOME/{state_dir}"; '
             f'setsid {background} < /dev/null >>"$HOME/{state_dir}/daemon.log" 2>&1 & echo $!'
         )
@@ -8420,10 +8672,21 @@ class ZeroClawService:
                 rows[name] = ""
         return rows
 
+    # ── prompt staging ──────────────────────────────────────────────
+    _PROMPT_STAGE_ROOT = Path("/tmp/clawie-prompt-stage")
+
+    @classmethod
+    def _prompt_stage_dir(cls, linux_user: str) -> Path:
+        return cls._PROMPT_STAGE_ROOT / linux_user
+
     def _write_core_prompt_file(self, provider: str, home: Path, prompt_name: str, content: str) -> Path:
         path = self._core_prompt_path(provider, home, prompt_name)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(content), encoding="utf-8")
+        try:
+            os.chmod(str(path), 0o664)
+        except OSError:
+            pass
         return path
 
     def _write_prompt_files_for_home(
@@ -8434,12 +8697,115 @@ class ZeroClawService:
         linux_user: str = "",
     ) -> list[str]:
         written: list[str] = []
+        staged: list[str] = []
         for name, content in self._normalize_core_prompts(provider, prompts).items():
-            target = self._write_core_prompt_file(provider, home, name, content)
-            if linux_user and os.geteuid() == 0:
-                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
-            written.append(str(target))
+            try:
+                target = self._write_core_prompt_file(provider, home, name, content)
+                if linux_user and os.geteuid() == 0:
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
+                written.append(str(target))
+            except PermissionError:
+                if linux_user:
+                    self._stage_prompt_file(linux_user, provider, name, content)
+                    staged.append(name)
+                else:
+                    raise
+        if staged:
+            self._apply_staged_prompts_if_possible(provider, home, linux_user)
         return written
+
+    def _stage_prompt_file(
+        self, linux_user: str, provider: str, prompt_name: str, content: str,
+    ) -> Path:
+        stage = self._prompt_stage_dir(linux_user)
+        stage.mkdir(parents=True, exist_ok=True, mode=0o755)
+        target = stage / f"{provider}--{prompt_name}"
+        target.write_text(str(content), encoding="utf-8")
+        os.chmod(str(target), 0o644)
+        return target
+
+    def _apply_staged_prompts_if_possible(
+        self, provider: str, home: Path, linux_user: str,
+    ) -> list[str]:
+        stage = self._prompt_stage_dir(linux_user)
+        if not stage.is_dir():
+            return []
+        applied: list[str] = []
+        prefix = f"{provider}--"
+        for entry in sorted(stage.iterdir()):
+            if not entry.name.startswith(prefix):
+                continue
+            prompt_name = entry.name[len(prefix):]
+            content = entry.read_text(encoding="utf-8")
+            try:
+                target = self._write_core_prompt_file(provider, home, prompt_name, content)
+                if linux_user and os.geteuid() == 0:
+                    subprocess.run(
+                        ["chown", f"{linux_user}:{linux_user}", str(target)],
+                        check=False,
+                    )
+                applied.append(prompt_name)
+                entry.unlink(missing_ok=True)
+            except PermissionError:
+                continue
+        if applied and not any(stage.iterdir()):
+            stage.rmdir()
+        return applied
+
+    def _ensure_workspace_accessible(
+        self, provider: str, home: Path, linux_user: str,
+    ) -> None:
+        """Make agent home group-accessible so the manager user can operate without sudo.
+
+        Sets the provider state dir and workspace to setgid-group-writable (2775)
+        so that files created there inherit the agent's group. Adds the current
+        (manager) user to the agent's group for traversal and write access.
+        The agent user's own access is unaffected (owner bits stay rwx).
+        """
+        if os.geteuid() != 0:
+            return
+        try:
+            spec = get_provider(provider)
+            state = home / spec.state_dir
+            ws = state / spec.workspace_dir
+
+            # Home dir: ensure group can at least traverse (g+rx).
+            # 750 (rwxr-x---) is the minimum; don't weaken if already tighter
+            # for "other", but ensure group bits.
+            if home.is_dir():
+                subprocess.run(["chmod", "g+rx", str(home)], check=False)
+
+            # State dir (.openclaw/): setgid + group-writable so manager
+            # can write config and new files inherit the agent group.
+            if state.is_dir():
+                subprocess.run(["chmod", "2775", str(state)], check=False)
+
+            # Workspace dir: same treatment.
+            if ws.is_dir():
+                subprocess.run(["chmod", "2775", str(ws)], check=False)
+
+            # Make existing files in workspace group-writable.
+            if ws.is_dir():
+                for child in ws.iterdir():
+                    if child.is_file():
+                        subprocess.run(["chmod", "g+rw", str(child)], check=False)
+
+            # Make existing files in state dir group-writable (config, logs).
+            if state.is_dir():
+                for child in state.iterdir():
+                    if child.is_file():
+                        subprocess.run(["chmod", "g+rw", str(child)], check=False)
+
+            # Add the manager (spawner) user to the agent's group so it can
+            # traverse home and write to state/workspace via group bits.
+            spawner = self._current_linux_user()
+            if spawner and spawner != linux_user:
+                subprocess.run(
+                    ["usermod", "-a", "-G", linux_user, spawner],
+                    check=False,
+                )
+        except OSError:
+            pass
 
     def _agent_linux_home(self, agent: dict[str, Any]) -> Path | None:
         linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()

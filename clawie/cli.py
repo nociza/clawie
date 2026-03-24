@@ -649,7 +649,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     service_sub = service.add_subparsers(
         dest="agent_service_command",
         required=True,
-        metavar="{start,stop,restart,status}",
+        metavar="{start,stop,restart,status,apply-prompts}",
     )
     for action in ("start", "stop", "restart", "status"):
         action_parser = service_sub.add_parser(
@@ -663,6 +663,35 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
             help_text="Agent ID",
         )
         action_parser.set_defaults(func=cmd_agents_service)
+
+    apply_prompts_parser = service_sub.add_parser(
+        "apply-prompts",
+        help="Apply staged prompt files to an agent workspace (may require sudo)",
+    )
+    _add_positional_argument(
+        apply_prompts_parser,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    apply_prompts_parser.set_defaults(func=cmd_agents_apply_prompts)
+
+    fix_perms = agent_sub.add_parser(
+        "fix-permissions",
+        help="Set up group access so the manager user can manage this agent without sudo",
+    )
+    _add_positional_argument(
+        fix_perms,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    fix_perms.add_argument(
+        "--manager",
+        default="",
+        help="Manager username (default: current user)",
+    )
+    fix_perms.set_defaults(func=cmd_agents_fix_permissions)
 
     provider = agent_sub.add_parser(
         "provider",
@@ -1669,6 +1698,37 @@ def cmd_agents_service(args: argparse.Namespace, service: ZeroClawService) -> in
     output = str(result.get("output", "")).strip()
     if output:
         print_info("Output: " + output)
+    return 0
+
+
+def cmd_agents_apply_prompts(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    result = service.apply_staged_prompts(agent_id)
+    applied = result.get("applied", [])
+    if applied:
+        print_success(f"Applied {len(applied)} prompt(s) for {agent_id}: {', '.join(applied)}")
+    else:
+        print_info(f"No staged prompts to apply for {agent_id}")
+    return 0
+
+
+def cmd_agents_fix_permissions(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    manager = getattr(args, "manager", "") or ""
+    result = service.ensure_agent_permissions(agent_id, manager_user=manager)
+    changes = result.get("changes", [])
+    if changes:
+        print_success(
+            f"Permissions updated for {agent_id} "
+            f"(manager={result.get('manager', '?')}, agent_user={result.get('linux_user', '?')})"
+        )
+        for change in changes:
+            print_info(f"  {change}")
+    else:
+        print_info(f"No permission changes needed for {agent_id}")
+    print_info("")
+    print_info("Note: group membership changes take effect on next login.")
+    print_info("Run `newgrp " + str(result.get("linux_user", "<group>")) + "` or re-login to activate.")
     return 0
 
 

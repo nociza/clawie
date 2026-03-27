@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_auth_parser(subparsers)
     _build_addon_parser(subparsers)
     _build_delegation_parser(subparsers)
+    _build_maintenance_parser(subparsers)
 
     dashboard = subparsers.add_parser(
         "dashboard",
@@ -2516,6 +2517,93 @@ def cmd_delegation_status(args: argparse.Namespace, service: ZeroClawService) ->
             f"age={a['age_seconds']}s  {a['socket']}"
         )
     return 0
+
+
+def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    maint = subparsers.add_parser(
+        "maintenance",
+        help="Manage periodic maintenance cron jobs (credential sync, prompt apply)",
+    )
+    maint_sub = maint.add_subparsers(
+        dest="maintenance_command",
+        required=True,
+        metavar="{enable,disable,status,run}",
+    )
+
+    maint_enable = maint_sub.add_parser(
+        "enable",
+        help="Install the maintenance cron job (requires sudo)",
+    )
+    maint_enable.add_argument(
+        "--interval", type=int, default=4,
+        help="Hours between runs (default: 4)",
+    )
+    maint_enable.set_defaults(func=cmd_maintenance_enable)
+
+    maint_disable = maint_sub.add_parser(
+        "disable",
+        help="Remove the maintenance cron job (requires sudo)",
+    )
+    maint_disable.set_defaults(func=cmd_maintenance_disable)
+
+    maint_status = maint_sub.add_parser(
+        "status",
+        help="Show maintenance cron job status",
+    )
+    maint_status.set_defaults(func=cmd_maintenance_status)
+
+    maint_run = maint_sub.add_parser(
+        "run",
+        help="Run maintenance tasks now (sync credentials, apply staged prompts)",
+    )
+    maint_run.set_defaults(func=cmd_maintenance_run)
+
+
+def cmd_maintenance_enable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    interval = getattr(args, "interval", 4)
+    result = service.maintenance_enable(interval_hours=interval)
+    print_success(f"Maintenance cron enabled (every {result['interval_hours']}h)")
+    print_info(f"Cron file: {result['cron_file']}")
+    print_info(f"Binary: {result['clawie_binary']}")
+    print_info(f"Log: {ZeroClawService.MAINTENANCE_LOG_FILE}")
+    return 0
+
+
+def cmd_maintenance_disable(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.maintenance_disable()
+    if result["removed"]:
+        print_success("Maintenance cron job removed")
+    else:
+        print_info("No maintenance cron job was installed")
+    return 0
+
+
+def cmd_maintenance_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.maintenance_status()
+    if result["enabled"] and result["cron_file_exists"]:
+        print_success(f"Maintenance cron is active (every {result['interval_hours']}h)")
+        print_info(f"Cron file: {result['cron_file']}")
+    elif result["enabled"]:
+        print_info("Config says enabled but cron file is missing — re-run 'maintenance enable'")
+    else:
+        print_info("Maintenance cron is not enabled")
+    return 0
+
+
+def cmd_maintenance_run(args: argparse.Namespace, service: ZeroClawService) -> int:
+    import datetime
+
+    print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] clawie maintenance run")
+    result = service.maintenance_run()
+    for agent_id, entry in result.get("results", {}).items():
+        creds = entry.get("credentials", "")
+        prompts = entry.get("prompts", "")
+        status = "ok" if "error" not in creds and "error" not in prompts else "FAIL"
+        print(f"  {agent_id}: credentials={creds}  prompts={prompts}  [{status}]")
+    total = result["agents_processed"]
+    errs = result["errors"]
+    print(f"  Total: {total} agents, {result['agents_skipped']} skipped, {errs} errors")
+    return 1 if errs > 0 else 0
 
 
 if __name__ == "__main__":

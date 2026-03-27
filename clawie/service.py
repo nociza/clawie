@@ -104,6 +104,8 @@ class ZeroClawService:
     SHARED_CLAUDE_DIR = Path("/var/lib/clawie/claude-shared")
     SHARED_PROVIDER_AUTH_DIR = Path("/var/lib/clawie/provider-auth")
     SHARED_TOOLCHAIN_DIR = Path("/var/lib/clawie/toolchain")
+    MAINTENANCE_CRON_FILE = Path("/etc/cron.d/clawie-maintenance")
+    MAINTENANCE_LOG_FILE = Path("/var/log/clawie-maintenance.log")
     SHARED_CLAUDE_SUBDIRS = (
         "backups",
         "cache",
@@ -9445,6 +9447,126 @@ class ZeroClawService:
         removed = cleanup_stale_sockets()
         active = list_active_agents()
         return {"removed_sockets": removed, "active_agents": active}
+
+    # ── Maintenance cron ──────────────────────────────────────────────────
+
+    def maintenance_enable(self, *, interval_hours: int = 4) -> dict[str, Any]:
+        """Install a system cron job that periodically syncs agent credentials."""
+        self._require_setup()
+        if os.geteuid() != 0:
+            raise SetupError("maintenance enable requires root. Re-run with sudo.")
+        clawie_bin = shutil.which("clawie") or "/usr/local/bin/clawie"
+        hour_spec = f"*/{interval_hours}" if interval_hours < 24 else "0"
+        cron_content = (
+            "# Managed by clawie -- do not edit manually\n"
+            "SHELL=/bin/bash\n"
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ":/home/linuxbrew/.linuxbrew/bin\n"
+            f"0 {hour_spec} * * * root {clawie_bin} maintenance run"
+            f" >> {self.MAINTENANCE_LOG_FILE} 2>&1\n"
+        )
+        self.MAINTENANCE_CRON_FILE.write_text(cron_content, encoding="utf-8")
+        os.chmod(str(self.MAINTENANCE_CRON_FILE), 0o644)
+        config = self.store.read_config()
+        config["maintenance_cron_enabled"] = True
+        config["maintenance_cron_interval_hours"] = interval_hours
+        self.store.write_config(config)
+        state = self.store.read_state()
+        self._event(state, "maintenance.enabled", f"Maintenance cron enabled (every {interval_hours}h)", {
+            "interval_hours": interval_hours, "cron_file": str(self.MAINTENANCE_CRON_FILE),
+        })
+        self.store.write_state(state)
+        return {"enabled": True, "cron_file": str(self.MAINTENANCE_CRON_FILE),
+                "interval_hours": interval_hours, "clawie_binary": clawie_bin}
+
+    def maintenance_disable(self) -> dict[str, Any]:
+        """Remove the maintenance cron job."""
+        self._require_setup()
+        if os.geteuid() != 0:
+            raise SetupError("maintenance disable requires root. Re-run with sudo.")
+        removed = self.MAINTENANCE_CRON_FILE.exists()
+        self.MAINTENANCE_CRON_FILE.unlink(missing_ok=True)
+        config = self.store.read_config()
+        config["maintenance_cron_enabled"] = False
+        self.store.write_config(config)
+        state = self.store.read_state()
+        self._event(state, "maintenance.disabled", "Maintenance cron disabled", {})
+        self.store.write_state(state)
+        return {"enabled": False, "removed": removed}
+
+    def maintenance_status(self) -> dict[str, Any]:
+        """Check whether the maintenance cron job is installed."""
+        self._require_setup()
+        config = self.store.read_config()
+        cron_exists = self.MAINTENANCE_CRON_FILE.exists()
+        cron_content = ""
+        if cron_exists:
+            try:
+                cron_content = self.MAINTENANCE_CRON_FILE.read_text(encoding="utf-8")
+            except OSError:
+                cron_content = "<unreadable>"
+        return {
+            "enabled": bool(config.get("maintenance_cron_enabled", False)),
+            "cron_file_exists": cron_exists,
+            "interval_hours": int(config.get("maintenance_cron_interval_hours", 4)),
+            "cron_file": str(self.MAINTENANCE_CRON_FILE),
+            "cron_content": cron_content,
+        }
+
+    def maintenance_run(self) -> dict[str, Any]:
+        """Run maintenance tasks: sync credentials and apply staged prompts for all managed agents."""
+        self._require_setup()
+        state = self.store.read_state()
+        agents = state.get("agents", state.get("users", {}))
+        results: dict[str, dict[str, str]] = {}
+        errors = 0
+        skipped = 0
+
+        for agent_id, agent in agents.items():
+            if not isinstance(agent, dict):
+                continue
+            info = agent.get("agent", {})
+            linux_user = str(info.get("linux_user", "")).strip()
+            if not linux_user:
+                skipped += 1
+                continue
+            sync_cfg = agent.get("credential_sync", {})
+            bundles = sync_cfg.get("bundles", []) if isinstance(sync_cfg, dict) else []
+
+            entry: dict[str, str] = {}
+
+            # Credential sync
+            if bundles:
+                try:
+                    self.sync_agent_credentials(agent_id)
+                    entry["credentials"] = "ok"
+                except Exception as exc:
+                    entry["credentials"] = f"error: {exc}"
+                    errors += 1
+            else:
+                entry["credentials"] = "skipped (no bundles)"
+
+            # Apply staged prompts
+            try:
+                applied = self.apply_staged_prompts(agent_id)
+                count = len(applied.get("applied", []))
+                entry["prompts"] = f"ok ({count} applied)" if count else "ok (none staged)"
+            except Exception as exc:
+                entry["prompts"] = f"error: {exc}"
+                errors += 1
+
+            results[agent_id] = entry
+
+        self._event(state, "maintenance.run", f"Maintenance run: {len(results)} agents, {errors} errors", {
+            "agents_processed": len(results), "skipped": skipped, "errors": errors,
+        })
+        self.store.write_state(state)
+        return {
+            "agents_processed": len(results),
+            "agents_skipped": skipped,
+            "errors": errors,
+            "results": results,
+        }
 
     # ── Session agent methods ─────────────────────────────────────────────
 

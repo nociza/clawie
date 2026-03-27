@@ -24,6 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "runtime_installed": False,
     "created_at": "",
     "updated_at": "",
+    "maintenance_cron_enabled": False,
+    "maintenance_cron_interval_hours": 4,
 }
 
 DEFAULT_STATE: dict[str, Any] = {

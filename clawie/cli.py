@@ -2595,6 +2595,7 @@ def cmd_maintenance_run(args: argparse.Namespace, service: ZeroClawService) -> i
 
     print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] clawie maintenance run")
     result = service.maintenance_run()
+    print(f"  Auth refresh: {result.get('auth_refresh', 'n/a')}")
     for agent_id, entry in result.get("results", {}).items():
         creds = entry.get("credentials", "")
         prompts = entry.get("prompts", "")

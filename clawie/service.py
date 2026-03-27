@@ -9516,6 +9516,20 @@ class ZeroClawService:
     def maintenance_run(self) -> dict[str, Any]:
         """Run maintenance tasks: sync credentials and apply staged prompts for all managed agents."""
         self._require_setup()
+
+        # First, refresh the shared auth store from the freshest source (codex).
+        # This converts codex OAuth tokens into openclaw/picoclaw auth-profiles
+        # so agents get a live token instead of a stale copy.
+        src_home = self._default_source_home()
+        auth_refresh = "skipped"
+        for source_type in ("codex", "claude"):
+            try:
+                self.import_shared_auth("openclaw", source=source_type, source_home=str(src_home))
+                auth_refresh = f"ok ({source_type} from {src_home})"
+                break
+            except Exception:
+                continue
+
         state = self.store.read_state()
         agents = state.get("agents", state.get("users", {}))
         results: dict[str, dict[str, str]] = {}
@@ -9562,6 +9576,7 @@ class ZeroClawService:
         })
         self.store.write_state(state)
         return {
+            "auth_refresh": auth_refresh,
             "agents_processed": len(results),
             "agents_skipped": skipped,
             "errors": errors,

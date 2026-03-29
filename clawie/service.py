@@ -9255,22 +9255,49 @@ class ZeroClawService:
         agent_state["addons"] = self._normalize_agent_addons(agent_state.get("addons"))
         self._seed_delegation_skill(agent_state["core_prompts"], agent["plugins"])
 
-    @staticmethod
+    _DELEGATION_AGENTS_MARKER = "<!-- clawie-delegation-boot-begin -->"
+    _DELEGATION_AGENTS_MARKER_END = "<!-- clawie-delegation-boot-end -->"
+    _DELEGATION_AGENTS_SNIPPET = (
+        "<!-- clawie-delegation-boot-begin -->\n"
+        "5. Read `DELEGATION.md` if it exists — you have a recursive task "
+        "delegation system managed by **Clawie** (the control plane that "
+        "manages your runtime, channels, credentials, and plugins)\n"
+        "<!-- clawie-delegation-boot-end -->"
+    )
+
+    @classmethod
     def _seed_delegation_skill(
+        cls,
         core_prompts: dict[str, str],
         plugins: dict[str, bool],
     ) -> None:
         if not plugins.get("delegation", False):
             core_prompts.pop("DELEGATION.md", None)
             return
-        if core_prompts.get("DELEGATION.md"):
-            return
-        try:
-            from clawie.delegation import DELEGATION_SKILL_CONTENT
+        if not core_prompts.get("DELEGATION.md"):
+            try:
+                from clawie.delegation import DELEGATION_SKILL_CONTENT
 
-            core_prompts["DELEGATION.md"] = DELEGATION_SKILL_CONTENT
-        except ImportError:
-            pass
+                core_prompts["DELEGATION.md"] = DELEGATION_SKILL_CONTENT
+            except ImportError:
+                pass
+        # Ensure AGENTS.md tells the bot to read DELEGATION.md on startup.
+        agents_md = core_prompts.get("AGENTS.md", "")
+        if agents_md and cls._DELEGATION_AGENTS_MARKER not in agents_md:
+            # Insert after the "4. **If in MAIN SESSION**" line or after
+            # the last numbered step in the "Every Session" section.
+            insertion_point = agents_md.find("\n\nDon't ask permission")
+            if insertion_point == -1:
+                insertion_point = agents_md.find("\n\n## Memory")
+            if insertion_point != -1:
+                core_prompts["AGENTS.md"] = (
+                    agents_md[:insertion_point]
+                    + "\n" + cls._DELEGATION_AGENTS_SNIPPET + "\n"
+                    + agents_md[insertion_point:]
+                )
+            else:
+                # Fallback: append to end
+                core_prompts["AGENTS.md"] = agents_md + "\n\n" + cls._DELEGATION_AGENTS_SNIPPET + "\n"
 
     def _discover_channels_from_source_home(
         self,

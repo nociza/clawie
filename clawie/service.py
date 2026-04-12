@@ -760,9 +760,9 @@ class ZeroClawService:
         providers: list[str] = []
         if requested_provider:
             providers.append(str(requested_provider).strip().lower())
-        config = self.store.read_config()
-        providers.append(str(config.get("provider", "openclaw")).strip().lower())
-        providers.extend(provider_names())
+        else:
+            config = self.store.read_config()
+            providers.append(str(config.get("provider", "openclaw")).strip().lower())
 
         updated: list[str] = []
         for rel in shared_auth_paths_for_providers(providers):
@@ -4909,13 +4909,13 @@ class ZeroClawService:
             )
         elif mode == "codex":
             imported = load_codex_auth(src_home)
-            updated.extend(self._write_provider_auth_profiles(provider_names(), imported))
+            updated.extend(self._write_provider_auth_profiles([name], imported))
             target = shared_home / ".codex" / "auth.json"
             if self._copy_if_present(src_home / ".codex" / "auth.json", target):
                 updated.append(str(target))
         elif mode == "claude":
             imported = load_claude_auth(src_home)
-            updated.extend(self._write_provider_auth_profiles(provider_names(), imported))
+            updated.extend(self._write_provider_auth_profiles([name], imported))
         else:
             raise ValueError("source must be one of: provider, codex, claude")
 
@@ -4923,7 +4923,7 @@ class ZeroClawService:
         applied = self.apply_shared_auth_links()
         auth = self.shared_auth_status(name)
         restart_required_agents = (
-            self._shared_provider_auth_agent_ids_for_providers(provider_names(), include_eligible=True)
+            self._shared_provider_auth_agent_ids_for_providers([name], include_eligible=True)
             if updated
             else []
         )

@@ -1446,18 +1446,15 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     assert native_path.exists()
     profile_path = shared_home / ".picoclaw" / "auth-profiles.json"
     assert profile_path.exists()
-    assert (shared_home / ".zeroclaw" / "auth-profiles.json").exists()
-    assert (shared_home / ".openclaw" / "auth-profiles.json").exists()
+    assert not (shared_home / ".zeroclaw" / "auth-profiles.json").exists()
+    assert not (shared_home / ".openclaw" / "auth-profiles.json").exists()
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
     assert payload["active_profiles"]["openai-codex"] == "openai-codex:default"
     native_payload = json.loads(native_path.read_text(encoding="utf-8"))
     assert native_payload["credentials"]["openai"]["access_token"] == "tok"
-    openclaw_payload = json.loads((shared_home / ".openclaw" / "auth-profiles.json").read_text(encoding="utf-8"))
-    assert openclaw_payload["profiles"]["openai-codex:default"]["type"] == "oauth"
-    assert openclaw_payload["profiles"]["openai-codex:default"]["access"] == "tok"
     assert (target_home / ".picoclaw" / "auth.json").is_symlink()
     assert (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
-    assert (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
+    assert not (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
     assert (target_home / ".codex" / "auth.json").is_symlink()
     assert ["chown", "alice:alice", str(target_home / ".picoclaw")] in calls
 
@@ -1507,11 +1504,9 @@ def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
     locked_profile.write_text("{}", encoding="utf-8")
     os.chmod(locked_profile, 0o400)
 
-    result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
+    result = service.import_shared_auth("openclaw", source="codex", source_home=source_home)
 
     assert result["auth"]["auth_status"] == "ready"
-    native_payload = json.loads((shared_home / ".picoclaw" / "auth.json").read_text(encoding="utf-8"))
-    assert native_payload["credentials"]["openai"]["access_token"] == "tok"
     openclaw_payload = json.loads(locked_profile.read_text(encoding="utf-8"))
     assert openclaw_payload["profiles"]["openai-codex:default"]["access"] == "tok"
     assert (locked_profile.stat().st_mode & 0o666) == 0o666

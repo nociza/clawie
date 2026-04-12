@@ -1440,6 +1440,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
 
     result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
     assert result["source"] == "codex"
+    assert result["restart_required_agents"] == ["alice"]
     assert (shared_home / ".codex" / "auth.json").exists()
     native_path = shared_home / ".picoclaw" / "auth.json"
     assert native_path.exists()
@@ -1464,6 +1465,56 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     assert status["auth_status"] == "ready"
     assert status["shared_provider_auth"] is True
     assert status["source"] == "file:auth.json"
+
+
+def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    shared_home = tmp_path / "shared-provider-auth"
+    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+
+    source_home = tmp_path / "source-home"
+    (source_home / ".codex").mkdir(parents=True)
+    (source_home / ".codex" / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {
+                    "access_token": "tok",
+                    "refresh_token": "ref",
+                    "id_token": "",
+                    "account_id": "acct-1",
+                },
+                "last_refresh": "2026-03-08T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    locked_profile = shared_home / ".openclaw" / "auth-profiles.json"
+    locked_profile.parent.mkdir(parents=True)
+    locked_profile.write_text("{}", encoding="utf-8")
+    os.chmod(locked_profile, 0o400)
+
+    result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
+
+    assert result["auth"]["auth_status"] == "ready"
+    native_payload = json.loads((shared_home / ".picoclaw" / "auth.json").read_text(encoding="utf-8"))
+    assert native_payload["credentials"]["openai"]["access_token"] == "tok"
+    openclaw_payload = json.loads(locked_profile.read_text(encoding="utf-8"))
+    assert openclaw_payload["profiles"]["openai-codex:default"]["access"] == "tok"
+    assert (locked_profile.stat().st_mode & 0o666) == 0o666
 
 
 def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(

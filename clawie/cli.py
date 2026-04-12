@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1236,6 +1238,7 @@ def cmd_shared_auth_login(args: argparse.Namespace, service: ZeroClawService) ->
     _print_auth_status(payload, title="Shared Auth")
     agents = payload.get("shared_agents", [])
     print_info("Linked agents: " + (", ".join(str(item) for item in agents) or "<none>"))
+    _print_restart_required_agents(args, payload.get("restart_required_agents", []))
     return 0
 
 
@@ -1258,6 +1261,7 @@ def cmd_shared_auth_import(args: argparse.Namespace, service: ZeroClawService) -
     skipped_agents = result.get("skipped_agents", [])
     if skipped_agents:
         print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
+    _print_restart_required_agents(args, result.get("restart_required_agents", []))
     auth = result.get("auth", {})
     if auth:
         _print_auth_status(auth, title="Shared Auth")
@@ -1275,7 +1279,29 @@ def cmd_shared_auth_apply(args: argparse.Namespace, service: ZeroClawService) ->
     skipped_agents = result.get("skipped_agents", [])
     if skipped_agents:
         print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
+    _print_restart_required_agents(args, result.get("restart_required_agents", []))
     return 0
+
+
+def _print_restart_required_agents(args: argparse.Namespace, agents: Any) -> None:
+    if not isinstance(agents, list):
+        return
+    tokens = [str(item).strip() for item in agents if str(item).strip()]
+    if not tokens:
+        return
+    print_warning("Restart required for agents using updated shared auth: " + ", ".join(tokens))
+    config_dir = Path(args.config_dir).expanduser() if getattr(args, "config_dir", None) else Path.home() / ".clawie"
+    executable = shutil.which("clawie") or "clawie"
+    restart_base = "sudo " + shlex.quote(executable) + " --config-dir " + shlex.quote(str(config_dir))
+    if len(tokens) == 1:
+        print_info("Run: " + restart_base + " agent service restart " + shlex.quote(tokens[0]))
+        return
+    print_info(
+        "Run one restart per agent, for example: "
+        + restart_base
+        + " agent service restart "
+        + shlex.quote(tokens[0])
+    )
 
 
 def cmd_addons_list(args: argparse.Namespace, service: ZeroClawService) -> int:

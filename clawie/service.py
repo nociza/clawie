@@ -649,6 +649,20 @@ class ZeroClawService:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     @staticmethod
+    def _write_replaceable_json_file(path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        try:
+            path.write_text(content, encoding="utf-8")
+            return
+        except PermissionError:
+            if path.exists() and os.access(path.parent, os.W_OK | os.X_OK):
+                path.unlink()
+                path.write_text(content, encoding="utf-8")
+                return
+            raise
+
+    @staticmethod
     def _chown_path(path: Path, username: str) -> None:
         token = str(username).strip()
         if not token or os.geteuid() != 0:
@@ -704,8 +718,7 @@ class ZeroClawService:
         target = shared_home / get_provider(provider).state_dir / "auth-profiles.json"
         existing = self._read_json_file(target)
         payload = merge_provider_auth_profile(existing, imported)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._write_replaceable_json_file(target, payload)
         self._relax_shared_path_permissions(target.parent)
         self._relax_shared_path_permissions(target)
         return [str(target)]
@@ -715,7 +728,7 @@ class ZeroClawService:
         target = shared_home / ".picoclaw" / "auth.json"
         existing = self._read_json_file(target)
         payload = merge_picoclaw_auth_store(existing, imported)
-        self._write_json_file(target, payload)
+        self._write_replaceable_json_file(target, payload)
         self._relax_shared_path_permissions(target.parent)
         self._relax_shared_path_permissions(target)
         return [str(target)]
@@ -4859,6 +4872,12 @@ class ZeroClawService:
                 "home": str(shared_home),
                 "shared_scope": self._shared_provider_auth_scope(),
                 "shared_agents": list(applied.get("updated_agents", [])),
+                "restart_required_agents": self._shared_provider_auth_agent_ids_for_providers(
+                    [spec.name],
+                    include_eligible=True,
+                )
+                if str(payload.get("action_performed", "")).strip().lower() != "status"
+                else [],
             }
         )
         return payload
@@ -4903,6 +4922,11 @@ class ZeroClawService:
         self._relax_shared_provider_auth_permissions()
         applied = self.apply_shared_auth_links()
         auth = self.shared_auth_status(name)
+        restart_required_agents = (
+            self._shared_provider_auth_agent_ids_for_providers(provider_names(), include_eligible=True)
+            if updated
+            else []
+        )
         return {
             "provider": name,
             "source": mode,
@@ -4911,6 +4935,7 @@ class ZeroClawService:
             "updated_paths": self._dedupe_paths(updated),
             "updated_agents": list(applied.get("updated_agents", [])),
             "skipped_agents": list(applied.get("skipped_agents", [])),
+            "restart_required_agents": restart_required_agents,
             "auth": auth,
         }
 
@@ -4968,21 +4993,33 @@ class ZeroClawService:
             "home": str(shared_home),
             "updated_agents": updated_agents,
             "skipped_agents": skipped_agents,
+            "restart_required_agents": updated_agents,
             "linked_paths": self._dedupe_paths(linked_paths),
         }
 
     def _shared_provider_auth_agent_ids(self, provider: str) -> list[str]:
-        name = str(provider).strip().lower()
+        return self._shared_provider_auth_agent_ids_for_providers([provider])
+
+    def _shared_provider_auth_agent_ids_for_providers(
+        self,
+        providers: list[str],
+        *,
+        include_eligible: bool = False,
+    ) -> list[str]:
+        names = {str(item).strip().lower() for item in providers if str(item).strip()}
+        if not names:
+            return []
         rows: list[str] = []
         state = self.store.read_state()
         agents = state.setdefault("agents", state.get("users", {}))
         for aid, agent in sorted(agents.items()):
             self._hydrate_agent_controls(agent)
             info = agent.get("agent", {})
-            if str(info.get("provider", "")).strip().lower() != name:
+            if str(info.get("provider", "")).strip().lower() not in names:
                 continue
             sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
-            if bool(sync.get("shared_provider_auth", False)):
+            bundles = {str(item).strip() for item in sync.get("bundles", []) if str(item).strip()}
+            if bool(sync.get("shared_provider_auth", False)) or (include_eligible and "provider-auth" in bundles):
                 rows.append(str(aid))
         return rows
 

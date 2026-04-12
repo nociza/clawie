@@ -117,6 +117,39 @@ class TestDelegationTree:
         with pytest.raises(ValueError, match="max children"):
             tree.register("one-too-many", "parent", "tx", depth=1)
 
+    def test_reregister_existing_child_does_not_duplicate_parent_link(self) -> None:
+        tree = DelegationTree()
+        tree.register("parent", "", "root", depth=0)
+        tree.register("child", "parent", "t1", depth=1)
+        tree.register("child", "parent", "t2", depth=1)
+
+        parent = tree.get_node("parent")
+        child = tree.get_node("child")
+        assert parent is not None
+        assert child is not None
+        assert parent.children == ["child"]
+        assert child.task_id == "t2"
+
+    def test_move_existing_child_to_full_parent_keeps_old_link(self) -> None:
+        tree = DelegationTree()
+        tree.register("old-parent", "", "old-root", depth=0)
+        tree.register("full-parent", "", "new-root", depth=0)
+        tree.register("child", "old-parent", "t1", depth=1)
+        from clawie.delegation import MAX_CHILDREN_PER_AGENT
+
+        for i in range(MAX_CHILDREN_PER_AGENT):
+            tree.register(f"full-child-{i}", "full-parent", f"t-{i}", depth=1)
+
+        with pytest.raises(ValueError, match="max children"):
+            tree.register("child", "full-parent", "t2", depth=1)
+
+        old_parent = tree.get_node("old-parent")
+        child = tree.get_node("child")
+        assert old_parent is not None
+        assert child is not None
+        assert "child" in old_parent.children
+        assert child.parent_id == "old-parent"
+
     def test_subtree(self) -> None:
         tree = DelegationTree()
         tree.register("root", "", "t0", depth=0)
@@ -624,6 +657,20 @@ class TestDelegationSkill:
         content = prompts.get("DELEGATION.md", "")
         assert content == ""
 
+    def test_core_prompt_defaults_persisted_for_new_agents(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert run_cli(tmp_path, "config", "set") == 0
+        capsys.readouterr()
+        assert run_cli(tmp_path, "agent", "create", "skill-test") == 0
+        capsys.readouterr()
+
+        stored = StateStore(config_dir=tmp_path).read_state()["agents"]["skill-test"]
+        prompts = stored.get("core_prompts", {})
+        assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
+        assert "recursive delegation" in prompts.get("IDENTITY.md", "")
+        assert "# Delegation Skill" in prompts.get("DELEGATION.md", "")
+
     def test_skill_content_includes_key_sections(self) -> None:
         from clawie.delegation import DELEGATION_SKILL_CONTENT
         assert "## 1. Core Concepts" in DELEGATION_SKILL_CONTENT
@@ -698,6 +745,24 @@ class TestDelegationSkill:
         loaded = svc.get_agent("legacy")
         assert loaded["agent"]["plugins"].get("delegation") is True
         assert "# Delegation Skill" in loaded["core_prompts"].get("DELEGATION.md", "")
+
+    def test_hydration_backfills_clawie_identity_for_legacy_blank_prompts(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from clawie.service import ZeroClawService
+
+        agent = self._setup_and_create(tmp_path, capsys)
+        store = StateStore(config_dir=tmp_path)
+        state = store.read_state()
+        state["agents"][agent["agent_id"]]["core_prompts"] = {}
+        store.write_state(state)
+
+        svc = ZeroClawService(store)
+        loaded = svc.get_agent(agent["agent_id"])
+        prompts = loaded.get("core_prompts", {})
+        assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
+        assert "recursive delegation" in prompts.get("IDENTITY.md", "")
+        assert "# Delegation Skill" in prompts.get("DELEGATION.md", "")
 
     def test_skill_includes_session_agent_docs(self) -> None:
         from clawie.delegation import DELEGATION_SKILL_CONTENT
@@ -810,7 +875,6 @@ class TestSessionAgentManager:
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("echo-worker")
-            time.sleep(0.2)  # Let REPL spin up
             result = mgr.delegate("echo-worker", {"msg": "hi"}, timeout=5.0)
             assert result == {"msg": "hi"}  # echo handler
         finally:
@@ -1181,6 +1245,89 @@ class TestSessionAgentTiers:
             assert info["model_tier"] == "balanced"
         finally:
             mgr.stop_all()
+
+    def test_service_spawn_session_agent_returns_tier(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from clawie.service import ZeroClawService
+
+        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path / "delegation")
+        svc = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
+        try:
+            info = svc.spawn_session_agent("parent", "child-1", model_tier="power")
+            assert info["model_tier"] == "power"
+            assert svc.list_session_agents("parent")[0]["model_tier"] == "power"
+        finally:
+            svc.stop_all_session_agents("parent")
+
+
+class TestSpawnPromptPersistence:
+    def test_spawn_writes_seeded_prompts_to_agent_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from clawie.service import ZeroClawService
+
+        service = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
+        service.setup(
+            provider="zeroclaw",
+            api_key="",
+            subscription="starter",
+            workspace="default",
+            api_url="https://example.com",
+        )
+        source_home = tmp_path / "source-home"
+        source_home.mkdir(parents=True)
+        target_home = tmp_path / "target-home"
+        target_home.mkdir(parents=True)
+        written: list[dict[str, str]] = []
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
+        monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: target_home)
+        monkeypatch.setattr(service, "ensure_provider_runtime", lambda _provider: {"provider": _provider})
+        monkeypatch.setattr(service, "_linux_user_exists", lambda _user: False)
+        monkeypatch.setattr(service, "_spawn_user_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(service, "_apply_spawn_password", lambda **_kwargs: ("global", "clawie"))
+        monkeypatch.setattr(service, "_disable_ssh_login_for_user", lambda _username: True)
+        monkeypatch.setattr(service, "_ensure_system_shared_runtime", lambda _source_home: [])
+        monkeypatch.setattr(service, "_copy_user_configs", lambda *args, **kwargs: [])
+        monkeypatch.setattr(service, "_sync_selected_credential_bundles", lambda **_kwargs: [])
+        monkeypatch.setattr(service, "_ensure_shared_toolchain_shell_init", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(service, "_ensure_shared_claude_links", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(service, "_ensure_workspace_accessible", lambda *_args, **_kwargs: None)
+
+        def capture_prompts(
+            _provider: str,
+            _home: Path,
+            prompts: dict[str, str],
+            _linux_user: str = "",
+        ) -> list[str]:
+            written.append(dict(prompts))
+            return []
+
+        monkeypatch.setattr(service, "_write_prompt_files_for_home", capture_prompts)
+
+        service.spawn_linux_user(
+            agent_id="worker",
+            linux_user="worker",
+            template="baseline",
+            agent_version="1.0.0",
+            provider="zeroclaw",
+            source_home=source_home,
+            copy_configs=False,
+            credential_bundles=[],
+            include_default_credentials=False,
+        )
+
+        assert written
+        prompts = written[-1]
+        assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
+        assert "# Delegation Skill" in prompts.get("DELEGATION.md", "")
 
 
 # ---------------------------------------------------------------------------

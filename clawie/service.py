@@ -92,6 +92,57 @@ def redact(secret: str) -> str:
     return f"{secret[:4]}...{secret[-4:]}"
 
 
+def _default_core_prompt_content(prompt_name: str, agent_id: str = "", display_name: str = "") -> str:
+    name = str(prompt_name).strip()
+    agent_token = str(agent_id).strip()
+    display_token = str(display_name).strip() or agent_token or "this agent"
+    identity_line = f"Your agent ID is `{agent_token}`.\n" if agent_token else ""
+    prompts = {
+        "SOUL.md": (
+            f"You are {display_token}, a managed AI agent in clawie.\n"
+            f"{identity_line}"
+            "Work as one node in a local multi-agent system: be accurate, execution-focused, and willing to "
+            "delegate when another agent is a better fit.\n"
+        ),
+        "IDENTITY.md": (
+            "clawie is a local control plane for provisioning, orchestrating, and monitoring a fleet of AI "
+            "agents.\n"
+            "It manages agents across providers from one CLI and supports recursive delegation, Linux-user "
+            "isolation, credential management, and a terminal dashboard.\n"
+            "You are operating inside that system, not as an isolated standalone assistant.\n"
+        ),
+        "AGENTS.md": (
+            "Other clawie agents may exist with different channels, providers, and model tiers.\n"
+            "Coordinate through clawie's delegation system for fan-out, specialization, or recursive sub-tasks.\n"
+            "Do not invent remote or network delegation paths; clawie delegation is local and explicit.\n"
+        ),
+        "TOOLS.md": (
+            "Use the tools and runtime available in this environment first.\n"
+            "If a task depends on clawie orchestration or local agent state, prefer clawie commands and report "
+            "missing permissions or runtime access explicitly.\n"
+        ),
+        "MEMORY.md": (
+            "Assume long-term memory is limited.\n"
+            "Preserve only durable facts that matter for future work, and prefer concise summaries over raw "
+            "transcripts.\n"
+        ),
+        "HEARTBEAT.md": (
+            "Surface status changes, blockers, and long-running work clearly so the control plane can monitor "
+            "progress.\n"
+        ),
+        "BOOTSTRAP.md": (
+            "On startup, ground yourself in the prompt files and current workspace before answering.\n"
+            "If the work can be split safely, identify delegation candidates early and keep returned context "
+            "compact.\n"
+        ),
+        "USER.md": (
+            "Default interaction style: concise, factual, and execution-focused.\n"
+            "State blockers, assumptions, and required follow-up actions plainly.\n"
+        ),
+    }
+    return prompts.get(name, "")
+
+
 class ZeroClawService:
     EVENT_LIMIT = 2000
     DEFAULT_SPAWN_PASSWORD = "clawie"
@@ -1680,6 +1731,13 @@ class ZeroClawService:
         if clone_from and not core_prompts:
             core_prompts = copy.deepcopy(agents.get(clone_from, {}).get("core_prompts", {}))
         normalized_prompts = self._normalize_core_prompts(provider_spec.name, core_prompts or {})
+        self._seed_core_prompt_defaults(
+            provider_spec.name,
+            normalized_prompts,
+            agent_id=agent_id,
+            display_name=display,
+        )
+        self._seed_delegation_skill(normalized_prompts, plugins)
 
         agent_state = {
             "agent_id": agent_id,
@@ -1804,17 +1862,26 @@ class ZeroClawService:
         info = agent.setdefault("agent", {})
         current_provider = str(info.get("provider", "")).strip().lower()
         target_spec = get_provider(target_provider)
-        auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
+        changed = current_provider != target_spec.name
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(agent)
+        auth_prepare = {
+            "provider": target_spec.name,
+            "required": False,
+            "prepared": False,
+            "action": "",
+            "source": "",
+            "source_home": "",
+            "auth": {},
+        }
+        if linux_user:
+            auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
         provider_auth = self._preferred_agent_provider_auth(
             target_spec.name,
             agent=agent,
             current_auth_mode=str(info.get("auth_mode", "")),
             allow_defaults=True,
         )
-
-        changed = current_provider != target_spec.name
-        linux_user = str(info.get("linux_user", "")).strip()
-        home = self._agent_linux_home(agent)
         prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
         effective_channels = self._effective_agent_channels(agent) if linux_user else []
         live_channel_payloads = self._discover_live_channel_payloads(agent) if linux_user else {}
@@ -4696,6 +4763,13 @@ class ZeroClawService:
             raise SetupError(f"agent '{token}' has no linux_user home to read prompts from")
         disk_prompts = self._read_core_prompts_from_home(provider, home)
         agent["core_prompts"] = self._normalize_core_prompts(provider, disk_prompts)
+        self._seed_core_prompt_defaults(
+            provider,
+            agent["core_prompts"],
+            agent_id=token,
+            display_name=str(agent.get("display_name", "")),
+        )
+        self._seed_delegation_skill(agent["core_prompts"], self._normalize_plugins(info.get("plugins", {})))
         info["last_sync"] = now_iso()
         self._event(
             state,
@@ -6259,7 +6333,7 @@ class ZeroClawService:
         resolved_provider = str(provider or config.get("provider", "openclaw")).strip().lower() or "openclaw"
         self.ensure_provider_runtime(resolved_provider)
 
-        target_home = Path("/home") / target_user
+        target_home = self._linux_home_for_user(target_user) or (Path("/home") / target_user)
         if self._linux_user_exists(target_user):
             raise AgentExistsError(f"linux user already exists: {target_user}")
 
@@ -6348,9 +6422,14 @@ class ZeroClawService:
             credential_sync["last_synced_at"] = now_iso()
             credential_sync["last_synced_paths"] = list(copied)
         agent_state["credential_sync"] = credential_sync
-        if copy_configs:
+        if target_home.exists():
             try:
-                self._write_prompt_files_for_home(resolved_provider, target_home, cloned_prompts, target_user)
+                self._write_prompt_files_for_home(
+                    resolved_provider,
+                    target_home,
+                    agent_state.get("core_prompts", {}),
+                    target_user,
+                )
             except PermissionError:
                 pass
         self._ensure_workspace_accessible(resolved_provider, target_home, target_user)
@@ -8660,6 +8739,20 @@ class ZeroClawService:
             rows[name] = str(value) if value is not None else ""
         return rows
 
+    def _seed_core_prompt_defaults(
+        self,
+        provider: str,
+        core_prompts: dict[str, str],
+        agent_id: str = "",
+        display_name: str = "",
+    ) -> None:
+        for name in self._provider_core_prompt_names(provider):
+            if core_prompts.get(name):
+                continue
+            content = _default_core_prompt_content(name, agent_id=agent_id, display_name=display_name)
+            if content:
+                core_prompts[name] = content
+
     def _core_prompt_path(self, provider: str, home: Path, prompt_name: str) -> Path:
         spec = get_provider(provider)
         name = self._canonical_core_prompt_name(provider, prompt_name)
@@ -9150,6 +9243,8 @@ class ZeroClawService:
         prompts = self._normalize_core_prompts(provider, {})
         if home:
             prompts = self._normalize_core_prompts(provider, self._read_core_prompts_from_home(provider, home))
+        self._seed_core_prompt_defaults(provider, prompts, agent_id=f"@local:{provider}", display_name="local-user")
+        self._seed_delegation_skill(prompts, self._default_plugins_for_provider(provider))
         return {
             "agent_id": f"@local:{provider}",
             "display_name": "local-user",
@@ -9248,6 +9343,12 @@ class ZeroClawService:
         if "model_tier" not in agent:
             agent["model_tier"] = "balanced"
         agent_state["core_prompts"] = self._normalize_core_prompts(provider, agent_state.get("core_prompts", {}))
+        self._seed_core_prompt_defaults(
+            provider,
+            agent_state["core_prompts"],
+            agent_id=str(agent_state.get("agent_id", "")),
+            display_name=str(agent_state.get("display_name", "")),
+        )
         agent_state["credential_sync"] = self._normalize_credential_sync_state(
             agent_state.get("credential_sync"),
             default_when_missing=True,
@@ -9632,16 +9733,16 @@ class ZeroClawService:
 
         tier = model_tier or DEFAULT_TIER
         mgr = self._get_session_manager(parent_id)
-        mgr.spawn(child_id, timeout=timeout, model_tier=tier)
+        info = mgr.spawn(child_id, timeout=timeout, model_tier=tier)
         state = self.store.read_state()
         self._event(
             state,
             "session.agent.spawned",
             f"Session agent {child_id} spawned under {parent_id}",
-            {"parent": parent_id, "child": child_id},
+            {"parent": parent_id, "child": child_id, "model_tier": tier},
         )
         self.store.write_state(state)
-        return {"agent_id": child_id, "parent_id": parent_id, "status": "running", "depth": 1}
+        return dict(info)
 
     def stop_session_agent(self, parent_id: str, child_id: str) -> None:
         mgr = self._get_session_manager(parent_id)

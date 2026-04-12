@@ -101,7 +101,7 @@ clawie delegation repl --agent-id worker --tier power
 clawie delegation spawn-session --parent p --child c --tier fast
 
 # Set tier on agent creation
-clawie agents create my-agent --model-tier fast
+clawie agent create my-agent --model-tier fast
 ```
 
 ---
@@ -306,13 +306,13 @@ def planning_handler(msg: Message, repl: AgentREPL) -> dict:
 
 ## 8. Session Sub-Agents (No Root Required)
 
-Spawn lightweight sub-agents **within your current session**:
+Spawn lightweight sub-agents **within the current Clawie process**:
 
 ```bash
 # Spawn with a specific tier
 clawie delegation spawn-session --parent <your-id> --child <child-id> --tier fast
 
-# Delegate to the session agent
+# Delegate to the session agent while that process is still alive
 clawie delegation submit --parent <your-id> --child <child-id> --payload '{"task":"work"}'
 
 # List session agents
@@ -339,6 +339,10 @@ for line in mgr.tree_lines():
 mgr.stop_all()
 ```
 
+For a persistent worker across separate shell commands, run
+`clawie delegation repl --agent-id <child-id>` in a live terminal and delegate to
+that REPL with `clawie delegation submit`.
+
 ---
 
 ## 9. Dashboard Delegation View
@@ -359,10 +363,10 @@ If you do not need delegation capabilities, you can disable this skill:
 
 ```bash
 # When creating an agent:
-clawie agents create --agent-id <id> --no-delegation
+clawie agent create <id> --no-delegation
 
 # When spawning:
-clawie spawn --agent-id <id> --no-delegation
+clawie runtime create <id> --no-delegation
 ```
 
 When disabled, this DELEGATION.md prompt is not included in the agent's core
@@ -827,10 +831,16 @@ class DelegationTree:
 
             # Check max children
             parent_node = self._nodes.get(parent_id)
-            if parent_node and len(parent_node.children) >= MAX_CHILDREN_PER_AGENT:
+            existing = self._nodes.get(agent_id)
+            same_parent = existing is not None and existing.parent_id == parent_id
+            if parent_node and len(parent_node.children) >= MAX_CHILDREN_PER_AGENT and not same_parent:
                 raise ValueError(
                     f"max children ({MAX_CHILDREN_PER_AGENT}) exceeded for {parent_id}"
                 )
+            if existing:
+                old_parent = self._nodes.get(existing.parent_id)
+                if old_parent and agent_id in old_parent.children:
+                    old_parent.children.remove(agent_id)
 
             node = TreeNode(
                 agent_id=agent_id,
@@ -841,7 +851,7 @@ class DelegationTree:
                 model_tier=model_tier,
             )
             self._nodes[agent_id] = node
-            if parent_node:
+            if parent_node and agent_id not in parent_node.children:
                 parent_node.children.append(agent_id)
             return node
 
@@ -870,6 +880,7 @@ class DelegationTree:
             "task_id": node.task_id,
             "depth": node.depth,
             "status": node.status,
+            "model_tier": node.model_tier,
             "children": [self._subtree_locked(cid) for cid in node.children],
         }
 
@@ -1155,6 +1166,9 @@ class DelegationCoordinator:
         self.tree = tree or DelegationTree()
         self.model_tier = model_tier
         self.context_budget = ContextBudget.for_tier(model_tier)
+        if self.tree.get_node(agent_id) is None:
+            self.tree.register(agent_id, "", "root", depth=0, model_tier=model_tier)
+        self.tree.update_status(agent_id, "running")
 
     def delegate(
         self,
@@ -1167,6 +1181,9 @@ class DelegationCoordinator:
         """Register in tree, connect, send task, wait for result."""
         tier = model_tier or self.model_tier
         task_id = uuid.uuid4().hex
+        parent_node = self.tree.get_node(self.agent_id)
+        if parent_node and depth <= parent_node.depth:
+            depth = parent_node.depth + 1
         self.tree.register(child_id, self.agent_id, task_id, depth=depth, model_tier=tier)
         self.tree.update_status(child_id, "connecting")
 
@@ -1473,7 +1490,8 @@ class SessionAgentManager:
         self._agents: dict[str, AgentREPL] = {}
         self._lock = threading.Lock()
         # Register parent as root so the tree renders properly
-        self.coordinator.tree.register(parent_agent_id, "", "root", depth=0)
+        if self.coordinator.tree.get_node(parent_agent_id) is None:
+            self.coordinator.tree.register(parent_agent_id, "", "root", depth=0)
         self.coordinator.tree.update_status(parent_agent_id, "running")
 
     def spawn(
@@ -1495,6 +1513,30 @@ class SessionAgentManager:
 
         repl = AgentREPL(child_id, handler=handler, timeout=timeout, model_tier=model_tier)
         thread = repl.start_background()
+        deadline = time.monotonic() + min(max(timeout, 0.1), 5.0)
+        while time.monotonic() < deadline:
+            if repl.bus.socket_path.exists():
+                probe: socket.socket | None = None
+                try:
+                    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    probe.settimeout(0.1)
+                    probe.connect(str(repl.bus.socket_path))
+                    break
+                except OSError:
+                    pass
+                finally:
+                    if probe is not None:
+                        try:
+                            probe.close()
+                        except OSError:
+                            pass
+            if not thread.is_alive() or not repl._running:
+                repl.stop()
+                raise RuntimeError(f"session agent failed to start: {child_id}")
+            time.sleep(0.01)
+        else:
+            repl.stop()
+            raise TimeoutError(f"session agent did not become ready: {child_id}")
 
         with self._lock:
             self._agents[child_id] = repl

@@ -854,19 +854,14 @@ class ZeroClawService:
         self._chown_tree(agent_dir, linux_user)
         target = agent_dir / "auth-profiles.json"
         if target.is_symlink():
-            try:
-                if target.resolve() == source.resolve():
-                    return
-            except OSError:
-                pass
             target.unlink(missing_ok=True)
         elif target.exists():
             if target.is_dir():
                 shutil.rmtree(target)
             else:
                 target.unlink()
-        target.symlink_to(source)
-        subprocess.run(["chown", "-h", f"{linux_user}:{linux_user}", str(target)], check=False)
+        shutil.copy2(source, target)
+        self._chown_tree(target, linux_user)
 
     def _repair_openclaw_auth_store(self, path: Path) -> bool:
         if not self._path_exists(path):

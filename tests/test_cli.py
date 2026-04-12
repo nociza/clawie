@@ -3140,7 +3140,10 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["agents"]["defaults"]["model"] == "openai-codex/gpt-5.4"
     assert (home / ".openclaw" / "auth-profiles.json").is_symlink()
-    assert (home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json").is_symlink()
+    agent_auth = home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+    assert agent_auth.is_file()
+    assert not agent_auth.is_symlink()
+    assert json.loads(agent_auth.read_text(encoding="utf-8"))["profiles"]["openai-codex:default"]["access"] == "tok"
 
 
 def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
@@ -3210,7 +3213,10 @@ def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
     assert profile["refresh"] == "ref"
     assert profile["accountId"] == "acct-1"
     assert "expires" in profile
-    assert (home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json").is_symlink()
+    agent_auth = home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
+    assert agent_auth.is_file()
+    assert not agent_auth.is_symlink()
+    assert json.loads(agent_auth.read_text(encoding="utf-8"))["profiles"]["openai-codex:default"]["access"] == "tok"
 
 
 def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remediation(

@@ -669,6 +669,7 @@ class TestDelegationSkill:
         prompts = stored.get("core_prompts", {})
         assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
         assert "recursive delegation" in prompts.get("IDENTITY.md", "")
+        assert "Never reply `HEARTBEAT_OK` to normal user" in prompts.get("HEARTBEAT.md", "")
         assert "# Delegation Skill" in prompts.get("DELEGATION.md", "")
 
     def test_skill_content_includes_key_sections(self) -> None:
@@ -763,6 +764,26 @@ class TestDelegationSkill:
         assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
         assert "recursive delegation" in prompts.get("IDENTITY.md", "")
         assert "# Delegation Skill" in prompts.get("DELEGATION.md", "")
+
+    def test_hydration_upgrades_legacy_heartbeat_prompt_default(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from clawie.service import ZeroClawService
+
+        agent = self._setup_and_create(tmp_path, capsys)
+        store = StateStore(config_dir=tmp_path)
+        state = store.read_state()
+        state["agents"][agent["agent_id"]]["core_prompts"]["HEARTBEAT.md"] = (
+            "Surface status changes, blockers, and long-running work clearly so the control plane can monitor "
+            "progress.\n"
+        )
+        store.write_state(state)
+
+        loaded = ZeroClawService(store).get_agent(agent["agent_id"])
+        heartbeat = loaded["core_prompts"].get("HEARTBEAT.md", "")
+
+        assert "Only reply `HEARTBEAT_OK`" in heartbeat
+        assert "Never reply `HEARTBEAT_OK` to normal user" in heartbeat
 
     def test_skill_includes_session_agent_docs(self) -> None:
         from clawie.delegation import DELEGATION_SKILL_CONTENT

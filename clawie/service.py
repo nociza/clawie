@@ -92,6 +92,12 @@ def redact(secret: str) -> str:
     return f"{secret[:4]}...{secret[-4:]}"
 
 
+_LEGACY_HEARTBEAT_PROMPT = (
+    "Surface status changes, blockers, and long-running work clearly so the control plane can monitor "
+    "progress.\n"
+)
+
+
 def _default_core_prompt_content(prompt_name: str, agent_id: str = "", display_name: str = "") -> str:
     name = str(prompt_name).strip()
     agent_token = str(agent_id).strip()
@@ -127,8 +133,14 @@ def _default_core_prompt_content(prompt_name: str, agent_id: str = "", display_n
             "transcripts.\n"
         ),
         "HEARTBEAT.md": (
-            "Surface status changes, blockers, and long-running work clearly so the control plane can monitor "
-            "progress.\n"
+            "Heartbeat handling:\n"
+            "- Only reply `HEARTBEAT_OK` when the current user message is an OpenClaw heartbeat poll, such as "
+            "a message that explicitly tells you to read HEARTBEAT.md and says to reply `HEARTBEAT_OK` if "
+            "nothing needs attention.\n"
+            "- Never reply `HEARTBEAT_OK` to normal user or channel messages, including short status checks "
+            "like \"what about now\". Answer the user's actual message instead.\n"
+            "- For true heartbeat polls, surface status changes, blockers, and long-running work clearly so "
+            "the control plane can monitor progress.\n"
         ),
         "BOOTSTRAP.md": (
             "On startup, ground yourself in the prompt files and current workspace before answering.\n"
@@ -141,6 +153,13 @@ def _default_core_prompt_content(prompt_name: str, agent_id: str = "", display_n
         ),
     }
     return prompts.get(name, "")
+
+
+def _is_legacy_core_prompt_default(prompt_name: str, content: str) -> bool:
+    name = str(prompt_name).strip().upper()
+    if name == "HEARTBEAT.MD":
+        return str(content).strip() == _LEGACY_HEARTBEAT_PROMPT.strip()
+    return False
 
 
 class ZeroClawService:
@@ -8823,7 +8842,13 @@ class ZeroClawService:
         display_name: str = "",
     ) -> None:
         for name in self._provider_core_prompt_names(provider):
-            if core_prompts.get(name):
+            existing = str(core_prompts.get(name, "") or "")
+            if existing and _is_legacy_core_prompt_default(name, existing):
+                content = _default_core_prompt_content(name, agent_id=agent_id, display_name=display_name)
+                if content:
+                    core_prompts[name] = content
+                continue
+            if existing:
                 continue
             content = _default_core_prompt_content(name, agent_id=agent_id, display_name=display_name)
             if content:

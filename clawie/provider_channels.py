@@ -114,7 +114,7 @@ class OpenClawChannelAdapter:
         if isinstance(channels_cfg, dict):
             for key, value in channels_cfg.items():
                 kind = str(key).strip().lower()
-                if not kind:
+                if not kind or kind == "defaults":
                     continue
                 if isinstance(value, dict):
                     if not bool(value.get("enabled", True)):

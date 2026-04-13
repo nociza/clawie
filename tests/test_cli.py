@@ -20,6 +20,7 @@ from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_ac
 from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
 from clawie.addon_auth import parse_gws_status_output
+from clawie.provider_channels import OpenClawChannelAdapter
 from clawie.service import SetupError, ZeroClawService
 from clawie.store import StateStore
 
@@ -1898,7 +1899,10 @@ def test_sync_agent_channels_from_provider_replaces_stale_channels(
         template="baseline",
         clone_from=None,
         channel_strategy="new",
-        channels=[{"kind": "cli", "name": "teleclaw-local"}],
+        channels=[
+            {"kind": "telegram", "name": "team", "enabled": False},
+            {"kind": "cli", "name": "teleclaw-local"},
+        ],
         agent_version="1.0.0",
         provider="picoclaw",
     )
@@ -1927,8 +1931,62 @@ name = "team"
     synced = service.sync_agent_channels_from_provider("teleclaw")
     channels = synced["channels"]
     assert [(row.get("kind"), row.get("name")) for row in channels] == [("telegram", "team")]
+    assert channels[0]["enabled"] is True
     assert channels[0]["channel_source"] == "live"
     assert channels[0]["discovered_provider"] == "zeroclaw"
+
+
+def test_discover_agent_channels_uses_readable_provider_home_without_root(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    home = tmp_path / "teleclaw-home"
+    root = home / ".openclaw"
+    root.mkdir(parents=True)
+    (root / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "botToken": _fake_telegram_token(),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _payload: home)
+    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: False)
+    monkeypatch.setattr(ZeroClawService, "_live_provider_names_for_user", lambda self, _user: ["openclaw"])
+
+    discovery = service._discover_agent_channels(agent)
+    payloads = service._discover_live_channel_payloads(agent)
+
+    assert discovery["source"] == "provider"
+    assert discovery["channels"] == [
+        {"kind": "telegram", "name": "telegram", "enabled": True, "discovered_provider": "openclaw"}
+    ]
+    assert sorted(payloads) == [("telegram", "telegram")]
 
 
 def test_agent_channel_view_prefers_live_provider_channels_after_cutover(
@@ -3219,6 +3277,48 @@ def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
     assert json.loads(agent_auth.read_text(encoding="utf-8"))["profiles"]["openai-codex:default"]["access"] == "tok"
 
 
+def test_ensure_openclaw_agent_auth_link_skips_unwritable_non_root_target(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    home = tmp_path / "teleclaw-home"
+    root = home / ".openclaw"
+    source = root / "auth-profiles.json"
+    target = root / "agents" / "main" / "agent" / "auth-profiles.json"
+    source.parent.mkdir(parents=True)
+    target.parent.mkdir(parents=True)
+    source.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "profiles": {
+                    "openai-codex:default": {
+                        "type": "oauth",
+                        "provider": "openai-codex",
+                        "access": "new",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    target.write_text('{"profiles":{"openai-codex:default":{"access":"old"}}}', encoding="utf-8")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    real_access = os.access
+
+    def fake_access(path: object, mode: int, *args: object, **kwargs: object) -> bool:
+        if Path(path) == target and mode == os.W_OK:
+            return False
+        return real_access(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "access", fake_access)
+
+    service._ensure_openclaw_agent_auth_link(home=home, linux_user="teleclaw")
+
+    assert json.loads(target.read_text(encoding="utf-8"))["profiles"]["openai-codex:default"]["access"] == "old"
+
+
 def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remediation(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -3543,9 +3643,19 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     assert config["gateway"]["mode"] == "local"
     assert config["agents"]["defaults"]["workspace"] == str(home / ".openclaw" / "workspace")
     assert config["agents"]["defaults"]["model"] == "openai-codex/gpt-5.4"
+    assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
+    assert config["agents"]["defaults"]["heartbeat"]["directPolicy"] == "block"
+    assert config["agents"]["defaults"]["heartbeat"]["lightContext"] is True
+    assert config["agents"]["defaults"]["heartbeat"]["ackMaxChars"] == 300
     assert config["auth"]["profiles"]["openai-codex:default"]["provider"] == "openai-codex"
     assert config["auth"]["order"]["openai-codex"][0] == "openai-codex:default"
+    assert config["channels"]["defaults"]["heartbeat"] == {
+        "showOk": False,
+        "showAlerts": False,
+        "useIndicator": False,
+    }
     assert config["channels"]["telegram"]["botToken"] == token
+    assert config["channels"]["telegram"]["streaming"] == "off"
     assert config["channels"]["telegram"]["allowFrom"] == ["tg:123"]
     assert config["channels"]["telegram"]["dmPolicy"] == "allowlist"
     assert config["channels"]["telegram"]["groups"]["*"]["requireMention"] is True
@@ -3581,6 +3691,7 @@ def test_ensure_openclaw_home_prepared_preserves_reachability_when_migrating_tel
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
+    assert config["channels"]["telegram"]["streaming"] == "off"
     assert config["channels"]["telegram"]["allowFrom"] == ["*"]
     assert config["channels"]["telegram"]["dmPolicy"] == "open"
 
@@ -3616,8 +3727,108 @@ def test_ensure_openclaw_home_prepared_heals_legacy_pairing_dm_policy_without_al
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
+    assert config["channels"]["telegram"]["streaming"] == "off"
     assert config["channels"]["telegram"]["allowFrom"] == ["*"]
     assert config["channels"]["telegram"]["dmPolicy"] == "open"
+
+
+def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without_live_channel(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    home = tmp_path / "teleclaw-home"
+    root = home / ".openclaw"
+    root.mkdir(parents=True)
+    (root / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "botToken": _fake_telegram_token(),
+                        "streaming": "partial",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
+
+    service._ensure_openclaw_home_prepared(
+        home=home,
+        linux_user="teleclaw",
+        channels=[],
+        live_payloads={},
+        auth_mode="linked",
+        api_key="",
+    )
+
+    config = json.loads((root / "openclaw.json").read_text(encoding="utf-8"))
+    assert config["channels"]["telegram"]["streaming"] == "off"
+    assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
+    assert config["channels"]["defaults"]["heartbeat"]["showAlerts"] is False
+
+
+def test_read_openclaw_channel_payloads_ignores_channel_defaults(tmp_path: Path) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    root = tmp_path / ".openclaw"
+    root.mkdir()
+    (root / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "defaults": {
+                        "heartbeat": {
+                            "showOk": False,
+                            "showAlerts": False,
+                            "useIndicator": False,
+                        }
+                    },
+                    "telegram": {
+                        "enabled": True,
+                        "botToken": _fake_telegram_token(),
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payloads = service._read_openclaw_channel_payloads(root)
+
+    assert ("defaults", "defaults") not in payloads
+    assert sorted(payloads) == [("telegram", "telegram")]
+
+
+def test_openclaw_channel_adapter_ignores_channel_defaults(tmp_path: Path) -> None:
+    root = tmp_path / ".openclaw"
+    root.mkdir()
+    (root / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "defaults": {
+                        "heartbeat": {
+                            "showOk": False,
+                            "showAlerts": False,
+                            "useIndicator": False,
+                        }
+                    },
+                    "telegram": {
+                        "enabled": True,
+                        "botToken": _fake_telegram_token(),
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    channels = OpenClawChannelAdapter().discover_channels(root)
+
+    assert channels == [{"kind": "telegram", "name": "telegram"}]
 
 
 def test_assert_provider_postflight_ready_runs_openclaw_models_status(

@@ -856,6 +856,8 @@ class ZeroClawService:
         if target.is_symlink():
             target.unlink(missing_ok=True)
         elif target.exists():
+            if os.geteuid() != 0 and not os.access(target, os.W_OK):
+                return
             if target.is_dir():
                 shutil.rmtree(target)
             else:
@@ -3091,6 +3093,8 @@ class ZeroClawService:
         rows: dict[tuple[str, str], dict[str, Any]] = {}
         for key, value in channels_cfg.items():
             kind = str(key).strip().lower()
+            if kind == "defaults":
+                continue
             if not kind or not isinstance(value, dict):
                 continue
             if not bool(value.get("enabled", True)):
@@ -3129,6 +3133,19 @@ class ZeroClawService:
                 }
         return rows
 
+    def _can_read_provider_channel_roots(self, home: Path, providers: list[str]) -> bool:
+        for item in providers:
+            token = str(item).strip().lower()
+            if not token:
+                continue
+            try:
+                root = home / get_provider(token).state_dir
+            except ValueError:
+                continue
+            if root.exists() and os.access(root, os.R_OK | os.X_OK):
+                return True
+        return False
+
     def _discover_live_channel_payloads(self, payload: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
         info = payload.get("agent", {})
         linux_user = str(info.get("linux_user", "")).strip()
@@ -3138,7 +3155,8 @@ class ZeroClawService:
         if not home:
             return {}
         if linux_user and not is_local and not self._can_manage_linux_user(linux_user):
-            return {}
+            if not self._can_read_provider_channel_roots(home, [provider, *provider_names()]):
+                return {}
 
         ordered: list[str] = []
         seen_providers: set[str] = set()
@@ -3480,6 +3498,14 @@ class ZeroClawService:
         if not isinstance(defaults, dict):
             defaults = {}
         defaults["workspace"] = str(workspace)
+        heartbeat = defaults.get("heartbeat", {})
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        heartbeat.setdefault("every", "0m")
+        heartbeat.setdefault("directPolicy", "block")
+        heartbeat.setdefault("lightContext", True)
+        heartbeat.setdefault("ackMaxChars", 300)
+        defaults["heartbeat"] = heartbeat
 
         desired_model = ""
         if auth_mode == "linked":
@@ -3546,6 +3572,22 @@ class ZeroClawService:
         channels_cfg = config.get("channels", {})
         if not isinstance(channels_cfg, dict):
             channels_cfg = {}
+        channel_defaults = channels_cfg.get("defaults", {})
+        if not isinstance(channel_defaults, dict):
+            channel_defaults = {}
+        heartbeat_visibility = channel_defaults.get("heartbeat", {})
+        if not isinstance(heartbeat_visibility, dict):
+            heartbeat_visibility = {}
+        heartbeat_visibility.setdefault("showOk", False)
+        heartbeat_visibility.setdefault("showAlerts", False)
+        heartbeat_visibility.setdefault("useIndicator", False)
+        channel_defaults["heartbeat"] = heartbeat_visibility
+        channels_cfg["defaults"] = channel_defaults
+
+        existing_telegram_cfg = channels_cfg.get("telegram", {})
+        if isinstance(existing_telegram_cfg, dict):
+            existing_telegram_cfg["streaming"] = "off"
+            channels_cfg["telegram"] = existing_telegram_cfg
         login_env = self._login_shell_env(linux_user)
         payload_by_kind: dict[str, dict[str, Any]] = {}
         for payload in live_payloads.values():
@@ -3569,6 +3611,7 @@ class ZeroClawService:
             telegram_cfg = channels_cfg.get("telegram", {})
             if not isinstance(telegram_cfg, dict):
                 telegram_cfg = {}
+            telegram_cfg["streaming"] = "off"
             token = (
                 str(settings.get("botToken", "")).strip()
                 or str(settings.get("bot_token", "")).strip()
@@ -4638,7 +4681,7 @@ class ZeroClawService:
             row = dict(existing_map.get(key, {}))
             row["kind"] = key[0]
             row["name"] = key[1]
-            row["enabled"] = bool(row.get("enabled", True))
+            row["enabled"] = bool(channel.get("enabled", row.get("enabled", True)))
             row["external_id"] = str(row.get("external_id", f"{token}:{key[0]}:{len(synced) + 1}"))
             synced.append(row)
 
@@ -8611,12 +8654,13 @@ class ZeroClawService:
         if not home:
             return {"source": "none", "detail": "agent home is not available", "channels": [], "providers": []}
         if linux_user and not is_local and not self._can_manage_linux_user(linux_user):
-            return {
-                "source": "permission",
-                "detail": "live channel discovery requires root for managed agents owned by another Linux user",
-                "channels": [],
-                "providers": [],
-            }
+            if not self._can_read_provider_channel_roots(home, [provider, *provider_names()]):
+                return {
+                    "source": "permission",
+                    "detail": "live channel discovery requires root for managed agents owned by another Linux user",
+                    "channels": [],
+                    "providers": [],
+                }
 
         ordered: list[str] = []
         seen_providers: set[str] = set()

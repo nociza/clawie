@@ -6087,7 +6087,8 @@ def test_systemd_status_prefers_any_running_candidate_over_stopped(
         def iterdir(self) -> list[FakeEntry]:
             return [FakeEntry("root"), FakeEntry("azicon")]
 
-    monkeypatch.setattr("clawie.service.Path", FakeHomePath)
+    # _systemd_user_candidates lives in the runtime mixin module.
+    monkeypatch.setattr("clawie._service_runtime.Path", FakeHomePath)
 
     class Result:
         def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:

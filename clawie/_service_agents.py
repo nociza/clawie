@@ -1,0 +1,1532 @@
+"""Agent lifecycle and provider switching (ZeroClawService mixin)."""
+from __future__ import annotations
+
+import copy
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+from clawie.providers import (
+    get_provider,
+    provider_names,
+)
+from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
+
+
+class AgentOpsMixin:
+
+    def create_agent(
+        self,
+        agent_id: str,
+        display_name: str | None,
+        template: str,
+        clone_from: str | None,
+        channel_strategy: str,
+        channels: list[dict[str, str]] | None,
+        agent_version: str,
+        provider: str | None = None,
+        core_prompts: dict[str, str] | None = None,
+        plugin_overrides: dict[str, bool] | None = None,
+    ) -> dict[str, Any]:
+        self._require_setup()
+
+        agent_id = agent_id.strip()
+        if not agent_id:
+            raise ValueError("agent_id is required")
+
+        if channel_strategy not in {"new", "migrate"}:
+            raise ValueError("channel_strategy must be one of: new, migrate")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        state["users"] = agents
+        if agent_id in agents:
+            raise AgentExistsError(f"agent already exists: {agent_id}")
+
+        base_channels: list[dict[str, str]] = []
+        source_template = template
+        source_agent_defaults: dict[str, Any] = {}
+        source_addons: dict[str, Any] = {}
+
+        if clone_from:
+            source = agents.get(clone_from)
+            if not source:
+                raise AgentNotFoundError(f"clone source agent not found: {clone_from}")
+            base_channels = copy.deepcopy(source.get("channels", []))
+            source_template = source.get("source_template") or template
+            source_agent_defaults = copy.deepcopy(source.get("agent", {}))
+            source_addons = copy.deepcopy(source.get("addons", {}))
+        else:
+            template_data = state["templates"].get(template)
+            if not template_data:
+                raise ValueError(f"template not found: {template}")
+            base_channels = copy.deepcopy(template_data.get("channels", []))
+            source_agent_defaults = copy.deepcopy(template_data.get("agent_defaults", {}))
+
+        if channels:
+            base_channels = copy.deepcopy(channels)
+
+        if channel_strategy == "new":
+            final_channels = self._mint_channels(agent_id, base_channels)
+        else:
+            if not clone_from and not channels:
+                raise ValueError(
+                    "channel strategy 'migrate' requires --clone-from or explicit channels"
+                )
+            final_channels = copy.deepcopy(base_channels)
+            for channel in final_channels:
+                channel["migrated_from"] = clone_from or "local-source"
+        for channel in final_channels:
+            channel["enabled"] = bool(channel.get("enabled", True))
+        transfer_from_clone = bool(clone_from and channel_strategy == "migrate")
+        self._assert_channels_unclaimed(
+            agents=agents,
+            owner_agent_id=agent_id,
+            channels=final_channels,
+            allow_owners={str(clone_from)} if transfer_from_clone else set(),
+        )
+
+        config = self.store.read_config()
+        default_provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
+        if provider:
+            provider_spec = get_provider(provider)
+        elif clone_from:
+            source = agents.get(clone_from, {})
+            source_provider = str(source.get("agent", {}).get("provider", "")).strip().lower()
+            provider_spec = get_provider(source_provider or default_provider)
+        else:
+            provider_spec = get_provider(default_provider)
+
+        provider_auth = self._preferred_agent_provider_auth(
+            provider_spec.name,
+            agent=None,
+            current_auth_mode="",
+            allow_defaults=True,
+        )
+
+        raw_plugins = source_agent_defaults.get("plugins", self._default_plugins_for_provider(provider_spec.name))
+        if not isinstance(raw_plugins, dict):
+            raw_plugins = self._default_plugins_for_provider(provider_spec.name)
+        plugins = self._normalize_plugins(raw_plugins)
+        if plugin_overrides:
+            for key, value in plugin_overrides.items():
+                plugins[str(key).strip().lower()] = bool(value)
+        runtime = provider_spec.runtime
+        if clone_from:
+            runtime = str(source_agent_defaults.get("runtime", provider_spec.runtime)).strip() or provider_spec.runtime
+
+        display = display_name.strip() if display_name else agent_id
+        agent = {
+            "status": "ready",
+            "version": agent_version,
+            "last_sync": now_iso(),
+            "runtime": runtime,
+            "provider": provider_spec.name,
+            "auth_mode": provider_auth.get("auth_mode", provider_spec.default_auth_mode),
+            "autostart": bool(source_agent_defaults.get("autostart", True)),
+            "heartbeat_seconds": int(source_agent_defaults.get("heartbeat_seconds", 30)),
+            "pid": int(source_agent_defaults.get("pid", 0)),
+            "plugins": plugins,
+            "model_tier": "balanced",
+        }
+        if clone_from and not core_prompts:
+            core_prompts = copy.deepcopy(agents.get(clone_from, {}).get("core_prompts", {}))
+        normalized_prompts = self._normalize_core_prompts(provider_spec.name, core_prompts or {})
+        self._seed_core_prompt_defaults(
+            provider_spec.name,
+            normalized_prompts,
+            agent_id=agent_id,
+            display_name=display,
+        )
+        self._seed_delegation_skill(normalized_prompts, plugins)
+
+        agent_state = {
+            "agent_id": agent_id,
+            "display_name": display,
+            "created_at": now_iso(),
+            "source_template": source_template,
+            "clone_from": clone_from,
+            "channel_strategy": channel_strategy,
+            "channels": final_channels,
+            "core_prompts": normalized_prompts,
+            "credential_sync": self._normalize_credential_sync_state({}, default_when_missing=True),
+            "addons": self._normalize_agent_addons(source_addons),
+            "agent": agent,
+        }
+        agents[agent_id] = agent_state
+        moved_from_clone = 0
+        if transfer_from_clone and clone_from:
+            source = agents.get(clone_from)
+            if source:
+                moved_from_clone = self._remove_channel_keys_from_agent(
+                    source=source,
+                    keys=self._channel_keys(final_channels),
+                )
+                if moved_from_clone:
+                    source.setdefault("agent", {})["last_sync"] = now_iso()
+
+        self._event(
+            state,
+            "agents.created",
+            f"Provisioned agent {agent_id}",
+            {
+                "agent_id": agent_id,
+                "channel_strategy": channel_strategy,
+                "channel_count": len(final_channels),
+                "clone_from": clone_from or "",
+                "provider": provider_spec.name,
+                "moved_from_clone": moved_from_clone,
+            },
+        )
+        self.store.write_state(state)
+        return agent_state
+
+    def list_agents(self) -> list[dict[str, Any]]:
+        self._refresh_managed_agent_provider_alignments()
+        state = self.store.read_state()
+        agents = list(state.setdefault("agents", state.get("users", {})).values())
+        for agent in agents:
+            self._hydrate_agent_controls(agent)
+        return sorted(
+            agents,
+            key=lambda row: (row.get("created_at", ""), row.get("agent_id", row.get("user_id", ""))),
+        )
+
+    def configured_provider_names(self) -> list[str]:
+        config = self.store.read_config()
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for item in [config.get("provider", "")] + list(self._normalized_provider_credentials(config).keys()):
+            token = str(item or "").strip().lower()
+            if not token or token in seen:
+                continue
+            try:
+                get_provider(token)
+            except ValueError:
+                continue
+            seen.add(token)
+            ordered.append(token)
+        return ordered
+
+    def get_agent(self, agent_id: str) -> dict[str, Any]:
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        return agent
+
+    def set_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
+        return self.switch_agent_provider(agent_id, provider)["agent"]
+
+    def switch_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
+        self._require_setup()
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+        if token.startswith("@local:"):
+            raise ValueError("provider switching is only supported for managed agents")
+        self._refresh_managed_agent_provider_alignment(token)
+
+        target_provider = str(provider).strip().lower()
+        if not target_provider:
+            raise ValueError("provider is required")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(token)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {token}")
+        self._hydrate_agent_controls(agent)
+
+        info = agent.setdefault("agent", {})
+        current_provider = str(info.get("provider", "")).strip().lower()
+        target_spec = get_provider(target_provider)
+        changed = current_provider != target_spec.name
+        linux_user = str(info.get("linux_user", "")).strip()
+        stop_result: dict[str, Any] = {}
+        stopped_results: list[dict[str, Any]] = []
+        start_result: dict[str, Any] = {}
+        reconnected_channels: list[dict[str, str]] = []
+        old_running = False
+        target_running_before = False
+        old_service_state = {
+            "service_status": str(info.get("service_status", "unknown")),
+            "service_mode": str(info.get("service_mode", "unknown")),
+            "fallback_pid": int(info.get("fallback_pid", 0) or 0),
+        }
+        new_service_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
+
+        try:
+            if linux_user:
+                # Permission is the most fundamental precondition: check it before
+                # auth/runtime preparation so callers get an actionable error
+                # instead of a misleading auth or install failure.
+                self._require_linux_user_access(linux_user, "provider switching")
+            auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
+            provider_auth = self._preferred_agent_provider_auth(
+                target_spec.name,
+                agent=agent,
+                # The stored auth mode belongs to the current provider; it only
+                # carries over when reconciling the same provider. A switch to a
+                # different provider must derive its own auth mode.
+                current_auth_mode=str(info.get("auth_mode", "")) if not changed else "",
+                allow_defaults=True,
+            )
+            home = self._agent_linux_home(agent)
+            prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+            effective_channels = self._effective_agent_channels(agent) if linux_user else []
+            live_channel_payloads = self._discover_live_channel_payloads(agent) if linux_user else {}
+
+            if not changed and not linux_user:
+                auth = self.agent_auth_status(token)
+                return {
+                    "agent": agent,
+                    "changed": False,
+                    "from_provider": current_provider,
+                    "to_provider": target_spec.name,
+                    "service": {},
+                    "stopped_service": {},
+                    "stopped_services": [],
+                    "reconnected_channels": [],
+                    "auth": auth,
+                    "auth_prepare": auth_prepare,
+                }
+
+            if linux_user:
+                self.ensure_provider_runtime(target_spec.name)
+                target_running_before = self._managed_provider_is_running(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    agent_info=new_service_state,
+                )
+                if changed and current_provider:
+                    self._resolve_provider_executable(current_provider)
+                if home:
+                    self._write_prompt_files_for_home(target_spec.name, home, prompts, linux_user)
+            if linux_user and changed and current_provider:
+                old_running = self._managed_provider_is_running(
+                    provider=current_provider,
+                    linux_user=linux_user,
+                    agent_info=old_service_state,
+                )
+                if old_running or int(old_service_state.get("fallback_pid", 0) or 0) > 0:
+                    stop_result = self._run_managed_provider_service_action(
+                        provider=current_provider,
+                        action="stop",
+                        linux_user=linux_user,
+                        agent_info=old_service_state,
+                    )
+
+            if linux_user:
+                self._prepare_agent_provider_home(
+                    provider=target_spec.name,
+                    agent=agent,
+                    linux_user=linux_user,
+                    home=home,
+                    channels=effective_channels,
+                    live_payloads=live_channel_payloads,
+                )
+                start_result = self._run_managed_provider_service_action(
+                    provider=target_spec.name,
+                    action="restart" if target_running_before else "start",
+                    linux_user=linux_user,
+                    agent_info=new_service_state,
+                )
+                reconnected_channels = self._reconnect_agent_channels(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    channels=effective_channels,
+                )
+                for other_provider in provider_names():
+                    if other_provider == target_spec.name:
+                        continue
+                    try:
+                        self._resolve_provider_executable(other_provider)
+                    except SetupError:
+                        continue
+                    other_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
+                    if self._managed_provider_is_running(
+                        provider=other_provider,
+                        linux_user=linux_user,
+                        agent_info=other_state,
+                    ):
+                        stopped = self._run_managed_provider_service_action(
+                            provider=other_provider,
+                            action="stop",
+                            linux_user=linux_user,
+                            agent_info=other_state,
+                        )
+                        stopped_results.append(stopped)
+                live_after_switch = self._live_provider_names_for_user(linux_user)
+                if target_spec.name not in live_after_switch:
+                    raise SetupError(
+                        f"provider switch to {target_spec.name} did not produce a live {target_spec.name} runtime"
+                    )
+                other_live = [item for item in live_after_switch if item != target_spec.name]
+                if other_live:
+                    raise SetupError(
+                        f"provider switch to {target_spec.name} left other runtimes active: {', '.join(other_live)}"
+                    )
+                self._assert_provider_postflight_ready(
+                    provider=target_spec.name,
+                    linux_user=linux_user,
+                    home=home,
+                    auth_mode=str(provider_auth.get("auth_mode", target_spec.default_auth_mode)),
+                )
+        except Exception as exc:
+            self._set_agent_provider_issue(
+                agent,
+                status="error",
+                kind="switch_failed",
+                issue=f"provider switch to {target_spec.name} failed: {exc}",
+                remediation=self._provider_switch_remediation(
+                    agent_id=token,
+                    target_provider=target_spec.name,
+                    linux_user=linux_user,
+                    error=str(exc),
+                ),
+                requested_provider=target_spec.name,
+            )
+            self._event(
+                state,
+                "agents.provider_switch_failed",
+                f"Provider switch failed for {token}",
+                {
+                    "agent_id": token,
+                    "from_provider": current_provider,
+                    "to_provider": target_spec.name,
+                    "linux_user": linux_user,
+                    "error": str(exc),
+                },
+            )
+            self.store.write_state(state)
+            if changed and linux_user and str(start_result.get("service_status", "")) == "running":
+                try:
+                    self._run_managed_provider_service_action(
+                        provider=target_spec.name,
+                        action="stop",
+                        linux_user=linux_user,
+                        agent_info=new_service_state,
+                    )
+                except Exception:
+                    pass
+            if changed and linux_user and current_provider and old_running:
+                try:
+                    self._run_managed_provider_service_action(
+                        provider=current_provider,
+                        action="start",
+                        linux_user=linux_user,
+                        agent_info=old_service_state,
+                    )
+                except Exception:
+                    pass
+            raise
+
+        info["provider"] = target_spec.name
+        info["runtime"] = target_spec.runtime
+        info["auth_mode"] = str(provider_auth.get("auth_mode", target_spec.default_auth_mode))
+        info["service_status"] = str(start_result.get("service_status", "unknown")) if linux_user else "unknown"
+        info["service_mode"] = str(start_result.get("service_mode", "unknown")) if linux_user else "unknown"
+        info["pid"] = 0
+        if "fallback_pid" in info or int(start_result.get("fallback_pid", 0) or 0) > 0:
+            info["fallback_pid"] = int(start_result.get("fallback_pid", 0) or 0)
+        info["last_sync"] = now_iso()
+        if effective_channels:
+            self._persist_effective_agent_channels(agent, effective_channels)
+        agent["core_prompts"] = prompts
+        self._clear_agent_provider_issue(agent)
+        if not stop_result and stopped_results:
+            stop_result = stopped_results[-1]
+        self._event(
+            state,
+            "agents.provider_changed" if changed else "agents.provider_reconciled",
+            f"Changed provider for {token}" if changed else f"Reconciled provider runtime for {token}",
+            {
+                "agent_id": token,
+                "from_provider": current_provider,
+                "to_provider": target_spec.name,
+                "linux_user": linux_user,
+                "service_status": str(start_result.get("service_status", "unknown")),
+                "service_mode": str(start_result.get("service_mode", "unknown")),
+                "reconnected_channels": len(reconnected_channels),
+                "stopped_provider_count": len(stopped_results or ([stop_result] if stop_result else [])),
+            },
+        )
+        self.store.write_state(state)
+        auth = self.agent_auth_status(token)
+        return {
+            "agent": agent,
+            "changed": changed,
+            "from_provider": current_provider,
+            "to_provider": target_spec.name,
+            "service": start_result,
+            "stopped_service": stop_result,
+            "stopped_services": stopped_results,
+            "reconnected_channels": reconnected_channels,
+            "auth": auth,
+            "auth_prepare": auth_prepare,
+        }
+
+    def toggle_agent_plugin(self, agent_id: str, plugin: str) -> dict[str, Any]:
+        self._require_setup()
+        plugin_name = str(plugin).strip().lower()
+        if not plugin_name:
+            raise ValueError("plugin is required")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        agent_info = agent.setdefault("agent", {})
+        plugins = agent_info.setdefault("plugins", {})
+        current = bool(plugins.get(plugin_name, True))
+        plugins[plugin_name] = not current
+        agent_info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.plugin_toggled",
+            f"Toggled plugin {plugin_name} for {agent_id}",
+            {
+                "agent_id": agent_id,
+                "plugin": plugin_name,
+                "enabled": bool(plugins.get(plugin_name, False)),
+            },
+        )
+        self.store.write_state(state)
+        return agent
+
+    def toggle_agent_autostart(self, agent_id: str) -> dict[str, Any]:
+        self._require_setup()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        agent_info = agent.setdefault("agent", {})
+        agent_info["autostart"] = not bool(agent_info.get("autostart", True))
+        agent_info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "agents.autostart_toggled",
+            f"Toggled autostart for {agent_id}",
+            {
+                "agent_id": agent_id,
+                "autostart": bool(agent_info.get("autostart", True)),
+            },
+        )
+        self.store.write_state(state)
+        return agent
+
+    def _prepare_agent_provider_home(
+        self,
+        *,
+        provider: str,
+        agent: dict[str, Any],
+        linux_user: str,
+        home: Path | None,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+    ) -> None:
+        if not home:
+            return
+        name = str(provider).strip().lower()
+        if name not in {"picoclaw", "openclaw"}:
+            return
+
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        use_shared_auth = "provider-auth" in set(sync.get("bundles", []))
+        if name == "picoclaw":
+            self._ensure_picoclaw_native_auth(home=home, linux_user=linux_user, use_shared_auth=use_shared_auth)
+        if use_shared_auth:
+            self._ensure_shared_provider_auth_links(target_home=home, username=linux_user)
+        if name == "openclaw":
+            self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
+
+        auth = self._preferred_agent_provider_auth(
+            name,
+            agent=agent,
+            current_auth_mode=str(agent.get("agent", {}).get("auth_mode", "")),
+            allow_defaults=True,
+        )
+        auth_mode = str(auth.get("auth_mode", get_provider(name).default_auth_mode)).strip().lower()
+        api_key = str(auth.get("api_key", "")).strip()
+        if name == "picoclaw":
+            self._ensure_picoclaw_home_prepared(
+                home=home,
+                linux_user=linux_user,
+                channels=channels,
+                live_payloads=live_payloads,
+                auth_mode=auth_mode,
+                api_key=api_key,
+            )
+            return
+        self._ensure_openclaw_home_prepared(
+            home=home,
+            linux_user=linux_user,
+            channels=channels,
+            live_payloads=live_payloads,
+            auth_mode=auth_mode,
+            api_key=api_key,
+        )
+
+    def _ensure_picoclaw_home_prepared(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+        auth_mode: str,
+        api_key: str,
+    ) -> None:
+        root = home / ".picoclaw"
+        root.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(root, linux_user)
+
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_path = root / "config.json"
+        config = self._read_json_file(config_path)
+
+        agents_cfg = config.get("agents", {})
+        if not isinstance(agents_cfg, dict):
+            agents_cfg = {}
+        defaults = agents_cfg.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["workspace"] = str(workspace)
+        defaults["restrict_to_workspace"] = bool(defaults.get("restrict_to_workspace", True))
+        defaults["provider"] = "openai"
+        defaults["model_name"] = "gpt-5.2"
+        defaults["model"] = "gpt-5.2"
+        agents_cfg["defaults"] = defaults
+        config["agents"] = agents_cfg
+
+        providers_cfg = config.get("providers", {})
+        if not isinstance(providers_cfg, dict):
+            providers_cfg = {}
+        openai_cfg = providers_cfg.get("openai", {})
+        if not isinstance(openai_cfg, dict):
+            openai_cfg = {}
+        openai_cfg.setdefault("api_base", "https://api.openai.com/v1")
+        if auth_mode == "linked":
+            openai_cfg["auth_method"] = "oauth"
+            openai_cfg.pop("api_key", None)
+        elif auth_mode == "api_key":
+            if not api_key:
+                raise SetupError("picoclaw API-key mode requires an API key before the runtime can start")
+            openai_cfg["api_key"] = api_key
+            openai_cfg.pop("auth_method", None)
+        providers_cfg["openai"] = openai_cfg
+        config["providers"] = providers_cfg
+
+        model_list = config.get("model_list", [])
+        if not isinstance(model_list, list):
+            model_list = []
+        model_entry: dict[str, Any] | None = None
+        for item in model_list:
+            if not isinstance(item, dict):
+                continue
+            model_name = str(item.get("model_name", "")).strip()
+            model_ref = str(item.get("model", "")).strip()
+            if model_name == "gpt-5.2" or model_ref == "openai/gpt-5.2":
+                model_entry = item
+                break
+        if model_entry is None:
+            for item in model_list:
+                if isinstance(item, dict) and str(item.get("model", "")).startswith("openai/"):
+                    model_entry = item
+                    break
+        if model_entry is None:
+            model_entry = {}
+            model_list.append(model_entry)
+        model_entry["model_name"] = "gpt-5.2"
+        model_entry["model"] = "openai/gpt-5.2"
+        model_entry.setdefault("api_base", "https://api.openai.com/v1")
+        if auth_mode == "linked":
+            model_entry["auth_method"] = "oauth"
+            model_entry.pop("api_key", None)
+        elif auth_mode == "api_key":
+            model_entry["api_key"] = api_key
+            model_entry.pop("auth_method", None)
+        config["model_list"] = model_list
+
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            channels_cfg = {}
+        login_env = self._login_shell_env(linux_user)
+        payload_by_kind: dict[str, dict[str, Any]] = {}
+        for payload in live_payloads.values():
+            kind = str(payload.get("kind", "")).strip().lower()
+            if kind and kind not in payload_by_kind:
+                payload_by_kind[kind] = payload
+
+        for channel in channels:
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or kind == "cli":
+                continue
+            payload = live_payloads.get((kind, name)) or payload_by_kind.get(kind, {})
+            settings = payload.get("settings", {}) if isinstance(payload, dict) else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings = self._resolve_shell_placeholders(settings, login_env)
+            if kind != "telegram":
+                continue
+            telegram_cfg = channels_cfg.get("telegram", {})
+            if not isinstance(telegram_cfg, dict):
+                telegram_cfg = {}
+            token = (
+                str(settings.get("token", "")).strip()
+                or str(settings.get("bot_token", "")).strip()
+                or str(telegram_cfg.get("token", "")).strip()
+            )
+            if not token:
+                raise SetupError(
+                    "picoclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                )
+            if self._looks_like_unresolved_secret(token):
+                raise SetupError(
+                    "picoclaw telegram bootstrap found an unresolved token placeholder; "
+                    "export the bot token in the target user's login shell or re-link Telegram first"
+                )
+            if not self._looks_like_telegram_bot_token(token):
+                raise SetupError(
+                    "picoclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
+                    "re-link Telegram or update the target user's Telegram token"
+                )
+            telegram_cfg["enabled"] = True
+            telegram_cfg["token"] = token
+            if name:
+                telegram_cfg["name"] = name
+            base_url = str(settings.get("base_url", telegram_cfg.get("base_url", ""))).strip()
+            if base_url:
+                telegram_cfg["base_url"] = base_url
+            proxy = str(settings.get("proxy", telegram_cfg.get("proxy", ""))).strip()
+            if proxy:
+                telegram_cfg["proxy"] = proxy
+            allow_from = self._coerce_string_list(settings.get("allow_from", telegram_cfg.get("allow_from", [])))
+            telegram_cfg["allow_from"] = allow_from
+            group_trigger = settings.get("group_trigger", telegram_cfg.get("group_trigger", {}))
+            if isinstance(group_trigger, dict) and group_trigger:
+                normalized_trigger: dict[str, Any] = {}
+                if "mention_only" in group_trigger:
+                    normalized_trigger["mention_only"] = bool(group_trigger.get("mention_only"))
+                prefixes = self._coerce_string_list(group_trigger.get("prefixes", []))
+                if prefixes:
+                    normalized_trigger["prefixes"] = prefixes
+                if normalized_trigger:
+                    telegram_cfg["group_trigger"] = normalized_trigger
+            channels_cfg["telegram"] = telegram_cfg
+
+        config["channels"] = channels_cfg
+        has_enabled_channel = any(
+            isinstance(value, dict) and bool(value.get("enabled", False))
+            for value in channels_cfg.values()
+        )
+        if not has_enabled_channel:
+            raise SetupError("picoclaw requires at least one enabled provider channel before the gateway can run")
+
+        self._write_json_file(config_path, config)
+        self._chown_tree(root, linux_user)
+
+    def _ensure_openclaw_home_prepared(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        channels: list[dict[str, Any]],
+        live_payloads: dict[tuple[str, str], dict[str, Any]],
+        auth_mode: str,
+        api_key: str,
+    ) -> None:
+        root = home / ".openclaw"
+        root.mkdir(parents=True, exist_ok=True)
+        self._chown_tree(root, linux_user)
+
+        workspace = root / "workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
+        config_path = root / "openclaw.json"
+        config = self._read_json_file(config_path)
+
+        gateway_cfg = config.get("gateway", {})
+        if not isinstance(gateway_cfg, dict):
+            gateway_cfg = {}
+        gateway_cfg["mode"] = "local"
+        config["gateway"] = gateway_cfg
+
+        agents_cfg = config.get("agents", {})
+        if not isinstance(agents_cfg, dict):
+            agents_cfg = {}
+        defaults = agents_cfg.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        defaults["workspace"] = str(workspace)
+        heartbeat = defaults.get("heartbeat", {})
+        if not isinstance(heartbeat, dict):
+            heartbeat = {}
+        heartbeat.setdefault("every", "0m")
+        heartbeat.setdefault("directPolicy", "block")
+        heartbeat.setdefault("lightContext", True)
+        heartbeat.setdefault("ackMaxChars", 300)
+        defaults["heartbeat"] = heartbeat
+
+        desired_model = ""
+        if auth_mode == "linked":
+            desired_model = "openai-codex/gpt-5.4"
+        elif auth_mode == "api_key":
+            if not api_key:
+                raise SetupError("openclaw API-key mode requires an API key before the runtime can start")
+            desired_model = "openai/gpt-5.2"
+
+        current_model = defaults.get("model")
+        if desired_model:
+            if isinstance(current_model, dict):
+                current_model["primary"] = desired_model
+                defaults["model"] = current_model
+            else:
+                defaults["model"] = desired_model
+        agents_cfg["defaults"] = defaults
+        config["agents"] = agents_cfg
+
+        if auth_mode == "linked":
+            auth_cfg = config.get("auth", {})
+            if not isinstance(auth_cfg, dict):
+                auth_cfg = {}
+            profiles = auth_cfg.get("profiles", {})
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles.setdefault(
+                "openai-codex:default",
+                {
+                    "provider": "openai-codex",
+                    "mode": "oauth",
+                },
+            )
+            auth_cfg["profiles"] = profiles
+            order = auth_cfg.get("order", {})
+            if not isinstance(order, dict):
+                order = {}
+            existing_order = order.get("openai-codex", [])
+            order["openai-codex"] = [
+                "openai-codex:default",
+                *[
+                    str(item).strip()
+                    for item in existing_order
+                    if str(item).strip() and str(item).strip() != "openai-codex:default"
+                ],
+            ]
+            auth_cfg["order"] = order
+            config["auth"] = auth_cfg
+        elif auth_mode == "api_key":
+            models_cfg = config.get("models", {})
+            if not isinstance(models_cfg, dict):
+                models_cfg = {}
+            providers_cfg = models_cfg.get("providers", {})
+            if not isinstance(providers_cfg, dict):
+                providers_cfg = {}
+            openai_cfg = providers_cfg.get("openai", {})
+            if not isinstance(openai_cfg, dict):
+                openai_cfg = {}
+            openai_cfg["apiKey"] = api_key
+            providers_cfg["openai"] = openai_cfg
+            models_cfg["providers"] = providers_cfg
+            config["models"] = models_cfg
+
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            channels_cfg = {}
+        channel_defaults = channels_cfg.get("defaults", {})
+        if not isinstance(channel_defaults, dict):
+            channel_defaults = {}
+        heartbeat_visibility = channel_defaults.get("heartbeat", {})
+        if not isinstance(heartbeat_visibility, dict):
+            heartbeat_visibility = {}
+        heartbeat_visibility.setdefault("showOk", False)
+        heartbeat_visibility.setdefault("showAlerts", False)
+        heartbeat_visibility.setdefault("useIndicator", False)
+        channel_defaults["heartbeat"] = heartbeat_visibility
+        channels_cfg["defaults"] = channel_defaults
+
+        existing_telegram_cfg = channels_cfg.get("telegram", {})
+        if isinstance(existing_telegram_cfg, dict):
+            existing_telegram_cfg["streaming"] = "off"
+            channels_cfg["telegram"] = existing_telegram_cfg
+        login_env = self._login_shell_env(linux_user)
+        payload_by_kind: dict[str, dict[str, Any]] = {}
+        for payload in live_payloads.values():
+            kind = str(payload.get("kind", "")).strip().lower()
+            if kind and kind not in payload_by_kind:
+                payload_by_kind[kind] = payload
+
+        for channel in channels:
+            kind = str(channel.get("kind", "")).strip().lower()
+            name = str(channel.get("name", "")).strip()
+            if not kind or kind == "cli":
+                continue
+            payload = live_payloads.get((kind, name)) or payload_by_kind.get(kind, {})
+            settings = payload.get("settings", {}) if isinstance(payload, dict) else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings = self._resolve_shell_placeholders(settings, login_env)
+            if kind != "telegram":
+                continue
+
+            telegram_cfg = channels_cfg.get("telegram", {})
+            if not isinstance(telegram_cfg, dict):
+                telegram_cfg = {}
+            telegram_cfg["streaming"] = "off"
+            token = (
+                str(settings.get("botToken", "")).strip()
+                or str(settings.get("bot_token", "")).strip()
+                or str(settings.get("token", "")).strip()
+                or str(telegram_cfg.get("botToken", "")).strip()
+            )
+            if not token:
+                raise SetupError(
+                    "openclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                )
+            if self._looks_like_unresolved_secret(token):
+                raise SetupError(
+                    "openclaw telegram bootstrap found an unresolved token placeholder; "
+                    "export the bot token in the target user's login shell or re-link Telegram first"
+                )
+            if not self._looks_like_telegram_bot_token(token):
+                raise SetupError(
+                    "openclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
+                    "re-link Telegram or update the target user's Telegram token"
+                )
+            telegram_cfg["enabled"] = True
+            telegram_cfg["botToken"] = token
+            allow_from = self._coerce_string_list(
+                settings.get("allowFrom", settings.get("allow_from", telegram_cfg.get("allowFrom", [])))
+            )
+            existing_allow_from = self._coerce_string_list(telegram_cfg.get("allowFrom", []))
+            effective_allow_from = allow_from or existing_allow_from
+            explicit_dm_policy = str(
+                settings.get("dmPolicy", settings.get("dm_policy", telegram_cfg.get("dmPolicy", "")))
+            ).strip().lower()
+            if effective_allow_from:
+                telegram_cfg["allowFrom"] = effective_allow_from
+                telegram_cfg["dmPolicy"] = "open" if "*" in set(effective_allow_from) else "allowlist"
+            elif explicit_dm_policy in {"open", "allowlist", "disabled"}:
+                telegram_cfg["dmPolicy"] = explicit_dm_policy
+            else:
+                # Managed Telegram cutovers should stay reachable by default.
+                # Heal older Clawie-generated openclaw configs that inherited the runtime default
+                # pairing mode without an explicit allowlist.
+                telegram_cfg["allowFrom"] = ["*"]
+                telegram_cfg["dmPolicy"] = "open"
+            proxy = str(settings.get("proxy", telegram_cfg.get("proxy", ""))).strip()
+            if proxy:
+                telegram_cfg["proxy"] = proxy
+            webhook_url = str(
+                settings.get("webhookUrl", settings.get("webhook_url", telegram_cfg.get("webhookUrl", "")))
+            ).strip()
+            if webhook_url:
+                telegram_cfg["webhookUrl"] = webhook_url
+            webhook_secret = str(
+                settings.get("webhookSecret", settings.get("webhook_secret", telegram_cfg.get("webhookSecret", "")))
+            ).strip()
+            if webhook_secret:
+                telegram_cfg["webhookSecret"] = webhook_secret
+            group_trigger = settings.get("group_trigger", settings.get("groupTrigger", {}))
+            if isinstance(group_trigger, dict) and "mention_only" in group_trigger:
+                groups = telegram_cfg.get("groups", {})
+                if not isinstance(groups, dict):
+                    groups = {}
+                default_group = groups.get("*", {})
+                if not isinstance(default_group, dict):
+                    default_group = {}
+                default_group["requireMention"] = bool(group_trigger.get("mention_only"))
+                groups["*"] = default_group
+                telegram_cfg["groups"] = groups
+            channels_cfg["telegram"] = telegram_cfg
+
+        config["channels"] = channels_cfg
+        self._write_json_file(config_path, config)
+        if auth_mode == "linked":
+            self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
+        self._chown_tree(root, linux_user)
+
+    def _remove_picoclaw_channel_from_home(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        kind: str,
+    ) -> None:
+        config_path = home / ".picoclaw" / "config.json"
+        config = self._read_json_file(config_path)
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return
+        token = str(kind).strip().lower()
+        if token in channels_cfg:
+            channels_cfg.pop(token, None)
+            config["channels"] = channels_cfg
+            self._write_json_file(config_path, config)
+            self._chown_tree(home / ".picoclaw", linux_user)
+
+    def _remove_openclaw_channel_from_home(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        kind: str,
+    ) -> None:
+        config_path = home / ".openclaw" / "openclaw.json"
+        config = self._read_json_file(config_path)
+        channels_cfg = config.get("channels", {})
+        if not isinstance(channels_cfg, dict):
+            return
+        token = str(kind).strip().lower()
+        if token in channels_cfg:
+            channels_cfg.pop(token, None)
+            config["channels"] = channels_cfg
+            self._write_json_file(config_path, config)
+            self._chown_tree(home / ".openclaw", linux_user)
+
+    def ensure_agent_permissions(self, agent_id: str, manager_user: str = "") -> dict[str, Any]:
+        """Set up group-based access so the manager user can manage the agent without sudo.
+
+        Requires root.  Adds *manager_user* (default: current user) to the
+        agent's Linux group and sets the provider state/workspace directories
+        to setgid-group-writable (2775).  The agent user's permissions are
+        unaffected—only group bits are widened.
+
+        After running this once (with sudo), the manager can write prompt
+        files, update configs, and apply staged prompts without root.
+        """
+        self._require_setup()
+        if os.geteuid() != 0:
+            raise SetupError("ensure_agent_permissions requires root. Re-run with sudo.")
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        self._hydrate_agent_controls(agent)
+        agent_info = agent.setdefault("agent", {})
+        provider = str(agent_info.get("provider", "")).strip().lower()
+        if not provider:
+            raise SetupError(f"agent '{agent_id}' has no provider configured")
+        linux_user = str(agent_info.get("linux_user", "")).strip()
+        if not linux_user:
+            raise SetupError(f"agent '{agent_id}' has no linux_user")
+        home = self._agent_linux_home(agent)
+        if not home:
+            raise SetupError(f"cannot resolve home directory for {linux_user}")
+
+        manager = (
+            str(manager_user).strip()
+            or str(agent_info.get("manager_user", "")).strip()
+            or os.environ.get("SUDO_USER", "").strip()
+            or self._current_linux_user()
+        )
+        changes: list[str] = []
+
+        spec = get_provider(provider)
+        state_dir = home / spec.state_dir
+        ws = state_dir / spec.workspace_dir
+
+        # Home dir: ensure group r-x for traversal.
+        if home.is_dir():
+            subprocess.run(["chmod", "g+rx", str(home)], check=False)
+            changes.append(f"{home}: g+rx")
+
+        # State dir: setgid + group-writable.
+        if state_dir.is_dir():
+            subprocess.run(["chmod", "2775", str(state_dir)], check=False)
+            changes.append(f"{state_dir}: 2775")
+            for child in state_dir.iterdir():
+                if child.is_file():
+                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
+
+        # Workspace: setgid + group-writable.
+        if ws.is_dir():
+            subprocess.run(["chmod", "2775", str(ws)], check=False)
+            changes.append(f"{ws}: 2775")
+            for child in ws.iterdir():
+                if child.is_file():
+                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
+                    changes.append(f"{child.name}: g+rw")
+
+        # Add manager to agent group.
+        if manager and manager != linux_user:
+            result = subprocess.run(
+                ["usermod", "-a", "-G", linux_user, manager],
+                check=False, capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                changes.append(f"added {manager} to group {linux_user}")
+            else:
+                changes.append(f"usermod failed: {(result.stderr or '').strip()}")
+
+        return {
+            "agent_id": agent_id,
+            "linux_user": linux_user,
+            "manager": manager,
+            "changes": changes,
+        }
+
+    def delete_agent(self, agent_id: str) -> None:
+        self._require_setup()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        if agent_id not in agents:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+        del agents[agent_id]
+        self._event(
+            state,
+            "agents.deleted",
+            f"Deleted agent {agent_id}",
+            {"agent_id": agent_id},
+        )
+        self.store.write_state(state)
+
+    def purge_agent(self, agent_id: str) -> dict[str, Any]:
+        self._require_setup()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        agent = agents.get(agent_id)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+
+        linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
+        user_removed = False
+        home_removed = False
+        if linux_user:
+            if os.geteuid() != 0:
+                raise SetupError(
+                    "purge requires root privileges for spawned Linux users. Re-run with sudo/root."
+                )
+            home_path = Path("/home") / linux_user
+            if self._linux_user_exists(linux_user):
+                subprocess.run(["userdel", "-r", linux_user], check=True)
+                user_removed = True
+                home_removed = True
+            elif home_path.exists():
+                shutil.rmtree(home_path)
+                home_removed = True
+
+        del agents[agent_id]
+        self._event(
+            state,
+            "agents.purged",
+            f"Purged agent {agent_id}",
+            {
+                "agent_id": agent_id,
+                "linux_user": linux_user,
+                "linux_user_removed": user_removed,
+                "home_removed": home_removed,
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "agent_id": agent_id,
+            "linux_user": linux_user,
+            "linux_user_removed": user_removed,
+            "home_removed": home_removed,
+        }
+
+    def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        results = {"created": [], "errors": []}
+        for entry in entries:
+            agent_id = str(entry.get("agent_id", entry.get("user_id", ""))).strip()
+            if not agent_id:
+                results["errors"].append({
+                    "agent_id": "",
+                    "error": "entry missing agent_id",
+                })
+                continue
+            try:
+                agent_state = self.create_agent(
+                    agent_id=agent_id,
+                    display_name=entry.get("display_name"),
+                    template=str(entry.get("template", "baseline")),
+                    clone_from=entry.get("clone_from"),
+                    channel_strategy=str(entry.get("channel_strategy", "new")),
+                    channels=entry.get("channels"),
+                    agent_version=str(entry.get("agent_version", "1.0.0")),
+                    provider=entry.get("provider"),
+                    core_prompts=entry.get("core_prompts"),
+                )
+                results["created"].append(agent_state["agent_id"])
+            except Exception as exc:  # noqa: BLE001
+                results["errors"].append({"agent_id": agent_id, "error": str(exc)})
+        return results
+
+    # Backward-compatible aliases.
+    def create_user(self, **kwargs: Any) -> dict[str, Any]:
+        return self.create_agent(
+            agent_id=str(kwargs.get("user_id", kwargs.get("agent_id", ""))),
+            display_name=kwargs.get("display_name"),
+            template=str(kwargs.get("template", "baseline")),
+            clone_from=kwargs.get("clone_from"),
+            channel_strategy=str(kwargs.get("channel_strategy", "new")),
+            channels=kwargs.get("channels"),
+            agent_version=str(kwargs.get("agent_version", "1.0.0")),
+            provider=kwargs.get("provider"),
+            core_prompts=kwargs.get("core_prompts"),
+        )
+
+    def list_users(self) -> list[dict[str, Any]]:
+        return self.list_agents()
+
+    def get_user(self, user_id: str) -> dict[str, Any]:
+        return self.get_agent(user_id)
+
+    def delete_user(self, user_id: str) -> None:
+        self.delete_agent(user_id)
+
+    def batch_create_users(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.batch_create_agents(entries)
+
+    def _refresh_managed_agent_provider_alignment(
+        self,
+        agent_id: str,
+        *,
+        daemon_map: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        token = str(agent_id).strip()
+        if not token or token.startswith("@local:"):
+            return
+        self._refresh_managed_agent_provider_alignments(agent_id=token, daemon_map=daemon_map)
+
+    def _refresh_managed_agent_provider_alignments(
+        self,
+        *,
+        agent_id: str | None = None,
+        daemon_map: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        if daemon_map is None:
+            daemon_map = self._running_provider_daemons_by_user()
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        dirty = False
+        for token, agent in agents.items():
+            if agent_id and token != agent_id:
+                continue
+            self._hydrate_agent_controls(agent)
+            if self._apply_live_provider_alignment(
+                state=state,
+                agent_id=token,
+                agent=agent,
+                daemon_map=daemon_map,
+            ):
+                dirty = True
+        if dirty:
+            self.store.write_state(state)
+
+    def _apply_live_provider_alignment(
+        self,
+        *,
+        state: dict[str, Any],
+        agent_id: str,
+        agent: dict[str, Any],
+        daemon_map: dict[str, list[dict[str, Any]]],
+    ) -> bool:
+        info = agent.setdefault("agent", {})
+        if bool(info.get("local_user", False)):
+            return False
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            return self._clear_runtime_provider_issue(agent)
+
+        current_provider = str(info.get("provider", "")).strip().lower()
+        live_entries = list(daemon_map.get(linux_user, []))
+        live_providers: list[str] = []
+        for entry in live_entries:
+            provider = str(entry.get("provider", "")).strip().lower()
+            if provider and provider not in live_providers:
+                live_providers.append(provider)
+
+        if not live_providers:
+            return self._clear_runtime_provider_issue(agent)
+
+        effective_provider = current_provider if current_provider in live_providers else live_providers[0]
+        changed = False
+        if effective_provider and effective_provider != current_provider:
+            info["provider"] = effective_provider
+            info["runtime"] = get_provider(effective_provider).runtime
+            auth_mode = str(info.get("auth_mode", "")).strip().lower()
+            spec = get_provider(effective_provider)
+            if not spec.supports_auth_mode(auth_mode):
+                info["auth_mode"] = spec.default_auth_mode
+            changed = True
+
+        if len(live_providers) > 1:
+            changed = self._set_agent_provider_issue(
+                agent,
+                status="warning",
+                kind="runtime_conflict",
+                issue=f"multiple provider daemons detected: {', '.join(live_providers)}; using {effective_provider}",
+                remediation=(
+                    f"Run 'sudo clawie agent provider set {agent_id} {effective_provider}' to stop the extra runtimes."
+                ),
+                requested_provider="",
+            ) or changed
+            if changed:
+                self._event(
+                    state,
+                    "agents.provider_runtime_conflict",
+                    f"Detected multiple runtimes for {agent_id}",
+                    {
+                        "agent_id": agent_id,
+                        "linux_user": linux_user,
+                        "live_providers": list(live_providers),
+                        "effective_provider": effective_provider,
+                    },
+                )
+            return changed
+
+        live_provider = live_providers[0]
+        if live_provider != current_provider:
+            changed = self._set_agent_provider_issue(
+                agent,
+                status="warning",
+                kind="runtime_drift",
+                issue=(
+                    f"live runtime was {live_provider}; Clawie aligned state away from {current_provider or 'unknown'}"
+                ),
+                remediation=(
+                    f"Run 'sudo clawie agent provider set {agent_id} {current_provider}' if you still want to switch."
+                    if current_provider
+                    else ""
+                ),
+                requested_provider=current_provider,
+            ) or changed
+            self._event(
+                state,
+                "agents.provider_aligned_to_runtime",
+                f"Aligned {agent_id} to live runtime {live_provider}",
+                {
+                    "agent_id": agent_id,
+                    "linux_user": linux_user,
+                    "previous_provider": current_provider,
+                    "live_provider": live_provider,
+                },
+            )
+            return True
+
+        return self._clear_runtime_provider_issue(agent) or changed
+
+    @staticmethod
+    def _clear_agent_provider_issue(agent: dict[str, Any]) -> None:
+        info = agent.setdefault("agent", {})
+        info["provider_status"] = "ok"
+        for key in ("provider_issue_kind", "provider_issue", "provider_remediation", "provider_requested"):
+            info.pop(key, None)
+
+    def _clear_runtime_provider_issue(self, agent: dict[str, Any]) -> bool:
+        info = agent.setdefault("agent", {})
+        if str(info.get("provider_issue_kind", "")) != "runtime_conflict":
+            return False
+        self._clear_agent_provider_issue(agent)
+        return True
+
+    @staticmethod
+    def _set_agent_provider_issue(
+        agent: dict[str, Any],
+        *,
+        status: str,
+        kind: str,
+        issue: str,
+        remediation: str,
+        requested_provider: str,
+    ) -> bool:
+        info = agent.setdefault("agent", {})
+        next_values = {
+            "provider_status": str(status or "warning"),
+            "provider_issue_kind": str(kind or "").strip(),
+            "provider_issue": str(issue or "").strip(),
+            "provider_remediation": str(remediation or "").strip(),
+            "provider_requested": str(requested_provider or "").strip().lower(),
+        }
+        current_values = {
+            key: str(info.get(key, "") if key != "provider_status" else info.get(key, "ok"))
+            for key in next_values
+        }
+        if current_values == next_values:
+            return False
+        info.update(next_values)
+        return True
+
+    def _provider_switch_remediation(
+        self,
+        *,
+        agent_id: str,
+        target_provider: str,
+        linux_user: str,
+        error: str,
+    ) -> str:
+        message = str(error).strip().lower()
+        if "requires root" in message or "sudo" in message:
+            return f"Re-run 'sudo clawie agent provider set {agent_id} {target_provider}'."
+        if "executable" in message or "not found" in message or "install" in message:
+            return f"Install or link '{target_provider}', then run 'sudo clawie agent provider set {agent_id} {target_provider}'."
+        if linux_user:
+            return (
+                f"Check the {target_provider} service for {linux_user}, then run "
+                f"'sudo clawie agent provider set {agent_id} {target_provider}' again."
+            )
+        return f"Retry 'clawie agent provider set {agent_id} {target_provider}' after fixing the provider runtime."
+
+    def _local_agent_view(self, provider: str) -> dict[str, Any]:
+        config = self.store.read_config()
+        local_state = self._normalized_local_service_state(config)
+        local_state = self._refresh_local_service_statuses([provider], local_state)
+        config = self.store.read_config()
+        local_state = self._normalized_local_service_state(config)
+        info = dict(local_state.get(provider, {}))
+        home = self._local_agent_home(provider)
+        prompts = self._normalize_core_prompts(provider, {})
+        if home:
+            prompts = self._normalize_core_prompts(provider, self._read_core_prompts_from_home(provider, home))
+        self._seed_core_prompt_defaults(provider, prompts, agent_id=f"@local:{provider}", display_name="local-user")
+        self._seed_delegation_skill(prompts, self._default_plugins_for_provider(provider))
+        return {
+            "agent_id": f"@local:{provider}",
+            "display_name": "local-user",
+            "source_template": "local-user",
+            "clone_from": "",
+            "channel_strategy": "local-user",
+            "channels": [],
+            "core_prompts": prompts,
+            "credential_sync": self._normalize_credential_sync_state({}, default_when_missing=False),
+            "agent": {
+                "provider": provider,
+                "auth_mode": str(self._provider_auth(provider).get("auth_mode", "")),
+                "autostart": False,
+                "heartbeat_seconds": 0,
+                "status": str(info.get("service_status", "unknown")),
+                "service_status": str(info.get("service_status", "unknown")),
+                "service_mode": str(info.get("service_mode", "unknown")),
+                "fallback_pid": int(info.get("fallback_pid", 0) or 0),
+                "version": "local",
+                "plugins": self._default_plugins_for_provider(provider),
+                "local_user": True,
+            },
+        }
+
+    def _default_plugins_for_provider(self, provider: str) -> dict[str, bool]:
+        _ = provider
+        return copy.deepcopy(self.DEFAULT_AGENT_PLUGINS)
+
+    def _normalize_plugins(self, plugins: dict[str, Any]) -> dict[str, bool]:
+        merged = self._default_plugins_for_provider("")
+        for key, value in plugins.items():
+            token = str(key).strip().lower()
+            if not token:
+                continue
+            merged[token] = bool(value)
+        return merged
+
+    def _hydrate_agent_controls(self, agent_state: dict[str, Any]) -> None:
+        channels = agent_state.get("channels", [])
+        if isinstance(channels, list):
+            for channel in channels:
+                if isinstance(channel, dict):
+                    channel["enabled"] = bool(channel.get("enabled", True))
+        agent = agent_state.setdefault("agent", {})
+        provider = str(agent.get("provider", "")).strip().lower()
+        raw_plugins = agent.get("plugins", self._default_plugins_for_provider(str(agent.get("provider", ""))))
+        if not isinstance(raw_plugins, dict):
+            raw_plugins = self._default_plugins_for_provider(str(agent.get("provider", "")))
+        agent["plugins"] = self._normalize_plugins(raw_plugins)
+        if "model_tier" not in agent:
+            agent["model_tier"] = "balanced"
+        agent_state["core_prompts"] = self._normalize_core_prompts(provider, agent_state.get("core_prompts", {}))
+        self._seed_core_prompt_defaults(
+            provider,
+            agent_state["core_prompts"],
+            agent_id=str(agent_state.get("agent_id", "")),
+            display_name=str(agent_state.get("display_name", "")),
+        )
+        agent_state["credential_sync"] = self._normalize_credential_sync_state(
+            agent_state.get("credential_sync"),
+            default_when_missing=True,
+        )
+        agent_state["addons"] = self._normalize_agent_addons(agent_state.get("addons"))
+        self._seed_delegation_skill(agent_state["core_prompts"], agent["plugins"])
+
+    def set_agent_model_tier(self, agent_id: str, tier: str = "") -> str:
+        """Set or cycle the model tier for *agent_id*. Returns the new tier."""
+        from clawie.delegation import VALID_TIER_NAMES
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", state.get("users", {}))
+        state["users"] = agents
+        agent_state = agents.get(agent_id)
+        if not agent_state:
+            raise AgentNotFoundError(f"agent not found: {agent_id}")
+
+        agent = agent_state.setdefault("agent", {})
+        current = str(agent.get("model_tier", "balanced"))
+
+        if tier:
+            if tier not in VALID_TIER_NAMES:
+                raise ValueError(
+                    f"unknown tier {tier!r}; valid: {', '.join(VALID_TIER_NAMES)}"
+                )
+            new_tier = tier
+        else:
+            # Cycle: fast -> balanced -> power -> fast
+            idx = list(VALID_TIER_NAMES).index(current) if current in VALID_TIER_NAMES else 0
+            new_tier = VALID_TIER_NAMES[(idx + 1) % len(VALID_TIER_NAMES)]
+
+        agent["model_tier"] = new_tier
+        self._event(
+            state,
+            "agent.model_tier.changed",
+            f"Agent {agent_id} model tier changed to {new_tier}",
+            {"agent_id": agent_id, "old_tier": current, "new_tier": new_tier},
+        )
+        self.store.write_state(state)
+        return new_tier
+
+    def start_agent_repl(self, agent_id: str, handler: Any = None, model_tier: str = "") -> None:
+        from clawie.delegation import AgentREPL, DEFAULT_TIER
+
+        tier = model_tier or DEFAULT_TIER
+
+        def _default_handler(msg: Any, repl: Any) -> dict[str, Any]:
+            return {"echo": msg.payload, "agent": agent_id}
+
+        repl = AgentREPL(agent_id, handler=handler or _default_handler, model_tier=tier)
+        import signal
+
+        def _shutdown(*_a: Any) -> None:
+            repl.stop()
+
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+        repl.start()
+
+    def stop_session_agent(self, parent_id: str, child_id: str) -> None:
+        mgr = self._get_session_manager(parent_id)
+        mgr.stop_agent(child_id)
+        state = self.store.read_state()
+        self._event(
+            state,
+            "session.agent.stopped",
+            f"Session agent {child_id} stopped under {parent_id}",
+            {"parent": parent_id, "child": child_id},
+        )
+        self.store.write_state(state)
+
+    def stop_all_session_agents(self, parent_id: str) -> None:
+        if parent_id in self._session_managers:
+            self._session_managers[parent_id].stop_all()
+            del self._session_managers[parent_id]
+
+    def list_session_agents(self, parent_id: str) -> list[dict[str, Any]]:
+        if parent_id not in self._session_managers:
+            return []
+        return self._session_managers[parent_id].list_agents()

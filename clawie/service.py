@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import copy
-import crypt
 import json
 import os
 import platform
 import pwd
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -19,9 +19,17 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import tomllib
+    import crypt  # removed from the stdlib in Python 3.13 (PEP 594)
 except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
+    crypt = None  # type: ignore[assignment]
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]  # Python 3.10 fallback
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 from clawie.auth_sources import (
     load_claude_auth,
@@ -164,7 +172,6 @@ def _is_legacy_core_prompt_default(prompt_name: str, content: str) -> bool:
 
 class ZeroClawService:
     EVENT_LIMIT = 2000
-    DEFAULT_SPAWN_PASSWORD = "clawie"
     SSHD_DENY_USERS_FILE = Path("/etc/ssh/sshd_config.d/99-clawie-deny-users.conf")
     HOMEBREW_PREFIX = Path("/home/linuxbrew/.linuxbrew")
     GLOBAL_PROFILE_DIR = Path("/etc/profile.d")
@@ -1893,27 +1900,6 @@ class ZeroClawService:
         target_spec = get_provider(target_provider)
         changed = current_provider != target_spec.name
         linux_user = str(info.get("linux_user", "")).strip()
-        home = self._agent_linux_home(agent)
-        auth_prepare = {
-            "provider": target_spec.name,
-            "required": False,
-            "prepared": False,
-            "action": "",
-            "source": "",
-            "source_home": "",
-            "auth": {},
-        }
-        if linux_user:
-            auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
-        provider_auth = self._preferred_agent_provider_auth(
-            target_spec.name,
-            agent=agent,
-            current_auth_mode=str(info.get("auth_mode", "")),
-            allow_defaults=True,
-        )
-        prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
-        effective_channels = self._effective_agent_channels(agent) if linux_user else []
-        live_channel_payloads = self._discover_live_channel_payloads(agent) if linux_user else {}
         stop_result: dict[str, Any] = {}
         stopped_results: list[dict[str, Any]] = []
         start_result: dict[str, Any] = {}
@@ -1927,24 +1913,43 @@ class ZeroClawService:
         }
         new_service_state = {"service_status": "unknown", "service_mode": "unknown", "fallback_pid": 0}
 
-        if not changed and not linux_user:
-            auth = self.agent_auth_status(token)
-            return {
-                "agent": agent,
-                "changed": False,
-                "from_provider": current_provider,
-                "to_provider": target_spec.name,
-                "service": {},
-                "stopped_service": {},
-                "stopped_services": [],
-                "reconnected_channels": [],
-                "auth": auth,
-                "auth_prepare": auth_prepare,
-            }
-
         try:
             if linux_user:
+                # Permission is the most fundamental precondition: check it before
+                # auth/runtime preparation so callers get an actionable error
+                # instead of a misleading auth or install failure.
                 self._require_linux_user_access(linux_user, "provider switching")
+            auth_prepare = self._prepare_linked_auth_for_provider_switch(provider=target_spec.name, agent=agent)
+            provider_auth = self._preferred_agent_provider_auth(
+                target_spec.name,
+                agent=agent,
+                # The stored auth mode belongs to the current provider; it only
+                # carries over when reconciling the same provider. A switch to a
+                # different provider must derive its own auth mode.
+                current_auth_mode=str(info.get("auth_mode", "")) if not changed else "",
+                allow_defaults=True,
+            )
+            home = self._agent_linux_home(agent)
+            prompts = self._normalize_core_prompts(target_spec.name, agent.get("core_prompts", {}))
+            effective_channels = self._effective_agent_channels(agent) if linux_user else []
+            live_channel_payloads = self._discover_live_channel_payloads(agent) if linux_user else {}
+
+            if not changed and not linux_user:
+                auth = self.agent_auth_status(token)
+                return {
+                    "agent": agent,
+                    "changed": False,
+                    "from_provider": current_provider,
+                    "to_provider": target_spec.name,
+                    "service": {},
+                    "stopped_service": {},
+                    "stopped_services": [],
+                    "reconnected_channels": [],
+                    "auth": auth,
+                    "auth_prepare": auth_prepare,
+                }
+
+            if linux_user:
                 self.ensure_provider_runtime(target_spec.name)
                 target_running_before = self._managed_provider_is_running(
                     provider=target_spec.name,
@@ -3761,6 +3766,10 @@ class ZeroClawService:
         if not provider:
             raise SetupError(f"agent '{agent_id}' has no provider configured")
         linux_user = str(agent_info.get("linux_user", "")).strip()
+        # Permission is the most fundamental precondition: check it before
+        # resolving or installing the provider runtime so callers get an
+        # actionable "requires root" error instead of an install hint.
+        self._require_linux_user_access(linux_user, "service control")
         home = self._agent_linux_home(agent)
         if command in {"start", "restart"}:
             self.ensure_provider_runtime(provider)
@@ -6755,13 +6764,25 @@ class ZeroClawService:
             "source_home": "",
             "auth": {},
         }
-        if not spec.supports_auth_mode("linked") or not self._agent_prefers_shared_provider_auth(agent):
+        sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+        if (
+            # Fail-fast auth preparation only applies to agents that consume the
+            # shared provider-auth store (shared_provider_auth flag). Agents that
+            # merely have the default provider-auth bundle selected keep their
+            # own auth and must not be blocked on shared linked auth.
+            not bool(sync.get("shared_provider_auth", False))
+            or not spec.supports_auth_mode("linked")
+        ):
             return result
 
         result["required"] = True
         status = self.shared_auth_status(spec.name)
         result["auth"] = status
         if self._auth_status_ready(status):
+            return result
+        if self._shared_linked_auth_available(spec.name):
+            # Shared linked auth material exists on disk (possibly expired):
+            # nothing to import. Cutover repair/refresh handles staleness.
             return result
 
         source_home = self._default_source_home()
@@ -6872,24 +6893,31 @@ class ZeroClawService:
     ) -> dict[str, Any]:
         spec = get_provider(provider)
         auth = self._provider_auth(spec.name)
+        current_mode = str(current_auth_mode).strip().lower()
         explicit_mode = str(auth.get("auth_mode", "")).strip().lower()
         if explicit_mode:
             if (
                 explicit_mode == "none"
                 and agent is not None
                 and spec.supports_auth_mode("linked")
-                and self._agent_prefers_shared_provider_auth(agent)
-                and self._shared_linked_auth_available(spec.name)
+                and (
+                    # An agent whose own record says "linked" keeps linked auth
+                    # (it may hold private linked auth in its home), even when
+                    # the shared store has nothing for this provider.
+                    current_mode == "linked"
+                    or (
+                        self._agent_prefers_shared_provider_auth(agent)
+                        and self._shared_linked_auth_available(spec.name)
+                    )
+                )
             ):
                 auth["auth_mode"] = "linked"
             return auth
 
         if agent is not None and spec.supports_auth_mode("linked"):
-            current_mode = str(current_auth_mode).strip().lower()
-            if current_mode == "linked" and self._agent_prefers_shared_provider_auth(agent):
-                if self._shared_linked_auth_available(spec.name):
-                    auth["auth_mode"] = "linked"
-                    return auth
+            if current_mode == "linked":
+                auth["auth_mode"] = "linked"
+                return auth
             if self._agent_prefers_shared_provider_auth(agent) and self._shared_linked_auth_available(spec.name):
                 auth["auth_mode"] = "linked"
                 return auth
@@ -7481,8 +7509,13 @@ class ZeroClawService:
                 self._set_password_hash(username, global_hash)
                 return ("global-password-hash", "")
 
-        self._set_password_plaintext(username, self.DEFAULT_SPAWN_PASSWORD)
-        return ("default-password", self.DEFAULT_SPAWN_PASSWORD)
+        # No password was provided or configured: generate a strong one-off
+        # password instead of falling back to a fixed, well-known default.
+        # It is returned (and printed once by the CLI) so the operator can
+        # record it; SSH login is separately disabled for spawned users.
+        generated = secrets.token_urlsafe(12)
+        self._set_password_plaintext(username, generated)
+        return ("generated-password", generated)
 
     @staticmethod
     def _spawn_user_shell() -> str:
@@ -7548,9 +7581,32 @@ class ZeroClawService:
     def _hash_password(password: str) -> str:
         if not password:
             raise ValueError("spawn password cannot be empty")
-        return str(crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)))
+        if crypt is not None:
+            return str(crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)))
+        # Python 3.13+ removed the stdlib crypt module (PEP 594). Fall back to
+        # openssl, which emits the same SHA512-crypt ($6$...) format chpasswd
+        # and usermod -p expect.
+        openssl = shutil.which("openssl")
+        if openssl:
+            result = subprocess.run(
+                [openssl, "passwd", "-6", "-stdin"],
+                input=f"{password}\n",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            hashed = (result.stdout or "").strip()
+            if result.returncode == 0 and hashed.startswith("$6$"):
+                return hashed
+        raise SetupError(
+            "hashing spawn passwords requires the stdlib 'crypt' module (Python <= 3.12) "
+            "or the 'openssl' executable; neither is available."
+        )
 
     def _service_command(self, provider: str, action: str, linux_user: str) -> list[str]:
+        # Check permission before resolving the executable: a missing-root error
+        # is more fundamental (and more actionable) than a missing-binary error.
+        self._require_linux_user_access(linux_user, "service control")
         spec = get_provider(provider)
         executable = self._resolve_provider_executable(spec.name)
         if spec.service_group:

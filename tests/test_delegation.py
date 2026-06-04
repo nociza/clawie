@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import shutil
 import socket
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import pytest
+
+_SHORT_DELEGATION_DIRS: list[Path] = []
+
+
+@atexit.register
+def _cleanup_short_delegation_dirs() -> None:
+    for path in _SHORT_DELEGATION_DIRS:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _use_short_delegation_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point DELEGATION_DIR at a short throwaway directory.
+
+    AF_UNIX socket paths are capped near 104 bytes on common platforms, and
+    pytest's tmp_path can exceed that, so delegation sockets must live
+    somewhere short."""
+    dlg_dir = Path(tempfile.mkdtemp(prefix="clawie-dlg-"))
+    _SHORT_DELEGATION_DIRS.append(dlg_dir)
+    monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", dlg_dir)
+    return dlg_dir
+
 
 from clawie.cli import main
 from clawie.delegation import (
@@ -192,12 +216,12 @@ class TestDelegationTree:
 
 class TestDelegationBus:
     def test_listen_and_connect(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         server_bus = DelegationBus("server")
         client_bus = DelegationBus("client")
         try:
             server_bus.listen()
-            assert (tmp_path / "server.sock").exists()
+            assert (dlg_dir / "server.sock").exists()
 
             # Connect from client in a thread
             results: list[Message] = []
@@ -243,7 +267,7 @@ class TestDelegationBus:
 
 class TestFileMailbox:
     def test_send_and_poll(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         sender = FileMailbox("sender")
         receiver = FileMailbox("receiver")
         receiver.ensure()
@@ -260,7 +284,7 @@ class TestFileMailbox:
         assert receiver.poll() == []
 
     def test_poll_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mbox = FileMailbox("agent")
         mbox.ensure()
         assert mbox.poll() == []
@@ -273,14 +297,14 @@ class TestFileMailbox:
 
 class TestAgentREPL:
     def test_echo_handler(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         repl = AgentREPL("echo-agent")
         repl.start_background()
         time.sleep(0.2)  # Let REPL spin up
 
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(str(tmp_path / "echo-agent.sock"))
+            sock.connect(str(dlg_dir / "echo-agent.sock"))
 
             msg = Message(
                 msg_type="task_submit",
@@ -305,7 +329,7 @@ class TestAgentREPL:
             repl.stop()
 
     def test_handler_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
 
         def failing_handler(msg: Message, repl: AgentREPL) -> dict:
             raise RuntimeError("boom")
@@ -316,7 +340,7 @@ class TestAgentREPL:
 
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(str(tmp_path / "fail-agent.sock"))
+            sock.connect(str(dlg_dir / "fail-agent.sock"))
 
             msg = Message(
                 msg_type="task_submit",
@@ -338,14 +362,14 @@ class TestAgentREPL:
             repl.stop()
 
     def test_shutdown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         repl = AgentREPL("shutdown-agent")
         repl.start_background()
         time.sleep(0.2)
 
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(str(tmp_path / "shutdown-agent.sock"))
+            sock.connect(str(dlg_dir / "shutdown-agent.sock"))
 
             msg = Message(msg_type="shutdown", parent_agent_id="caller")
             send_message(sock, msg)
@@ -365,7 +389,7 @@ class TestDelegationFlow:
     def test_parent_child_delegation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
 
         # Start child REPL
         child_repl = AgentREPL("child-worker")
@@ -384,7 +408,7 @@ class TestDelegationFlow:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test 3-level recursive delegation: root -> mid -> leaf."""
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
 
         # Leaf: echo handler
         leaf_repl = AgentREPL("leaf")
@@ -412,7 +436,7 @@ class TestDelegationFlow:
     def test_timeout_handling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
 
         def slow_handler(msg: Message, repl: AgentREPL) -> dict:
             time.sleep(10)
@@ -433,7 +457,7 @@ class TestDelegationFlow:
     def test_delegate_many(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
 
         workers = []
         for i in range(3):
@@ -529,9 +553,9 @@ class TestUtilities:
     def test_cleanup_stale_sockets(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         # Create a fake stale socket file
-        sock_path = tmp_path / "stale.sock"
+        sock_path = dlg_dir / "stale.sock"
         sock_path.touch()
         # Set mtime to old
         old_time = time.time() - 700
@@ -544,8 +568,8 @@ class TestUtilities:
     def test_cleanup_fresh_sockets_untouched(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
-        sock_path = tmp_path / "fresh.sock"
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        sock_path = dlg_dir / "fresh.sock"
         sock_path.touch()
         removed = cleanup_stale_sockets(max_age_seconds=600.0)
         assert removed == []
@@ -554,7 +578,7 @@ class TestUtilities:
     def test_list_active_agents_empty(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         assert list_active_agents() == []
 
 
@@ -863,7 +887,7 @@ class TestSessionAgentManager:
     def test_spawn_and_list(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1")
@@ -880,7 +904,7 @@ class TestSessionAgentManager:
     def test_spawn_duplicate_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("dup")
@@ -892,7 +916,7 @@ class TestSessionAgentManager:
     def test_delegate_to_session_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("echo-worker")
@@ -904,7 +928,7 @@ class TestSessionAgentManager:
     def test_tree_lines(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("root-agent")
         try:
             mgr.spawn("sub-1")
@@ -919,7 +943,7 @@ class TestSessionAgentManager:
     def test_stop_single_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("w1")
@@ -934,7 +958,7 @@ class TestSessionAgentManager:
     def test_delegate_to_nonexistent_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             with pytest.raises(ValueError, match="not found"):
@@ -1245,7 +1269,7 @@ class TestSessionAgentTiers:
     def test_spawn_with_tier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1", model_tier="fast")
@@ -1259,7 +1283,7 @@ class TestSessionAgentTiers:
     def test_spawn_default_tier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path)
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1")
@@ -1272,7 +1296,7 @@ class TestSessionAgentTiers:
     ) -> None:
         from clawie.service import ZeroClawService
 
-        monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", tmp_path / "delegation")
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
         svc = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
         try:
             info = svc.spawn_session_agent("parent", "child-1", model_tier="power")

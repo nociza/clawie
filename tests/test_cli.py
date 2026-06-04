@@ -634,7 +634,11 @@ def test_spawn_success_with_mocks(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -704,6 +708,11 @@ def test_spawn_uses_global_password_hash(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -720,7 +729,7 @@ def test_spawn_uses_global_password_hash(
     assert any(cmd[:2] == ["usermod", "-p"] for cmd in calls)
 
 
-def test_spawn_uses_builtin_default_password_and_prints_it(
+def test_spawn_generates_password_and_prints_it(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
@@ -742,6 +751,11 @@ def test_spawn_uses_builtin_default_password_and_prints_it(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -754,10 +768,15 @@ def test_spawn_uses_builtin_default_password_and_prints_it(
     )
     output = capsys.readouterr().out
     assert code == 0
-    assert "Password source: default-password" in output
-    assert "Password: clawie" in output
+    assert "Password source: generated-password" in output
     assert "SSH login: disabled for spawned Linux user" in output
-    assert any(cmd == ["chpasswd"] and input_data == "sam-default:clawie\n" for cmd, input_data in calls)
+    chpasswd_inputs = [str(input_data) for cmd, input_data in calls if cmd == ["chpasswd"]]
+    assert len(chpasswd_inputs) == 1
+    username, _, password = chpasswd_inputs[0].rstrip("\n").partition(":")
+    assert username == "sam-default"
+    assert len(password) >= 12
+    assert password != "clawie"
+    assert f"Password: {password}" in output
 
 
 def test_spawn_uses_per_agent_plaintext_password(
@@ -782,6 +801,11 @@ def test_spawn_uses_per_agent_plaintext_password(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -824,6 +848,11 @@ def test_spawn_creates_linux_user_with_bash_shell(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -985,6 +1014,11 @@ allowed_users = ["*"]
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,
@@ -1030,6 +1064,11 @@ def test_spawn_clones_core_prompts_from_local_source_home(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
 
     code = run_cli(
         tmp_path,

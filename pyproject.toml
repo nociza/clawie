@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Clawie Team" }]
-dependencies = []
+dependencies = [
+    # TOML parsing for provider channel discovery; stdlib tomllib exists on 3.11+.
+    "tomli>=2.0; python_version < '3.11'",
+]
 
 [project.scripts]
 clawie = "clawie.cli:main"

@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Protocol
 
 try:
-    import tomllib
+    import tomllib  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None  # type: ignore[assignment]
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]  # Python 3.10 fallback
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 
 
 class ProviderChannelAdapter(Protocol):

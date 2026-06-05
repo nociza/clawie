@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import json
 import os
 import shutil
 import socket
@@ -13,6 +12,32 @@ import time
 from pathlib import Path
 
 import pytest
+
+from clawie.cli import main
+from clawie.delegation import (
+    DEFAULT_MODEL_TIERS,
+    DEFAULT_TIER,
+    MAX_RECURSION_DEPTH,
+    VALID_TIER_NAMES,
+    AgentREPL,
+    ContextBudget,
+    DelegationBus,
+    DelegationCoordinator,
+    DelegationTree,
+    FileMailbox,
+    Message,
+    SessionAgentManager,
+    cleanup_stale_sockets,
+    estimate_payload_tokens,
+    estimate_tokens,
+    get_model_tier,
+    list_active_agents,
+    recommend_tier,
+    recv_message,
+    render_tree_ascii,
+    send_message,
+)
+from clawie.store import StateStore
 
 _SHORT_DELEGATION_DIRS: list[Path] = []
 
@@ -33,35 +58,6 @@ def _use_short_delegation_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
     _SHORT_DELEGATION_DIRS.append(dlg_dir)
     monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", dlg_dir)
     return dlg_dir
-
-
-from clawie.cli import main
-from clawie.delegation import (
-    DELEGATION_DIR,
-    DEFAULT_MODEL_TIERS,
-    DEFAULT_TIER,
-    MAX_RECURSION_DEPTH,
-    VALID_TIER_NAMES,
-    AgentREPL,
-    ContextBudget,
-    DelegationBus,
-    DelegationCoordinator,
-    DelegationTree,
-    FileMailbox,
-    Message,
-    ModelTier,
-    SessionAgentManager,
-    cleanup_stale_sockets,
-    estimate_payload_tokens,
-    estimate_tokens,
-    get_model_tier,
-    list_active_agents,
-    recommend_tier,
-    recv_message,
-    render_tree_ascii,
-    send_message,
-)
-from clawie.store import StateStore
 
 
 def run_cli(config_dir: Path, *args: str) -> int:
@@ -267,7 +263,7 @@ class TestDelegationBus:
 
 class TestFileMailbox:
     def test_send_and_poll(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         sender = FileMailbox("sender")
         receiver = FileMailbox("receiver")
         receiver.ensure()
@@ -284,7 +280,7 @@ class TestFileMailbox:
         assert receiver.poll() == []
 
     def test_poll_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mbox = FileMailbox("agent")
         mbox.ensure()
         assert mbox.poll() == []
@@ -389,7 +385,7 @@ class TestDelegationFlow:
     def test_parent_child_delegation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
 
         # Start child REPL
         child_repl = AgentREPL("child-worker")
@@ -408,7 +404,7 @@ class TestDelegationFlow:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test 3-level recursive delegation: root -> mid -> leaf."""
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
 
         # Leaf: echo handler
         leaf_repl = AgentREPL("leaf")
@@ -436,7 +432,7 @@ class TestDelegationFlow:
     def test_timeout_handling(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
 
         def slow_handler(msg: Message, repl: AgentREPL) -> dict:
             time.sleep(10)
@@ -457,7 +453,7 @@ class TestDelegationFlow:
     def test_delegate_many(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
 
         workers = []
         for i in range(3):
@@ -578,7 +574,7 @@ class TestUtilities:
     def test_list_active_agents_empty(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         assert list_active_agents() == []
 
 
@@ -757,7 +753,7 @@ class TestDelegationSkill:
             workspace="default", api_url="https://example.com",
         )
         # Create agent without the delegation plugin key (simulating old agent)
-        agent = svc.create_agent(
+        svc.create_agent(
             agent_id="legacy",
             display_name="legacy",
             template="baseline",
@@ -849,13 +845,13 @@ class TestTreeRendering:
             ],
         }
         lines = render_tree_ascii(nested)
-        assert any("root" in l for l in lines)
-        assert any("child-a" in l for l in lines)
-        assert any("child-b" in l for l in lines)
+        assert any("root" in line for line in lines)
+        assert any("child-a" in line for line in lines)
+        assert any("child-b" in line for line in lines)
         # Check status icons
-        assert any("\u25cf" in l for l in lines)  # ● running
-        assert any("\u2713" in l for l in lines)   # ✓ completed
-        assert any("\u25cb" in l for l in lines)   # ○ pending
+        assert any("\u25cf" in line for line in lines)  # ● running
+        assert any("\u2713" in line for line in lines)   # ✓ completed
+        assert any("\u25cb" in line for line in lines)   # ○ pending
 
     def test_flat_format(self) -> None:
         tree = DelegationTree()
@@ -866,8 +862,8 @@ class TestTreeRendering:
         tree.update_status("a", "completed")
 
         lines = render_tree_ascii(tree.to_dict(), root_id="root")
-        assert any("root" in l for l in lines)
-        assert any("a" in l and "\u2713" in l for l in lines)  # ✓
+        assert any("root" in line for line in lines)
+        assert any("a" in line and "\u2713" in line for line in lines)  # ✓
         assert len(lines) == 3  # root + 2 children
 
     def test_flat_format_auto_root(self) -> None:
@@ -875,8 +871,8 @@ class TestTreeRendering:
         tree.register("root", "", "t0", depth=0)
         tree.register("child", "root", "t1", depth=1)
         lines = render_tree_ascii(tree.to_dict())
-        assert any("root" in l for l in lines)
-        assert any("child" in l for l in lines)
+        assert any("root" in line for line in lines)
+        assert any("child" in line for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -888,7 +884,7 @@ class TestSessionAgentManager:
     def test_spawn_and_list(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1")
@@ -905,7 +901,7 @@ class TestSessionAgentManager:
     def test_spawn_duplicate_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("dup")
@@ -917,7 +913,7 @@ class TestSessionAgentManager:
     def test_delegate_to_session_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("echo-worker")
@@ -929,22 +925,22 @@ class TestSessionAgentManager:
     def test_tree_lines(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("root-agent")
         try:
             mgr.spawn("sub-1")
             mgr.spawn("sub-2")
             time.sleep(0.2)  # Let REPLs spin up
             lines = mgr.tree_lines()
-            assert any("sub-1" in l for l in lines)
-            assert any("sub-2" in l for l in lines)
+            assert any("sub-1" in line for line in lines)
+            assert any("sub-2" in line for line in lines)
         finally:
             mgr.stop_all()
 
     def test_stop_single_agent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             mgr.spawn("w1")
@@ -959,7 +955,7 @@ class TestSessionAgentManager:
     def test_delegate_to_nonexistent_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             with pytest.raises(ValueError, match="not found"):
@@ -1270,7 +1266,7 @@ class TestSessionAgentTiers:
     def test_spawn_with_tier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1", model_tier="fast")
@@ -1284,7 +1280,7 @@ class TestSessionAgentTiers:
     def test_spawn_default_tier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
             info = mgr.spawn("child-1")
@@ -1297,7 +1293,7 @@ class TestSessionAgentTiers:
     ) -> None:
         from clawie.service import ZeroClawService
 
-        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        _use_short_delegation_dir(monkeypatch)
         svc = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
         try:
             info = svc.spawn_session_agent("parent", "child-1", model_tier="power")
@@ -1423,14 +1419,12 @@ class TestStoreDelegationTiers:
 
 class TestDelegationCLITier:
     def test_submit_parser_accepts_tier(self, tmp_path: Path) -> None:
-        import argparse
         # Just verify the parser doesn't reject --tier
         code = run_cli(tmp_path, "delegation", "tasks")
         assert code == 0
 
     def test_parser_has_tier_on_submit(self) -> None:
         """Verify that the submit subparser includes --tier."""
-        import argparse
         from clawie.cli import build_parser
         parser = build_parser()
         # Parse a valid submit command

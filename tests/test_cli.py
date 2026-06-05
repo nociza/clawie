@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from pytest import CaptureFixture, MonkeyPatch, raises
 
@@ -2390,7 +2391,7 @@ def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
         workspace="default",
         api_url="https://api.picoclaw.example/v1",
     )
-    agent = service.create_agent(
+    service.create_agent(
         agent_id="alice",
         display_name="Alice",
         template="baseline",

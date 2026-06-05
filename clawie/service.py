@@ -5,20 +5,22 @@ import copy
 import json
 import os
 import pwd
-import shutil
+
+# Kept importable as ``clawie.service.shutil`` so tests can monkeypatch
+# ``clawie.service.shutil.which``; the shutil module object is shared, so this
+# also patches the executable lookups performed in the runtime mixins.
+import shutil  # noqa: F401
 from pathlib import Path
 from typing import Any
 from clawie.providers import (
     detect_installed_providers,
     get_provider,
-    provider_names,
-    shared_auth_paths_for_providers,
 )
 from clawie.store import StateStore
 
 # Re-exported for backwards compatibility: callers (clawie.cli, tests) import
 # these names from clawie.service.
-from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso, redact, _LEGACY_HEARTBEAT_PROMPT, _default_core_prompt_content, _is_legacy_core_prompt_default
+from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso, redact, _LEGACY_HEARTBEAT_PROMPT, _default_core_prompt_content, _is_legacy_core_prompt_default  # noqa: F401
 from clawie._service_shared import SharedInfraMixin
 from clawie._service_auth import ProviderAuthMixin
 from clawie._service_addons import AddonOpsMixin

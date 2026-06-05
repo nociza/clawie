@@ -92,7 +92,7 @@ Each agent has a default model tier that controls delegation budgets:
 clawie agent create alice --model-tier fast
 ```
 
-Cycle the tier from the dashboard settings, or set it programmatically via the service API.
+Set the tier programmatically via the service API.
 
 ## Delete
 

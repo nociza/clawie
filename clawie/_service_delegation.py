@@ -145,6 +145,16 @@ class DelegationOpsMixin:
         active = list_active_agents()
         return {"removed_sockets": removed, "active_agents": active}
 
+    def active_delegation_agents(self) -> list[dict[str, Any]]:
+        """Read-only list of agents with live delegation sockets.
+
+        Unlike :meth:`cleanup_delegation`, this never removes stale sockets, so
+        it is safe to call from read-only callers such as ``clawie status``.
+        """
+        from clawie.delegation import list_active_agents
+
+        return list_active_agents()
+
     # ── Maintenance cron ──────────────────────────────────────────────────
 
     def maintenance_enable(self, *, interval_hours: int = 4) -> dict[str, Any]:

@@ -290,7 +290,7 @@ class TelemetryOpsMixin:
             config = self.store.read_config()
         rows: list[dict[str, Any]] = []
         # Use the same home-resolution logic as list_installed_claws() so
-        # `sudo clawie dashboard` still inspects the invoking user's claws.
+        # `sudo clawie status` still inspects the invoking user's claws.
         for claw in installed:
             provider = str(claw.get("provider", "")).strip().lower()
             if not provider:

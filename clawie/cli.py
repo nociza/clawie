@@ -6,15 +6,16 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from clawie.dashboard import run_dashboard
 from clawie.providers import get_provider, provider_names
 from clawie.service import (
     SetupError,
     AgentExistsError,
     AgentNotFoundError,
+    STATUS_SECTIONS,
     ZeroClawService,
 )
 from clawie.store import StateStore
@@ -31,7 +32,7 @@ from clawie.ui import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clawie",
-        description="Clawie control plane for config, agents, runtimes, and dashboard operations",
+        description="Clawie control plane for config, agents, runtimes, delegation, and status",
     )
     parser.add_argument(
         "--config-dir",
@@ -40,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{config,agent,channel,runtime,auth,addon,delegation,dashboard,health,event,backup}",
+        metavar="{status,config,agent,channel,runtime,auth,addon,delegation,maintenance,health,event,backup,dashboard}",
     )
 
     _build_config_parser(subparsers)
@@ -52,9 +53,33 @@ def build_parser() -> argparse.ArgumentParser:
     _build_delegation_parser(subparsers)
     _build_maintenance_parser(subparsers)
 
+    status = subparsers.add_parser(
+        "status",
+        help="Show a unified status overview across the whole fleet",
+    )
+    status.add_argument(
+        "section",
+        nargs="?",
+        choices=STATUS_SECTIONS,
+        metavar="SECTION",
+        help="Limit to one section: " + ", ".join(STATUS_SECTIONS),
+    )
+    status.add_argument("--agent", default="", help="Focus a single agent")
+    status.add_argument("--json", action="store_true", help="Emit the snapshot as JSON")
+    status.add_argument(
+        "--watch", action="store_true", help="Live view; refresh until Ctrl-C"
+    )
+    status.add_argument(
+        "--interval", type=int, default=2, help="Watch refresh interval in seconds"
+    )
+    status.add_argument(
+        "--refresh", action="store_true", help="Sample live CPU/memory metrics"
+    )
+    status.set_defaults(func=cmd_status)
+
     dashboard = subparsers.add_parser(
         "dashboard",
-        help="Open the interactive dashboard",
+        help="(deprecated) alias for `status --watch`",
     )
     _add_positional_argument(
         dashboard,
@@ -69,13 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="Refresh interval in seconds",
     )
-    dashboard.set_defaults(func=cmd_monitor)
+    dashboard.set_defaults(func=cmd_dashboard)
 
     health = subparsers.add_parser(
         "health",
         help="Run health checks",
     )
-    health.set_defaults(func=cmd_doctor)
+    health.set_defaults(func=cmd_health)
 
     event = subparsers.add_parser(
         "event",
@@ -138,7 +163,7 @@ def _build_config_parser(subparsers: argparse._SubParsersAction[argparse.Argumen
         help="Write provider, auth, and workspace settings",
     )
     _add_setup_arguments(config_set)
-    config_set.set_defaults(func=cmd_setup)
+    config_set.set_defaults(func=cmd_config_set)
 
     config_show = config_sub.add_parser(
         "show",
@@ -760,7 +785,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         action="store_true",
         help="Skip interactive confirmation prompt",
     )
-    agent_purge.set_defaults(func=cmd_purge)
+    agent_purge.set_defaults(func=cmd_agent_purge)
 
     create_batch = agent_sub.add_parser(
         "create-batch",
@@ -806,7 +831,7 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         action="store_true",
         help="Replace existing channels instead of merging",
     )
-    apply_preset.set_defaults(func=cmd_channels_bootstrap)
+    apply_preset.set_defaults(func=cmd_channel_apply)
 
     move = channel_sub.add_parser(
         "move",
@@ -829,7 +854,7 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         action="store_true",
         help="Replace destination channels instead of merging",
     )
-    move.set_defaults(func=cmd_channels_migrate)
+    move.set_defaults(func=cmd_channel_move)
 
 
 def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -909,7 +934,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         action="store_true",
         help="Disable the delegation skill for the spawned agent",
     )
-    create.set_defaults(func=cmd_spawn)
+    create.set_defaults(func=cmd_runtime_create)
 
     detect = runtime_sub.add_parser(
         "detect",
@@ -919,7 +944,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         "--source-home",
         help="Home directory to inspect (default: current user home)",
     )
-    detect.set_defaults(func=cmd_claws_detect)
+    detect.set_defaults(func=cmd_runtime_detect)
 
     install = runtime_sub.add_parser(
         "install",
@@ -1112,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-def cmd_setup(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_config_set(args: argparse.Namespace, service: ZeroClawService) -> int:
     provider = str(args.provider).strip().lower() or "openclaw"
     provider_spec = get_provider(provider)
     api_key = str(args.api_key or "").strip()
@@ -1893,7 +1918,7 @@ def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) 
     return 0
 
 
-def cmd_channels_bootstrap(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_channel_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     agent = service.bootstrap_channels(
         agent_id=agent_id,
@@ -1906,7 +1931,7 @@ def cmd_channels_bootstrap(args: argparse.Namespace, service: ZeroClawService) -
     return 0
 
 
-def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_channel_move(args: argparse.Namespace, service: ZeroClawService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
     agent = service.migrate_channels(
@@ -1920,7 +1945,7 @@ def cmd_channels_migrate(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_create(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
@@ -1963,7 +1988,7 @@ def cmd_spawn(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agent_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     if not args.yes:
         print_warning(f"This will permanently purge agent '{agent_id}' and its Linux user profile.")
@@ -1981,13 +2006,268 @@ def cmd_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_monitor(args: argparse.Namespace, service: ZeroClawService) -> int:
-    refresh = max(1, int(args.refresh_seconds))
-    run_dashboard(service, agent_id=args.agent_id or None, refresh_seconds=refresh)
+def cmd_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+    sections = [args.section] if getattr(args, "section", None) else None
+    agent_id = (getattr(args, "agent", "") or "").strip() or None
+    as_json = bool(getattr(args, "json", False))
+    watch = bool(getattr(args, "watch", False))
+    interval = max(1, int(getattr(args, "interval", 2) or 2))
+    refresh = bool(getattr(args, "refresh", False)) or watch
+
+    def render_once() -> None:
+        snapshot = service.status_snapshot(
+            agent_id=agent_id, sections=sections, refresh=refresh
+        )
+        if as_json:
+            print(json.dumps(snapshot, indent=2, default=str))
+        else:
+            _print_status(snapshot)
+
+    # --watch gives a simple, non-curses live view (clear + reprint). When the
+    # output is not a TTY (piped/redirected) we fall back to a single snapshot.
+    if watch and not as_json and sys.stdout.isatty():
+        try:
+            while True:
+                sys.stdout.write("\033[2J\033[H")  # clear screen, cursor home
+                sys.stdout.flush()
+                render_once()
+                print()
+                print_info(f"watching every {interval}s — press Ctrl-C to exit")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print()
+        return 0
+
+    render_once()
     return 0
 
 
-def cmd_claws_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_dashboard(args: argparse.Namespace, service: ZeroClawService) -> int:
+    """Deprecated alias for ``clawie status --watch``."""
+    print_warning("`clawie dashboard` is deprecated; use `clawie status --watch`.")
+    args.section = None
+    args.agent = getattr(args, "agent_id", "") or ""
+    args.json = False
+    args.refresh = True
+    args.interval = max(1, int(getattr(args, "refresh_seconds", 2) or 2))
+    # Live view on a TTY, single snapshot when piped/redirected.
+    args.watch = sys.stdout.isatty()
+    return cmd_status(args, service)
+
+
+# ── status rendering ──────────────────────────────────────────────────────
+
+def _status_section_error(payload: Any) -> str | None:
+    if isinstance(payload, dict) and "error" in payload and len(payload) == 1:
+        return str(payload["error"])
+    return None
+
+
+def _print_status(snapshot: dict[str, Any]) -> None:
+    renderers = {
+        "setup": _print_status_setup,
+        "health": _print_status_health,
+        "agents": _print_status_agents,
+        "runtimes": _print_status_runtimes,
+        "auth": _print_status_auth,
+        "delegation": _print_status_delegation,
+        "maintenance": _print_status_maintenance,
+        "events": _print_status_events,
+    }
+    for name in STATUS_SECTIONS:
+        if name in snapshot:
+            renderers[name](snapshot[name])
+
+
+def _print_status_setup(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"setup: {err}")
+        return
+    print_panel(
+        "Setup",
+        [
+            f"configured: {payload.get('configured', False)}",
+            f"provider: {payload.get('provider', '')}",
+            f"auth_mode: {payload.get('auth_mode', '')}",
+            f"workspace: {payload.get('workspace', '')}",
+            f"subscription: {payload.get('subscription', '')}",
+            f"runtime_installed: {payload.get('runtime_installed', False)}",
+            f"updated_at: {payload.get('updated_at', '')}",
+        ],
+    )
+
+
+def _print_status_health(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"health: {err}")
+        return
+    print_panel("Health", [f"overall: {payload.get('status', 'unknown')}"])
+    rows = [
+        [str(check.get("status", "")), str(check.get("message", ""))]
+        for check in payload.get("checks", [])
+    ]
+    if rows:
+        print_table(["status", "check"], rows)
+
+
+def _print_status_agents(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"agents: {err}")
+        return
+    totals = payload.get("totals", {})
+    print_panel(
+        "Agents",
+        [
+            f"agents: {totals.get('agents', 0)}   channels: {totals.get('channels', 0)}",
+            f"cpu: {totals.get('cpu_percent', 0)}%   mem: {totals.get('mem_percent', 0)}%",
+            f"workspace: {payload.get('workspace', '')}   provider: {payload.get('provider', '')}",
+        ],
+    )
+    rows = payload.get("rows", [])
+    if not rows:
+        print_info("No agents provisioned yet.")
+        return
+    table = [
+        [
+            str(row.get("agent_id", "")),
+            str(row.get("status", "")),
+            str(row.get("provider", "")),
+            f"{row.get('channels', 0)}/{row.get('channels_total', 0)}",
+            str(row.get("cpu_percent", 0)),
+            str(row.get("mem_percent", 0)),
+            str(row.get("version", "")),
+        ]
+        for row in rows
+    ]
+    print_table(
+        ["agent_id", "status", "provider", "channels", "cpu%", "mem%", "version"],
+        table,
+    )
+    for row in rows:
+        if str(row.get("provider_status", "ok")) != "ok" and row.get("provider_issue"):
+            print_warning(f"{row.get('agent_id', '')}: {row.get('provider_issue', '')}")
+
+
+def _print_status_runtimes(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"runtimes: {err}")
+        return
+    if not payload:
+        print_info("No local runtimes detected.")
+        return
+    table = [
+        [
+            str(row.get("provider", "")),
+            str(row.get("linux_user", "")),
+            str(row.get("service_status", "unknown")),
+            str(row.get("auth_status", "unknown")),
+            str(row.get("expires_at", "")),
+        ]
+        for row in payload
+    ]
+    print_table(["provider", "linux_user", "service", "auth", "expires_at"], table)
+
+
+def _print_status_auth(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"auth: {err}")
+        return
+    if not payload:
+        print_info("No provider auth configured.")
+        return
+    table = [
+        [
+            str(row.get("provider", "")),
+            str(row.get("auth_status", "unknown")),
+            str(row.get("auth_mode", "")),
+            str(row.get("expires_at", "")),
+            "yes" if row.get("login_required") else "no",
+        ]
+        for row in payload
+    ]
+    print_table(["provider", "auth", "mode", "expires_at", "login_required"], table)
+
+
+def _print_status_delegation(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"delegation: {err}")
+        return
+    active = payload.get("active_agents", [])
+    tasks = payload.get("tasks", [])
+    print_panel(
+        "Delegation",
+        [f"active agents: {len(active)}", f"recent tasks: {len(tasks)}"],
+    )
+    if active:
+        print_table(
+            ["agent_id", "alive", "socket"],
+            [
+                [
+                    str(row.get("agent_id", "")),
+                    "yes" if row.get("alive") else "no",
+                    str(row.get("socket", "")),
+                ]
+                for row in active
+            ],
+        )
+    if tasks:
+        print_table(
+            ["task", "parent", "child", "status", "tier"],
+            [
+                [
+                    str(row.get("task_id", ""))[:8],
+                    str(row.get("parent_agent_id", "")),
+                    str(row.get("child_agent_id", "")),
+                    str(row.get("status", "")),
+                    str(row.get("model_tier", "")),
+                ]
+                for row in tasks
+            ],
+        )
+
+
+def _print_status_maintenance(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"maintenance: {err}")
+        return
+    print_panel(
+        "Maintenance",
+        [
+            f"enabled: {payload.get('enabled', False)}",
+            f"interval_hours: {payload.get('interval_hours', '')}",
+            f"cron_file_exists: {payload.get('cron_file_exists', False)}",
+            f"cron_file: {payload.get('cron_file', '')}",
+        ],
+    )
+
+
+def _print_status_events(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"events: {err}")
+        return
+    if not payload:
+        print_info("No events recorded.")
+        return
+    table = [
+        [
+            str(row.get("timestamp", ""))[:19],
+            str(row.get("type", "")),
+            str(row.get("message", "")),
+        ]
+        for row in payload
+    ]
+    print_table(["timestamp", "type", "message"], table)
+
+
+def cmd_runtime_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
     rows = service.list_installed_claws(source_home=args.source_home)
     if not rows:
         print_info("No installed claws detected.")
@@ -2088,7 +2368,7 @@ def cmd_runtime_service(args: argparse.Namespace, service: ZeroClawService) -> i
     return 0
 
 
-def cmd_doctor(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_health(args: argparse.Namespace, service: ZeroClawService) -> int:
     report = service.doctor()
     status = str(report.get("status", "unknown"))
 

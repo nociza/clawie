@@ -67,13 +67,13 @@ clawie agent create alice \
   --provider picoclaw
 ```
 
-## Launch the dashboard
+## Check fleet status
 
 ```bash
-clawie dashboard
+clawie status
 ```
 
-This opens a real-time terminal UI showing all your agents, their status, delegation trees, and channels. Press `q` to quit, `v` to switch views.
+This prints a read-only overview of all your agents — status, runtimes, auth, delegation, and health. Add `--json` for scripting, or `--watch` for a live view.
 
 ## Create an isolated runtime
 

@@ -31,6 +31,18 @@ from clawie._service_agents import AgentOpsMixin
 from clawie._service_telemetry import TelemetryOpsMixin
 from clawie._service_delegation import DelegationOpsMixin
 
+# Sections aggregated by ``status_snapshot`` / ``clawie status``, in display order.
+STATUS_SECTIONS: tuple[str, ...] = (
+    "setup",
+    "health",
+    "agents",
+    "runtimes",
+    "auth",
+    "delegation",
+    "maintenance",
+    "events",
+)
+
 
 class ZeroClawService(
     SharedInfraMixin,
@@ -354,6 +366,68 @@ class ZeroClawService(
         state = self.store.read_state()
         events = state.get("events", [])
         return list(reversed(events[-limit:]))
+
+    def status_snapshot(
+        self,
+        agent_id: str | None = None,
+        sections: list[str] | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Aggregate every clawie status surface into one read-only snapshot.
+
+        Each section is collected independently: a failure in one (e.g. an
+        unconfigured maintenance cron, or an unreadable runtime) is captured as
+        an ``{"error": ...}`` entry rather than aborting the whole report. That
+        makes ``clawie status`` safe to run on a half-broken system, which is
+        exactly when it is most useful.
+
+        With ``refresh=False`` (the default) no metrics are sampled and nothing
+        is written, so this is a pure read. ``refresh=True`` samples live
+        CPU/memory for the agents section.
+        """
+        agent = (agent_id or "").strip() or None
+        wanted = self._resolve_status_sections(sections)
+        collectors: dict[str, Any] = {
+            "setup": self.setup_status,
+            "health": self.doctor,
+            "agents": lambda: self.performance_snapshot(agent_id=agent, refresh=refresh),
+            "runtimes": lambda: self.list_local_runtime_statuses(refresh=refresh),
+            "auth": self.list_shared_auth_statuses,
+            "delegation": lambda: {
+                "tasks": self.delegation_tasks(agent_id=agent, limit=10),
+                "active_agents": self.active_delegation_agents(),
+            },
+            "maintenance": self.maintenance_status,
+            "events": lambda: self.list_events(limit=10),
+        }
+
+        result: dict[str, Any] = {"generated_at": now_iso()}
+        if agent:
+            result["agent_id"] = agent
+        for name in wanted:
+            collect = collectors.get(name)
+            if collect is None:
+                continue
+            try:
+                result[name] = collect()
+            except Exception as exc:  # noqa: BLE001 - status must survive partial failures
+                result[name] = {"error": str(exc)}
+        return result
+
+    def _resolve_status_sections(self, sections: list[str] | None) -> list[str]:
+        if not sections:
+            return list(STATUS_SECTIONS)
+        resolved: list[str] = []
+        for raw in sections:
+            name = str(raw).strip().lower()
+            if name not in STATUS_SECTIONS:
+                raise ValueError(
+                    f"unknown status section '{raw}'. choose from: "
+                    + ", ".join(STATUS_SECTIONS)
+                )
+            if name not in resolved:
+                resolved.append(name)
+        return resolved
 
     def list_installed_claws(self, source_home: str | Path | None = None) -> list[dict[str, Any]]:
         if source_home:

@@ -2,6 +2,25 @@
 
 All commands use `clawie` as the entry point. Use `--config-dir` to override the state directory.
 
+## status
+
+The single read-only overview of the whole fleet — setup, health, agents,
+runtimes, auth, delegation, maintenance, and recent events.
+
+```bash
+clawie status                 # full overview
+clawie status agents          # one section: agents|runtimes|auth|delegation|maintenance|health|events
+clawie status --agent alice   # focus a single agent
+clawie status --json          # machine-readable snapshot (for scripting)
+clawie status --watch         # live view; refresh until Ctrl-C
+clawie status --watch --interval 5
+clawie status --refresh       # sample live CPU/memory once
+```
+
+`status` is read-only and never requires root. A section that can't be read
+(e.g. an unconfigured maintenance cron) degrades to an error note instead of
+blanking the whole report.
+
 ## config
 
 ```bash
@@ -117,11 +136,23 @@ clawie addon auth login ADDON
 clawie addon auth import ADDON [--source-home PATH] [--from-agent A]
 ```
 
-## dashboard
+## maintenance
 
 ```bash
-clawie dashboard [--agent-id ID] [--refresh N]
+clawie maintenance status
+clawie maintenance enable [--interval-hours N]   # install the credential-sync cron (root)
+clawie maintenance disable                       # remove the cron (root)
+clawie maintenance run                           # run a sync pass now
 ```
+
+## dashboard (deprecated)
+
+```bash
+clawie dashboard [AGENT_ID] [--refresh N]
+```
+
+Deprecated alias for `clawie status --watch` (a single snapshot when output is
+not a TTY). Use `clawie status` instead.
 
 ## health & events
 

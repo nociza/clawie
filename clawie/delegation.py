@@ -345,15 +345,13 @@ that REPL with `clawie delegation submit`.
 
 ---
 
-## 9. Dashboard Delegation View
+## 9. Inspecting Delegation
 
-The clawie dashboard (``clawie dashboard``) has a **delegation** overview mode.
-Press **v** to cycle through: agents → channels → delegation.
-
-The delegation view shows:
-- **Left panel**: ASCII tree with tier icons (⚡⚖⭐) next to each node
-- **Right panel**: Active REPL sockets and recent delegation tasks with tier column
-- **Settings**: Model tier setting cycles through fast → balanced → power
+Use the CLI to inspect delegation state:
+- ``clawie status delegation`` — active REPL agents and recent delegation tasks
+- ``clawie delegation tree --agent-id <id>`` — the ASCII delegation tree with tier icons (⚡⚖⭐)
+- ``clawie delegation tasks`` — recent tasks with their tier and status
+- ``clawie delegation status`` — active REPL sockets
 
 ---
 

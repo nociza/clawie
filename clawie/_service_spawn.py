@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import os
+import pwd
 import secrets
 import shutil
 import subprocess
@@ -66,6 +67,19 @@ class SpawnOpsMixin:
 
         spawn_shell = self._spawn_user_shell()
         subprocess.run(["useradd", "-m", "-s", spawn_shell, target_user], check=True)
+        # useradd can exit 0 yet skip the home (full disk, CREATE_HOME=no). Once
+        # the user is registered in the password database, confirm its home
+        # really exists so later credential/config copies fail with a clear
+        # cause instead of a cryptic downstream error.
+        try:
+            created_home = Path(pwd.getpwnam(target_user).pw_dir)
+        except KeyError:
+            created_home = None
+        if created_home is not None and not created_home.is_dir():
+            raise SetupError(
+                f"useradd succeeded but home directory {created_home} was not created "
+                "(check disk space and CREATE_HOME in /etc/login.defs)."
+            )
         password_source, password_value = self._apply_spawn_password(
             username=target_user,
             password=password,
@@ -159,7 +173,9 @@ class SpawnOpsMixin:
                 )
             except PermissionError:
                 pass
-        self._ensure_workspace_accessible(resolved_provider, target_home, target_user)
+        permission_warnings = self._ensure_workspace_accessible(
+            resolved_provider, target_home, target_user
+        )
         state = self.store.read_state()
         self._event(
             state,
@@ -168,6 +184,7 @@ class SpawnOpsMixin:
             {
                 "agent_id": agent_id,
                 "linux_user": target_user,
+                "permission_warnings": permission_warnings,
                 "copied": copied,
                 "detected_providers": [
                     row["provider"] for row in self.list_installed_claws(source_home=src_home)
@@ -489,6 +506,21 @@ class SpawnOpsMixin:
         except OSError as exc:
             raise SetupError(f"failed writing ssh deny-users config: {exc}") from exc
 
+        # Validate the config before asking the daemon to reload it, so a bad
+        # drop-in can't lock everyone out of SSH. Skip if sshd isn't on PATH.
+        sshd_bin = shutil.which("sshd")
+        if not sshd_bin and Path("/usr/sbin/sshd").exists():
+            sshd_bin = "/usr/sbin/sshd"
+        if sshd_bin:
+            check = subprocess.run(
+                [sshd_bin, "-t"], capture_output=True, text=True, check=False
+            )
+            if check.returncode != 0:
+                detail = (check.stderr or check.stdout or "").strip() or f"exit {check.returncode}"
+                raise SetupError(
+                    f"refusing to reload ssh: sshd config validation failed: {detail}"
+                )
+
         attempts = [
             ["systemctl", "reload", "ssh"],
             ["systemctl", "reload", "sshd"],
@@ -507,28 +539,50 @@ class SpawnOpsMixin:
     def _set_password_plaintext(username: str, password: str) -> None:
         if not password:
             raise ValueError("password cannot be empty")
-        subprocess.run(
+        result = subprocess.run(
             ["chpasswd"],
             input=f"{username}:{password}\n",
             text=True,
-            check=True,
+            capture_output=True,
+            check=False,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+            raise SetupError(f"failed to set password for {username}: {detail}")
 
     @staticmethod
     def _set_password_hash(username: str, password_hash: str) -> None:
         if not password_hash:
             raise ValueError("password_hash cannot be empty")
-        subprocess.run(["usermod", "-p", password_hash, username], check=True)
+        result = subprocess.run(
+            ["usermod", "-p", password_hash, username],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+            raise SetupError(f"failed to set password hash for {username}: {detail}")
 
     @staticmethod
     def _hash_password(password: str) -> str:
         if not password:
             raise ValueError("spawn password cannot be empty")
+        # Prefer the stdlib crypt module, but only trust it if it actually
+        # produced a SHA512-crypt ($6$...) hash. Some platforms' crypt(3)
+        # (notably macOS) silently downgrade to a weaker/non-standard scheme
+        # that chpasswd and `usermod -p` won't accept, so fall through to
+        # openssl in that case.
         if crypt is not None:
-            return str(crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)))
-        # Python 3.13+ removed the stdlib crypt module (PEP 594). Fall back to
-        # openssl, which emits the same SHA512-crypt ($6$...) format chpasswd
-        # and usermod -p expect.
+            try:
+                hashed = str(crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)))
+            except (OSError, ValueError):
+                hashed = ""
+            if hashed.startswith("$6$"):
+                return hashed
+        # Python 3.13+ removed the stdlib crypt module (PEP 594), and some
+        # platforms can't emit SHA512 via crypt. openssl produces the same
+        # SHA512-crypt ($6$...) format chpasswd and `usermod -p` expect.
         openssl = shutil.which("openssl")
         if openssl:
             result = subprocess.run(
@@ -542,53 +596,68 @@ class SpawnOpsMixin:
             if result.returncode == 0 and hashed.startswith("$6$"):
                 return hashed
         raise SetupError(
-            "hashing spawn passwords requires the stdlib 'crypt' module (Python <= 3.12) "
-            "or the 'openssl' executable; neither is available."
+            "hashing spawn passwords requires a crypt(3) that supports SHA512 "
+            "or the 'openssl' executable; neither produced a usable $6$ hash."
         )
 
     def _ensure_workspace_accessible(
         self, provider: str, home: Path, linux_user: str,
-    ) -> None:
+    ) -> list[str]:
         """Make agent home group-accessible so the manager user can operate without sudo.
 
         Sets the provider state dir and workspace to setgid-group-writable (2775)
         so that files created there inherit the agent's group. Adds the current
         (manager) user to the agent's group for traversal and write access.
         The agent user's own access is unaffected (owner bits stay rwx).
+
+        This is best-effort: a failure here does not abort spawning (the agent
+        still works for its own user). But failures are collected and returned
+        so the caller can record them — silent permission drift is otherwise
+        very hard to diagnose later.
         """
+        warnings: list[str] = []
         if os.geteuid() != 0:
-            return
+            return warnings
+
+        def _chmod(label: str, cmd: list[str]) -> None:
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            except OSError as exc:
+                warnings.append(f"{label}: {exc}")
+                return
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+                warnings.append(f"{label}: {detail}")
+
         try:
             spec = get_provider(provider)
             state = home / spec.state_dir
             ws = state / spec.workspace_dir
 
             # Home dir: ensure group can at least traverse (g+rx).
-            # 750 (rwxr-x---) is the minimum; don't weaken if already tighter
-            # for "other", but ensure group bits.
             if home.is_dir():
-                subprocess.run(["chmod", "g+rx", str(home)], check=False)
+                _chmod("chmod home g+rx", ["chmod", "g+rx", str(home)])
 
             # State dir (.openclaw/): setgid + group-writable so manager
             # can write config and new files inherit the agent group.
             if state.is_dir():
-                subprocess.run(["chmod", "2775", str(state)], check=False)
+                _chmod("chmod state 2775", ["chmod", "2775", str(state)])
 
             # Workspace dir: same treatment.
             if ws.is_dir():
-                subprocess.run(["chmod", "2775", str(ws)], check=False)
+                _chmod("chmod workspace 2775", ["chmod", "2775", str(ws)])
 
             # Make existing files in workspace group-writable.
             if ws.is_dir():
                 for child in ws.iterdir():
                     if child.is_file():
-                        subprocess.run(["chmod", "g+rw", str(child)], check=False)
+                        _chmod(f"chmod {child.name} g+rw", ["chmod", "g+rw", str(child)])
 
             # Make existing files in state dir group-writable (config, logs).
             if state.is_dir():
                 for child in state.iterdir():
                     if child.is_file():
-                        subprocess.run(["chmod", "g+rw", str(child)], check=False)
+                        _chmod(f"chmod {child.name} g+rw", ["chmod", "g+rw", str(child)])
 
             # Add the manager (spawner) user to the agent's group so it can
             # traverse home and write to state/workspace via group bits.
@@ -598,12 +667,13 @@ class SpawnOpsMixin:
                 or self._current_linux_user()
             )
             if spawner and spawner != linux_user:
-                subprocess.run(
+                _chmod(
+                    f"usermod add {spawner} to group {linux_user}",
                     ["usermod", "-a", "-G", linux_user, spawner],
-                    check=False,
                 )
-        except OSError:
-            pass
+        except OSError as exc:
+            warnings.append(f"workspace accessibility: {exc}")
+        return warnings
 
     def spawn_session_agent(
         self,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import curses
 import io
 import json
 import os
@@ -9,14 +8,12 @@ from pathlib import Path
 
 from pytest import CaptureFixture, MonkeyPatch, raises
 
-import clawie.dashboard as dashboard
 from clawie.provider_auth import (
     auth_status_from_picoclaw_auth_json,
     auth_status_from_profiles_json,
     parse_provider_auth_status_output,
 )
 from clawie.cli import main
-from clawie.dashboard import DashboardState, _handle_detail_key, _run_setting_action, _settings_items
 from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
 from clawie.addon_auth import parse_gws_status_output
@@ -437,10 +434,12 @@ def test_create_agent_and_monitor_snapshot(tmp_path: Path, capsys: CaptureFixtur
     )
     capsys.readouterr()
 
+    # `dashboard` is now a deprecated alias for `status --watch`; piped (non-TTY)
+    # it prints a single status snapshot.
     code = run_cli(tmp_path, "dashboard")
     output = capsys.readouterr().out
     assert code == 0
-    assert "Clawie Monitor" in output
+    assert "deprecated" in output
     assert "alice" in output
     assert "cpu%" in output
 
@@ -624,7 +623,10 @@ def test_spawn_success_with_mocks(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         if cmd[:2] == ["id", "-u"]:
@@ -700,7 +702,10 @@ def test_spawn_uses_global_password_hash(
         calls.append(cmd)
 
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -743,7 +748,10 @@ def test_spawn_generates_password_and_prints_it(
         calls.append((cmd, kwargs.get("input")))
 
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -793,7 +801,10 @@ def test_spawn_uses_per_agent_plaintext_password(
         calls.append((cmd, kwargs.get("input")))
 
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -840,7 +851,10 @@ def test_spawn_creates_linux_user_with_bash_shell(
         calls.append(cmd)
 
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -1006,7 +1020,10 @@ allowed_users = ["*"]
 
     def fake_run(cmd: list[str], **_: object) -> object:
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -1056,7 +1073,10 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         class Result:
-            returncode = 1
+            # `id -u` must report the user is absent (non-zero) so spawn
+            # proceeds; every provisioning command (useradd/chpasswd/usermod)
+            # succeeds, mirroring a real root spawn.
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
             stdout = ""
 
         return Result()
@@ -4671,522 +4691,6 @@ def test_agent_auth_status_reports_permission_barrier_for_managed_user(
     assert "requires root" in payload["detail"]
 
 
-def test_dashboard_settings_navigation_not_capped_to_first_three_items() -> None:
-    class FakeService:
-        def get_dashboard_agent(self, _: str) -> dict[str, object]:
-            return {
-                "channels": [],
-                "agent": {
-                    "plugins": {},
-                    "provider": "zeroclaw",
-                    "status": "running",
-                    "version": "local",
-                    "autostart": False,
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "heartbeat_seconds": 30,
-                    "auth_mode": "linked",
-                    "local_user": True,
-                },
-            }
-
-    state = DashboardState(view="detail", selected_agent_id="@local:zeroclaw", focus_idx=2, setting_idx=2)
-    _handle_detail_key(ord("j"), state, FakeService())
-    _handle_detail_key(ord("j"), state, FakeService())
-    _handle_detail_key(ord("j"), state, FakeService())
-    assert state.setting_idx > 2
-
-
-def test_dashboard_detail_right_arrow_twice_reaches_settings_panel() -> None:
-    class FakeService:
-        def get_dashboard_agent(self, _: str) -> dict[str, object]:
-            return {
-                "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
-                "core_prompts": {"SOUL.md": "hello"},
-                "agent": {
-                    "plugins": {"memory": True},
-                    "provider": "picoclaw",
-                    "status": "running",
-                    "version": "1.0.0",
-                    "autostart": True,
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "heartbeat_seconds": 30,
-                    "auth_mode": "linked",
-                    "auth_status": "ready",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=0)
-    _handle_detail_key(curses.KEY_RIGHT, state, FakeService())
-    _handle_detail_key(curses.KEY_RIGHT, state, FakeService())
-    assert dashboard._focus_name(state) == "settings"
-
-
-def test_dashboard_detail_navigation_uses_cached_agent_payload() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def get_dashboard_agent(self, _: str) -> dict[str, object]:
-            self.calls += 1
-            return {
-                "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
-                "core_prompts": {"SOUL.md": "hello"},
-                "agent": {
-                    "plugins": {"memory": True},
-                    "provider": "picoclaw",
-                    "status": "running",
-                    "version": "1.0.0",
-                    "autostart": True,
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "heartbeat_seconds": 30,
-                    "auth_mode": "linked",
-                    "auth_status": "ready",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2)
-    _handle_detail_key(ord("j"), state, service)
-    _handle_detail_key(ord("k"), state, service)
-    assert service.calls == 1
-
-
-def test_dashboard_channels_navigation_uses_cached_inventory() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.inventory_calls = 0
-
-        def channel_inventory(self) -> dict[str, object]:
-            self.inventory_calls += 1
-            return {
-                "rows": [
-                    {"source": "pool", "kind": "telegram", "name": "team"},
-                    {"source": "agent", "owner_agent_id": "alice", "kind": "slack", "name": "ops", "enabled": True},
-                ]
-            }
-
-    service = FakeService()
-    state = DashboardState(view="overview", overview_mode="channels")
-    snapshot = {"rows": [{"agent_id": "alice"}, {"agent_id": "@local:openclaw"}]}
-    dashboard._handle_overview_key(ord("j"), state, snapshot, service)
-    dashboard._handle_overview_key(ord("k"), state, snapshot, service)
-    assert service.inventory_calls == 1
-
-
-def test_dashboard_settings_include_credential_rows_for_managed_agent() -> None:
-    rows = _settings_items(
-        {
-            "channels": [{"kind": "telegram", "name": "team", "enabled": True}],
-            "core_prompts": {"SOUL.md": "hi"},
-            "credential_sync": {"bundles": ["provider-auth"], "last_synced_at": ""},
-            "addon_access": {
-                "addons": [
-                    {
-                        "addon": "gws",
-                        "enabled": False,
-                        "auth_status": "missing",
-                        "applied": False,
-                    }
-                ]
-            },
-            "agent": {
-                "local_user": False,
-                "autostart": True,
-                "service_status": "running",
-                "service_mode": "systemd",
-                "heartbeat_seconds": 30,
-                "auth_mode": "linked",
-            },
-        },
-        addon_choices=[
-            {
-                "id": "gws",
-                "label": "Google Workspace CLI",
-                "description": "Google Workspace API CLI",
-            }
-        ],
-    )
-    kinds = {str(row.get("kind", "")) for row in rows}
-    assert "channel_status" in kinds
-    assert "channel_sync" in kinds
-    assert "channel_add" in kinds
-    assert "channel_connect" in kinds
-    assert "provider_current" in kinds
-    assert "auth_status" in kinds
-    assert "auth_login" in kinds
-    assert "prompt_sync_from_disk" in kinds
-    assert "prompt_write_to_disk" in kinds
-    assert "cred_bundle:provider-auth" in kinds
-    assert "cred_bundle:git" in kinds
-    assert "cred_sync_now" in kinds
-    assert "cred_revoke_now" in kinds
-    assert "addon_status:gws" in kinds
-    assert "addon_enable:gws" in kinds
-    assert "addon_disable:gws" in kinds
-    assert "addon_apply:gws" in kinds
-    assert "addon_login:gws" in kinds
-
-
-def test_dashboard_settings_include_provider_switch_rows_when_choices_available() -> None:
-    rows = _settings_items(
-        {
-            "credential_sync": {"bundles": [], "last_synced_at": ""},
-            "agent": {
-                "local_user": False,
-                "provider": "openclaw",
-                "auth_mode": "none",
-                "auth_status": "ready",
-                "service_status": "running",
-                "service_mode": "systemd",
-                "heartbeat_seconds": 30,
-                "autostart": True,
-            },
-        },
-        provider_choices=["picoclaw", "zeroclaw", "openclaw"],
-    )
-    kinds = [str(row.get("kind", "")) for row in rows]
-    assert "provider_switch:zeroclaw" in kinds
-    assert "provider_switch:picoclaw" in kinds
-    assert "provider_switch:openclaw" not in kinds
-
-
-def test_dashboard_settings_provider_rows_show_issue_and_fix() -> None:
-    rows = _settings_items(
-        {
-            "agent": {
-                "provider": "zeroclaw",
-                "provider_status": "warning",
-                "provider_issue": "live runtime was zeroclaw; Clawie aligned state away from openclaw",
-                "provider_remediation": "Run 'sudo clawie agent provider set teleclaw openclaw' if you still want to switch.",
-                "auth_status": "ready",
-                "auth_mode": "linked",
-            }
-        },
-        provider_choices=["openclaw", "zeroclaw"],
-    )
-
-    current = next(row["label"] for row in rows if row["kind"] == "provider_current")
-    issue = next(row["label"] for row in rows if row["kind"] == "provider_issue")
-    fix = next(row["label"] for row in rows if row["kind"] == "provider_fix")
-    assert current == "provider: zeroclaw"
-    assert "aligned state away from openclaw" in issue
-    assert "sudo clawie agent provider set teleclaw openclaw" in fix
-
-
-def test_dashboard_setting_actions_call_credential_operations() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.toggled: list[str] = []
-            self.synced = 0
-            self.revoked = 0
-
-        def toggle_agent_credential_bundle(self, _agent_id: str, bundle: str) -> None:
-            self.toggled.append(bundle)
-
-        def sync_agent_credentials(self, _agent_id: str) -> dict[str, object]:
-            self.synced += 1
-            return {"copied_paths": ["/tmp/a", "/tmp/b"]}
-
-        def revoke_agent_credentials(self, _agent_id: str) -> dict[str, object]:
-            self.revoked += 1
-            return {"removed_paths": ["/tmp/a"]}
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice")
-    _run_setting_action(service, state, {"kind": "cred_bundle:git"})
-    assert state.notice == "credential bundle toggled: git"
-    assert service.toggled == ["git"]
-
-    _run_setting_action(service, state, {"kind": "cred_sync_now"})
-    assert state.notice == "credentials synced (2 paths)"
-    assert service.synced == 1
-
-    _run_setting_action(service, state, {"kind": "cred_revoke_now"})
-    assert state.notice == "credentials revoked (1 paths)"
-    assert service.revoked == 1
-
-
-def test_dashboard_setting_actions_call_addon_operations() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.enabled: list[tuple[str, str]] = []
-            self.disabled: list[tuple[str, str]] = []
-            self.applied: list[tuple[str, tuple[str, ...]]] = []
-            self.logged_in: list[str] = []
-
-        def enable_agent_addon(self, agent_id: str, addon: str) -> dict[str, object]:
-            self.enabled.append((agent_id, addon))
-            return {"addon": addon, "pending": False}
-
-        def disable_agent_addon(self, agent_id: str, addon: str) -> dict[str, object]:
-            self.disabled.append((agent_id, addon))
-            return {"addon": addon}
-
-        def apply_agent_addons(self, agent_id: str, addons: list[str] | None = None) -> dict[str, object]:
-            self.applied.append((agent_id, tuple(addons or [])))
-            return {"addons": addons or []}
-
-        def shared_addon_auth_login(self, addon: str) -> dict[str, object]:
-            self.logged_in.append(addon)
-            return {"action_performed": "login"}
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice")
-
-    _run_setting_action(service, state, {"kind": "addon_enable:gws"})
-    assert state.notice == "addon gws enabled"
-    assert service.enabled == [("alice", "gws")]
-
-    _run_setting_action(service, state, {"kind": "addon_apply:gws"})
-    assert state.notice == "addon gws applied"
-    assert service.applied == [("alice", ("gws",))]
-
-    _run_setting_action(service, state, {"kind": "addon_login:gws"})
-    assert state.notice == "addon gws login completed"
-    assert service.logged_in == ["gws"]
-
-    _run_setting_action(service, state, {"kind": "addon_disable:gws"})
-    assert state.notice == "addon gws disabled"
-    assert service.disabled == [("alice", "gws")]
-
-
-def test_dashboard_setting_action_syncs_channels_from_provider() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.synced: list[str] = []
-
-        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
-            return {
-                "channels": [{"kind": "telegram", "name": "team", "channel_source": "discovered"}],
-                "agent": {
-                    "plugins": {},
-                    "provider": "picoclaw",
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "heartbeat_seconds": 30,
-                    "auth_mode": "linked",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-        def sync_agent_channels_from_provider(self, agent_id: str) -> dict[str, object]:
-            self.synced.append(agent_id)
-            return {}
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice")
-    assert _run_setting_action(service, state, {"kind": "channel_sync"}) is True
-    assert state.notice == "synced channels from provider"
-    assert service.synced == ["alice"]
-
-
-def test_dashboard_setting_actions_call_auth_and_provider_operations() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.auth_calls: list[str] = []
-            self.provider_calls: list[tuple[str, str]] = []
-
-        def agent_auth_login(self, agent_id: str) -> dict[str, object]:
-            self.auth_calls.append(agent_id)
-            return {"action_performed": "refresh"}
-
-        def switch_agent_provider(self, agent_id: str, provider: str) -> dict[str, object]:
-            self.provider_calls.append((agent_id, provider))
-            return {"changed": True}
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice")
-
-    _run_setting_action(service, state, {"kind": "auth_login"})
-    assert state.notice == "auth refreshed"
-    assert service.auth_calls == ["alice"]
-
-    _run_setting_action(service, state, {"kind": "provider_switch:zeroclaw"})
-    assert state.notice == "provider changed to zeroclaw"
-    assert service.provider_calls == [("alice", "zeroclaw")]
-
-
-def test_dashboard_settings_panel_runs_channel_actions(monkeypatch: MonkeyPatch) -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.channels = [{"kind": "telegram", "name": "team", "enabled": True}]
-            self.assigned: list[tuple[str, str, str, str]] = []
-            self.connected: list[tuple[str, str, str]] = []
-            self.unlinked: list[tuple[str, str, str]] = []
-
-        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
-            return {
-                "channels": list(self.channels),
-                "core_prompts": {"SOUL.md": "hello"},
-                "agent": {
-                    "plugins": {},
-                    "provider": "picoclaw",
-                    "status": "running",
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "version": "1.0.0",
-                    "auth_mode": "linked",
-                    "auth_status": "ready",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-        def assign_channel_to_agent(self, source: str, kind: str, name: str, agent_id: str) -> None:
-            self.assigned.append((source, kind, name, agent_id))
-            self.channels.append({"kind": kind, "name": name, "enabled": True})
-
-        def connect_agent_channel(self, agent_id: str, kind: str, name: str) -> None:
-            self.connected.append((agent_id, kind, name))
-
-        def unassign_channel_from_agent(self, agent_id: str, kind: str, name: str) -> None:
-            self.unlinked.append((agent_id, kind, name))
-            self.channels = [row for row in self.channels if not (row["kind"] == kind and row["name"] == name)]
-
-    def setting_idx(service: FakeService, state: DashboardState, kind: str) -> int:
-        rows = _settings_items(
-            service.get_dashboard_agent(state.selected_agent_id),
-            selected_channel=service.channels[state.channel_idx] if service.channels else None,
-        )
-        return next(idx for idx, row in enumerate(rows) if str(row.get("kind", "")) == kind)
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2, channel_idx=0)
-
-    monkeypatch.setattr(dashboard, "_prompt_channel_values", lambda default_kind="", default_name="": ("slack", "ops"))
-
-    state.setting_idx = setting_idx(service, state, "channel_add")
-    _handle_detail_key(ord(" "), state, service)
-    assert state.notice == "added slack:ops"
-    assert service.assigned == [("", "slack", "ops", "alice")]
-
-    state.setting_idx = setting_idx(service, state, "channel_connect")
-    _handle_detail_key(ord(" "), state, service)
-    assert state.notice == "linked telegram:team"
-    assert service.connected == [("alice", "telegram", "team")]
-
-    state.setting_idx = setting_idx(service, state, "channel_unlink")
-    _handle_detail_key(ord(" "), state, service)
-    assert state.notice == "unlinked telegram:team"
-    assert service.unlinked == [("alice", "telegram", "team")]
-
-
-def test_dashboard_settings_panel_runs_prompt_actions() -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.synced = 0
-            self.written = 0
-
-        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
-            return {
-                "channels": [],
-                "core_prompts": {"SOUL.md": "hello"},
-                "agent": {
-                    "plugins": {},
-                    "provider": "picoclaw",
-                    "status": "running",
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "version": "1.0.0",
-                    "auth_mode": "linked",
-                    "auth_status": "ready",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-        def sync_agent_core_prompts_from_disk(self, _agent_id: str) -> None:
-            self.synced += 1
-
-        def write_agent_core_prompts_to_disk(self, _agent_id: str) -> None:
-            self.written += 1
-
-    def setting_idx(service: FakeService, kind: str) -> int:
-        rows = _settings_items(service.get_dashboard_agent("alice"))
-        return next(idx for idx, row in enumerate(rows) if str(row.get("kind", "")) == kind)
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=2)
-
-    state.setting_idx = setting_idx(service, "prompt_sync_from_disk")
-    _handle_detail_key(ord(" "), state, service)
-    assert state.notice == "prompts synced from disk"
-    assert service.synced == 1
-
-    state.setting_idx = setting_idx(service, "prompt_write_to_disk")
-    _handle_detail_key(ord(" "), state, service)
-    assert state.notice == "prompts written to disk"
-    assert service.written == 1
-
-
-def test_dashboard_channel_shortcuts_add_link_and_unlink(monkeypatch: MonkeyPatch) -> None:
-    class FakeService:
-        def __init__(self) -> None:
-            self.channels = [{"kind": "telegram", "name": "team", "enabled": True}]
-            self.assigned: list[tuple[str, str, str, str]] = []
-            self.connected: list[tuple[str, str, str]] = []
-            self.unlinked: list[tuple[str, str, str]] = []
-
-        def get_dashboard_agent(self, _agent_id: str) -> dict[str, object]:
-            return {
-                "channels": list(self.channels),
-                "agent": {
-                    "plugins": {},
-                    "provider": "picoclaw",
-                    "status": "running",
-                    "service_status": "running",
-                    "service_mode": "systemd",
-                    "version": "1.0.0",
-                    "auth_mode": "linked",
-                    "auth_status": "ready",
-                    "local_user": False,
-                },
-                "credential_sync": {"bundles": []},
-            }
-
-        def assign_channel_to_agent(self, source: str, kind: str, name: str, agent_id: str) -> None:
-            self.assigned.append((source, kind, name, agent_id))
-            self.channels.append({"kind": kind, "name": name, "enabled": True})
-
-        def connect_agent_channel(self, agent_id: str, kind: str, name: str) -> None:
-            self.connected.append((agent_id, kind, name))
-            if not any(row["kind"] == kind and row["name"] == name for row in self.channels):
-                self.channels.append({"kind": kind, "name": name, "enabled": True})
-
-        def unassign_channel_from_agent(self, agent_id: str, kind: str, name: str) -> None:
-            self.unlinked.append((agent_id, kind, name))
-            self.channels = [row for row in self.channels if not (row["kind"] == kind and row["name"] == name)]
-
-    service = FakeService()
-    state = DashboardState(view="detail", selected_agent_id="alice", focus_idx=0, channel_idx=0)
-
-    monkeypatch.setattr(dashboard, "_prompt_channel_values", lambda default_kind="", default_name="": ("slack", "ops"))
-    _handle_detail_key(ord("n"), state, service)
-    assert state.notice == "added slack:ops"
-    assert service.assigned == [("", "slack", "ops", "alice")]
-
-    _handle_detail_key(ord("N"), state, service)
-    assert state.notice == "added + linked slack:ops"
-    assert service.connected[-1] == ("alice", "slack", "ops")
-
-    _handle_detail_key(ord("c"), state, service)
-    assert state.notice == "linked telegram:team"
-    assert service.connected[0] == ("alice", "slack", "ops")
-    assert service.connected[1] == ("alice", "telegram", "team")
-
-    _handle_detail_key(ord("u"), state, service)
-    assert state.notice == "unlinked telegram:team"
-    assert service.unlinked == [("alice", "telegram", "team")]
-
-
 def test_service_action_requires_root_for_other_linux_user(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -6511,3 +6015,231 @@ def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(
     commands = service._channel_connect_commands("picoclaw", "telegram", "team", linux_user="")
     assert commands == []
     assert not any(len(cmd) >= 2 and cmd[1] == "channel" for cmd in commands)
+
+
+# ── clawie status (unified read-only overview) ──────────────────────────────
+
+
+def _configured_service(tmp_path: Path) -> ZeroClawService:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    return ZeroClawService(StateStore(config_dir=tmp_path))
+
+
+def test_status_snapshot_includes_all_sections(tmp_path: Path) -> None:
+    snapshot = _configured_service(tmp_path).status_snapshot()
+    for section in (
+        "setup", "health", "agents", "runtimes",
+        "auth", "delegation", "maintenance", "events",
+    ):
+        assert section in snapshot
+    assert "generated_at" in snapshot
+
+
+def test_status_snapshot_scopes_to_requested_sections(tmp_path: Path) -> None:
+    snapshot = _configured_service(tmp_path).status_snapshot(sections=["agents"])
+    assert "agents" in snapshot
+    assert "health" not in snapshot
+    assert "events" not in snapshot
+
+
+def test_status_snapshot_rejects_unknown_section(tmp_path: Path) -> None:
+    with raises(ValueError):
+        _configured_service(tmp_path).status_snapshot(sections=["bogus"])
+
+
+def test_status_snapshot_isolates_section_errors(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = _configured_service(tmp_path)
+
+    def boom(*_a: object, **_k: object) -> dict[str, object]:
+        raise RuntimeError("maintenance exploded")
+
+    monkeypatch.setattr(service, "maintenance_status", boom)
+    snapshot = service.status_snapshot()
+    # The failing section degrades to an error note; the rest still render.
+    assert snapshot["maintenance"] == {"error": "maintenance exploded"}
+    assert "checks" in snapshot["health"]
+
+
+def test_status_command_json_output(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "status", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["setup"]["provider"] == "openclaw"
+    assert "agents" in payload
+
+
+def test_status_command_section_argument(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "status", "health") == 0
+    output = capsys.readouterr().out
+    assert "Health" in output
+    assert "cpu%" not in output  # scoped to one section; no agents table
+
+
+def test_status_command_rejects_unknown_section(tmp_path: Path) -> None:
+    with raises(SystemExit):  # argparse choices rejection
+        run_cli(tmp_path, "status", "nonsense")
+
+
+def test_dashboard_is_deprecated_alias_for_status(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "dashboard") == 0
+    output = capsys.readouterr().out
+    assert "deprecated" in output
+    assert "Setup" in output  # renders the status overview
+
+
+# ── spawn hardening ─────────────────────────────────────────────────────────
+
+
+def test_set_password_plaintext_surfaces_stderr(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "chpasswd: permission denied"
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: Result())
+    with raises(SetupError) as exc:
+        service._set_password_plaintext("sam", "secret")
+    assert "permission denied" in str(exc.value)
+
+
+def test_set_password_hash_surfaces_stderr(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "usermod: boom"
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: Result())
+    with raises(SetupError) as exc:
+        service._set_password_hash("sam", "$6$abc$def")
+    assert "boom" in str(exc.value)
+
+
+def test_spawn_fails_when_useradd_leaves_no_home(
+    tmp_path: Path, monkeypatch: MonkeyPatch, capsys: CaptureFixture[str]
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        class Result:
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    class FakePwd:
+        pw_dir = "/nonexistent/clawie-home"
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    # useradd "succeeds" and registers the user, but its home was never created.
+    monkeypatch.setattr("clawie._service_spawn.pwd.getpwnam", lambda _user: FakePwd())
+    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _u: True)
+    monkeypatch.setattr(
+        ZeroClawService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
+
+    code = run_cli(tmp_path, "runtime", "create", "sam", "--user", "sam", "--skip-config-copy")
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "was not created" in output
+
+
+def test_disable_ssh_login_validates_config_before_reload(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    monkeypatch.setattr(ZeroClawService, "SSHD_DENY_USERS_FILE", tmp_path / "deny.conf")
+    monkeypatch.setattr(
+        "clawie._service_spawn.shutil.which",
+        lambda name: "/usr/sbin/sshd" if name == "sshd" else None,
+    )
+
+    reloads: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["/usr/sbin/sshd", "-t"]:
+            class Bad:
+                returncode = 1
+                stdout = ""
+                stderr = "bad config line 3"
+
+            return Bad()
+        reloads.append(cmd)
+
+        class Ok:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Ok()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    with raises(SetupError) as exc:
+        service._disable_ssh_login_for_user("sam")
+    assert "validation failed" in str(exc.value)
+    assert reloads == []  # a bad config is never reloaded
+
+
+def test_ensure_workspace_accessible_collects_warnings_without_raising(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        class Result:
+            returncode = 1
+            stdout = ""
+            stderr = "chmod: operation not permitted"
+
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    warnings = service._ensure_workspace_accessible("openclaw", home, "sam")
+    assert warnings  # failures are collected, not silently swallowed
+    assert any("not permitted" in w for w in warnings)
+
+
+def test_hash_password_falls_back_to_openssl_when_crypt_not_sha512(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ZeroClawService(StateStore(config_dir=tmp_path))
+
+    class FakeCrypt:
+        METHOD_SHA512 = "sha512"
+
+        @staticmethod
+        def mksalt(_method: object) -> str:
+            return "salt"
+
+        @staticmethod
+        def crypt(_pw: str, _salt: str) -> str:
+            return "$1$weakhash"  # not SHA512 — must be rejected
+
+    class OpensslResult:
+        returncode = 0
+        stdout = "$6$realsalt$realhash\n"
+        stderr = ""
+
+    monkeypatch.setattr("clawie._service_spawn.crypt", FakeCrypt)
+    monkeypatch.setattr(
+        "clawie._service_spawn.shutil.which",
+        lambda name: "/usr/bin/openssl" if name == "openssl" else None,
+    )
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: OpensslResult())
+    assert service._hash_password("strongpass").startswith("$6$")

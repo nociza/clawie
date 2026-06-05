@@ -11,7 +11,7 @@ clawie manages multiple AI agents across providers from one CLI. It handles agen
 - **Agent orchestration** with recursive delegation, model tiers, and context budgets
 - **Multi-provider support** for openclaw, picoclaw, and zeroclaw
 - **Runtime isolation** via per-agent Linux users and scoped credentials
-- **Terminal dashboard** for real-time fleet monitoring
+- **Unified `clawie status`** for read-only fleet monitoring (with `--json` and `--watch`)
 - **Addon ecosystem** for extending agents with tools like Google Workspace
 - **Channel management** for connecting agents to Telegram, Slack, email, and more
 
@@ -21,7 +21,7 @@ clawie manages multiple AI agents across providers from one CLI. It handles agen
 uv tool install clawie
 clawie config set --provider picoclaw --subscription pro
 clawie agent create alice --template baseline
-clawie dashboard
+clawie status
 ```
 
 ## Requirements
@@ -38,6 +38,6 @@ Linux with Python 3.10+. No external Python dependencies. Root/sudo needed for r
 | [Delegation & Orchestration](delegation.md) | Task delegation, model tiers, context budgets |
 | [Providers & Auth](providers.md) | Provider setup, auth modes, shared credentials |
 | [Runtime Isolation](runtime.md) | Linux users, credential bundles, security model |
-| [Dashboard](dashboard.md) | TUI controls, views, navigation |
+| [Status](status.md) | Fleet overview, `--json`, live `--watch` |
 | [CLI Reference](cli-reference.md) | Every command and flag |
 | [Python API](python-api.md) | Programmatic usage from Python |

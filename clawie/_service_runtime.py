@@ -1216,10 +1216,13 @@ class RuntimeOpsMixin:
         raw = str(args).strip()
         if not raw:
             return ""
-        try:
-            tokens = shlex.split(raw)
-        except ValueError:
-            tokens = raw.split()
+        # `raw` is an arbitrary command line from `ps` and can be very long or
+        # oddly quoted. shlex.split() is pure-Python and char-by-char, so a
+        # pathological process arg string can make it pathologically slow (and
+        # this runs for every process on the host). We only need basename
+        # matching against known provider executables, so a plain whitespace
+        # split is both sufficient and safely O(n).
+        tokens = raw.split()
         if len(tokens) < 2:
             return ""
         known = set(provider_names())

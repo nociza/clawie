@@ -6,7 +6,7 @@ A local control plane for provisioning, orchestrating, and monitoring a fleet of
 
 ## Why clawie
 
-You have multiple agents across providers. Each needs its own config, credentials, channels, and runtime. clawie gives you one place to manage all of it — create agents, delegate tasks between them, isolate their environments, and monitor everything from a terminal dashboard.
+You have multiple agents across providers. Each needs its own config, credentials, channels, and runtime. clawie gives you one place to manage all of it — create agents, delegate tasks between them, isolate their environments, and monitor everything from one CLI.
 
 ## Core capabilities
 
@@ -16,16 +16,16 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Linux isolation** — Each agent gets its own Linux user, home directory, and credential scope. No agent sees another's secrets.
 
-**Terminal dashboard** — Real-time TUI showing agent status, delegation trees, channels, and health across your entire fleet.
+**Unified status** — One read-only `clawie status` command shows agent status, runtimes, auth, delegation trees, and health across your entire fleet — with `--json` for scripting and `--watch` for a live view.
 
 ## Requirements
 
 - **Linux** (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, and `/tmp` — no macOS or Windows support.
 - **Python 3.10+**
 - **No external Python dependencies** — stdlib only.
-- **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and the dashboard work without root.
+- **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and `clawie status` work without root.
 - **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
-- **Terminal**: UTF-8 with color support for the dashboard.
+- **Terminal**: UTF-8 with color support for `status` output.
 
 ## Install
 
@@ -39,7 +39,7 @@ uv tool install -e .          # from source
 ```bash
 clawie config set --provider picoclaw --subscription pro
 clawie agent create alice --template baseline
-clawie dashboard
+clawie status
 ```
 
 ## Agent orchestration
@@ -85,19 +85,25 @@ clawie config set --provider picoclaw
 sudo clawie runtime create alice --user alice
 clawie runtime detect
 
-# Dashboard
-clawie dashboard
+# Status
+clawie status
 ```
 
-## Dashboard
+## Status
 
-Launch with `clawie dashboard`. Press `v` to cycle views:
+`clawie status` is the read-only front door to the whole fleet:
 
-- **Agents** — status, provider, auth, service health per agent
-- **Channels** — all channels across agents, assign/move with keyboard
-- **Delegation** — live delegation trees with tier icons, active sockets, task history
+```bash
+clawie status                 # full overview
+clawie status agents          # one section
+clawie status --agent alice   # focus a single agent
+clawie status --json          # machine-readable, for scripting
+clawie status --watch         # live view; refresh until Ctrl-C
+```
 
-Navigate with arrow keys, `Enter` to drill into an agent, `Tab` to switch sections, `q` to quit.
+It aggregates setup, health, agents, runtimes, auth, delegation, maintenance,
+and recent events — and degrades gracefully if any one section can't be read.
+`clawie dashboard` is a deprecated alias for `clawie status --watch`.
 
 ## Limitations
 
@@ -120,7 +126,7 @@ Full documentation is in [`docs/`](docs/), deployable to GitHub Pages:
 - [Delegation & Orchestration](docs/delegation.md)
 - [Providers & Auth](docs/providers.md)
 - [Runtime Isolation](docs/runtime.md)
-- [Dashboard](docs/dashboard.md)
+- [Status](docs/status.md)
 - [CLI Reference](docs/cli-reference.md)
 - [Python API](docs/python-api.md)
 

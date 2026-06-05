@@ -200,10 +200,11 @@ store.write_delegation_task(
 tasks = store.read_delegation_tasks(parent_agent_id="planner")
 ```
 
-## Dashboard
+## Status
 
 ```python
-from clawie.dashboard import run_dashboard
-
-run_dashboard(service, single_agent_id=None, refresh_seconds=2)
+# Read-only aggregate snapshot of the whole fleet.
+snapshot = service.status_snapshot()                    # all sections
+agents = service.status_snapshot(sections=["agents"])   # a single section
+focused = service.status_snapshot(agent_id="alice")     # focus one agent
 ```

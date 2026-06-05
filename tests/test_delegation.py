@@ -814,7 +814,8 @@ class TestDelegationSkill:
         assert "## 8. Session Sub-Agents" in DELEGATION_SKILL_CONTENT
         assert "spawn-session" in DELEGATION_SKILL_CONTENT
         assert "SessionAgentManager" in DELEGATION_SKILL_CONTENT
-        assert "## 9. Dashboard Delegation View" in DELEGATION_SKILL_CONTENT
+        assert "## 9. Inspecting Delegation" in DELEGATION_SKILL_CONTENT
+        assert "clawie status delegation" in DELEGATION_SKILL_CONTENT
 
 
 # ---------------------------------------------------------------------------

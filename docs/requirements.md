@@ -7,7 +7,7 @@
 | **Operating system** | Linux (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, `/tmp`, and `apt-get`. Not compatible with macOS or Windows. |
 | **Python** | 3.10 or later |
 | **Dependencies** | None — stdlib only. No pip packages required. |
-| **Terminal** | UTF-8 encoding and color support for the dashboard. Minimum 80x24 recommended. |
+| **Terminal** | UTF-8 encoding and color support for `clawie status` output. Minimum 80x24 recommended. |
 
 ## Root / sudo
 
@@ -28,7 +28,7 @@ When run with `sudo`, clawie reads `SUDO_USER` and uses the invoking user's `~/.
 
 ## Provider runtimes
 
-Provider runtimes are external tools installed separately. They are only needed if you want to run agents — agent creation and the dashboard work without them.
+Provider runtimes are external tools installed separately. They are only needed if you want to run agents — agent creation and `clawie status` work without them.
 
 | Provider | Install method | Requires |
 |----------|---------------|----------|
@@ -115,7 +115,7 @@ This is defense-in-depth at the user level, not a security sandbox.
 
 ### SQLite single-writer
 
-The state database is SQLite with default journaling. It does not use WAL mode. Running multiple clawie processes or dashboard instances against the same `~/.clawie` directory simultaneously may cause locking errors.
+The state database is SQLite with default journaling. It does not use WAL mode. Running multiple clawie processes against the same `~/.clawie` directory simultaneously may cause locking errors.
 
 ### No real tokenizer
 

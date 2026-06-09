@@ -83,8 +83,23 @@ service.setup(
 ### Backup/restore
 
 ```python
-service.export_snapshot("backup.json")
-service.import_snapshot("backup.json", merge=False)
+# Git-backed knowledge backup
+service.backup_init("~/backups/agents", remote="git@github.com:you/agents.git")
+result = service.backup_run()                  # {"changed", "commit", "pushed", ...}
+status = service.backup_status()               # read-only repo/last-run view
+service.backup_restore("alice")                # restore prompts + workspace knowledge
+
+# Full-fidelity state snapshots (credentials included)
+service.export_state("backup.json")
+service.import_state("backup.json", merge=False)
+```
+
+### Credential porting
+
+```python
+result = service.port_shared_auth("openclaw", "picoclaw")
+result["profiles"]                 # ported profile ids
+result["restart_required_agents"]  # agents that should be restarted
 ```
 
 ## Delegation module

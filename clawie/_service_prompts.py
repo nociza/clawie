@@ -326,7 +326,11 @@ class PromptOpsMixin:
             try:
                 target = self._write_core_prompt_file(provider, home, name, content)
                 if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(target)], check=False)
+                    subprocess.run(
+                        ["chown", f"{linux_user}:{linux_user}", str(target)],
+                        check=False,
+                        capture_output=True,
+                    )
                 written.append(str(target))
             except PermissionError:
                 if linux_user:
@@ -379,6 +383,7 @@ class PromptOpsMixin:
                     subprocess.run(
                         ["chown", f"{linux_user}:{linux_user}", str(target)],
                         check=False,
+                        capture_output=True,
                     )
                 applied.append(prompt_name)
                 entry.unlink(missing_ok=True)

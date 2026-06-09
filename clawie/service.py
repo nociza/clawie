@@ -24,6 +24,7 @@ from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundErr
 from clawie._service_shared import SharedInfraMixin
 from clawie._service_auth import ProviderAuthMixin
 from clawie._service_addons import AddonOpsMixin
+from clawie._service_backup import BackupOpsMixin
 from clawie._service_channels import ChannelOpsMixin
 from clawie._service_runtime import RuntimeOpsMixin
 from clawie._service_spawn import SpawnOpsMixin
@@ -42,6 +43,7 @@ STATUS_SECTIONS: tuple[str, ...] = (
     "auth",
     "delegation",
     "maintenance",
+    "backup",
     "events",
 )
 
@@ -50,6 +52,7 @@ class ZeroClawService(
     SharedInfraMixin,
     ProviderAuthMixin,
     AddonOpsMixin,
+    BackupOpsMixin,
     ChannelOpsMixin,
     RuntimeOpsMixin,
     SpawnOpsMixin,
@@ -400,6 +403,7 @@ class ZeroClawService(
                 "active_agents": self.active_delegation_agents(),
             },
             "maintenance": self.maintenance_status,
+            "backup": self.backup_status,
             "events": lambda: self.list_events(limit=10),
         }
 
@@ -467,6 +471,12 @@ class ZeroClawService(
         with target.open("w", encoding="utf-8") as handle:
             json.dump(snapshot, handle, indent=2, sort_keys=True)
             handle.write("\n")
+        # The snapshot carries unredacted credentials (api keys, password
+        # hashes); keep it private to the exporting user.
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
         return target
 
     def import_state(self, input_path: str | Path, merge: bool = False) -> None:

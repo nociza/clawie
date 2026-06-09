@@ -85,9 +85,23 @@ sudo clawie runtime create alice --user alice
 
 This creates a dedicated Linux user, copies credentials, and installs the provider runtime. See [Runtime Isolation](runtime.md) for details.
 
+## Set up continuous backup
+
+Keep your agents' knowledge (prompts, memory, workspace notes) in a git repo
+that clawie maintains automatically:
+
+```bash
+clawie backup init --remote git@github.com:you/agent-backup.git
+clawie backup run                 # first snapshot
+sudo clawie maintenance enable    # keep it current on every maintenance pass
+```
+
+Credentials are never written to the backup repo. See [Backup & Restore](backup.md).
+
 ## What's next
 
 - [Agent Management](agents.md) — clone agents, manage prompts, configure addons
 - [Delegation & Orchestration](delegation.md) — delegate tasks between agents with tiers
-- [Providers & Auth](providers.md) — multi-provider setup and shared auth
-- [Dashboard](dashboard.md) — TUI navigation and controls
+- [Providers & Auth](providers.md) — multi-provider setup, shared auth, porting between claws
+- [Backup & Restore](backup.md) — git-backed knowledge backup
+- [Status](status.md) — fleet overview, `--json`, live `--watch`

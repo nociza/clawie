@@ -51,6 +51,32 @@ sudo clawie auth apply
 
 Shared auth is stored in the provider's native format, so imported credentials work without extra login steps.
 
+## Porting auth between claws
+
+Already authorized one claw (e.g. openclaw) and want the same session on
+another? `auth port` translates the shared auth store between provider
+formats — no new login required:
+
+```bash
+# Move every usable session from openclaw's store into picoclaw's
+clawie auth port --from openclaw --to picoclaw
+
+# Works in any direction
+clawie auth port --from picoclaw --to zeroclaw
+```
+
+Porting:
+
+- reads every profile from the source provider's shared store (including
+  picoclaw's native `auth.json`),
+- merges them into the target store in the target's native format, keeping
+  the active profile active,
+- re-links all agents that consume the shared provider-auth bundle, and
+- tells you which agents need a service restart to pick up the new auth.
+
+If the source store is empty you'll get a pointer to `clawie auth login` /
+`clawie auth import ... --from codex` instead of a silent no-op.
+
 ## Per-agent auth
 
 ```bash

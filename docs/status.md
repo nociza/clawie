@@ -21,6 +21,7 @@ A full `clawie status` prints these sections, in order:
 | **Auth** | shared provider auth status and whether a login is required |
 | **Delegation** | active REPL agents and recent delegation tasks |
 | **Maintenance** | the credential-sync cron's enabled state and interval |
+| **Backup** | backup repo, remote, HEAD commit, and last run |
 | **Events** | the most recent recorded events |
 
 Limit the output to a single section by naming it:

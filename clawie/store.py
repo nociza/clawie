@@ -26,6 +26,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "updated_at": "",
     "maintenance_cron_enabled": False,
     "maintenance_cron_interval_hours": 4,
+    "backup_enabled": False,
+    "backup_repo_path": "",
+    "backup_remote": "",
+    "backup_auto_push": True,
+    "backup_last_run_at": "",
+    "backup_last_commit": "",
 }
 
 DEFAULT_STATE: dict[str, Any] = {

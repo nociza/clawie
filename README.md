@@ -12,11 +12,13 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Agent orchestration** — Delegate tasks across agents in recursive trees with automatic tier-based routing. Fast agents handle lookups, power agents handle analysis, balanced agents handle everything else.
 
-**Multi-provider fleet** — Run agents on openclaw, picoclaw, or zeroclaw. Switch providers with a single command. Authorize once, share credentials across agents.
+**Multi-provider fleet** — Run agents on openclaw, picoclaw, or zeroclaw. Switch providers with a single command. Authorize once, share credentials across agents, and port sessions between claws with `clawie auth port`.
 
 **Linux isolation** — Each agent gets its own Linux user, home directory, and credential scope. No agent sees another's secrets.
 
-**Unified status** — One read-only `clawie status` command shows agent status, runtimes, auth, delegation trees, and health across your entire fleet — with `--json` for scripting and `--watch` for a live view.
+**Continuous knowledge backup** — Agent prompts and memory are mirrored into a git repo on every maintenance pass, with secrets redacted and credentials excluded. Restore one agent or the whole fleet with `clawie backup restore`.
+
+**Unified status** — One read-only `clawie status` command shows agent status, runtimes, auth, delegation trees, backup, and health across your entire fleet — with `--json` for scripting and `--watch` for a live view.
 
 ## Requirements
 
@@ -85,6 +87,17 @@ clawie config set --provider picoclaw
 sudo clawie runtime create alice --user alice
 clawie runtime detect
 
+# Credentials
+clawie auth login picoclaw                        # authorize the shared store once
+clawie auth import openclaw --from codex          # adopt an existing session
+clawie auth port --from openclaw --to picoclaw    # port sessions between claws
+sudo clawie auth apply                            # link into all eligible agents
+
+# Backup (git-backed, continuously maintained)
+clawie backup init --remote git@github.com:you/agent-backup.git
+clawie backup run
+clawie backup restore --agent alice
+
 # Status
 clawie status
 ```
@@ -102,8 +115,25 @@ clawie status --watch         # live view; refresh until Ctrl-C
 ```
 
 It aggregates setup, health, agents, runtimes, auth, delegation, maintenance,
-and recent events — and degrades gracefully if any one section can't be read.
-`clawie dashboard` is a deprecated alias for `clawie status --watch`.
+backup, and recent events — and degrades gracefully if any one section can't
+be read. `clawie dashboard` is a deprecated alias for `clawie status --watch`.
+
+## Backup
+
+Agent knowledge — core prompts, `MEMORY.md`, and workspace notes — lives in a
+git repo that clawie commits to automatically (and pushes, if a remote is
+configured) on every maintenance pass:
+
+```bash
+clawie backup init --remote git@github.com:you/agent-backup.git
+sudo clawie maintenance enable        # backup now runs every pass
+clawie backup status                  # repo, HEAD, last run
+clawie backup restore --agent alice   # bring knowledge back after a loss
+```
+
+Secrets are redacted from the snapshot and credential files are never
+collected; `clawie backup export` exists for full-fidelity local snapshots.
+See [docs/backup.md](docs/backup.md).
 
 ## Limitations
 
@@ -126,6 +156,7 @@ Full documentation is in [`docs/`](docs/), deployable to GitHub Pages:
 - [Delegation & Orchestration](docs/delegation.md)
 - [Providers & Auth](docs/providers.md)
 - [Runtime Isolation](docs/runtime.md)
+- [Backup & Restore](docs/backup.md)
 - [Status](docs/status.md)
 - [CLI Reference](docs/cli-reference.md)
 - [Python API](docs/python-api.md)

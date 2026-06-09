@@ -600,7 +600,13 @@ def test_agent_auth_login_prints_status(
     assert "auth_status: ready" in output
 
 
-def test_spawn_requires_root(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+def test_spawn_requires_root(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    # Force a non-root euid so the test also holds when the suite runs as root.
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
     assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
     code = run_cli(tmp_path, "runtime", "create", "sam")
@@ -2540,6 +2546,9 @@ def test_get_agent_addons_reports_permission_for_other_linux_user(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
+    # Force a non-root euid: root can manage any linux_user, which would
+    # bypass the permission report this test asserts on.
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
     service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
     shared_root = tmp_path / "shared-addon-auth"
     monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
@@ -2755,6 +2764,14 @@ def test_service_action_runs_provider_service_command(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/openclaw")
     monkeypatch.setattr("subprocess.run", fake_run)
+
+    # On real hosts the generated user unit cannot be written for a foreign
+    # user without root; replicate that here so the direct provider-command
+    # path is exercised even when the suite itself runs as root.
+    def deny_unit(self: ZeroClawService, provider: str, linux_user: str) -> None:
+        raise PermissionError("unit dir not writable")
+
+    monkeypatch.setattr(ZeroClawService, "_ensure_generated_user_service_unit", deny_unit)
 
     result = service.agent_service_action("alice", "status")
     assert result["service_status"] == "running"
@@ -4915,6 +4932,14 @@ def test_service_action_fallback_uses_provider_state_dir(
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("shutil.which", lambda _: "/home/linuxbrew/.linuxbrew/bin/picoclaw")
     monkeypatch.setattr("subprocess.run", fake_run)
+
+    # Replicate the non-root reality where the foreign user's unit file
+    # cannot be written, so the process-fallback path under test is taken
+    # even when the suite itself runs as root.
+    def deny_unit(self: ZeroClawService, provider: str, linux_user: str) -> None:
+        raise PermissionError("unit dir not writable")
+
+    monkeypatch.setattr(ZeroClawService, "_ensure_generated_user_service_unit", deny_unit)
 
     result = service.agent_service_action("teleclaw", "start")
     assert result["service_status"] == "running"

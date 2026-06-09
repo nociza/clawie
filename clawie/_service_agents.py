@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,8 +14,26 @@ from clawie.providers import (
 )
 from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
 
+# Agent IDs become file names (prompt staging, backups), channel prefixes, and
+# default Linux usernames; keep them path- and shell-safe.
+_AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
 
 class AgentOpsMixin:
+
+    @staticmethod
+    def _validate_agent_id(agent_id: str) -> str:
+        token = str(agent_id).strip()
+        if not token:
+            raise ValueError("agent_id is required")
+        if token.startswith("@local:"):
+            raise ValueError("agent_id must not use the reserved '@local:' prefix")
+        if ".." in token or not _AGENT_ID_PATTERN.fullmatch(token):
+            raise ValueError(
+                "agent_id must start with a letter or digit and contain only "
+                "letters, digits, '.', '_' or '-' (max 64 chars)"
+            )
+        return token
 
     def create_agent(
         self,
@@ -31,9 +50,7 @@ class AgentOpsMixin:
     ) -> dict[str, Any]:
         self._require_setup()
 
-        agent_id = agent_id.strip()
-        if not agent_id:
-            raise ValueError("agent_id is required")
+        agent_id = self._validate_agent_id(agent_id)
 
         if channel_strategy not in {"new", "migrate"}:
             raise ValueError("channel_strategy must be one of: new, migrate")

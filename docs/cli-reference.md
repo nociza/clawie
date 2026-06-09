@@ -9,7 +9,7 @@ runtimes, auth, delegation, maintenance, and recent events.
 
 ```bash
 clawie status                 # full overview
-clawie status agents          # one section: agents|runtimes|auth|delegation|maintenance|health|events
+clawie status agents          # one section: setup|health|agents|runtimes|auth|delegation|maintenance|backup|events
 clawie status --agent alice   # focus a single agent
 clawie status --json          # machine-readable snapshot (for scripting)
 clawie status --watch         # live view; refresh until Ctrl-C
@@ -121,7 +121,8 @@ clawie runtime service start|stop|restart|status PROVIDER
 ```bash
 clawie auth show
 clawie auth login PROVIDER
-clawie auth import PROVIDER [--from SOURCE]
+clawie auth import PROVIDER [--from codex|claude|provider] [--source-home PATH]
+clawie auth port --from PROVIDER --to PROVIDER   # port sessions between claws
 clawie auth apply [AGENT_ID]
 ```
 
@@ -140,10 +141,14 @@ clawie addon auth import ADDON [--source-home PATH] [--from-agent A]
 
 ```bash
 clawie maintenance status
-clawie maintenance enable [--interval-hours N]   # install the credential-sync cron (root)
-clawie maintenance disable                       # remove the cron (root)
-clawie maintenance run                           # run a sync pass now
+clawie maintenance enable [--interval N]   # install the maintenance cron (root)
+clawie maintenance disable                 # remove the cron (root)
+clawie maintenance run                     # sync credentials, apply prompts, run backup
 ```
+
+Each pass refreshes shared auth, syncs agent credentials, applies staged
+prompts, and — when backup is enabled — commits knowledge changes to the
+backup repo.
 
 ## dashboard (deprecated)
 
@@ -162,6 +167,17 @@ clawie event list [--limit N]
 ```
 
 ## backup
+
+Git-backed knowledge backup (see [Backup & Restore](backup.md)):
+
+```bash
+clawie backup init [PATH] [--remote URL] [--no-auto]
+clawie backup run [--message M] [--push|--no-push]
+clawie backup status
+clawie backup restore [--agent ID] [--no-workspace] [--no-apply-to-disk]
+```
+
+Full-fidelity local snapshots (credentials included; file is chmod `0600`):
 
 ```bash
 clawie backup export PATH

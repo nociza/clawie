@@ -259,8 +259,29 @@ class DelegationOpsMixin:
 
             results[agent_id] = entry
 
+        # Knowledge backup: keep the git backup repo current on every
+        # maintenance pass so it stays continuously maintained.
+        backup_summary = "disabled"
+        if bool(self.store.read_config().get("backup_enabled", False)):
+            try:
+                outcome = self.backup_run()
+                if outcome.get("changed"):
+                    backup_summary = f"ok (commit {str(outcome.get('commit', ''))[:10]})"
+                else:
+                    backup_summary = "ok (no changes)"
+                if outcome.get("push_error"):
+                    backup_summary += f"; push failed: {outcome['push_error']}"
+            except Exception as exc:
+                backup_summary = f"error: {exc}"
+                errors += 1
+
+        # Re-read state before recording the summary event: the per-agent
+        # operations above write state themselves, and writing the stale
+        # snapshot read at the top would clobber their updates.
+        state = self.store.read_state()
         self._event(state, "maintenance.run", f"Maintenance run: {len(results)} agents, {errors} errors", {
             "agents_processed": len(results), "skipped": skipped, "errors": errors,
+            "backup": backup_summary,
         })
         self.store.write_state(state)
         return {
@@ -268,6 +289,7 @@ class DelegationOpsMixin:
             "agents_processed": len(results),
             "agents_skipped": skipped,
             "errors": errors,
+            "backup": backup_summary,
             "results": results,
         }
 

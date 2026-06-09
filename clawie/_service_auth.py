@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 from clawie.auth_sources import (
+    extract_picoclaw_credentials,
+    extract_provider_auth_profiles,
     load_claude_auth,
     load_codex_auth,
     merge_picoclaw_auth_store,
@@ -117,7 +119,7 @@ class ProviderAuthMixin:
                 else:
                     dst.unlink()
             dst.symlink_to(src)
-            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False)
+            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False, capture_output=True)
             updated.append(str(dst))
         return updated
 
@@ -364,6 +366,94 @@ class ProviderAuthMixin:
             "restart_required_agents": restart_required_agents,
             "auth": auth,
         }
+
+    def port_shared_auth(self, from_provider: str, to_provider: str) -> dict[str, Any]:
+        """Port shared linked-auth sessions from one claw provider to another.
+
+        Reads the shared auth store for *from_provider*, normalizes every
+        usable profile, and merges them into *to_provider*'s shared auth store
+        (including picoclaw's native ``auth.json`` when applicable). Agents
+        that consume the shared provider-auth bundle are re-linked afterwards.
+        """
+        self._require_setup()
+        src = get_provider(str(from_provider).strip().lower())
+        dst = get_provider(str(to_provider).strip().lower())
+        if src.name == dst.name:
+            raise ValueError("source and target providers must differ")
+
+        shared_home = self._ensure_shared_provider_auth_root()
+        profiles = self._collect_shared_auth_profiles(src.name, shared_home)
+        if not profiles:
+            looked_at = ", ".join(str(shared_home / rel) for rel in src.shared_auth_paths)
+            raise SetupError(
+                f"no shared {src.name} auth sessions found to port (looked at: {looked_at}). "
+                f"Run 'clawie auth login {src.name}' or "
+                f"'clawie auth import {src.name} --from codex' first."
+            )
+
+        updated: list[str] = []
+        for profile in profiles:
+            updated.extend(self._write_provider_auth_profiles([dst.name], profile))
+        self._relax_shared_provider_auth_permissions()
+        applied = self.apply_shared_auth_links()
+        auth = self.shared_auth_status(dst.name)
+
+        state = self.store.read_state()
+        self._event(
+            state,
+            "auth.ported",
+            f"Ported shared auth {src.name} -> {dst.name}",
+            {
+                "from_provider": src.name,
+                "to_provider": dst.name,
+                "profiles": [str(row.get("profile_id", "")) for row in profiles],
+                "updated_paths": self._dedupe_paths(updated),
+            },
+        )
+        self.store.write_state(state)
+        return {
+            "from_provider": src.name,
+            "to_provider": dst.name,
+            "profiles": [str(row.get("profile_id", "")) for row in profiles],
+            "home": str(shared_home),
+            "updated_paths": self._dedupe_paths(updated),
+            "updated_agents": list(applied.get("updated_agents", [])),
+            "skipped_agents": list(applied.get("skipped_agents", [])),
+            "restart_required_agents": self._shared_provider_auth_agent_ids_for_providers(
+                [dst.name],
+                include_eligible=True,
+            ),
+            "auth": auth,
+        }
+
+    def _collect_shared_auth_profiles(self, provider: str, shared_home: Path) -> list[dict[str, str]]:
+        """Read every shared auth file for *provider* and normalize the profiles.
+
+        Profiles are deduped by profile id; when the same profile appears in
+        several files the later file in ``shared_auth_paths`` wins. Within one
+        file, active profiles sort last so replaying the merge keeps them active.
+        """
+        spec = get_provider(provider)
+        merged: dict[str, dict[str, str]] = {}
+        order: list[str] = []
+        for rel in spec.shared_auth_paths:
+            path = shared_home / rel
+            if not self._path_exists(path):
+                continue
+            payload = self._read_json_file(path)
+            if path.name == "auth.json":
+                rows = extract_picoclaw_credentials(payload)
+            else:
+                rows = extract_provider_auth_profiles(payload)
+            for row in rows:
+                profile_id = str(row.get("profile_id", "")).strip()
+                if not profile_id:
+                    continue
+                if profile_id in merged:
+                    order.remove(profile_id)
+                merged[profile_id] = row
+                order.append(profile_id)
+        return [merged[profile_id] for profile_id in order]
 
     def apply_shared_auth_links(self, agent_id: str | None = None) -> dict[str, Any]:
         self._require_setup()

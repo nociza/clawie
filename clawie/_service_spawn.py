@@ -297,7 +297,7 @@ class SpawnOpsMixin:
                 else:
                     dst.unlink()
             dst.symlink_to(src, target_is_directory=src.is_dir())
-            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False)
+            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False, capture_output=True)
             updated.append(str(dst))
         return updated
 

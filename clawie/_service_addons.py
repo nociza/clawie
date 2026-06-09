@@ -531,7 +531,7 @@ class AddonOpsMixin:
             updated = inject_addon_tools_snippet(current, addon_name, rendered_snippet)
             self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
             if linux_user and os.geteuid() == 0:
-                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False)
+                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False, capture_output=True)
         # ── Shell env exports ──
         if spec.env_exports:
             exports = {var: val.format_map(context) for var, val in spec.env_exports}
@@ -544,7 +544,7 @@ class AddonOpsMixin:
                 updated = inject_addon_env_block(current, addon_name, block)
                 path.write_text(updated, encoding="utf-8")
                 if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False)
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False, capture_output=True)
 
     def _remove_addon_agent_integration(
         self,
@@ -563,7 +563,7 @@ class AddonOpsMixin:
                 updated = remove_addon_tools_snippet(current, addon_name)
                 self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
                 if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False)
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False, capture_output=True)
         # ── Shell env exports ──
         if spec.env_exports:
             for rel in (".bashrc", ".profile"):
@@ -574,7 +574,7 @@ class AddonOpsMixin:
                 updated = remove_addon_env_block(current, addon_name)
                 path.write_text(updated, encoding="utf-8")
                 if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False)
+                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False, capture_output=True)
 
     def agent_display_status(self, agent_id: str) -> dict[str, Any]:
         """Return display status for an agent."""

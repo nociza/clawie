@@ -117,15 +117,83 @@ def build_parser() -> argparse.ArgumentParser:
 
     backup = subparsers.add_parser(
         "backup",
-        help="Export and import config/state snapshots",
+        help="Git-backed knowledge backup, plus config/state snapshots",
     )
     backup_sub = backup.add_subparsers(
         dest="backup_command",
         required=True,
-        metavar="{export,import}",
+        metavar="{init,run,status,restore,export,import}",
     )
 
-    backup_export = backup_sub.add_parser("export", help="Write a snapshot to disk")
+    backup_init = backup_sub.add_parser(
+        "init",
+        help="Create the backup git repo and enable continuous backup",
+    )
+    _add_positional_argument(
+        backup_init,
+        "path",
+        metavar="PATH",
+        help_text="Backup repo directory (default: <config-dir>/backup)",
+    )
+    backup_init.add_argument(
+        "--remote",
+        help="Git remote URL to push backups to (set as 'origin')",
+    )
+    backup_init.add_argument(
+        "--no-auto",
+        action="store_true",
+        help="Register the repo but do not enable automatic backups",
+    )
+    backup_init.set_defaults(func=cmd_backup_init)
+
+    backup_run = backup_sub.add_parser(
+        "run",
+        help="Snapshot fleet knowledge into the backup repo and commit",
+    )
+    backup_run.add_argument("--message", default="", help="Custom commit message")
+    push_group = backup_run.add_mutually_exclusive_group()
+    push_group.add_argument(
+        "--push",
+        dest="push",
+        action="store_true",
+        default=None,
+        help="Push to the configured remote after committing",
+    )
+    push_group.add_argument(
+        "--no-push",
+        dest="push",
+        action="store_false",
+        help="Skip pushing even if a remote is configured",
+    )
+    backup_run.set_defaults(func=cmd_backup_run)
+
+    backup_status = backup_sub.add_parser(
+        "status",
+        help="Show backup repo state and last run",
+    )
+    backup_status.set_defaults(func=cmd_backup_status)
+
+    backup_restore = backup_sub.add_parser(
+        "restore",
+        help="Restore agent prompts and workspace knowledge from the backup repo",
+    )
+    backup_restore.add_argument("--agent", default="", help="Only restore one agent")
+    backup_restore.add_argument(
+        "--no-workspace",
+        action="store_true",
+        help="Restore core prompts only; skip workspace knowledge files",
+    )
+    backup_restore.add_argument(
+        "--no-apply-to-disk",
+        action="store_true",
+        help="Only update state; do not write prompt files to agent homes",
+    )
+    backup_restore.set_defaults(func=cmd_backup_restore)
+
+    backup_export = backup_sub.add_parser(
+        "export",
+        help="Write a full-fidelity snapshot file (includes credentials)",
+    )
     _add_positional_argument(
         backup_export,
         "output",
@@ -141,7 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help_text="Snapshot file to import",
     )
-    backup_import.add_argument("--merge", action="store_true")
+    backup_import.add_argument(
+        "--merge",
+        action="store_true",
+        help="Merge into current state instead of replacing it",
+    )
     backup_import.set_defaults(func=cmd_state_import)
 
     return parser
@@ -180,7 +252,7 @@ def _build_auth_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
     auth_sub = auth.add_subparsers(
         dest="shared_auth_command",
         required=True,
-        metavar="{show,login,import,apply}",
+        metavar="{show,login,import,port,apply}",
     )
 
     auth_show = auth_sub.add_parser(
@@ -229,6 +301,26 @@ def _build_auth_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentP
         help="Home directory to import from (default: current user home)",
     )
     auth_import.set_defaults(func=cmd_shared_auth_import)
+
+    auth_port = auth_sub.add_parser(
+        "port",
+        help="Port shared auth sessions from one claw provider to another",
+    )
+    auth_port.add_argument(
+        "--from",
+        dest="from_provider",
+        required=True,
+        choices=provider_names(),
+        help="Source provider to read shared auth from",
+    )
+    auth_port.add_argument(
+        "--to",
+        dest="to_provider",
+        required=True,
+        choices=provider_names(),
+        help="Target provider to write shared auth into",
+    )
+    auth_port.set_defaults(func=cmd_shared_auth_port)
 
     auth_apply = auth_sub.add_parser(
         "apply",
@@ -1132,7 +1224,9 @@ def main(argv: list[str] | None = None) -> int:
     ) as exc:
         print_error(str(exc))
         return 1
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
+        # EOFError covers interactive prompts running without stdin
+        # (piped/cron); treat it like a user abort instead of a traceback.
         print_warning("Interrupted")
         return 130
 
@@ -1276,6 +1370,31 @@ def cmd_shared_auth_import(args: argparse.Namespace, service: ZeroClawService) -
     )
     print_success(f"Imported {result.get('source', '')} auth into shared store for {provider}")
     print_info(f"Shared home: {result.get('home', '')}")
+    updated_paths = result.get("updated_paths", [])
+    if updated_paths:
+        print_info("Updated shared auth paths:")
+        for path in updated_paths:
+            print(f"- {path}")
+    updated_agents = result.get("updated_agents", [])
+    print_info("Linked agents: " + (", ".join(str(item) for item in updated_agents) or "<none>"))
+    skipped_agents = result.get("skipped_agents", [])
+    if skipped_agents:
+        print_warning("Skipped agents: " + ", ".join(str(item) for item in skipped_agents))
+    _print_restart_required_agents(args, result.get("restart_required_agents", []))
+    auth = result.get("auth", {})
+    if auth:
+        _print_auth_status(auth, title="Shared Auth")
+    return 0
+
+
+def cmd_shared_auth_port(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.port_shared_auth(args.from_provider, args.to_provider)
+    profiles = result.get("profiles", [])
+    print_success(
+        f"Ported {len(profiles)} auth profile(s) from "
+        f"{result.get('from_provider', '')} to {result.get('to_provider', '')}"
+    )
+    print_info("Profiles: " + (", ".join(str(item) for item in profiles) or "<none>"))
     updated_paths = result.get("updated_paths", [])
     if updated_paths:
         print_info("Updated shared auth paths:")
@@ -1992,7 +2111,12 @@ def cmd_agent_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     if not args.yes:
         print_warning(f"This will permanently purge agent '{agent_id}' and its Linux user profile.")
-        confirmation = input("Proceed? [y/N]: ").strip().lower()
+        try:
+            confirmation = input("Proceed? [y/N]: ").strip().lower()
+        except EOFError:
+            raise ValueError(
+                "purge cancelled: no confirmation input available (use --yes for non-interactive runs)"
+            ) from None
         if confirmation not in {"y", "yes"}:
             raise ValueError("purge cancelled by user")
     result = service.purge_agent(agent_id)
@@ -2072,6 +2196,7 @@ def _print_status(snapshot: dict[str, Any]) -> None:
         "auth": _print_status_auth,
         "delegation": _print_status_delegation,
         "maintenance": _print_status_maintenance,
+        "backup": _print_status_backup,
         "events": _print_status_events,
     }
     for name in STATUS_SECTIONS:
@@ -2248,6 +2373,31 @@ def _print_status_maintenance(payload: Any) -> None:
     )
 
 
+def _print_status_backup(payload: Any) -> None:
+    err = _status_section_error(payload)
+    if err:
+        print_warning(f"backup: {err}")
+        return
+    _print_backup_status_panel(payload)
+
+
+def _print_backup_status_panel(payload: dict[str, Any]) -> None:
+    print_panel(
+        "Backup",
+        [
+            f"enabled: {payload.get('enabled', False)}",
+            f"repo: {payload.get('repo', '')}",
+            f"initialized: {payload.get('initialized', False)}",
+            f"remote: {payload.get('remote', '') or '<none>'}",
+            f"auto_push: {payload.get('auto_push', True)}",
+            f"head: {payload.get('head', '') or '<no commits>'}",
+            f"commits: {payload.get('commit_count', 0)}",
+            f"dirty: {payload.get('dirty', False)}",
+            f"last_run_at: {payload.get('last_run_at', '')}",
+        ],
+    )
+
+
 def _print_status_events(payload: Any) -> None:
     err = _status_section_error(payload)
     if err:
@@ -2413,9 +2563,85 @@ def cmd_events_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
+def cmd_backup_init(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.backup_init(
+        repo_path=(str(args.path).strip() or None) if args.path else None,
+        remote=args.remote,
+        enable=not bool(args.no_auto),
+    )
+    if result.get("created"):
+        print_success(f"Created backup repo at {result.get('repo', '')}")
+    else:
+        print_success(f"Backup repo ready at {result.get('repo', '')}")
+    print_info("Remote: " + (str(result.get("remote", "")) or "<none>"))
+    if result.get("enabled"):
+        print_info("Automatic backup: enabled (runs on every maintenance pass)")
+        status = service.maintenance_status()
+        if not status.get("enabled"):
+            print_warning(
+                "Maintenance cron is not enabled; run 'sudo clawie maintenance enable' "
+                "so backups run automatically, or run 'clawie backup run' manually."
+            )
+    else:
+        print_info("Automatic backup: disabled (run 'clawie backup run' manually)")
+    return 0
+
+
+def cmd_backup_run(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.backup_run(message=str(args.message or ""), push=args.push)
+    if result.get("changed"):
+        print_success(f"Backup committed {str(result.get('commit', ''))[:10]} in {result.get('repo', '')}")
+    else:
+        print_info(f"Backup up to date (no changes) in {result.get('repo', '')}")
+    agents = result.get("agents", [])
+    print_info(f"Backed up {len(agents)} agent(s), {result.get('files', 0)} file(s)")
+    if result.get("pushed"):
+        print_info("Pushed to remote origin")
+    push_error = str(result.get("push_error", "")).strip()
+    if push_error:
+        print_warning(f"Push failed: {push_error}")
+    skipped = result.get("skipped", [])
+    for row in skipped:
+        print_warning(f"{row.get('agent_id', '')}: {row.get('reason', '')}")
+    return 0
+
+
+def cmd_backup_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+    _ = args
+    payload = service.backup_status()
+    _print_backup_status_panel(payload)
+    if not payload.get("git_available"):
+        print_warning("git is not installed; backup commands will fail until it is.")
+        return 1
+    if not payload.get("initialized"):
+        print_info("Backup repo not initialized. Run 'clawie backup init'.")
+        return 1
+    return 0
+
+
+def cmd_backup_restore(args: argparse.Namespace, service: ZeroClawService) -> int:
+    agent_id = (str(args.agent or "").strip()) or None
+    result = service.backup_restore(
+        agent_id=agent_id,
+        apply_to_disk=not bool(args.no_apply_to_disk),
+        include_workspace=not bool(args.no_workspace),
+    )
+    restored = result.get("restored", {})
+    print_success(f"Restored {len(restored)} agent(s) from {result.get('repo', '')}")
+    for token, counts in sorted(restored.items()):
+        print_info(
+            f"{token}: {counts.get('prompts', 0)} prompt(s), "
+            f"{counts.get('workspace_files', 0)} workspace file(s)"
+        )
+    for row in result.get("skipped", []):
+        print_warning(f"{row.get('agent_id', '')}: {row.get('reason', '')}")
+    return 0
+
+
 def cmd_state_export(args: argparse.Namespace, service: ZeroClawService) -> int:
     target = service.export_state(_resolve_required_value(args.output, field_name="output"))
     print_success(f"State exported to {target}")
+    print_warning("Snapshot contains unredacted credentials; keep the file private.")
     return 0
 
 
@@ -2907,6 +3133,7 @@ def cmd_maintenance_run(args: argparse.Namespace, service: ZeroClawService) -> i
         prompts = entry.get("prompts", "")
         status = "ok" if "error" not in creds and "error" not in prompts else "FAIL"
         print(f"  {agent_id}: credentials={creds}  prompts={prompts}  [{status}]")
+    print(f"  Backup: {result.get('backup', 'disabled')}")
     total = result["agents_processed"]
     errs = result["errors"]
     print(f"  Total: {total} agents, {result['agents_skipped']} skipped, {errs} errors")

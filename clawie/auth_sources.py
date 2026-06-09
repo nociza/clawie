@@ -168,6 +168,98 @@ def merge_picoclaw_auth_store(existing: dict[str, Any], imported: dict[str, str]
     return payload
 
 
+def extract_provider_auth_profiles(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Convert an ``auth-profiles.json`` payload into normalized imported-auth dicts.
+
+    Returns one dict per usable profile, in merge order: inactive profiles
+    first, the active profile for each upstream provider last, so replaying
+    them through :func:`merge_provider_auth_profile` preserves which profile
+    is active. Profiles without any token material are skipped.
+    """
+    if not isinstance(payload, dict):
+        return []
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return []
+    active_profiles = payload.get("active_profiles", {})
+    if not isinstance(active_profiles, dict):
+        active_profiles = {}
+    active_ids = {str(value).strip() for value in active_profiles.values() if str(value).strip()}
+
+    rows: list[dict[str, str]] = []
+    for profile_id, raw in profiles.items():
+        if not isinstance(raw, dict):
+            continue
+        token = str(profile_id).strip()
+        upstream = str(raw.get("provider", "")).strip()
+        if not token or not upstream:
+            continue
+        access_token = str(raw.get("access_token", raw.get("access", "")) or "").strip()
+        refresh_token = str(raw.get("refresh_token", raw.get("refresh", "")) or "").strip()
+        id_token = str(raw.get("id_token", "") or "").strip()
+        if not any((access_token, refresh_token, id_token)):
+            continue
+        kind = str(raw.get("kind", raw.get("type", "oauth")) or "oauth").strip().lower() or "oauth"
+        expires_at = str(raw.get("expires_at", "") or "").strip()
+        if not expires_at:
+            expires_at = _epoch_millis_to_iso(raw.get("expires"))
+        rows.append(
+            {
+                "source": "port",
+                "upstream_provider": upstream,
+                "profile_name": str(raw.get("profile_name", "default") or "default").strip() or "default",
+                "profile_id": token,
+                "kind": kind,
+                "account_id": str(raw.get("account_id", raw.get("accountId", "")) or "").strip(),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "expires_at": expires_at,
+                "updated_at": str(raw.get("updated_at", "") or "").strip(),
+            }
+        )
+    rows.sort(key=lambda row: (row["profile_id"] in active_ids, row["profile_id"]))
+    return rows
+
+
+def extract_picoclaw_credentials(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Convert a picoclaw ``auth.json`` payload into normalized imported-auth dicts."""
+    if not isinstance(payload, dict):
+        return []
+    credentials = payload.get("credentials", {})
+    if not isinstance(credentials, dict):
+        return []
+
+    rows: list[dict[str, str]] = []
+    for provider, raw in sorted(credentials.items()):
+        if not isinstance(raw, dict):
+            continue
+        upstream = _upstream_provider_for_picoclaw(str(provider))
+        if not upstream:
+            continue
+        access_token = str(raw.get("access_token", "") or "").strip()
+        refresh_token = str(raw.get("refresh_token", "") or "").strip()
+        if not any((access_token, refresh_token)):
+            continue
+        method = str(raw.get("auth_method", "oauth") or "oauth").strip().lower()
+        rows.append(
+            {
+                "source": "port",
+                "upstream_provider": upstream,
+                "profile_name": "default",
+                "profile_id": f"{upstream}:default",
+                "kind": "oauth" if method == "oauth" else "token",
+                "account_id": str(raw.get("account_id", "") or "").strip(),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": "",
+                "expires_at": str(raw.get("expires_at", "") or "").strip(),
+                "updated_at": "",
+            }
+        )
+    return rows
+
+
 def _read_json_object(path: Path, *, allow_missing: bool = False) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -231,3 +323,28 @@ def _picoclaw_provider_name(imported: dict[str, str]) -> str:
     if upstream in {"google-antigravity", "antigravity"}:
         return "google-antigravity"
     return ""
+
+
+def _upstream_provider_for_picoclaw(provider: str) -> str:
+    token = str(provider).strip().lower()
+    if token == "openai":
+        return "openai-codex"
+    if token == "anthropic":
+        return "anthropic-claude"
+    if token == "google-antigravity":
+        return "google-antigravity"
+    return ""
+
+
+def _epoch_millis_to_iso(value: Any) -> str:
+    try:
+        millis = int(value)
+    except (TypeError, ValueError):
+        return ""
+    if millis <= 0:
+        return ""
+    try:
+        stamp = datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return stamp.replace(microsecond=0).isoformat().replace("+00:00", "Z")

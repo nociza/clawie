@@ -3273,7 +3273,7 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     )
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
-    assert config["agents"]["defaults"]["model"] == "openai-codex/gpt-5.4"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.4"
     assert (home / ".openclaw" / "auth-profiles.json").is_symlink()
     agent_auth = home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
     assert agent_auth.is_file()
@@ -3719,7 +3719,7 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["gateway"]["mode"] == "local"
     assert config["agents"]["defaults"]["workspace"] == str(home / ".openclaw" / "workspace")
-    assert config["agents"]["defaults"]["model"] == "openai-codex/gpt-5.4"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.4"
     assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
     assert config["agents"]["defaults"]["heartbeat"]["directPolicy"] == "block"
     assert config["agents"]["defaults"]["heartbeat"]["lightContext"] is True
@@ -4106,7 +4106,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     assert result["stopped_service"]["provider"] == "zeroclaw"
     assert config["gateway"]["mode"] == "local"
     assert config["channels"]["telegram"]["botToken"] == _fake_telegram_token()
-    assert config["agents"]["defaults"]["model"] == "openai-codex/gpt-5.4"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.4"
     assert ("openclaw", "start", "teleclaw") in unit_actions
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
 

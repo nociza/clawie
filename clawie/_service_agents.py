@@ -795,7 +795,9 @@ class AgentOpsMixin:
 
         desired_model = ""
         if auth_mode == "linked":
-            desired_model = "openai-codex/gpt-5.4"
+            # Canonical `openai/*` id — `openai-codex/*` is legacy that
+            # `openclaw doctor --fix` rewrites (see clawie.adapters).
+            desired_model = "openai/gpt-5.4"
         elif auth_mode == "api_key":
             if not api_key:
                 raise SetupError("openclaw API-key mode requires an API key before the runtime can start")
@@ -1178,32 +1180,6 @@ class AgentOpsMixin:
             except Exception as exc:  # noqa: BLE001
                 results["errors"].append({"agent_id": agent_id, "error": str(exc)})
         return results
-
-    # Backward-compatible aliases.
-    def create_user(self, **kwargs: Any) -> dict[str, Any]:
-        return self.create_agent(
-            agent_id=str(kwargs.get("user_id", kwargs.get("agent_id", ""))),
-            display_name=kwargs.get("display_name"),
-            template=str(kwargs.get("template", "baseline")),
-            clone_from=kwargs.get("clone_from"),
-            channel_strategy=str(kwargs.get("channel_strategy", "new")),
-            channels=kwargs.get("channels"),
-            agent_version=str(kwargs.get("agent_version", "1.0.0")),
-            provider=kwargs.get("provider"),
-            core_prompts=kwargs.get("core_prompts"),
-        )
-
-    def list_users(self) -> list[dict[str, Any]]:
-        return self.list_agents()
-
-    def get_user(self, user_id: str) -> dict[str, Any]:
-        return self.get_agent(user_id)
-
-    def delete_user(self, user_id: str) -> None:
-        self.delete_agent(user_id)
-
-    def batch_create_users(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.batch_create_agents(entries)
 
     def _refresh_managed_agent_provider_alignment(
         self,

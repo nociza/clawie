@@ -72,24 +72,28 @@ declarative artifact is the spine of the redesign.
 
 ## 3. Design principles
 
-1. **The workspace manifest is the source of truth.** Everything else is
-   derived or reconciled from it. SQLite becomes a rebuildable cache.
-2. **Reconcile, don't orchestrate.** Replace imperative multi-step sagas with
+1. **Clean break — no backwards compatibility (decision).** We are not
+   preserving old on-disk shapes, dual keys, aliases, or legacy surfaces. Design
+   the interface you'd write today, then delete what doesn't fit. No compat
+   fallbacks, no migration shims that keep stale paths alive, no "also accept the
+   old name." Clean interfaces and clean code win over continuity.
+2. **The workspace manifest is the source of truth.** Everything else is derived
+   from it. SQLite is a rebuildable cache.
+3. **Reconcile, don't orchestrate.** Replace imperative multi-step sagas with
    `reconcile(desired, observed)` that converges and is safe to re-run.
-3. **Providers are adapters.** openclaw is the reference adapter; core knows no
+4. **Providers are adapters.** openclaw is the reference adapter; core knows no
    provider's file schema. Adding hermes is a new file.
-4. **Trust precedes autonomy.** The security fixes (Phase 2) gate the control
+5. **Trust precedes autonomy.** The security fixes (Phase 2) gate the control
    agent (Phase 4). Never hand an LLM root + repo-write while tokens are
    world-writable.
-5. **Gate in code, not in the prompt.** Capability limits and confirmations are
+6. **Gate in code, not in the prompt.** Capability limits and confirmations are
    enforced by the tool/RPC layer, because prompt-only boundaries fail under
    injection.
-6. **Notify on version drift; don't chase durability.** Detect unknown openclaw
-   versions, degrade to read-only, and tell the human **(decision)**. We accept
-   that openclaw upgrades can break clawie as long as the user is warned.
-7. **Least privilege at the one chokepoint.** All cross-user mutation flows
-   through `_can_manage_linux_user` (root-or-same-user); the control agent gets
-   a scoped sudoers allowlist, never blanket root.
+7. **Notify on version drift; don't chase durability.** Detect unknown openclaw
+   versions, degrade to read-only, and tell the human **(decision)**.
+8. **Least privilege at the one chokepoint.** All cross-user mutation flows
+   through `_can_manage_linux_user` (root-or-same-user); the control agent gets a
+   scoped sudoers allowlist, never blanket root.
 
 ---
 
@@ -356,7 +360,7 @@ clawied RPC layer (not the prompt):
 
 A destructive/outward call cannot execute without the confirmation token,
 regardless of what the model "decided" — this is the prompt-injection defense
-(Principle 5). Nonce-based confirmation prevents a poisoned log line or stray
+(Principle 6). Nonce-based confirmation prevents a poisoned log line or stray
 "yes" from self-approving.
 
 **openclaw enforces a second layer.** Connect the control agent to each gateway
@@ -455,20 +459,41 @@ tool RPC (§9), and writes the audit log. CLI and control agent become clients.
 This resolves concurrency, gives the reconcile loop a home, and is the clean
 place for the code-enforced gates.
 
-**Interim (before clawied):** WAL + `busy_timeout` + an advisory file lock, and
-route the control agent's mutations through a single serialized path.
+There is **no interim multi-writer compatibility layer** (Principle 1): `clawied`
+is the single writer from the start, and its state schema is defined clean from
+the manifest rather than migrated from today's `users`/`agents` SQLite shape.
 
 ---
 
-## 14. What we explicitly preserve
+## 14. What we keep — and what we cut
+
+Keep the **ideas** that are sound (the patterns, not the old interfaces):
 
 - `status_snapshot` graceful degradation and the `--json`/`--watch` surface.
 - The event-sourced audit log (now also backing control-agent audit).
 - Password hashing safety, `sshd -t` pre-validation, archive path-traversal
   guards (`_extract_tarball_safe`).
-- The delegation IPC framing and tree (repurposed as the `loopback` adapter).
+- The delegation **tree + budget** concepts — but **not** the Unix-socket
+  transport: `DelegationBus`/`FileMailbox`/`AgentREPL`/`SessionAgentManager` are
+  replaced by `adapter.deliver()`. Tests use a small in-memory adapter, not a
+  socket REPL.
 - The drift-alignment instinct (`_apply_live_provider_alignment`) — generalized
   into the reconcile loop.
+
+Cut outright (no backwards compatibility — Principle 1):
+
+- The `users`/`agents` dual key and the `state["users"]` mirror — agents only.
+- The `create_user` / `list_users` / `get_user` / `delete_user` /
+  `batch_create_users` aliases.
+- `ZeroClawService` → a clean service name; fix the `0.1.1`/`0.1.3` version skew.
+- `store.py` legacy importers/migrations (`_migrate_legacy_json`,
+  `_migrate_remove_legacy_default_channels`, `_LEGACY_HEARTBEAT_PROMPT`, the
+  `config.json`/`state.json` legacy inputs).
+- The `auth-profiles.json` / `openai-codex` writers and the `auth_sources.py`
+  JSON conversion → replaced by the `openclaw models auth` CLI.
+- The Unix-socket delegation transport (above) and the deprecated `dashboard`
+  alias.
+- The `cli.js` binary patch (also Phase 2).
 
 ---
 
@@ -480,9 +505,10 @@ Each phase is independently valuable. **Phase 2 gates Phase 4.**
 Extract `ProviderAdapter`; move openclaw config-render / CLI verbs / readiness /
 addon injection / auth-store writer out of `_service_agents` + `_service_addons`
 into `OpenclawAdapter`. Add `detect_version` + `supported_range` →
-degrade-to-read-only + warn. **No behavior change; unblocks everything; delivers
-notify-on-upgrade.** Split the upstream credential sources (codex/claude) from
-the provider writer. **Also fix the live drift:** stop writing legacy
+degrade-to-read-only + warn. **Unblocks everything; delivers notify-on-upgrade;
+deletes the legacy auth writers and `users`/alias cruft as it goes (Principle
+1).** Split the upstream credential sources (codex/claude) from the provider
+writer. **Also fix the live drift:** stop writing legacy
 `auth-profiles.json` / `openai-codex` ids — drive `openclaw models auth` + SQLite
 — and have `render_config` assign a per-agent `gateway.port` + `gateway.auth.token`
 so Phase 1 has an endpoint to talk to.
@@ -504,8 +530,9 @@ auth default. **Load-bearing; must precede Phase 4.** (Independent of 0/1.)
 Define `agent.toml`; build `reconcile(desired, observed)` to retire the
 provider-switch saga and the spawn imperative; stand up `clawied` as single
 writer + reconcile host (resolves concurrency); graduate backup to manifest-
-based runnable restore; retire `users`/`agents` duality, the `ZeroClawService`
-name, and the version skew. (Needs 0; benefits 1.)
+based runnable restore; **delete** the `users`/`agents` duality, the
+`ZeroClawService` name, and the legacy migrations outright — clean schema from
+the manifest, no migration shim. (Needs 0; benefits 1.)
 
 ### Phase 4 — Control agent
 `role: control` workspace; control-tool RPC with code-enforced capability tiers
@@ -539,13 +566,16 @@ adapter in CI; real resource-metrics source for the control agent; split the
   clawie provisions + rotates the per-agent gateway token and the control agent's
   scoped device token.
 - **clawied scope (Phase 3):** introducing a daemon is the biggest structural
-  bet. If deferred, the interim WAL+lock path must hold under the control agent.
+  bet. It is committed as the single writer (Principle 1 — no interim multi-writer
+  layer); the open question is sequencing/effort, not whether to keep the old
+  multi-writer status quo alive.
 - **hermes interface (Phase 5):** unknown until its runtime exists; the seam in
   §6 is our best current guess and may need a method added.
 - **Per-agent auth UX:** moving off the shared store improves isolation but adds
   per-agent login friction; the control agent should streamline it.
-- **Migration:** existing fleets carry the `users`/`agents` shape and shared
-  stores; Phase 2/3 need a one-time migration that doesn't strand live agents.
+- **Existing deployments:** no migration path is provided (Principle 1). A live
+  fleet is re-declared as manifests and reconciled fresh, not migrated from the
+  old SQLite/shared-store shape — the accepted cost of the clean break.
 
 ---
 

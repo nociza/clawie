@@ -221,8 +221,15 @@ version-pinned unit:
 - **Upstream credential sources** — readers for `codex/auth.json` (with JWT
   expiry decode) and `claude/.credentials.json`. These are *not* openclaw; they
   are the model backends. One module, contract-tested.
-- **Provider auth-store writer** — `OpenclawAdapter.write_provider_auth`
-  produces `auth-profiles.json`. hermes will produce its own.
+- **Provider auth-store writer** — drives openclaw's own auth surface, **not**
+  hand-written JSON. As of openclaw 2026.6.2, auth lives in each agent's
+  `openclaw-agent.sqlite`; the `auth-profiles.json` files and `openai-codex`
+  profile ids clawie writes today are **legacy migration input** that `openclaw
+  doctor --fix` rewrites to the canonical `openai` route. So
+  `write_provider_auth` should call `openclaw models auth login/paste-token/order`
+  (and use SecretRef `keyRef`/`tokenRef` for static keys) instead of writing the
+  deprecated JSON. **This is a live version-drift bug to fix in Phase 0**, not a
+  future risk. hermes drives its own auth CLI.
 
 `render_config`, `render_addon_integration`, and `write_provider_auth` together
 hold *all* of openclaw's schema knowledge currently smeared across
@@ -252,27 +259,42 @@ parent ──`clawie delegation submit --child c`──▶ clawied
    ◀─ reply ─────────────────────────────────────────────────────────────────
 ```
 
-Design details:
+Design details (verified against openclaw 2026.6.2 — see Appendix A):
 
-- **Endpoint is rendered, not discovered.** `render_config` writes a
-  deterministic per-agent endpoint (e.g. `~/.openclaw/gateway.sock`) so the
-  gateway binds a known address and `deliver()` knows where to connect. Cross-
-  user reach uses the group bit at the `_can_manage_linux_user` chokepoint, not
-  a localhost port.
-- **Budgets become real.** If the gateway returns usage, budgets consume it; the
-  `len//4` heuristic and placeholder `model_id`s are dropped or explicitly
-  labeled estimates (C1).
-- **Tier → model** moves into the adapter (openclaw already distinguishes
-  `openai-codex/gpt-5.4` vs `openai/gpt-5.2`).
-- **Echo REPL is demoted** to a `loopback` adapter used only by tests and the
-  no-gateway dev path — preserving the existing delegation test suite as
-  loopback tests.
-- **Delegation ≠ heartbeat.** Tasks go to a *separate conversation thread* with
-  the `task_id` attached, so they don't pollute the human channel and aren't
-  mistaken for a `HEARTBEAT_OK` poll (the prompts are careful about this; the
-  bridge must preserve it).
-- **Cross-host later, for free.** `deliver()` against an `Endpoint` means the
-  localhost-only limit is no longer baked into core.
+- **The endpoint is a loopback port, not a socket clawie invents.** The gateway
+  is one always-on process exposing a single multiplexed port (default `18789`,
+  `gateway.bind: "loopback"`) that serves both a WebSocket control/RPC plane and
+  OpenAI-compatible HTTP. `render_config` assigns a **unique `gateway.port` per
+  agent** (the way clawie already allocates VNC ports for the display addon) and
+  `gateway_endpoint()` returns `127.0.0.1:<port>`.
+- **`deliver()` has three fidelity levels, all real:** (1) **native WS RPC**
+  (primary) — `connect` → `hello-ok`, then the `agent` RPC paired with
+  `agent.wait`; runs are two-stage (`accepted` ack → streamed `agent` events →
+  final `ok|error`), mapping **1:1 onto clawie's existing
+  `task_accepted`→`task_result` protocol**, and openclaw explicitly recommends
+  this path for external apps; (2) **OpenAI HTTP** (fallback) — `POST
+  /v1/responses`, model `openclaw/<agentId>`, `Authorization: Bearer`; (3) **CLI**
+  (bootstrap) — `openclaw agent --agent <id> --session-key
+  agent:<id>:clawie:<task_id> --message <payload> --json --timeout <n>`.
+- **Auth to the gateway.** `render_config` provisions `gateway.auth.mode="token"`
+  + a **per-agent `gateway.auth.token`** (or `OPENCLAW_GATEWAY_TOKEN` in
+  `~/.openclaw/.env`). On loopback a same-host backend client authenticating with
+  that token uses openclaw's reserved internal control-plane path and skips device
+  pairing. That token is a **full-operator** credential → a per-agent 0o600 secret
+  under Phase 2, never a shared/world-relaxed file.
+- **Session-scoped, never a heartbeat.** Each delegation runs in a dedicated
+  session key (`agent:<id>:clawie:<task_id>`) so it doesn't pollute the human
+  channel history and isn't mistaken for a `HEARTBEAT_OK` poll.
+- **Budgets become real.** openclaw reports usage/cost via `sessions.usage` /
+  `usage.cost`; budgets consume that instead of the `len//4` heuristic, and tier
+  → model uses real ids (`openai/gpt-5.4`, not the legacy `openai-codex/*`) (C1).
+- **Echo REPL is demoted** to a `loopback` adapter for tests and the no-gateway
+  dev path, preserving the existing delegation test suite.
+- **openclaw already has recursive primitives.** Its `tasks.*` ledger
+  (`parentTaskId`, `childSessionKey`, `flowId`) and native subagents are a
+  delegation model clawie's tree can ride on or converge with later.
+- **The bridge is forward-durable** via protocol negotiation (§10), unlike the
+  config-write surface.
 
 ---
 
@@ -294,6 +316,14 @@ The single enforcement chokepoint, `_can_manage_linux_user` (root-or-same-user,
 `_service_shared.py:272`), is where the control agent's **scoped sudoers
 allowlist** (specific `clawie`/`clawied` verbs, not all) is wired — so even a
 hijacked control agent cannot `userdel` the fleet.
+
+openclaw's own guidance reinforces the model: operator scopes are "a guardrail
+inside one trusted operator domain, **not hostile multi-tenant isolation**… run
+separate Gateways under separate OS users or hosts" for strong separation.
+clawie's one-gateway-per-Linux-user design **is** that separation — the OS-user
+boundary is the real isolation; gateway scopes are the intra-agent guardrail.
+Phase 2 must additionally treat each agent's `gateway.auth.token` as a per-agent
+0o600 secret, since it is a full-operator credential.
 
 ---
 
@@ -328,6 +358,15 @@ A destructive/outward call cannot execute without the confirmation token,
 regardless of what the model "decided" — this is the prompt-injection defense
 (Principle 5). Nonce-based confirmation prevents a poisoned log line or stray
 "yes" from self-approving.
+
+**openclaw enforces a second layer.** Connect the control agent to each gateway
+with a **scoped device token** — `operator.read` to diagnose, `operator.write`
+for safe-heal — and **withhold `operator.admin`**. openclaw then refuses
+`config.*`, `update.*`, and `exec.approvals.*` at the gateway no matter what the
+model attempts, independent of clawie's code-enforced gates. Caveat: a **shared
+gateway token/password is full-operator scope** (openclaw honors narrower scopes
+only for device-token/identity-bearing connects), so the control agent must use a
+scoped device token, not the shared secret.
 
 ### Repo escalation (decision)
 
@@ -364,6 +403,16 @@ Policy: **detect, degrade, notify** — not heroic durability.
 This is where the **notify-on-upgrade** decision, the **version gate** (§6), and
 the **control agent** (§9) converge. Contract tests per adapter (Phase 5) turn a
 breaking upgrade into a CI failure rather than a production surprise.
+
+The **delegation bridge specifically is forward-durable**: openclaw's WS protocol
+is versioned (`PROTOCOL_VERSION`, currently `4`); `connect` negotiates
+`minProtocol`/`maxProtocol`, the server rejects out-of-range, and
+`hello-ok.features.methods/events` is a capability-discovery list. The adapter
+declares the protocol range it speaks and degrades+notifies on mismatch.
+openclaw's docs literally tell integrators to "pin the version you test against"
+and "recheck on upgrade" — notify-on-upgrade is openclaw's own recommended
+practice. The fragile surface is the **config/auth file write**, which is why
+Phase 0 moves auth to the `openclaw models auth` CLI.
 
 ---
 
@@ -433,13 +482,17 @@ addon injection / auth-store writer out of `_service_agents` + `_service_addons`
 into `OpenclawAdapter`. Add `detect_version` + `supported_range` →
 degrade-to-read-only + warn. **No behavior change; unblocks everything; delivers
 notify-on-upgrade.** Split the upstream credential sources (codex/claude) from
-the provider writer.
+the provider writer. **Also fix the live drift:** stop writing legacy
+`auth-profiles.json` / `openai-codex` ids — drive `openclaw models auth` + SQLite
+— and have `render_config` assign a per-agent `gateway.port` + `gateway.auth.token`
+so Phase 1 has an endpoint to talk to.
 
 ### Phase 1 — Real delegation bridge
-Render a deterministic gateway endpoint into `openclaw.json`; implement
-`OpenclawAdapter.deliver()`; rewire `DelegationCoordinator` to call it for
-managed agents; demote echo REPL to `loopback`; feed real usage into budgets;
-separate delegation thread from heartbeat. **Delivers the headline.** (Needs 0.)
+Implement `OpenclawAdapter.deliver()` over the loopback WS `agent` + `agent.wait`
+RPC (OpenAI `/v1/responses` fallback; `openclaw agent --json` CLI bootstrap), each
+delegation in its own session key; rewire `DelegationCoordinator` to call it for
+managed agents; demote echo REPL to `loopback`; feed real usage from
+`sessions.usage` into budgets. **Delivers the headline.** (Needs 0.)
 
 ### Phase 2 — Trust (GATING)
 De-relax all three shared stores; per-agent secrets at 0o600 (or 0o700 broker);
@@ -459,7 +512,9 @@ name, and the version skew. (Needs 0; benefits 1.)
 + nonce confirmation; autonomous safe-heal; confirmed destructive + outward;
 scoped GitHub integration (issues + PRs-from-branch, never auto-merge,
 dedupe/rate-limit); 0o600 repo token outside shared stores; systemd watchdog +
-out-of-band alerting; full audit; delivers version-drift notices; DR-aware.
+out-of-band alerting; full audit; delivers version-drift notices; DR-aware. Scope
+the control agent's gateway device token to `operator.read`/`write` without
+`operator.admin`, so openclaw blocks config/update mutations as a second layer.
 (Needs 0,1,3; **gated by 2**.)
 
 ### Phase 5 — Hardening & extensibility
@@ -477,9 +532,12 @@ adapter in CI; real resource-metrics source for the control agent; split the
 
 ## 16. Risks & open questions
 
-- **openclaw gateway protocol (Phase 1):** exact transport/schema/auth of the
-  local endpoint is an implementation detail to confirm against openclaw before
-  writing `deliver()`. The design assumes a request/response "await final" mode.
+- **openclaw gateway protocol (Phase 1): RESOLVED** (Appendix A). Loopback WS RPC
+  (`agent` + `agent.wait`) / OpenAI HTTP (`/v1/responses`) / CLI (`openclaw
+  agent`), token auth, protocol v4. Remaining detail: the exact `agent` WS param
+  schema (`packages/gateway-protocol/src/schema.ts`, `/reference/rpc`) and how
+  clawie provisions + rotates the per-agent gateway token and the control agent's
+  scoped device token.
 - **clawied scope (Phase 3):** introducing a daemon is the biggest structural
   bet. If deferred, the interim WAL+lock path must hold under the control agent.
 - **hermes interface (Phase 5):** unknown until its runtime exists; the seam in
@@ -488,3 +546,58 @@ adapter in CI; real resource-metrics source for the control agent; split the
   per-agent login friction; the control agent should streamline it.
 - **Migration:** existing fleets carry the `users`/`agents` shape and shared
   stores; Phase 2/3 need a one-time migration that doesn't strand live agents.
+
+---
+
+## Appendix A — openclaw integration facts (verified)
+
+Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
+(openclaw `2026.6.2`). Primary sources: `docs/gateway/*`, `docs/cli/agent.md`,
+`packages/gateway-protocol`.
+
+**Gateway runtime**
+- One always-on process, single multiplexed port. Default `18789`; bind default
+  `loopback`. Port precedence `--port` → `OPENCLAW_GATEWAY_PORT` → `gateway.port`
+  → `18789`. `gateway.mode=local` required to start.
+- Same port serves WS control/RPC **and** HTTP: `/v1/models`, `/v1/embeddings`,
+  `/v1/chat/completions`, `/v1/responses`, `/tools/invoke`.
+- `/v1/models` is agent-first: returns `openclaw`, `openclaw/default`,
+  `openclaw/<agentId>`.
+
+**Delivering a task to an agent (the bridge)**
+- Native WS: `connect` → `hello-ok`; `agent` RPC + `agent.wait`; two-stage
+  `accepted` → streamed `agent` events → final `ok|error`; `deliver=true` for
+  outbound, `result.deliveryStatus` reported.
+- HTTP: `POST /v1/responses`, model `openclaw/<agentId>`.
+- CLI: `openclaw agent --agent <id> --session-key <key> --message <text> --json
+  --timeout <n>` (session keys are `agent:<id>:<key>`).
+- Sessions/tasks: `sessions.*` (durable threads); `tasks.*` ledger with
+  `parentTaskId`/`childSessionKey`/`flowId`; native subagents.
+
+**Auth**
+- Gateway connection: `gateway.auth.mode` ∈ `token|password|trusted-proxy|none`;
+  `gateway.auth.token`/`OPENCLAW_GATEWAY_TOKEN` or `gateway.auth.password`/
+  `OPENCLAW_GATEWAY_PASSWORD`; HTTP uses `Authorization: Bearer`. Loopback still
+  requires auth by default; a same-host `gateway-client` backend may skip device
+  pairing with the shared token.
+- Operator scopes: `operator.read|write|admin|approvals|pairing|talk.secrets`.
+  `config.*`/`update.*`/`exec.approvals.*` require `operator.admin`. **Shared-
+  secret bearer = full operator scope**; narrower scopes are honored only for
+  device-token/identity-bearing connects.
+- Model-provider auth now lives in each agent's `openclaw-agent.sqlite`.
+  `auth-profiles.json`, `auth-state.json`, and `openai-codex` ids are **legacy**,
+  migrated by `openclaw doctor --fix`. Preferred: `openclaw models auth
+  login/paste-token/order`, `~/.openclaw/.env` API keys, Claude-CLI reuse, and
+  SecretRef `keyRef`/`tokenRef`.
+
+**Protocol versioning**
+- `PROTOCOL_VERSION = 4` (`packages/gateway-protocol/src/version.ts`); `connect`
+  sends `minProtocol`/`maxProtocol`; server rejects out-of-range;
+  `hello-ok.features.methods/events` = capability discovery. Docs instruct
+  integrators to pin the tested version and recheck on upgrade.
+
+**Isolation**
+- openclaw: operator scopes are an intra-domain guardrail, "not hostile
+  multi-tenant isolation… run separate Gateways under separate OS users or hosts"
+  for strong separation — validating clawie's one-gateway-per-Linux-user model as
+  the real boundary.

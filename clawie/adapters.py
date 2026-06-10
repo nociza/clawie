@@ -174,32 +174,27 @@ def deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-class OpenclawAdapter:
-    """Reference adapter for the openclaw gateway runtime."""
+class GatewayCliAdapter:
+    """Base adapter for gateway + CLI agent runtimes (openclaw, hermes, …).
 
-    name = "openclaw"
+    Subclasses set the class attributes below; every method here is runtime-
+    agnostic. This is the seam in practice: a new runtime is a subclass plus a
+    registry entry, not surgery into the service mixins.
+    """
 
-    # Tested band: the 2026.6.x line. Outside this range clawie degrades writes
-    # for that agent to read-only and notifies (Principle 7 — notify on drift).
-    MIN_SUPPORTED = Version(2026, 6, 0)
-    MAX_SUPPORTED_EXCLUSIVE = Version(2026, 7, 0)
-
-    PROTOCOL_MIN = OPENCLAW_PROTOCOL_MIN
-    PROTOCOL_MAX = OPENCLAW_PROTOCOL_MAX
-
-    # Canonical ``openai/*`` ids — NOT the legacy ``openai-codex/*`` ids that
-    # `openclaw doctor --fix` rewrites (Appendix A).
-    TIER_MODELS: dict[str, str] = {
-        "fast": "openai/gpt-5.2",
-        "balanced": "openai/gpt-5.4",
-        "power": "openai/gpt-5.4",
-    }
-    DEFAULT_MODEL = "openai/gpt-5.4"
+    name = "gateway"
+    binary = "gateway"  # the runtime's CLI entrypoint on PATH
+    MIN_SUPPORTED = Version(0, 0, 0)
+    MAX_SUPPORTED_EXCLUSIVE = Version(9999, 0, 0)
+    PROTOCOL_MIN = 1
+    PROTOCOL_MAX = 1
+    TIER_MODELS: dict[str, str] = {}
+    DEFAULT_MODEL = ""
 
     # --- version policy ------------------------------------------------------
 
     def version_command(self) -> list[str]:
-        return ["openclaw", "--version"]
+        return [self.binary, "--version"]
 
     def supported_range(self) -> tuple[Version, Version]:
         return (self.MIN_SUPPORTED, self.MAX_SUPPORTED_EXCLUSIVE)
@@ -217,17 +212,17 @@ class OpenclawAdapter:
             return VersionGate(
                 None,
                 False,
-                "could not detect openclaw version; config writes degraded to "
+                f"could not detect {self.name} version; config writes degraded to "
                 "read-only until a supported version is confirmed",
             )
         if self.is_supported(version):
-            return VersionGate(version, True, f"openclaw {version} is within the tested range")
+            return VersionGate(version, True, f"{self.name} {version} is within the tested range")
         return VersionGate(
             version,
             False,
-            f"openclaw {version} is outside the tested range "
+            f"{self.name} {version} is outside the tested range "
             f"[{low}, {high}); config writes degraded to read-only — upgrade clawie "
-            "or pin openclaw, then re-run",
+            f"or pin {self.name}, then re-run",
         )
 
     # --- endpoint + config ---------------------------------------------------
@@ -269,7 +264,7 @@ class OpenclawAdapter:
         return f"agent:{agent_id}:clawie:{task_id}"
 
     def deliver_command(
-        self, agent_id: str, task: Task, *, timeout: float, openclaw_bin: str = "openclaw"
+        self, agent_id: str, task: Task, *, timeout: float, openclaw_bin: str = ""
     ) -> list[str]:
         """Bootstrap delivery path: one agent turn via the gateway, JSON out.
 
@@ -281,7 +276,7 @@ class OpenclawAdapter:
         if not aid:
             raise AdapterError("agent_id is required")
         cmd = [
-            openclaw_bin,
+            openclaw_bin or self.binary,
             "agent",
             "--agent",
             aid,
@@ -361,9 +356,9 @@ class OpenclawAdapter:
         method: str = "",
         set_default: bool = False,
         agent: str = "",
-        openclaw_bin: str = "openclaw",
+        openclaw_bin: str = "",
     ) -> list[str]:
-        """Drive openclaw's own auth surface instead of writing legacy JSON.
+        """Drive the runtime's own auth surface instead of writing legacy JSON.
 
         openclaw stores auth in each agent's ``openclaw-agent.sqlite``; the
         ``auth-profiles.json`` + ``openai-codex`` ids clawie used to write are
@@ -372,7 +367,7 @@ class OpenclawAdapter:
         prov = str(provider).strip().lower()
         if not prov:
             raise AdapterError("provider is required")
-        cmd = [openclaw_bin, "models", "auth", "login", "--provider", prov]
+        cmd = [openclaw_bin or self.binary, "models", "auth", "login", "--provider", prov]
         if profile_id:
             cmd += ["--profile-id", str(profile_id)]
         if method:
@@ -384,18 +379,57 @@ class OpenclawAdapter:
         return cmd
 
     def auth_paste_token_command(
-        self, provider: str, *, openclaw_bin: str = "openclaw"
+        self, provider: str, *, openclaw_bin: str = ""
     ) -> list[str]:
         prov = str(provider).strip().lower()
         if not prov:
             raise AdapterError("provider is required")
-        return [openclaw_bin, "models", "auth", "paste-token", "--provider", prov]
+        return [openclaw_bin or self.binary, "models", "auth", "paste-token", "--provider", prov]
 
-    def readiness_command(self, openclaw_bin: str = "openclaw") -> list[str]:
-        return [openclaw_bin, "models", "status", "--json"]
+    def readiness_command(self, openclaw_bin: str = "") -> list[str]:
+        return [openclaw_bin or self.binary, "models", "status", "--json"]
 
-    def gateway_status_command(self, openclaw_bin: str = "openclaw") -> list[str]:
-        return [openclaw_bin, "gateway", "status", "--json"]
+    def gateway_status_command(self, openclaw_bin: str = "") -> list[str]:
+        return [openclaw_bin or self.binary, "gateway", "status", "--json"]
+
+
+class OpenclawAdapter(GatewayCliAdapter):
+    """Reference adapter — the openclaw gateway runtime (verified 2026.6.2)."""
+
+    name = "openclaw"
+    binary = "openclaw"
+    # Tested band: the 2026.6.x line. Outside this range clawie degrades writes
+    # for that agent to read-only and notifies (Principle 7 — notify on drift).
+    MIN_SUPPORTED = Version(2026, 6, 0)
+    MAX_SUPPORTED_EXCLUSIVE = Version(2026, 7, 0)
+    PROTOCOL_MIN = OPENCLAW_PROTOCOL_MIN
+    PROTOCOL_MAX = OPENCLAW_PROTOCOL_MAX
+    # Canonical ``openai/*`` ids — NOT the legacy ``openai-codex/*`` ids that
+    # `openclaw doctor --fix` rewrites (Appendix A).
+    TIER_MODELS = {
+        "fast": "openai/gpt-5.2",
+        "balanced": "openai/gpt-5.4",
+        "power": "openai/gpt-5.4",
+    }
+    DEFAULT_MODEL = "openai/gpt-5.4"
+
+
+class HermesAdapter(GatewayCliAdapter):
+    """Scaffold adapter for the planned hermes runtime.
+
+    hermes is intended as a second first-class runtime. Its exact contract has
+    not been verified against hermes source, so the gateway+CLI shape inherited
+    from the base is a starting point, not a guarantee. The supported range is
+    intentionally empty, so the version gate degrades hermes agents to read-only
+    until a real, pinned hermes version + model map is filled in here.
+    """
+
+    name = "hermes"
+    binary = "hermes"
+    MIN_SUPPORTED = Version(9999, 0, 0)
+    MAX_SUPPORTED_EXCLUSIVE = Version(9999, 0, 1)
+    TIER_MODELS = {"fast": "", "balanced": "", "power": ""}
+    DEFAULT_MODEL = ""
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +438,7 @@ class OpenclawAdapter:
 
 _ADAPTERS: dict[str, ProviderAdapter] = {
     OpenclawAdapter.name: OpenclawAdapter(),
+    HermesAdapter.name: HermesAdapter(),
 }
 
 

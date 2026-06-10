@@ -261,10 +261,44 @@ def test_paste_token_and_readiness_commands(adapter: OpenclawAdapter) -> None:
 
 def test_registry() -> None:
     assert "openclaw" in adapter_names()
+    assert "hermes" in adapter_names()
     assert isinstance(get_adapter("openclaw"), OpenclawAdapter)
     assert isinstance(get_adapter("OpenClaw"), OpenclawAdapter)
     with pytest.raises(AdapterError):
-        get_adapter("hermes")
+        get_adapter("ghostclaw")
+
+
+@pytest.mark.parametrize("name", adapter_names())
+def test_adapter_contract(name: str) -> None:
+    """Every registered adapter must satisfy the same contract (Phase 5)."""
+    adapter = get_adapter(name)
+    assert isinstance(adapter, ProviderAdapter)
+    assert isinstance(adapter.name, str) and adapter.name
+    # version policy
+    assert adapter.version_command()[-1] == "--version"
+    low, high = adapter.supported_range()
+    assert isinstance(low, Version) and isinstance(high, Version) and low <= high
+    assert isinstance(adapter.version_gate("0.0.0"), VersionGate)
+    # endpoint + config
+    ep = adapter.gateway_endpoint(12345)
+    assert isinstance(ep, Endpoint) and ep.port == 12345
+    patch = adapter.gateway_config_patch(port=12345, token="t")
+    assert patch["gateway"]["port"] == 12345
+    assert patch["gateway"]["auth"] == {"mode": "token", "token": "t"}
+    with pytest.raises(AdapterError):
+        adapter.gateway_config_patch(port=1, token="")
+    # token + models
+    assert len(adapter.new_gateway_token()) >= 16
+    assert isinstance(adapter.tier_to_model("balanced"), str)
+    # delivery
+    cmd = adapter.deliver_command("a", Task("t1", "hi"), timeout=10)
+    assert cmd[0] == adapter.binary and "agent" in cmd and "--json" in cmd
+    good = adapter.parse_reply('{"payloads":[{"text":"ok"}]}')
+    assert isinstance(good, Reply) and good.ok and good.output == "ok"
+    assert adapter.parse_reply("").ok is False
+    # auth / readiness
+    assert adapter.auth_login_command("openai")[0] == adapter.binary
+    assert adapter.readiness_command()[0] == adapter.binary
 
 
 def test_openclaw_satisfies_protocol(adapter: OpenclawAdapter) -> None:

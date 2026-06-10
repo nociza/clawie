@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import shutil
-from typing import Any
+import subprocess
+import uuid
+from typing import Any, Callable
 from clawie.service_common import SetupError
 
 
@@ -304,3 +306,79 @@ class DelegationOpsMixin:
         if parent_id not in self._session_managers:
             return []
         return self._session_managers[parent_id].tree_lines()
+
+    # ── Gateway delivery bridge ───────────────────────────────────────────
+    #
+    # The real delegation path: deliver a task to a managed agent through its
+    # live gateway and return the reply. Unlike the legacy Unix-socket REPL
+    # (which only echoes), this resolves the agent's provider adapter and runs
+    # the adapter's delivery command as the agent's Linux user.
+
+    def deliver_to_agent(
+        self,
+        agent_id: str,
+        message: str,
+        *,
+        tier: str = "balanced",
+        timeout: float = 300.0,
+        run: Callable[[list[str]], str] | None = None,
+    ) -> dict[str, Any]:
+        """Deliver one task to *agent_id* via its gateway; return the parsed reply.
+
+        *run* is the injection point for tests (it takes the adapter's argv and
+        returns stdout). In production it defaults to a runner that executes the
+        command in the agent user's service environment.
+        """
+        from clawie.adapters import Task, get_adapter
+
+        agent = self.get_agent(agent_id)
+        info = agent.get("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        linux_user = str(info.get("linux_user", "")).strip()
+        adapter = get_adapter(provider)
+
+        task = Task(task_id=uuid.uuid4().hex, message=str(message), tier=str(tier or "balanced"))
+        cmd = adapter.deliver_command(agent_id, task, timeout=timeout)
+        runner = run or self._default_deliver_runner(linux_user)
+        stdout = runner(cmd)
+        reply = adapter.parse_reply(stdout)
+
+        result = {
+            "agent_id": agent_id,
+            "task_id": task.task_id,
+            "ok": reply.ok,
+            "output": reply.output,
+            "error": reply.error,
+            "usage": reply.usage,
+            "delivery_status": reply.delivery_status,
+        }
+        state = self.store.read_state()
+        self._event(
+            state,
+            "delegation.delivered" if reply.ok else "delegation.delivery_failed",
+            f"Delivered task to {agent_id}" if reply.ok else f"Delivery to {agent_id} failed",
+            {"agent_id": agent_id, "task_id": task.task_id, "ok": reply.ok, "tier": task.tier},
+        )
+        self.store.write_state(state)
+        return result
+
+    def _default_deliver_runner(self, linux_user: str) -> Callable[[list[str]], str]:
+        """Run an adapter delivery command in the agent user's service env."""
+
+        def _run(cmd: list[str]) -> str:
+            executable = self._resolve_provider_executable("openclaw")
+            argv = [executable, *list(cmd)[1:]]
+            wrapped = self._wrap_user_command(argv, linux_user, purpose="agent delegation")
+            result = subprocess.run(
+                wrapped,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(linux_user),
+            )
+            if result.returncode != 0 and not str(result.stdout).strip():
+                detail = (result.stderr or "").strip() or f"exit {result.returncode}"
+                raise SetupError(f"openclaw agent delivery failed: {detail}")
+            return result.stdout
+
+        return _run

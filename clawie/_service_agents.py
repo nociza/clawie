@@ -539,6 +539,26 @@ class AgentOpsMixin:
         self.store.write_state(state)
         return agent
 
+    def _allocate_gateway_port(self, base: int = 18789) -> int:
+        """Pick the next free per-agent gateway port, starting at *base* (18789).
+
+        One openclaw gateway runs per agent Linux user, so each managed agent
+        needs a distinct loopback port (mirrors display VNC port allocation).
+        """
+        state = self.store.read_state()
+        agents = state.get("agents", state.get("users", {}))
+        used: set[int] = set()
+        for row in agents.values():
+            if not isinstance(row, dict):
+                continue
+            port = int(row.get("agent", {}).get("gateway_port", 0) or 0)
+            if port:
+                used.add(port)
+        port = int(base)
+        while port in used:
+            port += 1
+        return port
+
     def _prepare_agent_provider_home(
         self,
         *,
@@ -582,6 +602,13 @@ class AgentOpsMixin:
                 api_key=api_key,
             )
             return
+        gw = agent.setdefault("agent", {})
+        from clawie.adapters import OpenclawAdapter
+
+        gateway_port = int(gw.get("gateway_port") or 0) or self._allocate_gateway_port()
+        gateway_token = str(gw.get("gateway_token") or "") or OpenclawAdapter.new_gateway_token()
+        gw["gateway_port"] = gateway_port
+        gw["gateway_token"] = gateway_token
         self._ensure_openclaw_home_prepared(
             home=home,
             linux_user=linux_user,
@@ -589,6 +616,8 @@ class AgentOpsMixin:
             live_payloads=live_payloads,
             auth_mode=auth_mode,
             api_key=api_key,
+            gateway_port=gateway_port,
+            gateway_token=gateway_token,
         )
 
     def _ensure_picoclaw_home_prepared(
@@ -761,6 +790,8 @@ class AgentOpsMixin:
         live_payloads: dict[tuple[str, str], dict[str, Any]],
         auth_mode: str,
         api_key: str,
+        gateway_port: int | None = None,
+        gateway_token: str = "",
     ) -> None:
         root = home / ".openclaw"
         root.mkdir(parents=True, exist_ok=True)
@@ -776,6 +807,15 @@ class AgentOpsMixin:
             gateway_cfg = {}
         gateway_cfg["mode"] = "local"
         config["gateway"] = gateway_cfg
+        if gateway_port and gateway_token:
+            # Make this agent's gateway addressable for delegation: loopback
+            # bind, a deterministic per-agent port, and token auth.
+            from clawie.adapters import OpenclawAdapter, deep_merge
+
+            config = deep_merge(
+                config,
+                OpenclawAdapter().gateway_config_patch(port=int(gateway_port), token=gateway_token),
+            )
 
         agents_cfg = config.get("agents", {})
         if not isinstance(agents_cfg, dict):

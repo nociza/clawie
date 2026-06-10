@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, runtime_checkable
 
@@ -248,6 +249,11 @@ class OpenclawAdapter:
                 "auth": {"mode": "token", "token": str(token)},
             }
         }
+
+    @staticmethod
+    def new_gateway_token() -> str:
+        """A fresh per-agent gateway auth token (URL-safe, ~256 bits of entropy)."""
+        return secrets.token_urlsafe(32)
 
     # --- models --------------------------------------------------------------
 

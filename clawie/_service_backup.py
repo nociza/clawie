@@ -488,6 +488,9 @@ class BackupOpsMixin:
             for agent in agents.values():
                 if not isinstance(agent, dict):
                     continue
+                info = agent.get("agent", {})
+                if isinstance(info, dict) and str(info.get("gateway_token", "")).strip():
+                    info["gateway_token"] = "<redacted>"
                 channels = agent.get("channels", [])
                 if not isinstance(channels, list):
                     continue

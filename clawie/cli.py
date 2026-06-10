@@ -1096,7 +1096,7 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
     delegation_sub = delegation.add_subparsers(
         dest="delegation_command",
         required=True,
-        metavar="{submit,repl,tree,tasks,spawn-session,stop-session,session-agents,cleanup,status}",
+        metavar="{submit,deliver,repl,tree,tasks,spawn-session,stop-session,session-agents,cleanup,status}",
     )
 
     deleg_submit = delegation_sub.add_parser("submit", help="Delegate a task")
@@ -1106,6 +1106,18 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
     deleg_submit.add_argument("--timeout", type=float, default=300.0, help="Timeout seconds")
     deleg_submit.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
     deleg_submit.set_defaults(func=cmd_delegation_submit)
+
+    deleg_deliver = delegation_sub.add_parser(
+        "deliver", help="Deliver a task to an agent's gateway and print the reply"
+    )
+    deleg_deliver.add_argument("--agent", required=True, help="Target agent ID")
+    deleg_deliver.add_argument("--message", required=True, help="Task message")
+    deleg_deliver.add_argument(
+        "--tier", choices=["fast", "balanced", "power"], default="balanced", help="Model tier"
+    )
+    deleg_deliver.add_argument("--timeout", type=float, default=300.0, help="Timeout seconds")
+    deleg_deliver.add_argument("--json", action="store_true", help="Emit the reply as JSON")
+    deleg_deliver.set_defaults(func=cmd_delegation_deliver)
 
     deleg_repl = delegation_sub.add_parser("repl", help="Start agent REPL (blocks)")
     deleg_repl.add_argument("--agent-id", required=True, help="Agent ID")
@@ -2945,6 +2957,26 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) ->
         ],
     )
     return 0
+
+
+def cmd_delegation_deliver(args: argparse.Namespace, service: ZeroClawService) -> int:
+    result = service.deliver_to_agent(
+        args.agent,
+        args.message,
+        tier=getattr(args, "tier", "balanced") or "balanced",
+        timeout=args.timeout,
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("ok") else 1
+    if result.get("ok"):
+        print_success(f"Delivered to {args.agent}")
+        output = str(result.get("output", "")).strip()
+        if output:
+            print(output)
+        return 0
+    print_error(f"Delivery to {args.agent} failed: {result.get('error', '')}")
+    return 1
 
 
 def cmd_delegation_repl(args: argparse.Namespace, service: ZeroClawService) -> int:

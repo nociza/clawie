@@ -94,3 +94,51 @@ def test_default_deliver_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     result = service.deliver_to_agent("alice", "x")
     assert result["ok"] is True
     assert result["output"] == "ok"
+
+
+def test_cli_delegation_deliver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from clawie.cli import main
+
+    monkeypatch.setattr(
+        ZeroClawService,
+        "deliver_to_agent",
+        lambda self, agent_id, message, **kw: {
+            "agent_id": agent_id,
+            "task_id": "t",
+            "ok": True,
+            "output": "RESULT",
+            "error": "",
+            "usage": {},
+            "delivery_status": "sent",
+        },
+    )
+    code = main(["--config-dir", str(tmp_path), "delegation", "deliver", "--agent", "alice", "--message", "hi"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "RESULT" in out
+
+
+def test_cli_delegation_deliver_failure_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from clawie.cli import main
+
+    monkeypatch.setattr(
+        ZeroClawService,
+        "deliver_to_agent",
+        lambda self, agent_id, message, **kw: {
+            "agent_id": agent_id,
+            "task_id": "t",
+            "ok": False,
+            "output": "",
+            "error": "boom",
+            "usage": {},
+            "delivery_status": "",
+        },
+    )
+    code = main(
+        ["--config-dir", str(tmp_path), "delegation", "deliver", "--agent", "alice", "--message", "hi", "--json"]
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert '"ok": false' in out

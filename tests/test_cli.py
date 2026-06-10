@@ -2263,20 +2263,6 @@ def test_ensure_system_shared_runtime_seeds_claude_and_profiles(
     shared_dir = tmp_path / "var" / "lib" / "clawie" / "claude-shared"
     shared_dir.parent.mkdir(parents=True)
     brew_prefix = tmp_path / "homebrew"
-    claude_cli = (
-        brew_prefix
-        / "bin"
-        / "global"
-        / "5"
-        / ".pnpm"
-        / "@anthropic-ai+claude-code@2.1.62"
-        / "node_modules"
-        / "@anthropic-ai"
-        / "claude-code"
-        / "cli.js"
-    )
-    claude_cli.parent.mkdir(parents=True)
-    claude_cli.write_text("mode:384\nbt9(K,384)\n", encoding="utf-8")
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(ClawieService, "HOMEBREW_PREFIX", brew_prefix)
@@ -2301,10 +2287,6 @@ def test_ensure_system_shared_runtime_seeds_claude_and_profiles(
     assert shared_state.exists()
     assert (shared_credentials.stat().st_mode & 0o777) == 0o666
     assert (shared_state.stat().st_mode & 0o777) == 0o666
-
-    patched_cli = claude_cli.read_text(encoding="utf-8")
-    assert "mode:438" in patched_cli
-    assert "bt9(K,438)" in patched_cli
 
     assert str(shared_credentials) in updated
     assert str(profile_dir / "20-claude-shared.sh") in updated

@@ -320,32 +320,6 @@ class SpawnOpsMixin:
             changed = True
         return changed
 
-    def _patch_claude_cli_for_shared_permissions(self) -> str:
-        global_root = self.HOMEBREW_PREFIX / "bin" / "global"
-        if not global_root.exists():
-            return ""
-        candidates: list[Path] = []
-        for row in global_root.rglob("cli.js"):
-            token = str(row)
-            if "@anthropic-ai+claude-code@" not in token:
-                continue
-            if not token.endswith("/node_modules/@anthropic-ai/claude-code/cli.js"):
-                continue
-            candidates.append(row)
-        if not candidates:
-            return ""
-        target = sorted(candidates)[-1]
-        text = target.read_text(encoding="utf-8")
-        rendered = text.replace("mode:384", "mode:438").replace("bt9(K,384)", "bt9(K,438)")
-        changed = rendered != text
-        if changed:
-            target.write_text(rendered, encoding="utf-8")
-        current_mode = int(target.stat().st_mode) & 0o777
-        if current_mode != 0o644:
-            os.chmod(target, 0o644)
-            changed = True
-        return str(target) if changed else ""
-
     def _seed_shared_claude_state(self, source_home: Path) -> list[str]:
         shared = self.SHARED_CLAUDE_DIR
         updated: list[str] = []
@@ -438,9 +412,6 @@ class SpawnOpsMixin:
             if path not in updated:
                 updated.append(path)
 
-        patched = self._patch_claude_cli_for_shared_permissions()
-        if patched and patched not in updated:
-            updated.append(patched)
         return updated
 
     def _apply_spawn_password(

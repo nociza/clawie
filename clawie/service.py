@@ -48,7 +48,7 @@ STATUS_SECTIONS: tuple[str, ...] = (
 )
 
 
-class ZeroClawService(
+class ClawieService(
     SharedInfraMixin,
     ProviderAuthMixin,
     AddonOpsMixin,

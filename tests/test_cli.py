@@ -19,7 +19,7 @@ from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
 from clawie.addon_auth import parse_gws_status_output
 from clawie.provider_channels import OpenClawChannelAdapter
-from clawie.service import SetupError, ZeroClawService
+from clawie.service import SetupError, ClawieService
 from clawie.store import StateStore
 
 
@@ -55,7 +55,7 @@ def test_setup_openclaw_without_api_key(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "install_provider_runtime",
         lambda self, provider: {
             "provider": provider,
@@ -98,7 +98,7 @@ def test_runtime_install_cli(
 ) -> None:
     seen: list[str] = []
 
-    def fake_install(self: ZeroClawService, provider: str) -> dict[str, object]:
+    def fake_install(self: ClawieService, provider: str) -> dict[str, object]:
         seen.append(provider)
         return {
             "provider": provider,
@@ -110,7 +110,7 @@ def test_runtime_install_cli(
             "output": "installed",
         }
 
-    monkeypatch.setattr(ZeroClawService, "install_provider_runtime", fake_install)
+    monkeypatch.setattr(ClawieService, "install_provider_runtime", fake_install)
 
     code = run_cli(tmp_path, "runtime", "install", "picoclaw")
     output = capsys.readouterr().out
@@ -129,7 +129,7 @@ def test_addon_install_cli(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "install_addon",
         lambda self, addon: {
             "addon": addon,
@@ -141,7 +141,7 @@ def test_addon_install_cli(
         },
     )
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "get_addon_status",
         lambda self, addon: {
             "addon": addon,
@@ -169,7 +169,7 @@ def test_addon_install_cli(
 
 
 def test_ensure_addon_installed_uses_service_path_for_existing_binary(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     def fake_which(cmd: str, path: str | None = None) -> str | None:
         if cmd == "gws" and path and "/home/linuxbrew/.linuxbrew/bin" in path:
@@ -185,7 +185,7 @@ def test_ensure_addon_installed_uses_service_path_for_existing_binary(tmp_path: 
 
 
 def test_install_addon_falls_back_to_pnpm_when_npm_missing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     calls: list[list[str]] = []
 
     class Result:
@@ -220,7 +220,7 @@ def test_install_addon_falls_back_to_pnpm_when_npm_missing(tmp_path: Path, monke
 
 
 def test_service_env_includes_shared_toolchain_paths(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     path_entries = service._service_env("").get("PATH", "").split(":")
 
@@ -232,8 +232,8 @@ def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
-    monkeypatch.setattr(ZeroClawService, "_shared_toolchain_home", lambda self: tmp_path / "shared-toolchain")
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(ClawieService, "_shared_toolchain_home", lambda self: tmp_path / "shared-toolchain")
     downloads: list[str] = []
 
     class FakeResponse(io.BytesIO):
@@ -263,7 +263,7 @@ def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
         os.chmod(executable, 0o755)
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    monkeypatch.setattr(ZeroClawService, "_extract_tarball_safe", staticmethod(fake_extract))
+    monkeypatch.setattr(ClawieService, "_extract_tarball_safe", staticmethod(fake_extract))
     monkeypatch.setattr(
         "subprocess.run",
         lambda cmd, **_: Result(stdout="Google Cloud SDK 1.0\n") if cmd[-1] == "version" else Result(),
@@ -285,7 +285,7 @@ def test_relax_shared_path_permissions_preserves_execute_bits(tmp_path: Path) ->
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     os.chmod(path, 0o755)
 
-    ZeroClawService._relax_shared_path_permissions(path)
+    ClawieService._relax_shared_path_permissions(path)
 
     assert oct(path.stat().st_mode & 0o777) == "0o777"
 
@@ -374,7 +374,7 @@ def test_agent_service_status_cli(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "agent_service_action",
         lambda self, agent_id, action: {
             "agent_id": agent_id,
@@ -400,7 +400,7 @@ def test_runtime_service_status_cli(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "local_claw_service_action",
         lambda self, provider, action: {
             "provider": provider,
@@ -475,7 +475,7 @@ def test_runtime_status_shows_auth_state(
     capsys: CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "list_local_runtime_statuses",
         lambda self, refresh=True: [
             {
@@ -507,7 +507,7 @@ def test_runtime_login_prints_auth_status(
     capsys: CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "local_claw_auth_login",
         lambda self, provider: {
             "provider": provider,
@@ -540,7 +540,7 @@ def test_agent_auth_show_prints_status(
     capsys: CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "agent_auth_status",
         lambda self, agent_id: {
             "agent_id": agent_id,
@@ -573,7 +573,7 @@ def test_agent_auth_login_prints_status(
     capsys: CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "agent_auth_login",
         lambda self, agent_id: {
             "agent_id": agent_id,
@@ -642,9 +642,9 @@ def test_spawn_success_with_mocks(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -719,9 +719,9 @@ def test_spawn_uses_global_password_hash(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -765,9 +765,9 @@ def test_spawn_generates_password_and_prints_it(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -818,9 +818,9 @@ def test_spawn_uses_per_agent_plaintext_password(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -868,9 +868,9 @@ def test_spawn_creates_linux_user_with_bash_shell(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -895,9 +895,9 @@ def test_disable_ssh_login_for_user_writes_denyusers_and_reloads(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     deny_file = tmp_path / "sshd_config.d" / "99-clawie-no-ssh.conf"
-    monkeypatch.setattr(ZeroClawService, "SSHD_DENY_USERS_FILE", deny_file)
+    monkeypatch.setattr(ClawieService, "SSHD_DENY_USERS_FILE", deny_file)
 
     calls: list[list[str]] = []
 
@@ -951,7 +951,7 @@ def test_purge_removes_agent_and_linux_user_with_root(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(tmp_path, "agent", "purge", "teleclaw", "--yes")
     output = capsys.readouterr().out
@@ -1037,9 +1037,9 @@ allowed_users = ["*"]
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -1090,9 +1090,9 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -1120,7 +1120,7 @@ def test_spawn_clones_core_prompts_from_local_source_home(
 def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     assert run_cli(tmp_path, "config", "set", "--provider", "zeroclaw") == 0
     capsys.readouterr()
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.create_agent(
         agent_id="src",
         display_name=None,
@@ -1264,7 +1264,7 @@ def test_dashboard_local_rows_use_sudo_user_home(
     monkeypatch.setattr("pwd.getpwnam", lambda _: UserInfo())
     monkeypatch.setattr("clawie.service.detect_installed_providers", fake_detect)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     snapshot = service.performance_snapshot(refresh=False)
     ids = {str(row.get("agent_id", "")) for row in snapshot["rows"]}
 
@@ -1369,8 +1369,8 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -1423,7 +1423,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", lambda cmd, **_kwargs: calls.append(cmd) or Result())
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
 
     service.set_agent_credential_bundles("alice", ["provider-auth", "git"])
     sync = service.sync_agent_credentials("alice", source_home=source_home)
@@ -1450,9 +1450,9 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -1503,7 +1503,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", lambda cmd, **_kwargs: calls.append(cmd) or Result())
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
 
     result = service.import_shared_auth("picoclaw", source="codex", source_home=source_home)
     assert result["source"] == "codex"
@@ -1536,9 +1536,9 @@ def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -1584,9 +1584,9 @@ def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -1640,7 +1640,7 @@ def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
     monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
     monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: target_home)
     monkeypatch.setattr(service, "_run_provider_auth_status", lambda **_kwargs: None)
-    monkeypatch.setattr(ZeroClawService, "_default_source_home", staticmethod(lambda: source_home))
+    monkeypatch.setattr(ClawieService, "_default_source_home", staticmethod(lambda: source_home))
 
     prepared = service._prepare_linked_auth_for_provider_switch(provider="openclaw", agent=agent)
 
@@ -1657,9 +1657,9 @@ def test_prepare_linked_auth_for_provider_switch_fails_when_no_source_credential
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -1680,7 +1680,7 @@ def test_prepare_linked_auth_for_provider_switch_fails_when_no_source_credential
     agent["credential_sync"] = {"bundles": ["provider-auth"], "shared_provider_auth": True}
     source_home = tmp_path / "source-home"
     source_home.mkdir(parents=True)
-    monkeypatch.setattr(ZeroClawService, "_default_source_home", staticmethod(lambda: source_home))
+    monkeypatch.setattr(ClawieService, "_default_source_home", staticmethod(lambda: source_home))
     monkeypatch.setattr(service, "_run_provider_auth_status", lambda **_kwargs: None)
 
     with raises(SetupError, match="Sign in to Codex first"):
@@ -1692,9 +1692,9 @@ def test_shared_auth_status_prefers_linked_for_openclaw_when_shared_profiles_exi
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -1801,9 +1801,9 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -1876,7 +1876,7 @@ def test_prepare_picoclaw_home_resolves_env_backed_channel_values(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -1951,7 +1951,7 @@ def test_sync_agent_channels_from_provider_replaces_stale_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -1991,8 +1991,8 @@ name = "team"
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
-    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_can_manage_linux_user", lambda self, _user: True)
 
     synced = service.sync_agent_channels_from_provider("teleclaw")
     channels = synced["channels"]
@@ -2006,7 +2006,7 @@ def test_discover_agent_channels_uses_readable_provider_home_without_root(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -2041,9 +2041,9 @@ def test_discover_agent_channels_uses_readable_provider_home_without_root(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _payload: home)
-    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: False)
-    monkeypatch.setattr(ZeroClawService, "_live_provider_names_for_user", lambda self, _user: ["openclaw"])
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _payload: home)
+    monkeypatch.setattr(ClawieService, "_can_manage_linux_user", lambda self, _user: False)
+    monkeypatch.setattr(ClawieService, "_live_provider_names_for_user", lambda self, _user: ["openclaw"])
 
     discovery = service._discover_agent_channels(agent)
     payloads = service._discover_live_channel_payloads(agent)
@@ -2059,7 +2059,7 @@ def test_agent_channel_view_prefers_live_provider_channels_after_cutover(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     payload = {
         "agent_id": "teleclaw",
         "channels": [{"kind": "cli", "name": "local", "enabled": True, "external_id": "teleclaw:cli:1"}],
@@ -2069,18 +2069,18 @@ def test_agent_channel_view_prefers_live_provider_channels_after_cutover(
         },
     }
     home = tmp_path / "teleclaw-home"
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _payload: home)
-    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
-    monkeypatch.setattr(ZeroClawService, "_live_provider_names_for_user", lambda self, _user: ["picoclaw"])
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _payload: home)
+    monkeypatch.setattr(ClawieService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(ClawieService, "_live_provider_names_for_user", lambda self, _user: ["picoclaw"])
 
-    def fake_discover(self: ZeroClawService, provider: str, root: Path) -> list[dict[str, str]]:
+    def fake_discover(self: ClawieService, provider: str, root: Path) -> list[dict[str, str]]:
         if provider == "picoclaw":
             return [{"kind": "telegram", "name": "telegram", "enabled": True}]
         if provider == "zeroclaw":
             return [{"kind": "cli", "name": "local", "enabled": True}]
         return []
 
-    monkeypatch.setattr(ZeroClawService, "_discover_channels_for_provider_root", fake_discover)
+    monkeypatch.setattr(ClawieService, "_discover_channels_for_provider_root", fake_discover)
 
     view = service._attach_agent_channel_view(payload)
     live_or_discovered = [
@@ -2103,7 +2103,7 @@ def test_shared_auth_show_cli_lists_rows(
     monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "list_shared_auth_statuses",
         lambda self: [
             {
@@ -2163,7 +2163,7 @@ def test_copy_selected_paths_deduplicates_and_copies(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     copied = service._copy_selected_paths(
         source_home=source_home,
         target_home=target_home,
@@ -2201,7 +2201,7 @@ def test_ensure_shared_toolchain_shell_init_writes_profiles(
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     updated = service._ensure_shared_toolchain_shell_init(target_home=target_home, username="sam")
 
     assert str(target_home / ".profile") in updated
@@ -2239,7 +2239,7 @@ def test_ensure_shared_toolchain_shell_init_is_idempotent(
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     first = service._ensure_shared_toolchain_shell_init(target_home=target_home, username="sam")
     assert len(first) == 2
 
@@ -2279,14 +2279,14 @@ def test_ensure_system_shared_runtime_seeds_claude_and_profiles(
     claude_cli.write_text("mode:384\nbt9(K,384)\n", encoding="utf-8")
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
-    monkeypatch.setattr(ZeroClawService, "HOMEBREW_PREFIX", brew_prefix)
-    monkeypatch.setattr(ZeroClawService, "GLOBAL_PROFILE_DIR", profile_dir)
-    monkeypatch.setattr(ZeroClawService, "GLOBAL_HOMEBREW_PROFILE_FILE", profile_dir / "00-homebrew.sh")
-    monkeypatch.setattr(ZeroClawService, "GLOBAL_FNM_PROFILE_FILE", profile_dir / "zz-fnm.sh")
-    monkeypatch.setattr(ZeroClawService, "GLOBAL_CLAUDE_PROFILE_FILE", profile_dir / "20-claude-shared.sh")
-    monkeypatch.setattr(ZeroClawService, "SHARED_CLAUDE_DIR", shared_dir)
+    monkeypatch.setattr(ClawieService, "HOMEBREW_PREFIX", brew_prefix)
+    monkeypatch.setattr(ClawieService, "GLOBAL_PROFILE_DIR", profile_dir)
+    monkeypatch.setattr(ClawieService, "GLOBAL_HOMEBREW_PROFILE_FILE", profile_dir / "00-homebrew.sh")
+    monkeypatch.setattr(ClawieService, "GLOBAL_FNM_PROFILE_FILE", profile_dir / "zz-fnm.sh")
+    monkeypatch.setattr(ClawieService, "GLOBAL_CLAUDE_PROFILE_FILE", profile_dir / "20-claude-shared.sh")
+    monkeypatch.setattr(ClawieService, "SHARED_CLAUDE_DIR", shared_dir)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     updated = service._ensure_system_shared_runtime(source_home)
 
     assert (profile_dir / "00-homebrew.sh").exists()
@@ -2336,9 +2336,9 @@ def test_ensure_shared_claude_links_points_home_to_shared_store(
         return Result()
 
     monkeypatch.setattr("subprocess.run", fake_run)
-    monkeypatch.setattr(ZeroClawService, "SHARED_CLAUDE_DIR", shared_dir)
+    monkeypatch.setattr(ClawieService, "SHARED_CLAUDE_DIR", shared_dir)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     updated = service._ensure_shared_claude_links(target_home=target_home, username="sam")
 
     assert str(target_home / ".claude") in updated
@@ -2352,7 +2352,7 @@ def test_ensure_shared_claude_links_points_home_to_shared_store(
 
 
 def test_service_toggles_channel_plugin_and_autostart(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -2387,9 +2387,9 @@ def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     shared_root = tmp_path / "shared-addon-auth"
-    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    monkeypatch.setattr(ClawieService, "_shared_addon_auth_home", lambda self: shared_root)
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -2422,10 +2422,10 @@ def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
-    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_can_manage_linux_user", lambda self, _user: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_addon_installed",
         lambda self, addon: {
             "addon": addon,
@@ -2437,7 +2437,7 @@ def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
         },
     )
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "_resolve_executable_in_service_env",
         lambda self, executable, linux_user="": "",
     )
@@ -2462,9 +2462,9 @@ def test_enable_agent_addon_can_trigger_shared_login_when_requested(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     shared_root = tmp_path / "shared-addon-auth"
-    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    monkeypatch.setattr(ClawieService, "_shared_addon_auth_home", lambda self: shared_root)
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -2492,7 +2492,7 @@ def test_enable_agent_addon_can_trigger_shared_login_when_requested(
 
     calls: list[str] = []
 
-    def fake_status(self: ZeroClawService, addon: str) -> dict[str, object]:
+    def fake_status(self: ClawieService, addon: str) -> dict[str, object]:
         if (shared_dir / "credentials.json").exists():
             return {
                 "addon": addon,
@@ -2513,17 +2513,17 @@ def test_enable_agent_addon_can_trigger_shared_login_when_requested(
             "linked_agents": [],
         }
 
-    def fake_login(self: ZeroClawService, addon: str) -> dict[str, object]:
+    def fake_login(self: ClawieService, addon: str) -> dict[str, object]:
         calls.append(addon)
         (shared_dir / "credentials.json").write_text('{"refresh_token":"rtok"}\n', encoding="utf-8")
         return fake_status(self, addon)
 
-    monkeypatch.setattr(ZeroClawService, "shared_addon_auth_status", fake_status)
-    monkeypatch.setattr(ZeroClawService, "shared_addon_auth_login", fake_login)
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
-    monkeypatch.setattr(ZeroClawService, "_can_manage_linux_user", lambda self, _user: True)
+    monkeypatch.setattr(ClawieService, "shared_addon_auth_status", fake_status)
+    monkeypatch.setattr(ClawieService, "shared_addon_auth_login", fake_login)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_can_manage_linux_user", lambda self, _user: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_addon_installed",
         lambda self, addon: {
             "addon": addon,
@@ -2549,9 +2549,9 @@ def test_get_agent_addons_reports_permission_for_other_linux_user(
     # Force a non-root euid: root can manage any linux_user, which would
     # bypass the permission report this test asserts on.
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     shared_root = tmp_path / "shared-addon-auth"
-    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    monkeypatch.setattr(ClawieService, "_shared_addon_auth_home", lambda self: shared_root)
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -2576,14 +2576,14 @@ def test_get_agent_addons_reports_permission_for_other_linux_user(
 
     target_home = tmp_path / "target-home"
     target_home.mkdir(parents=True)
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: target_home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "_resolve_executable_in_service_env",
         lambda self, executable, linux_user="": "/mock/bin/gws" if executable == "gws" else "",
     )
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "shared_addon_auth_status",
         lambda self, addon: {
             "addon": addon,
@@ -2609,9 +2609,9 @@ def test_shared_addon_auth_login_gws_bootstraps_gcloud_before_setup(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     shared_root = tmp_path / "shared-addon-auth"
-    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    monkeypatch.setattr(ClawieService, "_shared_addon_auth_home", lambda self: shared_root)
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -2638,7 +2638,7 @@ def test_shared_addon_auth_login_gws_bootstraps_gcloud_before_setup(
         return Result()
 
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_addon_installed",
         lambda self, addon: {
             "addon": addon,
@@ -2650,7 +2650,7 @@ def test_shared_addon_auth_login_gws_bootstraps_gcloud_before_setup(
         },
     )
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_support_tool_installed",
         lambda self, tool: tool_calls.append(tool) or {
             "tool": tool,
@@ -2675,9 +2675,9 @@ def test_shared_addon_auth_status_gws_uses_command_output_over_stub_files(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     shared_root = tmp_path / "shared-addon-auth"
-    monkeypatch.setattr(ZeroClawService, "_shared_addon_auth_home", lambda self: shared_root)
+    monkeypatch.setattr(ClawieService, "_shared_addon_auth_home", lambda self: shared_root)
     shared_dir = service._ensure_shared_addon_config_dir("gws")
     (shared_dir / "credentials.json").write_text('{"refresh_token":"rtok"}\n', encoding="utf-8")
     (shared_dir / "client_secret.json").write_text('{"installed":{"client_id":"cid"}}\n', encoding="utf-8")
@@ -2689,7 +2689,7 @@ def test_shared_addon_auth_status_gws_uses_command_output_over_stub_files(
             self.returncode = returncode
 
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "_resolve_executable_in_service_env",
         lambda self, executable, linux_user="": "/mock/bin/gws" if executable == "gws" else "",
     )
@@ -2724,7 +2724,7 @@ def test_service_action_runs_provider_service_command(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -2768,10 +2768,10 @@ def test_service_action_runs_provider_service_command(
     # On real hosts the generated user unit cannot be written for a foreign
     # user without root; replicate that here so the direct provider-command
     # path is exercised even when the suite itself runs as root.
-    def deny_unit(self: ZeroClawService, provider: str, linux_user: str) -> None:
+    def deny_unit(self: ClawieService, provider: str, linux_user: str) -> None:
         raise PermissionError("unit dir not writable")
 
-    monkeypatch.setattr(ZeroClawService, "_ensure_generated_user_service_unit", deny_unit)
+    monkeypatch.setattr(ClawieService, "_ensure_generated_user_service_unit", deny_unit)
 
     result = service.agent_service_action("alice", "status")
     assert result["service_status"] == "running"
@@ -2781,7 +2781,7 @@ def test_service_action_runs_provider_service_command(
 def test_dashboard_status_prefers_service_status(
     tmp_path: Path,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -2821,7 +2821,7 @@ def test_dashboard_refresh_updates_local_service_status(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -2864,7 +2864,7 @@ def test_dashboard_refresh_local_status_uses_sudo_user_context(
         pw_dir = "/root"
         pw_name = "root"
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -2905,7 +2905,7 @@ def test_local_agent_view_refreshes_service_status(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -2980,7 +2980,7 @@ def test_local_claw_auth_login_refreshes_before_login(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -3013,12 +3013,12 @@ def test_local_claw_auth_login_refreshes_before_login(
     )
 
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "_inspect_provider_auth_state",
         lambda self, **kwargs: dict(next(states)),
     )
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "_resolve_local_runtime_target",
         lambda self, provider: {"linux_user": "", "home": str(tmp_path), "root": ""},
     )
@@ -3051,7 +3051,7 @@ def test_set_agent_provider_updates_runtime_and_auth_mode(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -3091,7 +3091,7 @@ def test_set_agent_provider_updates_runtime_and_auth_mode(
 
 
 def test_set_agent_provider_uses_default_auth_mode_when_target_has_no_global_config(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3122,7 +3122,7 @@ def test_set_agent_provider_prefers_linked_auth_when_shared_provider_auth_is_rea
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3159,9 +3159,9 @@ def test_agent_auth_status_prefers_linked_for_shared_openclaw_auth_even_when_sta
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3218,8 +3218,8 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3286,8 +3286,8 @@ def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
     monkeypatch: MonkeyPatch,
 ) -> None:
     shared_home = tmp_path / "shared-provider-auth"
-    monkeypatch.setattr(ZeroClawService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_home)
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3358,7 +3358,7 @@ def test_ensure_openclaw_agent_auth_link_skips_unwritable_non_root_target(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     root = home / ".openclaw"
     source = root / "auth-profiles.json"
@@ -3400,7 +3400,7 @@ def test_get_dashboard_agent_reconciles_provider_to_live_runtime_and_sets_remedi
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3462,7 +3462,7 @@ def test_get_dashboard_agent_uses_managed_provider_status_when_ps_misses_opencla
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3508,7 +3508,7 @@ def test_get_dashboard_agent_marks_managed_status_unknown_when_non_root_cannot_p
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -3552,7 +3552,7 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -3663,7 +3663,7 @@ def test_picoclaw_home_prepare_rejects_invalid_telegram_token(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
 
@@ -3691,7 +3691,7 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     token = _fake_telegram_token()
     monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
@@ -3742,7 +3742,7 @@ def test_ensure_openclaw_home_prepared_preserves_reachability_when_migrating_tel
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     token = _fake_telegram_token()
     monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
@@ -3777,7 +3777,7 @@ def test_ensure_openclaw_home_prepared_heals_legacy_pairing_dm_policy_without_al
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     token = _fake_telegram_token()
     monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
@@ -3813,7 +3813,7 @@ def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     root = home / ".openclaw"
     root.mkdir(parents=True)
@@ -3849,7 +3849,7 @@ def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without
 
 
 def test_read_openclaw_channel_payloads_ignores_channel_defaults(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     root = tmp_path / ".openclaw"
     root.mkdir()
     (root / "openclaw.json").write_text(
@@ -3912,7 +3912,7 @@ def test_assert_provider_postflight_ready_runs_openclaw_models_status(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     home = tmp_path / "teleclaw-home"
     (home / ".openclaw").mkdir(parents=True)
     (home / ".openclaw" / "auth-profiles.json").write_text(
@@ -3966,12 +3966,12 @@ def test_provider_from_process_args_detects_openclaw_module_process() -> None:
         "/home/linuxbrew/.linuxbrew/bin/global/5/.pnpm/openclaw@2026.3.7/node_modules/openclaw/openclaw.mjs "
         "gateway run"
     )
-    assert ZeroClawService._provider_from_process_args(args) == "openclaw"
+    assert ClawieService._provider_from_process_args(args) == "openclaw"
 
 
 def _mock_openclaw_generated_user_unit(
     monkeypatch: MonkeyPatch,
-    service: ZeroClawService,
+    service: ClawieService,
     runtime_state: dict[str, bool],
 ) -> list[tuple[str, str, str]]:
     actions: list[tuple[str, str, str]] = []
@@ -4005,7 +4005,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4115,7 +4115,7 @@ def test_switch_agent_provider_returns_auth_prepare_details(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4208,7 +4208,7 @@ def test_switch_agent_provider_restarts_same_provider_to_apply_reconciled_config
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -4271,7 +4271,7 @@ def test_switch_agent_provider_succeeds_when_status_reports_running_but_ps_misse
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4360,7 +4360,7 @@ def test_agent_service_start_installs_generated_picoclaw_user_unit(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -4444,7 +4444,7 @@ def test_switch_agent_provider_force_stops_lingering_zeroclaw_when_bus_control_f
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4549,7 +4549,7 @@ def test_switch_agent_provider_fails_when_live_runtime_does_not_cut_over(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4628,7 +4628,7 @@ def test_set_agent_provider_requires_root_for_managed_user_switch(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4676,7 +4676,7 @@ def test_agent_auth_status_reports_permission_barrier_for_managed_user(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -4713,7 +4713,7 @@ def test_service_action_requires_root_for_other_linux_user(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4745,7 +4745,7 @@ def test_service_action_requires_root_for_other_linux_user(
 
 def test_create_agent_defaults_to_no_channels(tmp_path: Path) -> None:
     store = StateStore(config_dir=tmp_path)
-    service = ZeroClawService(store)
+    service = ClawieService(store)
     service.setup(
         provider="openclaw",
         api_key="",
@@ -4769,7 +4769,7 @@ def test_create_agent_defaults_to_no_channels(tmp_path: Path) -> None:
 
 def test_create_agent_ignores_stale_template_runtime_for_new_agents(tmp_path: Path) -> None:
     store = StateStore(config_dir=tmp_path)
-    service = ZeroClawService(store)
+    service = ClawieService(store)
     service.setup(
         provider="openclaw",
         api_key="",
@@ -4800,7 +4800,7 @@ def test_service_action_falls_back_when_bus_unavailable(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -4821,7 +4821,7 @@ def test_service_action_falls_back_when_bus_unavailable(
     state = service.store.read_state()
     state["agents"]["teleclaw"] = agent
     service.store.write_state(state)
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: tmp_path / "teleclaw-home")
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: tmp_path / "teleclaw-home")
 
     class Result:
         def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
@@ -4856,7 +4856,7 @@ def test_service_action_fallback_uses_provider_state_dir(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -4894,7 +4894,7 @@ def test_service_action_fallback_uses_provider_state_dir(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: home)
     agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
 
     commands: list[list[str]] = []
@@ -4936,10 +4936,10 @@ def test_service_action_fallback_uses_provider_state_dir(
     # Replicate the non-root reality where the foreign user's unit file
     # cannot be written, so the process-fallback path under test is taken
     # even when the suite itself runs as root.
-    def deny_unit(self: ZeroClawService, provider: str, linux_user: str) -> None:
+    def deny_unit(self: ClawieService, provider: str, linux_user: str) -> None:
         raise PermissionError("unit dir not writable")
 
-    monkeypatch.setattr(ZeroClawService, "_ensure_generated_user_service_unit", deny_unit)
+    monkeypatch.setattr(ClawieService, "_ensure_generated_user_service_unit", deny_unit)
 
     result = service.agent_service_action("teleclaw", "start")
     assert result["service_status"] == "running"
@@ -4950,7 +4950,7 @@ def test_agent_service_start_surfaces_picoclaw_daemon_log_on_failure(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -4988,7 +4988,7 @@ def test_agent_service_start_surfaces_picoclaw_daemon_log_on_failure(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: home)
     agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
 
     class Result:
@@ -5026,7 +5026,7 @@ def test_agent_service_start_surfaces_picoclaw_probe_output_when_log_is_empty(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -5064,7 +5064,7 @@ def test_agent_service_start_surfaces_picoclaw_probe_output_when_log_is_empty(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr(ZeroClawService, "_agent_linux_home", lambda self, _agent: home)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: home)
     agent["channels"] = [{"kind": "telegram", "name": "teleclaw-team", "enabled": True}]
 
     class Result:
@@ -5101,7 +5101,7 @@ def test_attach_agent_runtime_status_marks_managed_agent_stopped_when_no_live_da
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     payload = {
         "agent": {
             "provider": "openclaw",
@@ -5124,7 +5124,7 @@ def test_performance_snapshot_includes_local_user_claw_rows(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5156,7 +5156,7 @@ def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5211,7 +5211,7 @@ def test_local_claw_service_action_updates_local_state(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5247,7 +5247,7 @@ def test_local_claw_service_status_falls_back_to_stopped_on_command_failure(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5278,7 +5278,7 @@ def test_local_claw_service_status_empty_success_output_uses_best_effort(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5314,7 +5314,7 @@ def test_local_claw_service_stop_prefers_systemd_machine_control(
         pw_dir = "/root"
         pw_name = "root"
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5357,7 +5357,7 @@ def test_dashboard_refresh_local_status_non_bus_error_uses_best_effort(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5392,7 +5392,7 @@ def test_dashboard_refresh_local_status_empty_success_output_uses_best_effort(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5432,7 +5432,7 @@ def test_dashboard_refresh_local_status_retries_as_sudo_user_for_parseable_outpu
         pw_dir = "/root"
         pw_name = "root"
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5482,7 +5482,7 @@ def test_dashboard_refresh_uses_user_hint_from_provider_root_when_sudo_user_miss
         pw_dir = "/root"
         pw_name = "root"
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5536,7 +5536,7 @@ def test_dashboard_refresh_prefers_sudo_user_over_root_hint(
         pw_dir = "/root"
         pw_name = "root"
 
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -5576,7 +5576,7 @@ def test_dashboard_refresh_prefers_sudo_user_over_root_hint(
 
 
 def test_preferred_local_linux_user_prioritizes_default_over_cached() -> None:
-    selected = ZeroClawService._preferred_local_linux_user(
+    selected = ClawieService._preferred_local_linux_user(
         default_user="azicon",
         hint_user="teleclaw",
         cached_user="teleclaw",
@@ -5585,16 +5585,16 @@ def test_preferred_local_linux_user_prioritizes_default_over_cached() -> None:
 
 
 def test_parse_systemctl_status_ignores_bus_errors() -> None:
-    assert ZeroClawService._parse_systemctl_status("", "Failed to connect to bus: No medium found") == "unknown"
-    assert ZeroClawService._parse_systemctl_status("active\n", "") == "running"
-    assert ZeroClawService._parse_systemctl_status("inactive\n", "") == "stopped"
+    assert ClawieService._parse_systemctl_status("", "Failed to connect to bus: No medium found") == "unknown"
+    assert ClawieService._parse_systemctl_status("active\n", "") == "running"
+    assert ClawieService._parse_systemctl_status("inactive\n", "") == "stopped"
 
 
 def test_systemd_status_prefers_any_running_candidate_over_stopped(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(service, "_local_target_user", lambda: "root")
@@ -5642,7 +5642,7 @@ def test_channel_inventory_includes_agent_and_local_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5681,7 +5681,7 @@ def test_channel_inventory_includes_agent_and_local_channels(
 
 
 def test_assign_channel_moves_between_agents(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5717,7 +5717,7 @@ def test_assign_channel_moves_between_agents(tmp_path: Path) -> None:
 
 
 def test_assign_channel_without_source_still_moves_existing_owner(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5756,7 +5756,7 @@ def test_assign_channel_without_source_still_moves_existing_owner(tmp_path: Path
 
 
 def test_create_agent_rejects_channel_already_owned_by_another_agent(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5791,7 +5791,7 @@ def test_create_agent_rejects_channel_already_owned_by_another_agent(tmp_path: P
 
 
 def test_clone_with_migrate_transfers_channels_from_source_agent(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5829,7 +5829,7 @@ def test_clone_with_migrate_transfers_channels_from_source_agent(tmp_path: Path)
 
 
 def test_migrate_channels_moves_ownership_instead_of_copying(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5865,7 +5865,7 @@ def test_migrate_channels_moves_ownership_instead_of_copying(tmp_path: Path) -> 
 
 
 def test_unassign_channel_moves_to_pool_and_stays_visible(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5899,7 +5899,7 @@ def test_unassign_channel_moves_to_pool_and_stays_visible(tmp_path: Path) -> Non
 
 
 def test_assign_from_pool_removes_pool_entry(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5945,7 +5945,7 @@ def test_connect_agent_channel_runs_provider_command(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="openclaw",
         api_key="",
@@ -5987,7 +5987,7 @@ def test_connect_agent_channel_rolls_back_assignment_when_provider_command_fails
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="zeroclaw",
         api_key="",
@@ -6029,7 +6029,7 @@ def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     service.setup(
         provider="picoclaw",
         api_key="",
@@ -6046,9 +6046,9 @@ def test_channel_connect_commands_for_picoclaw_do_not_use_channel_add(
 # ── clawie status (unified read-only overview) ──────────────────────────────
 
 
-def _configured_service(tmp_path: Path) -> ZeroClawService:
+def _configured_service(tmp_path: Path) -> ClawieService:
     assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
-    return ZeroClawService(StateStore(config_dir=tmp_path))
+    return ClawieService(StateStore(config_dir=tmp_path))
 
 
 def test_status_snapshot_includes_all_sections(tmp_path: Path) -> None:
@@ -6122,7 +6122,7 @@ def test_dashboard_is_deprecated_alias_for_status(tmp_path: Path, capsys: Captur
 
 
 def test_set_password_plaintext_surfaces_stderr(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     class Result:
         returncode = 1
@@ -6136,7 +6136,7 @@ def test_set_password_plaintext_surfaces_stderr(tmp_path: Path, monkeypatch: Mon
 
 
 def test_set_password_hash_surfaces_stderr(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     class Result:
         returncode = 1
@@ -6170,9 +6170,9 @@ def test_spawn_fails_when_useradd_leaves_no_home(
     monkeypatch.setattr("subprocess.run", fake_run)
     # useradd "succeeds" and registers the user, but its home was never created.
     monkeypatch.setattr("clawie._service_spawn.pwd.getpwnam", lambda _user: FakePwd())
-    monkeypatch.setattr(ZeroClawService, "_disable_ssh_login_for_user", lambda self, _u: True)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _u: True)
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "ensure_provider_runtime",
         lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
     )
@@ -6186,8 +6186,8 @@ def test_spawn_fails_when_useradd_leaves_no_home(
 def test_disable_ssh_login_validates_config_before_reload(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
-    monkeypatch.setattr(ZeroClawService, "SSHD_DENY_USERS_FILE", tmp_path / "deny.conf")
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
+    monkeypatch.setattr(ClawieService, "SSHD_DENY_USERS_FILE", tmp_path / "deny.conf")
     monkeypatch.setattr(
         "clawie._service_spawn.shutil.which",
         lambda name: "/usr/sbin/sshd" if name == "sshd" else None,
@@ -6222,7 +6222,7 @@ def test_disable_ssh_login_validates_config_before_reload(
 def test_ensure_workspace_accessible_collects_warnings_without_raising(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path / "clawie"))
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -6244,7 +6244,7 @@ def test_ensure_workspace_accessible_collects_warnings_without_raising(
 def test_hash_password_falls_back_to_openssl_when_crypt_not_sha512(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
 
     class FakeCrypt:
         METHOD_SHA512 = "sha512"

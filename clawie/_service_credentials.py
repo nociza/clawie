@@ -1,4 +1,4 @@
-"""Credential bundle policy and sync/revoke (ZeroClawService mixin)."""
+"""Credential bundle policy and sync/revoke (ClawieService mixin)."""
 from __future__ import annotations
 
 import shutil

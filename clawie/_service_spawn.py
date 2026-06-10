@@ -1,4 +1,4 @@
-"""Linux user provisioning for managed agents (ZeroClawService mixin)."""
+"""Linux user provisioning for managed agents (ClawieService mixin)."""
 from __future__ import annotations
 
 import copy

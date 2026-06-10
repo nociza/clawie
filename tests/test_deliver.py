@@ -12,15 +12,15 @@ from pathlib import Path
 import pytest
 
 from clawie.adapters import AdapterError
-from clawie.service import ZeroClawService
+from clawie.service import ClawieService
 from clawie.service_common import AgentNotFoundError
 from clawie.store import StateStore
 
 
 def _service_with_agent(
     tmp_path: Path, *, provider: str = "openclaw", linux_user: str = "alice"
-) -> ZeroClawService:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+) -> ClawieService:
+    service = ClawieService(StateStore(config_dir=tmp_path))
     state = service.store.read_state()
     state["agents"] = {
         "alice": {
@@ -65,7 +65,7 @@ def test_deliver_to_agent_error_reply(tmp_path: Path) -> None:
 
 
 def test_deliver_to_agent_unknown_agent(tmp_path: Path) -> None:
-    service = ZeroClawService(StateStore(config_dir=tmp_path))
+    service = ClawieService(StateStore(config_dir=tmp_path))
     with pytest.raises(AgentNotFoundError):
         service.deliver_to_agent("ghost", "x", run=lambda cmd: "{}")
 
@@ -100,7 +100,7 @@ def test_cli_delegation_deliver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     from clawie.cli import main
 
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "deliver_to_agent",
         lambda self, agent_id, message, **kw: {
             "agent_id": agent_id,
@@ -124,7 +124,7 @@ def test_cli_delegation_deliver_failure_json(
     from clawie.cli import main
 
     monkeypatch.setattr(
-        ZeroClawService,
+        ClawieService,
         "deliver_to_agent",
         lambda self, agent_id, message, **kw: {
             "agent_id": agent_id,

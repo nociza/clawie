@@ -1,4 +1,4 @@
-"""Provider auth stores, linked-auth inspection, and login flows (ZeroClawService mixin)."""
+"""Provider auth stores, linked-auth inspection, and login flows (ClawieService mixin)."""
 from __future__ import annotations
 
 import os

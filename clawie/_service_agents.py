@@ -1,4 +1,4 @@
-"""Agent lifecycle and provider switching (ZeroClawService mixin)."""
+"""Agent lifecycle and provider switching (ClawieService mixin)."""
 from __future__ import annotations
 
 import copy

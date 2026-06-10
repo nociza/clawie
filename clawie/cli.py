@@ -16,7 +16,7 @@ from clawie.service import (
     AgentExistsError,
     AgentNotFoundError,
     STATUS_SECTIONS,
-    ZeroClawService,
+    ClawieService,
 )
 from clawie.store import StateStore
 from clawie.ui import (
@@ -1216,7 +1216,7 @@ def _add_positional_argument(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    service = ZeroClawService(StateStore(config_dir=args.config_dir))
+    service = ClawieService(StateStore(config_dir=args.config_dir))
 
     try:
         handler = getattr(args, "func", None)
@@ -1243,7 +1243,7 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
 
-def cmd_config_set(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
     provider = str(args.provider).strip().lower() or "openclaw"
     provider_spec = get_provider(provider)
     api_key = str(args.api_key or "").strip()
@@ -1303,12 +1303,12 @@ def cmd_config_set(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_config_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_config_show(args: argparse.Namespace, service: ClawieService) -> int:
     _ = args
     return _print_setup_status(service)
 
 
-def _print_setup_status(service: ZeroClawService) -> int:
+def _print_setup_status(service: ClawieService) -> int:
     status = service.setup_status()
     print_panel(
         "Config",
@@ -1331,7 +1331,7 @@ def _print_setup_status(service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_shared_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_shared_auth_show(args: argparse.Namespace, service: ClawieService) -> int:
     provider = str(args.provider or "").strip().lower()
     if provider:
         payload = service.shared_auth_status(provider)
@@ -1356,7 +1356,7 @@ def cmd_shared_auth_show(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_shared_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_shared_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     payload = service.shared_auth_login(provider)
     action = str(payload.get("action_performed", "login"))
@@ -1373,7 +1373,7 @@ def cmd_shared_auth_login(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
-def cmd_shared_auth_import(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_shared_auth_import(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     result = service.import_shared_auth(
         provider,
@@ -1399,7 +1399,7 @@ def cmd_shared_auth_import(args: argparse.Namespace, service: ZeroClawService) -
     return 0
 
 
-def cmd_shared_auth_port(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_shared_auth_port(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.port_shared_auth(args.from_provider, args.to_provider)
     profiles = result.get("profiles", [])
     print_success(
@@ -1424,7 +1424,7 @@ def cmd_shared_auth_port(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_shared_auth_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_shared_auth_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = str(args.agent_id or "").strip() or None
     result = service.apply_shared_auth_links(agent_id=agent_id)
     target = agent_id or "eligible agents"
@@ -1460,7 +1460,7 @@ def _print_restart_required_agents(args: argparse.Namespace, agents: Any) -> Non
     )
 
 
-def cmd_addons_list(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addons_list(args: argparse.Namespace, service: ClawieService) -> int:
     _ = args
     rows: list[list[str]] = []
     for addon in service.list_addons():
@@ -1478,7 +1478,7 @@ def cmd_addons_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addons_show(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
     payload = service.get_addon_status(addon)
     _print_addon_status(payload, title="Addon")
@@ -1499,7 +1499,7 @@ def cmd_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_addons_install(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addons_install(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
     payload = service.install_addon(addon)
     print_success(f"Installed addon {payload.get('addon', addon)}")
@@ -1507,7 +1507,7 @@ def cmd_addons_install(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_addon_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addon_auth_show(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
     payload = service.shared_addon_auth_status(addon)
     _print_addon_auth_status(payload, title="Shared Addon Auth")
@@ -1516,7 +1516,7 @@ def cmd_addon_auth_show(args: argparse.Namespace, service: ZeroClawService) -> i
     return 0
 
 
-def cmd_addon_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addon_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
     payload = service.shared_addon_auth_login(addon)
     action = str(payload.get("action_performed", "login"))
@@ -1530,7 +1530,7 @@ def cmd_addon_auth_login(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_addon_auth_import(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_addon_auth_import(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
     result = service.import_shared_addon_auth(
         addon,
@@ -1555,7 +1555,7 @@ def cmd_addon_auth_import(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
-def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
     plugin_overrides = {}
@@ -1580,7 +1580,7 @@ def cmd_agents_create(args: argparse.Namespace, service: ZeroClawService) -> int
     return 0
 
 
-def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     agent_id = _resolve_agent_id(args.agent_id)
     channels = _resolve_channels(args.channel, args.channels_file)
@@ -1606,7 +1606,7 @@ def cmd_agents_clone(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_agents_clone_prompts(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_clone_prompts(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
     updated = service.clone_agent_prompts(
@@ -1619,7 +1619,7 @@ def cmd_agents_clone_prompts(args: argparse.Namespace, service: ZeroClawService)
     return 0
 
 
-def cmd_agents_credentials_bundles(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_credentials_bundles(args: argparse.Namespace, service: ClawieService) -> int:
     _ = args
     rows: list[list[str]] = []
     for item in service.credential_bundle_options():
@@ -1634,7 +1634,7 @@ def cmd_agents_credentials_bundles(args: argparse.Namespace, service: ZeroClawSe
     return 0
 
 
-def cmd_agents_credentials_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_credentials_show(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     payload = service.get_agent_credential_sync(agent_id)
     selected = ", ".join(str(item) for item in payload.get("selected_bundles", [])) or "<none>"
@@ -1665,7 +1665,7 @@ def cmd_agents_credentials_show(args: argparse.Namespace, service: ZeroClawServi
     return 0
 
 
-def cmd_agents_credentials_set(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_credentials_set(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
     agent = service.set_agent_credential_bundles(
@@ -1679,7 +1679,7 @@ def cmd_agents_credentials_set(args: argparse.Namespace, service: ZeroClawServic
     return 0
 
 
-def cmd_agents_credentials_sync(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_credentials_sync(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     override_bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
     result = service.sync_agent_credentials(
@@ -1699,7 +1699,7 @@ def cmd_agents_credentials_sync(args: argparse.Namespace, service: ZeroClawServi
     return 0
 
 
-def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
     result = service.revoke_agent_credentials(
@@ -1717,7 +1717,7 @@ def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ZeroClawSer
     return 0
 
 
-def cmd_agents_addons_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_addons_show(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     payload = service.get_agent_addons(agent_id)
     _print_agent_addons(payload)
@@ -1745,7 +1745,7 @@ def cmd_agents_addons_show(args: argparse.Namespace, service: ZeroClawService) -
     return 0
 
 
-def cmd_agents_addons_enable(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_addons_enable(args: argparse.Namespace, service: ClawieService) -> int:
     from clawie.addons import is_service_addon
 
     agent_id = _resolve_agent_id(args.agent_id)
@@ -1799,7 +1799,7 @@ def cmd_agents_addons_enable(args: argparse.Namespace, service: ZeroClawService)
     return 0
 
 
-def cmd_agents_addons_disable(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_addons_disable(args: argparse.Namespace, service: ClawieService) -> int:
     from clawie.addons import is_service_addon
 
     agent_id = _resolve_agent_id(args.agent_id)
@@ -1827,7 +1827,7 @@ def cmd_agents_addons_disable(args: argparse.Namespace, service: ZeroClawService
     return 0
 
 
-def cmd_agents_addons_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_addons_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     addons = [str(args.addon).strip()] if str(args.addon or "").strip() else None
     result = service.apply_agent_addons(agent_id, addons=addons)
@@ -1842,14 +1842,14 @@ def cmd_agents_addons_apply(args: argparse.Namespace, service: ZeroClawService) 
     return 0
 
 
-def cmd_agents_auth_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_auth_show(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     payload = service.agent_auth_status(agent_id)
     _print_auth_status(payload, title="Agent Auth")
     return 0
 
 
-def cmd_agents_auth_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     payload = service.agent_auth_login(agent_id)
     action = str(payload.get("action_performed", "login"))
@@ -1863,7 +1863,7 @@ def cmd_agents_auth_login(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
-def cmd_agents_service(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_service(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     action = _resolve_required_value(args.agent_service_command, field_name="action")
     result = service.agent_service_action(agent_id, action)
@@ -1884,7 +1884,7 @@ def cmd_agents_service(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_agents_apply_prompts(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_apply_prompts(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     result = service.apply_staged_prompts(agent_id)
     applied = result.get("applied", [])
@@ -1902,7 +1902,7 @@ def cmd_agents_apply_prompts(args: argparse.Namespace, service: ZeroClawService)
     return 0
 
 
-def cmd_agents_fix_permissions(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_fix_permissions(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     manager = getattr(args, "manager", "") or ""
     result = service.ensure_agent_permissions(agent_id, manager_user=manager)
@@ -1922,7 +1922,7 @@ def cmd_agents_fix_permissions(args: argparse.Namespace, service: ZeroClawServic
     return 0
 
 
-def cmd_agents_provider_set(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_provider_set(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     provider = _resolve_required_value(args.provider, field_name="provider")
     result = service.switch_agent_provider(agent_id, provider)
@@ -1969,7 +1969,7 @@ def cmd_agents_provider_set(args: argparse.Namespace, service: ZeroClawService) 
     return 0
 
 
-def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_list(args: argparse.Namespace, service: ClawieService) -> int:
     agents = service.list_agents()
     if not agents:
         print_info("No agents provisioned yet.")
@@ -2002,21 +2002,21 @@ def cmd_agents_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     )
     return 0
 
-def cmd_agents_show(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_show(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     agent = service.get_dashboard_agent(agent_id)
     _print_agent(agent)
     return 0
 
 
-def cmd_agents_delete(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_delete(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     service.delete_agent(agent_id)
     print_success(f"Deleted agent {agent_id}")
     return 0
 
 
-def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agents_batch_create(args: argparse.Namespace, service: ClawieService) -> int:
     source = _resolve_required_value(args.file, field_name="file")
     payload = _read_json_file(source)
     if not isinstance(payload, list):
@@ -2049,7 +2049,7 @@ def cmd_agents_batch_create(args: argparse.Namespace, service: ZeroClawService) 
     return 0
 
 
-def cmd_channel_apply(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_channel_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     agent = service.bootstrap_channels(
         agent_id=agent_id,
@@ -2062,7 +2062,7 @@ def cmd_channel_apply(args: argparse.Namespace, service: ZeroClawService) -> int
     return 0
 
 
-def cmd_channel_move(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_channel_move(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
     agent = service.migrate_channels(
@@ -2076,7 +2076,7 @@ def cmd_channel_move(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_runtime_create(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
@@ -2119,7 +2119,7 @@ def cmd_runtime_create(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_agent_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_agent_purge(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     if not args.yes:
         print_warning(f"This will permanently purge agent '{agent_id}' and its Linux user profile.")
@@ -2142,7 +2142,7 @@ def cmd_agent_purge(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_status(args: argparse.Namespace, service: ClawieService) -> int:
     sections = [args.section] if getattr(args, "section", None) else None
     agent_id = (getattr(args, "agent", "") or "").strip() or None
     as_json = bool(getattr(args, "json", False))
@@ -2178,7 +2178,7 @@ def cmd_status(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_dashboard(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_dashboard(args: argparse.Namespace, service: ClawieService) -> int:
     """Deprecated alias for ``clawie status --watch``."""
     print_warning("`clawie dashboard` is deprecated; use `clawie status --watch`.")
     args.section = None
@@ -2429,7 +2429,7 @@ def _print_status_events(payload: Any) -> None:
     print_table(["timestamp", "type", "message"], table)
 
 
-def cmd_runtime_detect(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_detect(args: argparse.Namespace, service: ClawieService) -> int:
     rows = service.list_installed_claws(source_home=args.source_home)
     if not rows:
         print_info("No installed claws detected.")
@@ -2447,7 +2447,7 @@ def cmd_runtime_detect(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_runtime_install(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_install(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     result = service.install_provider_runtime(provider)
     if bool(result.get("already_present", False)):
@@ -2469,7 +2469,7 @@ def cmd_runtime_install(args: argparse.Namespace, service: ZeroClawService) -> i
     return 0
 
 
-def cmd_runtime_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_status(args: argparse.Namespace, service: ClawieService) -> int:
     _ = args
     rows = service.list_local_runtime_statuses(refresh=True)
     if not rows:
@@ -2498,7 +2498,7 @@ def cmd_runtime_status(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_runtime_login(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_login(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     payload = service.local_claw_auth_login(provider)
     action = str(payload.get("action_performed", "login"))
@@ -2512,7 +2512,7 @@ def cmd_runtime_login(args: argparse.Namespace, service: ZeroClawService) -> int
     return 0
 
 
-def cmd_runtime_service(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_runtime_service(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     action = _resolve_required_value(args.runtime_service_command, field_name="action")
     result = service.local_claw_service_action(provider, action)
@@ -2530,7 +2530,7 @@ def cmd_runtime_service(args: argparse.Namespace, service: ZeroClawService) -> i
     return 0
 
 
-def cmd_health(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_health(args: argparse.Namespace, service: ClawieService) -> int:
     report = service.doctor()
     status = str(report.get("status", "unknown"))
 
@@ -2555,7 +2555,7 @@ def cmd_health(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 1
 
 
-def cmd_events_list(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_events_list(args: argparse.Namespace, service: ClawieService) -> int:
     limit = max(1, int(args.limit))
     events = service.list_events(limit=limit)
     if not events:
@@ -2575,7 +2575,7 @@ def cmd_events_list(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_backup_init(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.backup_init(
         repo_path=(str(args.path).strip() or None) if args.path else None,
         remote=args.remote,
@@ -2599,7 +2599,7 @@ def cmd_backup_init(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_backup_run(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_backup_run(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.backup_run(message=str(args.message or ""), push=args.push)
     if result.get("changed"):
         print_success(f"Backup committed {str(result.get('commit', ''))[:10]} in {result.get('repo', '')}")
@@ -2618,7 +2618,7 @@ def cmd_backup_run(args: argparse.Namespace, service: ZeroClawService) -> int:
     return 0
 
 
-def cmd_backup_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_backup_status(args: argparse.Namespace, service: ClawieService) -> int:
     _ = args
     payload = service.backup_status()
     _print_backup_status_panel(payload)
@@ -2631,7 +2631,7 @@ def cmd_backup_status(args: argparse.Namespace, service: ZeroClawService) -> int
     return 0
 
 
-def cmd_backup_restore(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_backup_restore(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = (str(args.agent or "").strip()) or None
     result = service.backup_restore(
         agent_id=agent_id,
@@ -2650,14 +2650,14 @@ def cmd_backup_restore(args: argparse.Namespace, service: ZeroClawService) -> in
     return 0
 
 
-def cmd_state_export(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_state_export(args: argparse.Namespace, service: ClawieService) -> int:
     target = service.export_state(_resolve_required_value(args.output, field_name="output"))
     print_success(f"State exported to {target}")
     print_warning("Snapshot contains unredacted credentials; keep the file private.")
     return 0
 
 
-def cmd_state_import(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_state_import(args: argparse.Namespace, service: ClawieService) -> int:
     source = _resolve_required_value(args.input, field_name="input")
     service.import_state(source, merge=bool(args.merge))
     if args.merge:
@@ -2937,7 +2937,7 @@ def _prompt_yes_no(label: str, *, default: bool) -> bool:
 # ── Delegation handlers ─────────────────────────────────────────────────────
 
 
-def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_submit(args: argparse.Namespace, service: ClawieService) -> int:
     import json as _json
 
     payload = _json.loads(args.payload)
@@ -2959,7 +2959,7 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ZeroClawService) ->
     return 0
 
 
-def cmd_delegation_deliver(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_deliver(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.deliver_to_agent(
         args.agent,
         args.message,
@@ -2979,12 +2979,12 @@ def cmd_delegation_deliver(args: argparse.Namespace, service: ZeroClawService) -
     return 1
 
 
-def cmd_delegation_repl(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_repl(args: argparse.Namespace, service: ClawieService) -> int:
     service.start_agent_repl(args.agent_id, model_tier=getattr(args, "tier", "") or "")
     return 0
 
 
-def cmd_delegation_tree(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_tree(args: argparse.Namespace, service: ClawieService) -> int:
     lines = service.delegation_tree_lines(args.agent_id)
     if not lines:
         print_info("No delegation tree found.")
@@ -2993,7 +2993,7 @@ def cmd_delegation_tree(args: argparse.Namespace, service: ZeroClawService) -> i
     return 0
 
 
-def cmd_delegation_tasks(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_tasks(args: argparse.Namespace, service: ClawieService) -> int:
     tasks = service.delegation_tasks(
         agent_id=getattr(args, "agent_id", None),
         status=getattr(args, "status", None),
@@ -3010,7 +3010,7 @@ def cmd_delegation_tasks(args: argparse.Namespace, service: ZeroClawService) -> 
     return 0
 
 
-def cmd_delegation_spawn_session(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_spawn_session(args: argparse.Namespace, service: ClawieService) -> int:
     info = service.spawn_session_agent(
         parent_id=args.parent,
         child_id=args.child,
@@ -3031,13 +3031,13 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ZeroClawServ
     return 0
 
 
-def cmd_delegation_stop_session(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_stop_session(args: argparse.Namespace, service: ClawieService) -> int:
     service.stop_session_agent(parent_id=args.parent, child_id=args.child)
     print_success(f"Stopped session agent {args.child}")
     return 0
 
 
-def cmd_delegation_session_agents(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_session_agents(args: argparse.Namespace, service: ClawieService) -> int:
     agents = service.list_session_agents(parent_id=args.parent)
     if not agents:
         print_info("No session agents found.")
@@ -3054,7 +3054,7 @@ def cmd_delegation_session_agents(args: argparse.Namespace, service: ZeroClawSer
     return 0
 
 
-def cmd_delegation_cleanup(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_cleanup(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.cleanup_delegation()
     removed = result.get("removed_sockets", [])
     active = result.get("active_agents", [])
@@ -3068,7 +3068,7 @@ def cmd_delegation_cleanup(args: argparse.Namespace, service: ZeroClawService) -
     return 0
 
 
-def cmd_delegation_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_delegation_status(args: argparse.Namespace, service: ClawieService) -> int:
     from clawie.delegation import list_active_agents
 
     active = list_active_agents()
@@ -3123,17 +3123,17 @@ def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.Ar
     maint_run.set_defaults(func=cmd_maintenance_run)
 
 
-def cmd_maintenance_enable(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_maintenance_enable(args: argparse.Namespace, service: ClawieService) -> int:
     interval = getattr(args, "interval", 4)
     result = service.maintenance_enable(interval_hours=interval)
     print_success(f"Maintenance cron enabled (every {result['interval_hours']}h)")
     print_info(f"Cron file: {result['cron_file']}")
     print_info(f"Binary: {result['clawie_binary']}")
-    print_info(f"Log: {ZeroClawService.MAINTENANCE_LOG_FILE}")
+    print_info(f"Log: {ClawieService.MAINTENANCE_LOG_FILE}")
     return 0
 
 
-def cmd_maintenance_disable(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_maintenance_disable(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.maintenance_disable()
     if result["removed"]:
         print_success("Maintenance cron job removed")
@@ -3142,7 +3142,7 @@ def cmd_maintenance_disable(args: argparse.Namespace, service: ZeroClawService) 
     return 0
 
 
-def cmd_maintenance_status(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_maintenance_status(args: argparse.Namespace, service: ClawieService) -> int:
     result = service.maintenance_status()
     if result["enabled"] and result["cron_file_exists"]:
         print_success(f"Maintenance cron is active (every {result['interval_hours']}h)")
@@ -3154,7 +3154,7 @@ def cmd_maintenance_status(args: argparse.Namespace, service: ZeroClawService) -
     return 0
 
 
-def cmd_maintenance_run(args: argparse.Namespace, service: ZeroClawService) -> int:
+def cmd_maintenance_run(args: argparse.Namespace, service: ClawieService) -> int:
     import datetime
 
     print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] clawie maintenance run")

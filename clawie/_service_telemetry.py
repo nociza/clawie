@@ -1,4 +1,4 @@
-"""Dashboard payloads, metrics, and status attachment (ZeroClawService mixin)."""
+"""Dashboard payloads, metrics, and status attachment (ClawieService mixin)."""
 from __future__ import annotations
 
 import copy

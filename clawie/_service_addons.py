@@ -1,4 +1,4 @@
-"""Shared addon install, auth, and agent attachment (ZeroClawService mixin)."""
+"""Shared addon install, auth, and agent attachment (ClawieService mixin)."""
 from __future__ import annotations
 
 import os

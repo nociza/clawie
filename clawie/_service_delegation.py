@@ -1,4 +1,4 @@
-"""Recursive delegation, session agents, and maintenance automation (ZeroClawService mixin)."""
+"""Recursive delegation, session agents, and maintenance automation (ClawieService mixin)."""
 from __future__ import annotations
 
 import os

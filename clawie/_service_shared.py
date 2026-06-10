@@ -1,4 +1,4 @@
-"""Shared filesystem, permissions, and path helpers (ZeroClawService mixin)."""
+"""Shared filesystem, permissions, and path helpers (ClawieService mixin)."""
 from __future__ import annotations
 
 import json

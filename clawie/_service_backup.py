@@ -1,4 +1,4 @@
-"""Git-backed knowledge backup and restore (ZeroClawService mixin).
+"""Git-backed knowledge backup and restore (ClawieService mixin).
 
 The backup repository mirrors the fleet's durable knowledge:
 

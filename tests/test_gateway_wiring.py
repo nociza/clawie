@@ -8,12 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from clawie.service import ZeroClawService
+from clawie.service import ClawieService
 from clawie.store import StateStore
 
 
-def _service(tmp_path: Path) -> ZeroClawService:
-    return ZeroClawService(StateStore(config_dir=tmp_path))
+def _service(tmp_path: Path) -> ClawieService:
+    return ClawieService(StateStore(config_dir=tmp_path))
 
 
 def test_home_prep_writes_gateway_endpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

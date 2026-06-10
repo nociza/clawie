@@ -1,4 +1,4 @@
-"""Channel discovery, assignment, sync, and connect flows (ZeroClawService mixin)."""
+"""Channel discovery, assignment, sync, and connect flows (ClawieService mixin)."""
 from __future__ import annotations
 
 import copy

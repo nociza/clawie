@@ -1,4 +1,4 @@
-"""Core prompt files and prompt sync (ZeroClawService mixin)."""
+"""Core prompt files and prompt sync (ClawieService mixin)."""
 from __future__ import annotations
 
 import os

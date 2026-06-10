@@ -1,4 +1,4 @@
-"""Provider runtime install, process supervision, and service control (ZeroClawService mixin)."""
+"""Provider runtime install, process supervision, and service control (ClawieService mixin)."""
 from __future__ import annotations
 
 import os

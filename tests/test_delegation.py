@@ -642,7 +642,7 @@ class TestDelegationSkill:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], extra_args: list[str] | None = None
     ) -> dict:
         """Setup provider and create agent, return agent state from store."""
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         assert run_cli(tmp_path, "config", "set") == 0
         capsys.readouterr()
@@ -652,7 +652,7 @@ class TestDelegationSkill:
         assert run_cli(tmp_path, *args) == 0
         capsys.readouterr()
         store = StateStore(config_dir=tmp_path)
-        svc = ZeroClawService(store)
+        svc = ClawieService(store)
         return svc.get_agent("skill-test")
 
     def test_delegation_skill_auto_loaded_by_default(
@@ -727,13 +727,13 @@ class TestDelegationSkill:
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Toggling delegation off clears the prompt on next hydrate."""
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         agent = self._setup_and_create(tmp_path, capsys)
         assert agent["core_prompts"].get("DELEGATION.md", "") != ""
 
         store = StateStore(config_dir=tmp_path)
-        svc = ZeroClawService(store)
+        svc = ClawieService(store)
         svc.toggle_agent_plugin("skill-test", "delegation")
 
         updated = svc.get_agent("skill-test")
@@ -744,10 +744,10 @@ class TestDelegationSkill:
         self, tmp_path: Path
     ) -> None:
         """Agents created before the skill existed get it on hydration."""
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         store = StateStore(config_dir=tmp_path)
-        svc = ZeroClawService(store)
+        svc = ClawieService(store)
         svc.setup(
             provider="zeroclaw", api_key="", subscription="starter",
             workspace="default", api_url="https://example.com",
@@ -770,7 +770,7 @@ class TestDelegationSkill:
     def test_hydration_backfills_clawie_identity_for_legacy_blank_prompts(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         agent = self._setup_and_create(tmp_path, capsys)
         store = StateStore(config_dir=tmp_path)
@@ -778,7 +778,7 @@ class TestDelegationSkill:
         state["agents"][agent["agent_id"]]["core_prompts"] = {}
         store.write_state(state)
 
-        svc = ZeroClawService(store)
+        svc = ClawieService(store)
         loaded = svc.get_agent(agent["agent_id"])
         prompts = loaded.get("core_prompts", {})
         assert "managed AI agent in clawie" in prompts.get("SOUL.md", "")
@@ -788,7 +788,7 @@ class TestDelegationSkill:
     def test_hydration_upgrades_legacy_heartbeat_prompt_default(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         agent = self._setup_and_create(tmp_path, capsys)
         store = StateStore(config_dir=tmp_path)
@@ -799,7 +799,7 @@ class TestDelegationSkill:
         )
         store.write_state(state)
 
-        loaded = ZeroClawService(store).get_agent(agent["agent_id"])
+        loaded = ClawieService(store).get_agent(agent["agent_id"])
         heartbeat = loaded["core_prompts"].get("HEARTBEAT.md", "")
 
         assert "Only reply `HEARTBEAT_OK`" in heartbeat
@@ -1291,10 +1291,10 @@ class TestSessionAgentTiers:
     def test_service_spawn_session_agent_returns_tier(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
         _use_short_delegation_dir(monkeypatch)
-        svc = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
+        svc = ClawieService(StateStore(config_dir=tmp_path / "state"))
         try:
             info = svc.spawn_session_agent("parent", "child-1", model_tier="power")
             assert info["model_tier"] == "power"
@@ -1307,9 +1307,9 @@ class TestSpawnPromptPersistence:
     def test_spawn_writes_seeded_prompts_to_agent_home(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from clawie.service import ZeroClawService
+        from clawie.service import ClawieService
 
-        service = ZeroClawService(StateStore(config_dir=tmp_path / "state"))
+        service = ClawieService(StateStore(config_dir=tmp_path / "state"))
         service.setup(
             provider="zeroclaw",
             api_key="",

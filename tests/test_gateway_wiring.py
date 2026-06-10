@@ -90,3 +90,61 @@ def test_backup_redacts_gateway_token(tmp_path: Path) -> None:
     assert redacted["agents"]["alice"]["agent"]["gateway_token"] == "<redacted>"
     # original state is untouched (deep copy)
     assert service.store.read_state()["agents"]["alice"]["agent"]["gateway_token"] == "supersecret"
+
+
+def test_openclaw_version_gate_supported(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    gate = service.openclaw_version_gate(run=lambda cmd: "openclaw 2026.6.2")
+    assert gate["runtime"] == "openclaw"
+    assert gate["version"] == "2026.6.2"
+    assert gate["supported"] is True
+    assert gate["degraded"] is False
+
+
+def test_openclaw_version_gate_unknown_degrades(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    gate = service.openclaw_version_gate(run=lambda cmd: "weird output, no version")
+    assert gate["version"] == ""
+    assert gate["degraded"] is True
+
+
+def test_cli_runtime_version_supported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from clawie.cli import main
+
+    monkeypatch.setattr(
+        ClawieService,
+        "openclaw_version_gate",
+        lambda self, run=None: {
+            "runtime": "openclaw",
+            "version": "2026.6.2",
+            "supported": True,
+            "degraded": False,
+            "message": "ok",
+        },
+    )
+    code = main(["--config-dir", str(tmp_path), "runtime", "version"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "2026.6.2" in out
+
+
+def test_cli_runtime_version_unsupported_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    from clawie.cli import main
+
+    monkeypatch.setattr(
+        ClawieService,
+        "openclaw_version_gate",
+        lambda self, run=None: {
+            "runtime": "openclaw",
+            "version": "2030.1.0",
+            "supported": False,
+            "degraded": True,
+            "message": "too new",
+        },
+    )
+    code = main(["--config-dir", str(tmp_path), "runtime", "version"])
+    assert code == 1

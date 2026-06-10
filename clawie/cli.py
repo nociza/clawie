@@ -957,7 +957,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     runtime_sub = runtime.add_subparsers(
         dest="runtime_command",
         required=True,
-        metavar="{create,detect,install,status,login,service}",
+        metavar="{create,detect,install,status,version,login,service}",
     )
 
     create = runtime_sub.add_parser(
@@ -1055,6 +1055,12 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         help="Show local runtime service and auth status",
     )
     status.set_defaults(func=cmd_runtime_status)
+
+    version = runtime_sub.add_parser(
+        "version",
+        help="Show the installed openclaw version and whether it is supported",
+    )
+    version.set_defaults(func=cmd_runtime_version)
 
     login = runtime_sub.add_parser(
         "login",
@@ -2466,6 +2472,24 @@ def cmd_runtime_install(args: argparse.Namespace, service: ClawieService) -> int
     output = str(result.get("output", "")).strip()
     if output:
         print_info("Output: " + output)
+    return 0
+
+
+def cmd_runtime_version(args: argparse.Namespace, service: ClawieService) -> int:
+    _ = args
+    gate = service.openclaw_version_gate()
+    print_panel(
+        "openclaw version",
+        [
+            f"version: {gate.get('version', '') or 'unknown'}",
+            f"supported: {gate.get('supported', False)}",
+            f"message: {gate.get('message', '')}",
+        ],
+    )
+    if gate.get("degraded"):
+        print_warning("openclaw version is unsupported; config writes degrade to read-only.")
+        return 1
+    print_success("openclaw version is supported.")
     return 0
 
 

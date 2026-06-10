@@ -851,6 +851,33 @@ class RuntimeOpsMixin:
             "output": output,
         }
 
+    def openclaw_version_gate(self, run=None) -> dict[str, Any]:
+        """Probe the installed openclaw version and classify it against the
+        adapter's tested range (notify-on-upgrade). Never raises: an undetectable
+        or out-of-band version degrades to read-only with a message.
+        """
+        from clawie.adapters import detect_version, get_adapter
+
+        adapter = get_adapter("openclaw")
+        runner = run or self._adapter_version_runner()
+        gate = detect_version(adapter, runner)
+        return {
+            "runtime": adapter.name,
+            "version": str(gate.version) if gate.version else "",
+            "supported": gate.supported,
+            "degraded": gate.degraded,
+            "message": gate.message,
+        }
+
+    def _adapter_version_runner(self):
+        def _run(cmd: list[str]) -> str:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, env=self._service_env("")
+            )
+            return f"{result.stdout or ''}\n{result.stderr or ''}"
+
+        return _run
+
     def list_local_runtime_statuses(self, refresh: bool = True) -> list[dict[str, Any]]:
         config = self.store.read_config()
         local_state = self._normalized_local_service_state(config)

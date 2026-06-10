@@ -631,3 +631,26 @@ Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
   multi-tenant isolation… run separate Gateways under separate OS users or hosts"
   for strong separation — validating clawie's one-gateway-per-Linux-user model as
   the real boundary.
+
+---
+
+## Appendix B — implementation status
+
+Tracks what has landed on `claude/great-meitner-m564jm` against the roadmap. The
+suite is green at every commit (298 → 395 tests).
+
+| Phase | Status | Landed |
+|---|---|---|
+| **0** Adapter seam + version gate | **Done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; `ZeroClawService`→`ClawieService`; `clawie runtime version` |
+| **1** Real delegation bridge | **Core done** | per-agent gateway endpoint (port + token) written into `openclaw.json`, token redacted from backups; `deliver_to_agent()` via the gateway (adapter-driven, injectable runner); `clawie delegation deliver` |
+| **2** Trust / security | **Partial** | `cli.js` binary patch removed. **Remaining:** de-relax the three shared stores (needs a `clawie` shared-group mechanism + real multi-user verification), close the `/tmp` prompt-staging vector, per-agent auth default |
+| **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`. **Remaining:** the `clawied` single-writer daemon and wiring reconcile into the service to retire the provider-switch saga |
+| **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed). **Remaining:** the control-agent runtime (RPC surface, GitHub escalation, watchdog), gated behind Phase 2 |
+| **5** Hardening + hermes | **Seam done** | `HermesAdapter` + a parametrized adapter contract test prove extensibility. hermes is an honest scaffold (read-only until pinned to real source). **Remaining:** real hermes contract; resource telemetry; `cli.py` split |
+
+**Deferred with rationale:** Phase 2's store de-relax would ship an unverifiable
+permission change to the credential store — it needs a new shared-group mechanism
+and a real multi-user host to verify, so landing it blind is too risky. Phase 3's
+`clawied` daemon and Phase 4's control-agent runtime are large new subsystems for
+subsequent focused sessions; their pure cores (reconcile, the gate) are landed and
+tested, so the runtimes have a verified foundation to build on.

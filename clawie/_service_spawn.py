@@ -7,10 +7,17 @@ import pwd
 import secrets
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 from typing import Any
 try:
-    import crypt  # removed from the stdlib in Python 3.13 (PEP 594)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="'crypt' is deprecated.*",
+            category=DeprecationWarning,
+        )
+        import crypt  # removed from the stdlib in Python 3.13 (PEP 594)
 except ModuleNotFoundError:  # pragma: no cover
     crypt = None  # type: ignore[assignment]
 from clawie.providers import (

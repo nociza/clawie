@@ -455,7 +455,7 @@ class StateStore:
             if count == 0:
                 for name, payload in DEFAULT_STATE["templates"].items():
                     conn.execute(
-                        "INSERT INTO templates(name, payload) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO templates(name, payload) VALUES (?, ?)",
                         (name, json.dumps(payload, sort_keys=True)),
                     )
 
@@ -463,7 +463,7 @@ class StateStore:
             if config_count == 0:
                 for key, value in DEFAULT_CONFIG.items():
                     conn.execute(
-                        "INSERT INTO config(key, value) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO config(key, value) VALUES (?, ?)",
                         (key, self._encode_value(value)),
                     )
             conn.commit()

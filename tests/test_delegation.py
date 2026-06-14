@@ -631,6 +631,85 @@ class TestDelegationCLI:
         assert code == 0
         assert "cli-test" in output
 
+    def test_submit_unreachable_child_marks_failed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _use_short_delegation_dir(monkeypatch)
+
+        code = run_cli(
+            tmp_path,
+            "delegation",
+            "submit",
+            "--parent",
+            "planner",
+            "--child",
+            "missing-worker",
+            "--payload",
+            '{"task":"check"}',
+            "--timeout",
+            "0.1",
+        )
+        output = capsys.readouterr().out
+
+        assert code == 1
+        assert "status: failed" in output
+        assert "connection failed" in output
+
+        store = StateStore(config_dir=tmp_path)
+        tasks = store.read_delegation_tasks(parent_agent_id="planner")
+        assert len(tasks) == 1
+        assert tasks[0]["status"] == "failed"
+        assert "connection failed" in tasks[0]["error"]
+        assert tasks[0]["result"]["error"] == tasks[0]["error"]
+
+        events = store.read_state()["events"]
+        assert events[-1]["type"] == "delegation.failed"
+
+    def test_submit_success_result_can_contain_error_key(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _use_short_delegation_dir(monkeypatch)
+
+        def handler(_msg: Message, _repl: AgentREPL) -> dict[str, str]:
+            return {"error": "domain-level result"}
+
+        child_repl = AgentREPL("payload-worker", handler=handler)
+        child_repl.start_background()
+        time.sleep(0.2)
+
+        try:
+            code = run_cli(
+                tmp_path,
+                "delegation",
+                "submit",
+                "--parent",
+                "planner",
+                "--child",
+                "payload-worker",
+                "--payload",
+                "{}",
+                "--timeout",
+                "5",
+            )
+            output = capsys.readouterr().out
+        finally:
+            child_repl.stop()
+
+        assert code == 0
+        assert "status: completed" in output
+
+        tasks = StateStore(config_dir=tmp_path).read_delegation_tasks(parent_agent_id="planner")
+        assert len(tasks) == 1
+        assert tasks[0]["status"] == "completed"
+        assert tasks[0]["error"] == ""
+        assert tasks[0]["result"] == {"error": "domain-level result"}
+
 
 # ---------------------------------------------------------------------------
 # Delegation skill auto-loading

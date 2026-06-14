@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import uuid
 from typing import Any, Callable
-from clawie.service_common import SetupError
+from clawie.service_common import SetupError, now_iso
 
 
 class DelegationOpsMixin:
@@ -55,16 +55,23 @@ class DelegationOpsMixin:
         timeout: float = 300.0,
         model_tier: str = "",
     ) -> dict[str, Any]:
-        from clawie.delegation import DelegationCoordinator, DelegationBus, DelegationTree, DEFAULT_TIER
+        from clawie.delegation import (
+            DEFAULT_TIER,
+            DelegationBus,
+            DelegationCoordinator,
+            DelegationTree,
+        )
 
         tier = model_tier or DEFAULT_TIER
-        task_id = str(__import__("uuid").uuid4().hex)
+        task_id = uuid.uuid4().hex
+        created_at = now_iso()
         self.store.write_delegation_task(
             task_id=task_id,
             parent_agent_id=parent_id,
             child_agent_id=child_id,
             payload=payload or {},
             depth=0,
+            created_at=created_at,
             timeout_seconds=timeout,
             model_tier=tier,
         )
@@ -83,6 +90,8 @@ class DelegationOpsMixin:
                 timeout_seconds=timeout,
                 status="failed",
                 error=str(exc),
+                created_at=created_at,
+                completed_at=now_iso(),
                 model_tier=tier,
             )
             state = self.store.read_state()
@@ -94,6 +103,42 @@ class DelegationOpsMixin:
             )
             self.store.write_state(state)
             return {"task_id": task_id, "status": "failed", "error": str(exc)}
+        tree_data = tree.to_dict()
+        self.store.write_delegation_tree(parent_id, tree_data)
+        clean_result = dict(result)
+        child_node = tree.get_node(child_id)
+        failed = child_node is None or child_node.status in {"failed", "timeout"}
+        if failed:
+            status_detail = child_node.status if child_node is not None else "failed"
+            error = str(clean_result.get("error") or f"delegation {status_detail}")
+            self.store.write_delegation_task(
+                task_id=task_id,
+                parent_agent_id=parent_id,
+                child_agent_id=child_id,
+                payload=payload or {},
+                depth=0,
+                timeout_seconds=timeout,
+                status="failed",
+                result=clean_result,
+                error=error,
+                created_at=created_at,
+                completed_at=now_iso(),
+                model_tier=tier,
+            )
+            state = self.store.read_state()
+            self._event(
+                state,
+                "delegation.failed",
+                f"Delegation {parent_id}->{child_id} failed: {error}",
+                {"task_id": task_id, "parent": parent_id, "child": child_id},
+            )
+            self.store.write_state(state)
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "error": error,
+                "result": clean_result,
+            }
         self.store.write_delegation_task(
             task_id=task_id,
             parent_agent_id=parent_id,
@@ -102,11 +147,11 @@ class DelegationOpsMixin:
             depth=0,
             timeout_seconds=timeout,
             status="completed",
-            result=result,
+            result=clean_result,
+            created_at=created_at,
+            completed_at=now_iso(),
             model_tier=tier,
         )
-        tree_data = tree.to_dict()
-        self.store.write_delegation_tree(parent_id, tree_data)
         state = self.store.read_state()
         self._event(
             state,
@@ -115,7 +160,7 @@ class DelegationOpsMixin:
             {"task_id": task_id, "parent": parent_id, "child": child_id},
         )
         self.store.write_state(state)
-        return {"task_id": task_id, "status": "completed", "result": result}
+        return {"task_id": task_id, "status": "completed", "result": clean_result}
 
     def delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
         return self.store.read_delegation_tree(root_agent_id) or {}

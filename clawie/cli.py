@@ -2977,10 +2977,11 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ClawieService) -> i
         [
             f"task_id: {result.get('task_id', '')}",
             f"status: {result.get('status', '')}",
+            *([f"error: {result.get('error', '')}"] if result.get("error") else []),
             f"result: {_json.dumps(result.get('result', {}), indent=2)[:200]}",
         ],
     )
-    return 0
+    return 0 if result.get("status") != "failed" else 1
 
 
 def cmd_delegation_deliver(args: argparse.Namespace, service: ClawieService) -> int:

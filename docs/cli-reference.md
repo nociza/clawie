@@ -38,7 +38,7 @@ clawie config set --control-github-repo OWNER/REPO --control-github-token-path P
 ## agent
 
 ```bash
-clawie agent create AGENT_ID [--display-name N] [--template T] [--clone-from A] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
+clawie agent create [AGENT_ID] [--display-name N] [--template T] [--clone-from A] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
 clawie agent clone SOURCE TARGET [--display-name N] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
 clawie agent list
 clawie agent show AGENT_ID
@@ -114,11 +114,26 @@ clawie delegation stop-session --parent P --child C
 clawie delegation session-agents --parent P
 ```
 
+## workspace
+
+Published artifacts are copied from a private agent workspace into clawie's
+shared published workspace. Authorized viewers see generated read-only views at
+`~/.openclaw/workspace/published`.
+
+```bash
+clawie workspace status
+clawie workspace publish PATH [--agent A] [--to B[,C]] [--title T] [--json]
+clawie workspace list [--agent A] [--publisher P] [--json]
+clawie workspace show PUB_ID [--agent A] [--json]
+clawie workspace mount [--agent A|--all]
+clawie workspace verify [PUB_ID] [--json]
+```
+
 ## runtime
 
 ```bash
 clawie runtime install PROVIDER
-clawie runtime create AGENT_ID [--user USER] [--source-home PATH] [--skip-config-copy] [--credential-bundle B] [--no-default-credentials] [--password P] [--password-hash H] [--no-global-password] [--from-agent A] [--provider P] [--no-delegation]
+clawie runtime create [AGENT_ID] [--user USER] [--source-home PATH] [--skip-config-copy] [--credential-bundle B] [--no-default-credentials] [--password P] [--password-hash H] [--no-global-password] [--from-agent A] [--provider P] [--no-delegation]
 clawie runtime detect
 clawie runtime status
 clawie runtime version

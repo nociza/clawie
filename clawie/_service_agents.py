@@ -639,6 +639,7 @@ class AgentOpsMixin:
         self._ensure_openclaw_home_prepared(
             home=home,
             linux_user=linux_user,
+            agent_id=str(agent.get("agent_id", "")),
             channels=channels,
             live_payloads=live_payloads,
             auth_mode=auth_mode,
@@ -819,6 +820,7 @@ class AgentOpsMixin:
         api_key: str,
         gateway_port: int | None = None,
         gateway_token: str = "",
+        agent_id: str = "",
     ) -> None:
         root = home / ".openclaw"
         root.mkdir(parents=True, exist_ok=True)
@@ -1021,6 +1023,12 @@ class AgentOpsMixin:
         self._write_json_file(config_path, config)
         if auth_mode == "linked":
             self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
+        if agent_id:
+            self._ensure_published_workspace_mount(
+                agent_id=agent_id,
+                workspace=workspace,
+                linux_user=linux_user,
+            )
         self._chown_tree(root, linux_user)
 
     def _remove_picoclaw_channel_from_home(

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from clawie import __version__
+from clawie.default_names import choose_default_agent_name
 from clawie.providers import get_provider, provider_names
 from clawie.service import (
     SetupError,
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{status,config,agent,channel,runtime,auth,addon,delegation,maintenance,control,clawied,production,health,event,backup,dashboard}",
+        metavar="{status,config,agent,channel,runtime,auth,addon,delegation,workspace,maintenance,control,clawied,production,health,event,backup,dashboard}",
     )
 
     _build_config_parser(subparsers)
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     _build_auth_parser(subparsers)
     _build_addon_parser(subparsers)
     _build_delegation_parser(subparsers)
+    _build_workspace_parser(subparsers)
     _build_maintenance_parser(subparsers)
     _build_control_parser(subparsers)
     _build_clawied_parser(subparsers)
@@ -436,7 +438,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         create,
         "agent_id",
         metavar="AGENT_ID",
-        help_text="New agent ID",
+        help_text="New agent ID (defaults to a random built-in name)",
     )
     create.add_argument("--display-name", help="Display name")
     create.add_argument("--template", default="baseline", help="Template name")
@@ -984,7 +986,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         create,
         "agent_id",
         metavar="AGENT_ID",
-        help_text="Agent ID to create",
+        help_text="Agent ID to create (defaults to a random built-in name)",
     )
     create.add_argument(
         "--user",
@@ -1183,6 +1185,79 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
 
     deleg_status = delegation_sub.add_parser("status", help="Show active REPL agents")
     deleg_status.set_defaults(func=cmd_delegation_status)
+
+
+def _build_workspace_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    workspace = subparsers.add_parser(
+        "workspace",
+        help="Publish and inspect shared read-only agent artifacts",
+    )
+    workspace_sub = workspace.add_subparsers(
+        dest="workspace_command",
+        required=True,
+        metavar="{status,publish,list,show,mount,verify}",
+    )
+
+    status = workspace_sub.add_parser("status", help="Show published workspace status")
+    status.set_defaults(func=cmd_workspace_status)
+
+    publish = workspace_sub.add_parser(
+        "publish",
+        help="Publish a file or directory from an agent workspace",
+    )
+    _add_positional_argument(
+        publish,
+        "path",
+        metavar="PATH",
+        help_text="File or directory to publish",
+    )
+    publish.add_argument("--agent", default="", help="Publishing agent ID (default: infer from Linux user)")
+    publish.add_argument(
+        "--to",
+        action="append",
+        default=[],
+        metavar="AGENT[,AGENT...]",
+        help="Viewer agent ID or comma-separated agent IDs (repeatable)",
+    )
+    publish.add_argument("--title", default="", help="Human-readable title")
+    publish.add_argument("--json", action="store_true", help="Emit publication metadata as JSON")
+    publish.set_defaults(func=cmd_workspace_publish)
+
+    list_cmd = workspace_sub.add_parser("list", help="List visible publications")
+    list_cmd.add_argument("--agent", default="", help="Viewer agent ID (default: infer when possible)")
+    list_cmd.add_argument("--publisher", default="", help="Filter by publisher agent ID")
+    list_cmd.add_argument("--json", action="store_true", help="Emit publications as JSON")
+    list_cmd.set_defaults(func=cmd_workspace_list)
+
+    show = workspace_sub.add_parser("show", help="Show one publication")
+    _add_positional_argument(
+        show,
+        "publication_id",
+        metavar="PUB_ID",
+        help_text="Publication ID",
+    )
+    show.add_argument("--agent", default="", help="Viewer agent ID for access check")
+    show.add_argument("--json", action="store_true", help="Emit publication metadata as JSON")
+    show.set_defaults(func=cmd_workspace_show)
+
+    mount = workspace_sub.add_parser(
+        "mount",
+        help="Mount generated published views into agent workspaces",
+    )
+    mount_target = mount.add_mutually_exclusive_group()
+    mount_target.add_argument("--agent", default="", help="Agent ID to mount (default: infer from Linux user)")
+    mount_target.add_argument("--all", action="store_true", help="Mount all manageable agents")
+    mount.set_defaults(func=cmd_workspace_mount)
+
+    verify = workspace_sub.add_parser("verify", help="Verify publication hashes")
+    _add_positional_argument(
+        verify,
+        "publication_id",
+        metavar="PUB_ID",
+        help_text="Publication ID (default: all)",
+    )
+    verify.add_argument("--json", action="store_true", help="Emit verification result as JSON")
+    verify.set_defaults(func=cmd_workspace_verify)
 
 
 def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1698,7 +1773,7 @@ def cmd_addon_auth_import(args: argparse.Namespace, service: ClawieService) -> i
 
 
 def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
-    agent_id = _resolve_agent_id(args.agent_id)
+    agent_id = _resolve_new_agent_id(args.agent_id, service)
     channels = _resolve_channels(args.channel, args.channels_file)
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
@@ -2392,7 +2467,10 @@ def cmd_channel_move(args: argparse.Namespace, service: ClawieService) -> int:
 
 
 def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
-    agent_id = _resolve_agent_id(args.agent_id)
+    agent_id = _resolve_new_agent_id(args.agent_id, service)
+    linux_user = args.linux_user
+    if not str(linux_user or "").strip() and not str(args.agent_id or "").strip():
+        linux_user = agent_id.lower()
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
         plugin_overrides["delegation"] = False
@@ -2401,7 +2479,7 @@ def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
         "spawn_linux_user",
         {
             "agent_id": agent_id,
-            "linux_user": args.linux_user,
+            "linux_user": linux_user,
             "copy_configs": not bool(args.skip_config_copy),
             "source_home": _resolve_optional_path_arg(args.source_home),
             "template": args.template,
@@ -2419,7 +2497,7 @@ def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
     if result is _CLAWIED_UNAVAILABLE:
         result = service.spawn_linux_user(
             agent_id=agent_id,
-            linux_user=args.linux_user,
+            linux_user=linux_user,
             copy_configs=not bool(args.skip_config_copy),
             source_home=args.source_home,
             template=args.template,
@@ -2992,6 +3070,157 @@ def cmd_events_list(args: argparse.Namespace, service: ClawieService) -> int:
     return 0
 
 
+def cmd_workspace_status(args: argparse.Namespace, service: ClawieService) -> int:
+    _ = args
+    payload = service.workspace_status()
+    print_panel(
+        "Published Workspace",
+        [
+            f"root: {payload.get('root', '')}",
+            f"initialized: {payload.get('initialized', False)}",
+            f"publications: {payload.get('publications', 0)}",
+            f"views: {payload.get('views', '')}",
+        ],
+    )
+    return 0
+
+
+def cmd_workspace_publish(args: argparse.Namespace, service: ClawieService) -> int:
+    source = _resolve_required_value(args.path, field_name="path")
+    result = service.workspace_publish(
+        _resolve_path_arg(source),
+        agent_id=str(args.agent or ""),
+        visible_to=_parse_workspace_viewers(args.to),
+        title=str(args.title or ""),
+    )
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0
+    print_success(f"Published {result.get('publication_id', '')}")
+    print_panel(
+        "Publication",
+        [
+            f"publisher: {result.get('publisher_agent_id', '')}",
+            f"title: {result.get('title', '')}",
+            f"visible_to: {', '.join(str(item) for item in result.get('visible_to', []))}",
+            f"files: {result.get('file_count', 0)}",
+            f"path: {result.get('path', '')}",
+        ],
+    )
+    mounts = result.get("mounts", {})
+    mounted = mounts.get("mounted", []) if isinstance(mounts, dict) else []
+    skipped = mounts.get("skipped", []) if isinstance(mounts, dict) else []
+    for row in mounted:
+        print_info(f"Mounted for {row.get('agent_id', '')}: {row.get('target', '')}")
+    for row in skipped:
+        print_warning(f"Mount skipped for {row.get('agent_id', '')}: {row.get('reason', '')}")
+    return 0
+
+
+def cmd_workspace_list(args: argparse.Namespace, service: ClawieService) -> int:
+    rows = service.workspace_list(
+        agent_id=str(args.agent or ""),
+        publisher_agent_id=str(args.publisher or ""),
+    )
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+        return 0
+    if not rows:
+        print_info("No publications found.")
+        return 0
+    table: list[list[str]] = []
+    for row in rows:
+        table.append(
+            [
+                str(row.get("publication_id", "")),
+                str(row.get("publisher_agent_id", "")),
+                str(row.get("title", "")),
+                str(row.get("created_at", "")),
+                str(row.get("file_count", 0)),
+                str(row.get("view_path", row.get("path", ""))),
+            ]
+        )
+    print_table(["publication", "publisher", "title", "created", "files", "path"], table)
+    return 0
+
+
+def cmd_workspace_show(args: argparse.Namespace, service: ClawieService) -> int:
+    publication_id = _resolve_required_value(args.publication_id, field_name="publication_id")
+    result = service.workspace_show(publication_id, agent_id=str(args.agent or ""))
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0
+    print_panel(
+        "Publication",
+        [
+            f"publication_id: {result.get('publication_id', '')}",
+            f"publisher: {result.get('publisher_agent_id', '')}",
+            f"title: {result.get('title', '')}",
+            f"mode: {result.get('mode', '')}",
+            f"created_at: {result.get('created_at', '')}",
+            f"visible_to: {', '.join(str(item) for item in result.get('visible_to', []))}",
+            f"path: {result.get('path', '')}",
+        ],
+    )
+    manifest = result.get("manifest", {})
+    files = manifest.get("files", []) if isinstance(manifest, dict) else []
+    table = [
+        [str(item.get("path", "")), str(item.get("size", 0)), str(item.get("sha256", ""))[:12]]
+        for item in files
+        if isinstance(item, dict)
+    ]
+    if table:
+        print_table(["path", "bytes", "sha256"], table)
+    return 0
+
+
+def cmd_workspace_mount(args: argparse.Namespace, service: ClawieService) -> int:
+    result = service.workspace_mount(
+        agent_id=str(args.agent or ""),
+        all_agents=bool(args.all),
+    )
+    mounted = result.get("mounted", [])
+    skipped = result.get("skipped", [])
+    if mounted:
+        print_success(f"Mounted published workspace for {len(mounted)} agent(s)")
+        rows = [
+            [str(row.get("agent_id", "")), str(row.get("target", "")), str(row.get("view", ""))]
+            for row in mounted
+        ]
+        print_table(["agent", "target", "view"], rows)
+    else:
+        print_info("No published workspace mounts changed.")
+    for row in skipped:
+        print_warning(f"Skipped {row.get('agent_id', '')}: {row.get('reason', '')}")
+    return 0
+
+
+def cmd_workspace_verify(args: argparse.Namespace, service: ClawieService) -> int:
+    publication_id = str(args.publication_id or "").strip()
+    result = service.workspace_verify(publication_id)
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0 if result.get("status") == "ok" else 1
+    print_panel(
+        "Published Workspace Verify",
+        [
+            f"status: {result.get('status', '')}",
+            f"publications: {result.get('publications', 0)}",
+            f"files: {result.get('files', 0)}",
+        ],
+    )
+    failures = result.get("failures", [])
+    if failures:
+        rows = [
+            [str(row.get("publication_id", "")), str(row.get("path", "")), str(row.get("reason", ""))]
+            for row in failures
+        ]
+        print_table(["publication", "path", "reason"], rows)
+        return 1
+    print_success("Published workspace hashes verified")
+    return 0
+
+
 def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
     repo_path = _resolve_optional_path_arg(args.path)
     result = _clawied_service_call_or_unavailable(
@@ -3333,6 +3562,16 @@ def _parse_channel_args(values: list[str]) -> list[dict[str, str]]:
     return parsed
 
 
+def _parse_workspace_viewers(values: list[str] | None) -> list[str]:
+    rows: list[str] = []
+    for value in values or []:
+        for item in str(value or "").split(","):
+            token = item.strip()
+            if token:
+                rows.append(token)
+    return rows
+
+
 def _read_json_file(path: str) -> Any:
     source = Path(path).expanduser()
     with source.open("r", encoding="utf-8") as handle:
@@ -3363,6 +3602,14 @@ def _resolve_required_value(
 
 def _resolve_agent_id(agent_id: str | None) -> str:
     return _resolve_required_value(agent_id, field_name="agent_id")
+
+
+def _resolve_new_agent_id(agent_id: str | None, service: ClawieService) -> str:
+    token = str(agent_id or "").strip()
+    if token:
+        return token
+    state = service.store.read_state()
+    return choose_default_agent_name(state.get("agents", {}).keys())
 
 
 def _resolve_bundles(positional: list[str] | None, flags: list[str] | None) -> list[str]:

@@ -8,6 +8,8 @@ Agents are the core unit in clawie. Each agent has a provider, channels, credent
 clawie agent create alice --template baseline
 ```
 
+If `AGENT_ID` is omitted, clawie picks an unused default name at random.
+
 Options:
 
 | Flag | Description |

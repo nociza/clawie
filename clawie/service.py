@@ -34,6 +34,7 @@ from clawie._service_prompts import PromptOpsMixin
 from clawie._service_agents import AgentOpsMixin
 from clawie._service_telemetry import TelemetryOpsMixin
 from clawie._service_delegation import DelegationOpsMixin
+from clawie._service_published_workspace import PublishedWorkspaceOpsMixin
 from clawie._service_reconcile import ReconcileOpsMixin
 from clawie._service_escalation import ControlEscalationMixin
 from clawie._service_watchdog import ControlWatchdogMixin
@@ -65,6 +66,7 @@ class ClawieService(
     AgentOpsMixin,
     TelemetryOpsMixin,
     DelegationOpsMixin,
+    PublishedWorkspaceOpsMixin,
     ReconcileOpsMixin,
     ControlEscalationMixin,
     ControlWatchdogMixin,

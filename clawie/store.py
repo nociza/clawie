@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "backup_auto_push": True,
     "backup_last_run_at": "",
     "backup_last_commit": "",
+    "published_workspace_root": "",
     "control_operator_allowlist": [],
     "control_github_repo": "",
     "control_github_token_path": "",

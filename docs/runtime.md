@@ -8,6 +8,10 @@ clawie uses Linux users for agent isolation. Each agent can get its own OS user,
 sudo clawie runtime create alice --user alice
 ```
 
+If the agent ID is omitted, clawie picks an unused default name at random. For
+runtime creation, the implicit Linux username is the lowercase form of that name
+unless `--user` is provided.
+
 This:
 1. Creates a Linux user `alice` with a home directory
 2. Installs the configured provider runtime

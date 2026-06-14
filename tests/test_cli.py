@@ -1045,6 +1045,49 @@ def test_create_agent_uses_openclaw_as_default_provider(
     assert "provider: openclaw" in output
 
 
+def test_create_agent_uses_random_default_name_when_omitted(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("clawie.default_names.random.choice", lambda _items: "Abulafia")
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    code = run_cli(tmp_path, "agent", "create")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Provisioned agent Abulafia" in output
+    state = StateStore(config_dir=tmp_path).read_state()
+    assert "Abulafia" in state["agents"]
+
+
+def test_random_default_name_skips_existing_names_case_insensitively(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    seen_candidates: list[list[str]] = []
+
+    def choose(items: list[str]) -> str:
+        seen_candidates.append(list(items))
+        return items[0]
+
+    monkeypatch.setattr("clawie.default_names.random.choice", choose)
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert run_cli(tmp_path, "agent", "create", "abulafia") == 0
+    capsys.readouterr()
+
+    code = run_cli(tmp_path, "agent", "create")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Abulafia" not in seen_candidates[0]
+    assert "Provisioned agent Diotallevi" in output
+
+
 def test_agent_provider_set_changes_provider(
     tmp_path: Path,
     capsys: CaptureFixture[str],
@@ -1360,6 +1403,40 @@ def test_spawn_success_with_mocks(
     state = StateStore(config_dir=tmp_path).read_state()
     assert "sam" in state["agents"]
     assert state["agents"]["sam"]["agent"]["linux_user"] == "sam"
+
+
+def test_spawn_uses_random_default_name_when_agent_id_omitted(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("clawie.default_names.random.choice", lambda _items: "Abulafia")
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        class Result:
+            returncode = 1 if cmd[:2] == ["id", "-u"] else 0
+            stdout = ""
+
+        return Result()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
+    monkeypatch.setattr(
+        ClawieService,
+        "ensure_provider_runtime",
+        lambda self, provider: {"provider": provider, "installed": False, "already_present": True},
+    )
+
+    code = run_cli(tmp_path, "runtime", "create", "--skip-config-copy")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "Spawned linux user abulafia and provisioned Abulafia" in output
+    state = StateStore(config_dir=tmp_path).read_state()
+    assert state["agents"]["Abulafia"]["agent"]["linux_user"] == "abulafia"
 
 
 def test_setup_sets_global_spawn_password(tmp_path: Path, capsys: CaptureFixture[str]) -> None:

@@ -24,6 +24,8 @@ class ProviderSpec:
     auth_refresh_command: tuple[str, ...] = ("auth", "refresh")
     auth_status_command: tuple[str, ...] = ("auth", "status")
     readiness_command: tuple[str, ...] = ()
+    verified_delivery: bool = False
+    delivery_note: str = ""
 
     def supports_auth_mode(self, mode: str) -> bool:
         return mode in self.auth_modes
@@ -35,7 +37,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         runtime="zeroclaw-agent",
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
-        default_api_url="https://api.zeroclaw.example/v1",
+        default_api_url="",
         state_dir=".zeroclaw",
         workspace_dir="workspace",
         marker_files=("config.toml", "auth-profiles.json", ".secret_key"),
@@ -65,13 +67,14 @@ PROVIDERS: dict[str, ProviderSpec] = {
         service_group="service",
         background_command=("daemon",),
         readiness_command=("auth", "status"),
+        delivery_note="lifecycle/auth support only; delegated-task delivery adapter is not source-pinned",
     ),
     "picoclaw": ProviderSpec(
         name="picoclaw",
         runtime="picoclaw-agent",
         auth_modes=("linked", "api_key"),
         default_auth_mode="linked",
-        default_api_url="https://api.picoclaw.example/v1",
+        default_api_url="",
         state_dir=".picoclaw",
         workspace_dir="workspace",
         marker_files=("config.json", "config.toml", "auth.json", "auth-profiles.json"),
@@ -105,13 +108,14 @@ PROVIDERS: dict[str, ProviderSpec] = {
         auth_refresh_command=("auth", "status"),
         auth_status_command=("auth", "status"),
         readiness_command=("auth", "status"),
+        delivery_note="lifecycle/auth support only; delegated-task delivery adapter is not source-pinned",
     ),
     "openclaw": ProviderSpec(
         name="openclaw",
         runtime="openclaw-agent",
         auth_modes=("none", "linked", "api_key"),
         default_auth_mode="none",
-        default_api_url="https://api.openclaw.example/v1",
+        default_api_url="",
         state_dir=".openclaw",
         workspace_dir="workspace",
         marker_files=(
@@ -127,6 +131,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
             ".openai",
         ),
         shared_auth_paths=(
+            ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+            ".openclaw/agents/main/agent/openclaw-agent.sqlite-wal",
+            ".openclaw/agents/main/agent/openclaw-agent.sqlite-shm",
             ".openclaw/auth-profiles.json",
         ),
         core_prompt_files=(
@@ -145,12 +152,18 @@ PROVIDERS: dict[str, ProviderSpec] = {
         service_group="daemon",
         background_command=("gateway", "run"),
         readiness_command=("models", "status"),
+        verified_delivery=True,
+        delivery_note="source-pinned gateway delivery adapter",
     ),
 }
 
 
 def provider_names() -> list[str]:
     return sorted(PROVIDERS)
+
+
+def verified_delivery_provider_names() -> list[str]:
+    return sorted(name for name, spec in PROVIDERS.items() if spec.verified_delivery)
 
 
 def get_provider(name: str) -> ProviderSpec:

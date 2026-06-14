@@ -57,14 +57,18 @@ clawie status --watch --interval 5
 ```
 
 By default `status` uses cached metrics (a pure read). Pass `--refresh` (implied
-by `--watch`) to sample live CPU/memory once.
+by `--watch`) to sample live CPU/memory once. Runtime metrics use `ps` when
+available, prefer existing Linux cgroup memory accounting when the host exposes
+it, and fall back to `/proc` RSS/memory data.
 
 ## Resilience
 
 `status` is designed to be useful even on a half-broken system: if one section
 can't be read (for example, an unconfigured maintenance cron, or a runtime that
 can't be probed), that section degrades to an error note and the rest of the
-report still renders.
+report still renders. Fatal state-store safety refusals still exit nonzero after
+rendering details, so scripts can detect an unsafe `--config-dir` or symlinked
+state path.
 
 ## Migrating from `clawie dashboard`
 

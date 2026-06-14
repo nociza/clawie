@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from clawie.adapters import AdapterError
-from clawie.service import ClawieService
+from clawie.service import ClawieService, SetupError
 from clawie.service_common import AgentNotFoundError
 from clawie.store import StateStore
 
@@ -76,10 +76,24 @@ def test_deliver_to_agent_provider_without_adapter(tmp_path: Path) -> None:
         service.deliver_to_agent("alice", "x", run=lambda cmd: "{}")
 
 
-def test_default_deliver_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_deliver_runner_resolves_agent_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service_with_agent(tmp_path)
-    monkeypatch.setattr(service, "_resolve_provider_executable", lambda provider: "/opt/openclaw")
-    monkeypatch.setattr(service, "_wrap_user_command", lambda argv, lu, purpose="": list(argv))
+    seen: dict[str, object] = {}
+
+    def fake_resolve(provider: str) -> str:
+        seen["provider"] = provider
+        return f"/opt/{provider}"
+
+    def fake_wrap(argv: list[str], linux_user: str, purpose: str = "") -> list[str]:
+        seen["argv"] = argv
+        seen["linux_user"] = linux_user
+        seen["purpose"] = purpose
+        return list(argv)
+
+    monkeypatch.setattr(service, "_resolve_provider_executable", fake_resolve)
+    monkeypatch.setattr(service, "_wrap_user_command", fake_wrap)
     monkeypatch.setattr(service, "_service_env", lambda lu: {})
 
     class _R:
@@ -94,6 +108,29 @@ def test_default_deliver_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     result = service.deliver_to_agent("alice", "x")
     assert result["ok"] is True
     assert result["output"] == "ok"
+    assert seen["provider"] == "openclaw"
+    assert seen["argv"][0] == "/opt/openclaw"
+    assert seen["linux_user"] == "alice"
+    assert seen["purpose"] == "agent delegation"
+
+
+def test_default_deliver_runner_reports_agent_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service_with_agent(tmp_path)
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda provider: f"/opt/{provider}")
+    monkeypatch.setattr(service, "_wrap_user_command", lambda argv, lu, purpose="": list(argv))
+    monkeypatch.setattr(service, "_service_env", lambda lu: {})
+
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "gateway unavailable"
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+
+    with pytest.raises(SetupError, match="openclaw agent delivery failed: gateway unavailable"):
+        service.deliver_to_agent("alice", "x")
 
 
 def test_cli_delegation_deliver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:

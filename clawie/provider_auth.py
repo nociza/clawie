@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -239,6 +240,12 @@ def inspect_auth_files(provider: str, home: Path | None) -> dict[str, Any]:
         parsed = auth_status_from_picoclaw_auth_json(native_path)
         if parsed:
             return parsed
+    if spec.name == "openclaw":
+        sqlite_path = home / spec.state_dir / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+        if _path_exists(sqlite_path):
+            parsed = auth_status_from_openclaw_sqlite(sqlite_path)
+            if parsed:
+                return parsed
     profiles_path = home / spec.state_dir / "auth-profiles.json"
     if _path_exists(profiles_path):
         parsed = auth_status_from_profiles_json(profiles_path)
@@ -250,6 +257,55 @@ def inspect_auth_files(provider: str, home: Path | None) -> dict[str, Any]:
         if parsed:
             return parsed
     return {}
+
+
+def auth_status_from_openclaw_sqlite(path: Path) -> dict[str, Any]:
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(path)
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    except sqlite3.Error:
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+    if not row or not row[0]:
+        return {"auth_status": "missing", "detail": "no auth profiles found", "source": f"file:{path.name}"}
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return {}
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict) or not profiles:
+        return {"auth_status": "missing", "detail": "no auth profiles found", "source": f"file:{path.name}"}
+
+    selected_key = ""
+    selected: dict[str, Any] = {}
+    for key, item in profiles.items():
+        if isinstance(item, dict):
+            selected_key = str(key)
+            selected = item
+            break
+    if not selected:
+        return {}
+
+    expires_at = _profile_expiry_for_display(selected)
+    has_token = any(
+        str(selected.get(name, "")).strip()
+        for name in ("access", "refresh", "token", "idToken", "key")
+    )
+    return {
+        "auth_status": auth_status_from_expiry(expires_at, has_token=has_token),
+        "auth_profile": str(selected.get("displayName", "")).strip() or selected_key,
+        "account": str(selected.get("accountId", "")).strip(),
+        "expires_at": expires_at,
+        "last_refresh": "",
+        "detail": str(selected.get("type", "")).strip(),
+        "source": f"file:{path.name}",
+    }
 
 
 def auth_status_from_profiles_json(path: Path) -> dict[str, Any]:

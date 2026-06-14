@@ -80,11 +80,12 @@ service.start_agent_repl("worker", model_tier="balanced")
 
 ```python
 service.setup(
-    provider="picoclaw",
+    provider="openclaw",
     api_key="",
+    auth_mode="none",
     subscription="pro",
     workspace="production",
-    api_url="https://api.example.com/v1",
+    api_url="",
 )
 ```
 

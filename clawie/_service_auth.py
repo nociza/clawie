@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 from clawie.auth_sources import (
     extract_picoclaw_credentials,
+    extract_openclaw_sqlite_auth_profiles,
     extract_provider_auth_profiles,
     load_claude_auth,
     load_codex_auth,
@@ -37,6 +40,8 @@ class ProviderAuthMixin:
         provider: str,
         imported: dict[str, str],
     ) -> list[str]:
+        if str(provider).strip().lower() == "openclaw":
+            return self._write_openclaw_native_auth_profile(imported)
         shared_home = self._ensure_shared_provider_auth_root()
         target = shared_home / get_provider(provider).state_dir / "auth-profiles.json"
         existing = self._read_json_file(target)
@@ -45,6 +50,211 @@ class ProviderAuthMixin:
         self._harden_private_path_permissions(target.parent)
         self._harden_private_path_permissions(target)
         return [str(target)]
+
+    def _write_openclaw_native_auth_profile(self, imported: dict[str, str]) -> list[str]:
+        shared_home = self._ensure_shared_provider_auth_root()
+        agent_dir = self._openclaw_native_auth_agent_dir(shared_home)
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        db_path = agent_dir / "openclaw-agent.sqlite"
+        profile_id, provider, credential = self._openclaw_native_auth_credential(imported)
+        store, state = self._read_openclaw_native_auth_store(db_path)
+        profiles = store.setdefault("profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            store["profiles"] = profiles
+        profiles[profile_id] = credential
+        store["version"] = int(store.get("version", 1) or 1)
+
+        order = state.setdefault("order", {})
+        if not isinstance(order, dict):
+            order = {}
+            state["order"] = order
+        existing_order = order.get(provider, [])
+        if not isinstance(existing_order, list):
+            existing_order = []
+        order[provider] = [
+            profile_id,
+            *[
+                str(item).strip()
+                for item in existing_order
+                if str(item).strip() and str(item).strip() != profile_id
+            ],
+        ]
+        state["version"] = int(state.get("version", 1) or 1)
+
+        self._write_openclaw_native_auth_store(db_path, store=store, state=state)
+        self._harden_private_path_permissions(agent_dir)
+        self._harden_private_path_permissions(db_path)
+        return [str(db_path)]
+
+    @staticmethod
+    def _openclaw_native_auth_agent_dir(home: Path) -> Path:
+        return home / ".openclaw" / "agents" / "main" / "agent"
+
+    def _read_openclaw_native_auth_store(self, db_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not db_path.exists():
+            return {"version": 1, "profiles": {}}, {"version": 1}
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(db_path)
+            store_row = conn.execute(
+                "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+                ("primary",),
+            ).fetchone()
+            state_row = conn.execute(
+                "SELECT state_json FROM auth_profile_state WHERE state_key = ?",
+                ("primary",),
+            ).fetchone()
+        except sqlite3.Error:
+            return {"version": 1, "profiles": {}}, {"version": 1}
+        finally:
+            if conn is not None:
+                conn.close()
+        store = self._decode_json_obj(str(store_row[0])) if store_row and store_row[0] else {}
+        state = self._decode_json_obj(str(state_row[0])) if state_row and state_row[0] else {}
+        if not isinstance(store, dict):
+            store = {}
+        if not isinstance(state, dict):
+            state = {}
+        store.setdefault("version", 1)
+        store.setdefault("profiles", {})
+        state.setdefault("version", 1)
+        return store, state
+
+    @staticmethod
+    def _decode_json_obj(value: str) -> dict[str, Any]:
+        import json
+
+        try:
+            payload = json.loads(value)
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_openclaw_native_auth_store(
+        self,
+        db_path: Path,
+        *,
+        store: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        import json
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_profile_store (
+                    store_key TEXT PRIMARY KEY,
+                    store_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_profile_state (
+                    state_key TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            updated_at = int(time.time() * 1000)
+            conn.execute(
+                """
+                INSERT INTO auth_profile_store(store_key, store_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(store_key) DO UPDATE SET
+                    store_json = excluded.store_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("primary", json.dumps(store, sort_keys=True), updated_at),
+            )
+            conn.execute(
+                """
+                INSERT INTO auth_profile_state(state_key, state_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(state_key) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                ("primary", json.dumps(state, sort_keys=True), updated_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _openclaw_native_auth_credential(
+        self,
+        imported: dict[str, str],
+    ) -> tuple[str, str, dict[str, Any]]:
+        provider = self._openclaw_native_provider(str(imported.get("upstream_provider", "")))
+        profile_id = self._openclaw_native_profile_id(str(imported.get("profile_id", "")), provider)
+        kind = str(imported.get("kind", "oauth")).strip().lower().replace("-", "_") or "oauth"
+        account_id = str(imported.get("account_id", "")).strip()
+        expires_at = str(imported.get("expires_at", "")).strip()
+        expires_ms = 0
+        if expires_at:
+            parsed = parse_iso_timestamp(expires_at)
+            if parsed is not None:
+                expires_ms = int(parsed.timestamp() * 1000)
+        if kind == "api_key":
+            key = str(imported.get("api_key", imported.get("key", ""))).strip()
+            if not key:
+                raise ValueError("OpenClaw native API-key auth import requires api_key/key material")
+            credential: dict[str, Any] = {"type": "api_key", "provider": provider, "key": key}
+        elif kind == "token":
+            token = str(imported.get("access_token", imported.get("token", ""))).strip()
+            if not token:
+                raise ValueError("OpenClaw native token auth import requires token/access_token material")
+            credential = {"type": "token", "provider": provider, "token": token}
+            if expires_ms > 0:
+                credential["expires"] = expires_ms
+        elif kind == "oauth":
+            access = str(imported.get("access_token", imported.get("access", ""))).strip()
+            refresh = str(imported.get("refresh_token", imported.get("refresh", ""))).strip()
+            if not access or not refresh:
+                raise ValueError("OpenClaw native OAuth auth import requires access and refresh tokens")
+            if expires_ms <= 0:
+                raise ValueError("OpenClaw native OAuth auth import requires a valid expires_at timestamp")
+            credential = {
+                "type": "oauth",
+                "provider": provider,
+                "access": access,
+                "refresh": refresh,
+                "expires": expires_ms,
+            }
+            id_token = str(imported.get("id_token", "")).strip()
+            if id_token:
+                credential["idToken"] = id_token
+            if account_id:
+                credential["accountId"] = account_id
+        else:
+            raise ValueError(f"unsupported OpenClaw native auth credential type: {kind}")
+        return profile_id, provider, credential
+
+    @staticmethod
+    def _openclaw_native_provider(value: str) -> str:
+        token = str(value).strip().lower()
+        if token in {"openai-codex", "openai-chatgpt"}:
+            return "openai"
+        if token == "anthropic-claude":
+            return "anthropic"
+        return token
+
+    @staticmethod
+    def _openclaw_native_profile_id(value: str, provider: str) -> str:
+        token = str(value).strip()
+        if not token:
+            return f"{provider}:default"
+        prefix, sep, suffix = token.partition(":")
+        if not sep:
+            return f"{provider}:{token}"
+        normalized_prefix = ProviderAuthMixin._openclaw_native_provider(prefix)
+        if normalized_prefix != provider:
+            return token
+        return f"{provider}:{suffix or 'default'}"
 
     def _write_picoclaw_auth_store(self, imported: dict[str, str]) -> list[str]:
         shared_home = self._ensure_shared_provider_auth_root()
@@ -448,10 +658,13 @@ class ProviderAuthMixin:
             path = shared_home / rel
             if not self._path_exists(path):
                 continue
-            payload = self._read_json_file(path)
-            if path.name == "auth.json":
+            if path.name == "openclaw-agent.sqlite":
+                rows = extract_openclaw_sqlite_auth_profiles(path)
+            elif path.name == "auth.json":
+                payload = self._read_json_file(path)
                 rows = extract_picoclaw_credentials(payload)
             else:
+                payload = self._read_json_file(path)
                 rows = extract_provider_auth_profiles(payload)
             for row in rows:
                 profile_id = str(row.get("profile_id", "")).strip()
@@ -467,7 +680,7 @@ class ProviderAuthMixin:
         self._require_setup()
         shared_home = self._ensure_shared_provider_auth_root()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         updated_agents: list[str] = []
         skipped_agents: list[str] = []
         linked_paths: list[str] = []
@@ -535,7 +748,7 @@ class ProviderAuthMixin:
             return []
         rows: list[str] = []
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         for aid, agent in sorted(agents.items()):
             self._hydrate_agent_controls(agent)
             info = agent.get("agent", {})
@@ -604,7 +817,7 @@ class ProviderAuthMixin:
         self._refresh_managed_agent_provider_alignment(token)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -652,7 +865,7 @@ class ProviderAuthMixin:
         self._refresh_managed_agent_provider_alignment(token)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -801,9 +1014,9 @@ class ProviderAuthMixin:
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
         if (
             # Fail-fast auth preparation only applies to agents that consume the
-            # shared provider-auth store (shared_provider_auth flag). Agents that
-            # merely have the default provider-auth bundle selected keep their
-            # own auth and must not be blocked on shared linked auth.
+            # shared provider-auth store (shared_provider_auth flag). Agents can
+            # select the provider-auth bundle without having it synced yet; those
+            # agents keep their own auth until sync/apply explicitly opts them in.
             not bool(sync.get("shared_provider_auth", False))
             or not spec.supports_auth_mode("linked")
         ):

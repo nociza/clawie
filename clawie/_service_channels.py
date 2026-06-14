@@ -27,7 +27,7 @@ class ChannelOpsMixin:
     def toggle_agent_channel(self, agent_id: str, channel_index: int) -> dict[str, Any]:
         self._require_setup()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -366,7 +366,7 @@ class ChannelOpsMixin:
             raise ValueError("from_agent and to_agent must differ")
         state = self.store.read_state()
 
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         source = agents.get(from_agent)
         target = agents.get(to_agent)
         if not source:
@@ -444,7 +444,7 @@ class ChannelOpsMixin:
             raise ValueError("preset must be one of: minimal, growth, enterprise")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         target = agents.get(agent_id)
         if not target:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -486,7 +486,7 @@ class ChannelOpsMixin:
 
     def channel_inventory(self) -> dict[str, Any]:
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         rows: list[dict[str, Any]] = []
         assigned_keys: set[tuple[str, str]] = set()
         for aid, payload in sorted(agents.items()):
@@ -567,7 +567,7 @@ class ChannelOpsMixin:
             raise ValueError("target_agent_id is required")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         target = agents.get(dst)
         if not target:
             raise AgentNotFoundError(f"target agent not found: {dst}")
@@ -638,7 +638,7 @@ class ChannelOpsMixin:
             raise ValueError("kind and name are required")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         source = agents.get(src)
         if not source:
             raise AgentNotFoundError(f"agent not found: {src}")
@@ -729,7 +729,7 @@ class ChannelOpsMixin:
         self._refresh_managed_agent_provider_alignment(target)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(target)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {target}")
@@ -747,7 +747,7 @@ class ChannelOpsMixin:
         if not already_assigned:
             self.assign_channel_to_agent("", channel_kind, channel_name, target)
             state = self.store.read_state()
-            agents = state.setdefault("agents", state.get("users", {}))
+            agents = state.setdefault("agents", {})
             agent = agents.get(target)
             if not agent:
                 raise AgentNotFoundError(f"agent not found: {target}")
@@ -865,7 +865,7 @@ class ChannelOpsMixin:
             output = (result.stdout or result.stderr or "").strip()
             if result.returncode == 0:
                 state = self.store.read_state()
-                agents = state.setdefault("agents", state.get("users", {}))
+                agents = state.setdefault("agents", {})
                 refreshed = agents.get(target, {})
                 refreshed_info = refreshed.setdefault("agent", {})
                 refreshed_info["last_sync"] = now_iso()
@@ -911,7 +911,7 @@ class ChannelOpsMixin:
             raise ValueError("channel sync is only supported for managed agents")
         self._refresh_managed_agent_provider_alignment(token)
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")

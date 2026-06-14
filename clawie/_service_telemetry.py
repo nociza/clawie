@@ -37,7 +37,7 @@ class TelemetryOpsMixin:
         daemon_map = self._running_provider_daemons_by_user()
         self._refresh_managed_agent_provider_alignments(agent_id=agent_id, daemon_map=daemon_map)
         state = self.store.read_state()
-        agents = list(state.setdefault("agents", state.get("users", {})).values())
+        agents = list(state.setdefault("agents", {}).values())
         if agent_id:
             agents = [
                 row
@@ -127,13 +127,18 @@ class TelemetryOpsMixin:
 
     def collect_metrics(self, agent_id: str | None = None) -> dict[str, Any]:
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
+        daemon_map = self._running_provider_daemons_by_user()
         sampled = 0
         for aid, agent_state in agents.items():
             if agent_id and aid != agent_id:
                 continue
+            self._hydrate_agent_controls(agent_state)
             agent = agent_state.setdefault("agent", {})
-            pid = int(agent.get("pid") or 0)
+            live_entry = self._live_process_entry_for_agent(agent, daemon_map)
+            pid = int((live_entry or {}).get("pid", 0) or 0)
+            if pid <= 0:
+                pid = int(agent.get("fallback_pid", 0) or agent.get("pid") or 0)
             status = "offline"
             cpu_percent = 0.0
             mem_percent = 0.0
@@ -145,6 +150,10 @@ class TelemetryOpsMixin:
                     mem_percent = float(probe["mem_percent"])
                     rss_kb = int(probe["rss_kb"])
                     status = "running"
+                    agent["pid"] = pid
+                elif live_entry is not None:
+                    status = "running"
+                    agent["pid"] = pid
                 else:
                     agent["pid"] = 0
 
@@ -161,6 +170,23 @@ class TelemetryOpsMixin:
             sampled += 1
         self.store.write_state(state)
         return {"sampled": sampled}
+
+    @staticmethod
+    def _live_process_entry_for_agent(
+        agent: dict[str, Any],
+        daemon_map: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        linux_user = str(agent.get("linux_user", "")).strip()
+        if not linux_user:
+            return None
+        entries = list(daemon_map.get(linux_user, []))
+        if not entries:
+            return None
+        provider = str(agent.get("provider", "")).strip().lower()
+        for entry in entries:
+            if str(entry.get("provider", "")).strip().lower() == provider:
+                return entry
+        return entries[0]
 
     def _attach_agent_auth_status(self, payload: dict[str, Any]) -> dict[str, Any]:
         agent_id = str(payload.get("agent_id", payload.get("user_id", ""))).strip()

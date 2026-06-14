@@ -170,10 +170,16 @@ def reconcile_plan(desired: AgentManifest, observed: dict[str, Any] | None) -> l
     *observed* is a plain dict the service builds from live state::
 
         {"provider": str, "model_tier": str,
-         "channels": [{"kind","name"}], "addons": {name: bool}}
+         "channels": [{"kind","name"}],
+         "credential_bundles": [str],
+         "addons": {name: bool}}
     """
+    missing = not observed
     observed = observed or {}
     actions: list[ReconcileAction] = []
+
+    if missing:
+        actions.append(ReconcileAction("ensure_agent", {"agent_id": desired.id}))
 
     obs_provider = str(observed.get("provider", "")).strip().lower()
     if obs_provider != desired.provider:
@@ -200,6 +206,28 @@ def reconcile_plan(desired: AgentManifest, observed: dict[str, Any] | None) -> l
             )
     for key in sorted(observed_ch - set(desired_ch)):
         actions.append(ReconcileAction("remove_channel", {"kind": key[0], "name": key[1]}))
+
+    desired_credentials = sorted(
+        {
+            ref.name.strip().lower().replace("_", "-")
+            for ref in desired.credentials
+            if ref.name.strip()
+        }
+    )
+    observed_credentials = sorted(
+        {
+            str(item).strip().lower().replace("_", "-")
+            for item in observed.get("credential_bundles", [])
+            if str(item).strip()
+        }
+    )
+    if observed_credentials != desired_credentials:
+        actions.append(
+            ReconcileAction(
+                "set_credentials",
+                {"from": observed_credentials, "to": desired_credentials},
+            )
+        )
 
     obs_addons = dict(observed.get("addons", {}))
     for name in sorted(desired.addons):

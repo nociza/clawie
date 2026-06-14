@@ -9,6 +9,7 @@ automatically**. Credentials never enter the repo.
 | Path in repo | Contents |
 |--------------|----------|
 | `state/snapshot.json` | Fleet config and agent records, **secrets redacted** (API keys, password hashes, bot tokens) |
+| `agents/<id>/manifest.json` | Secret-free declarative agent manifest used to recreate missing local agent records |
 | `agents/<id>/prompts/` | Core prompt files from the control plane (SOUL.md, MEMORY.md, DELEGATION.md, ...) |
 | `agents/<id>/workspace/` | Knowledge files captured from the live agent workspace: markdown/text notes plus everything under `memory/` |
 
@@ -17,7 +18,8 @@ What is deliberately **excluded**:
 - Credential material — auth files, copied provider/addon credential material,
   key/PEM files, and any file whose name looks credential-like
   (`*token*`, `*secret*`, `*auth*`, ...). A `.gitignore` safety net backs
-  this up at the git layer.
+  this up at the git layer. Secret-like channel names are omitted from the
+  manifest and must be re-linked after restore.
 - The event log, so commits only happen when knowledge actually changes.
 - Files over 1 MiB and non-knowledge formats (binaries, JSON state).
 
@@ -61,25 +63,27 @@ clawie backup import PATH [--merge]
   A failed push is reported but never fails the backup.
 - `status` is read-only: repo path, remote, HEAD, commit count, dirty flag,
   last run.
-- `restore` writes prompts back into agent state (and agent homes), then
-  restores workspace knowledge files. Live workspace files win over
-  control-plane prompt copies, so an agent's self-edited `MEMORY.md` comes
-  back exactly as it was captured.
+- `restore` reconciles backed-up manifests for agents missing from local state,
+  writes prompts back into agent state (and agent homes), then restores
+  workspace knowledge files. Live workspace files win over control-plane prompt
+  copies, so an agent's self-edited `MEMORY.md` comes back exactly as it was
+  captured.
 
 ## Restore semantics
 
 ```bash
-clawie backup restore                 # all agents present in local state
+clawie backup restore                 # all agents in the backup repo
 clawie backup restore --agent alice   # one agent
 ```
 
-- Agents present in the backup but missing from local state are skipped with
-  a warning — recreate the agent (or `clawie backup import` a snapshot) first.
+- Agents present in the backup but missing from local state are recreated from
+  `manifest.json`, then prompts and workspace knowledge are restored.
+- Older backup entries without `manifest.json` are skipped with a warning.
 - `--no-apply-to-disk` updates control-plane state only.
 - `--no-workspace` restores core prompts only.
 - Restoring to another machine: clone the backup repo to the configured path
-  (`clawie backup init PATH`), import a state snapshot if you need agent
-  records, then `clawie backup restore`.
+  (`clawie backup init PATH`), make credentials available separately, then
+  `clawie backup restore`.
 
 ## How continuous backup works
 

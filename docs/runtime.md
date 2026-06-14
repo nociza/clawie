@@ -11,7 +11,7 @@ sudo clawie runtime create alice --user alice
 This:
 1. Creates a Linux user `alice` with a home directory
 2. Installs the configured provider runtime
-3. Copies common config and credentials from the invoking user
+3. Copies common config from the invoking user
 4. Bootstraps provider-specific config in the agent home
 
 Options:
@@ -21,8 +21,8 @@ Options:
 | `--user` | Linux username (defaults to agent ID) |
 | `--source-home` | Copy configs from this path instead of current user |
 | `--skip-config-copy` | Don't copy any configs |
-| `--credential-bundle` | Additional credential bundles to sync |
-| `--no-default-credentials` | Skip the default `provider-auth` bundle |
+| `--credential-bundle` | Credential bundle to sync; use `provider-auth` only when this agent should reuse shared provider auth |
+| `--no-default-credentials` | Compatibility flag; default credential bundles are empty |
 | `--password` | Set a password for the Linux user |
 | `--password-hash` | Set a pre-hashed Linux password |
 | `--no-global-password` | Ignore the configured global spawn password |
@@ -38,15 +38,18 @@ Credentials are synced in scoped bundles:
 
 | Bundle | Contents |
 |--------|----------|
-| `provider-auth` (default) | .codex/auth.json and provider auth stores copied into the agent home as private files |
+| `provider-auth` | .codex/auth.json and provider auth stores copied into the agent home as private files |
 | `git` | .gitconfig, .git-credentials, .config/gh, .ssh |
 
 ```bash
-# Sync with defaults + git
-sudo clawie runtime create alice --user alice --credential-bundle git
+# Default: no credential bundles, so the agent authenticates independently
+sudo clawie runtime create alice --user alice
 
-# Only git, no defaults
-sudo clawie runtime create alice --user alice --no-default-credentials --credential-bundle git
+# Explicitly reuse shared provider auth
+sudo clawie runtime create alice --user alice --credential-bundle provider-auth
+
+# Explicitly copy git credentials
+sudo clawie runtime create alice --user alice --credential-bundle git
 ```
 
 ## Credential management after creation
@@ -55,8 +58,11 @@ sudo clawie runtime create alice --user alice --no-default-credentials --credent
 # View credential policy
 clawie agent credentials show alice
 
-# Add a bundle
-clawie agent credentials set alice git --include-defaults
+# Opt into shared provider auth
+clawie agent credentials set alice provider-auth
+
+# Add git credentials
+clawie agent credentials set alice git
 
 # Sync credentials to agent home
 sudo clawie agent credentials sync alice
@@ -69,6 +75,39 @@ sudo clawie agent credentials revoke alice git
 ```
 
 Revoking removes the credential files from the agent home and updates the policy so they stay revoked until re-enabled. Shared provider-auth and addon-auth caches are manager-side only; agents receive owned copies rather than symlinks to shared credential files.
+
+`clawie health` verifies this host isolation surface: the shared provider-auth
+store must be private, copied provider-auth files must not be symlinks, and
+copied provider-auth files must not be group/world-readable.
+
+For release/production validation, run the stronger Linux/root host proof:
+
+```bash
+sudo clawie health --host-validate --json
+```
+
+That command requires Linux with `/proc`, root, and at least two managed
+Linux-user agents. It checks that the users exist, homes are private, credential
+files are private and not symlinks, and one agent user cannot read another
+agent's sensitive paths. A skipped or failed report is not production evidence.
+The repository includes a Linux/root container proof in
+[`docs/proofs/host-validation-linux-container-2026-06-14.md`](proofs/host-validation-linux-container-2026-06-14.md);
+the built wheel also has a Colima Linux/systemd aggregate proof in
+[`docs/proofs/production-verify-colima-systemd-wheel-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-2026-06-14.md).
+Repeat the verifier on any different deployment host before accepting that host.
+
+For full target-host acceptance, run the aggregate verifier:
+
+```bash
+sudo clawie production verify --exercise-watchdog-restart --json
+```
+
+It combines standard health, host isolation validation, watchdog restart
+verification, and configured runtime adapter contract checks into one report.
+For package release acceptance, add `--all-provider-contracts` so every verified
+production delivery provider is checked for a source-pinned adapter.
+The aggregate verifier exits nonzero unless `--exercise-watchdog-restart`
+actually proves restart behavior.
 
 ## Detect installed runtimes
 

@@ -3,6 +3,7 @@
 The backup repository mirrors the fleet's durable knowledge:
 
 - ``state/snapshot.json`` — config and agent records with secrets redacted
+- ``agents/<agent_id>/manifest.json`` — secret-free declarative agent manifest
 - ``agents/<agent_id>/prompts/`` — core prompt files from the control plane
 - ``agents/<agent_id>/workspace/`` — knowledge files captured from the live
   agent workspace (markdown notes, memory files)
@@ -22,6 +23,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from clawie.manifest import AgentManifest, ChannelSpec, CredentialRef, ManifestError
 from clawie.providers import get_provider
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso, redact
 
@@ -32,6 +34,7 @@ This repository is maintained automatically by `clawie backup`.
 Layout:
 
 - `state/snapshot.json` — fleet config and agent records (secrets redacted)
+- `agents/<agent_id>/manifest.json` — secret-free declarative agent manifest
 - `agents/<agent_id>/prompts/` — core prompt files (SOUL.md, MEMORY.md, ...)
 - `agents/<agent_id>/workspace/` — knowledge files captured from the agent workspace
 
@@ -39,7 +42,8 @@ Events are intentionally excluded so that commits only happen when knowledge
 actually changes. Credentials are never written here; use `clawie backup export`
 for a full-fidelity local snapshot instead.
 
-Restore prompts with `clawie backup restore [--agent AGENT_ID]`.
+Restore manifests, prompts, and workspace knowledge with
+`clawie backup restore [--agent AGENT_ID]`.
 """
 
 _BACKUP_GITIGNORE = """# Safety net: never commit credential material.
@@ -282,16 +286,11 @@ class BackupOpsMixin:
             )
 
         state = self.store.read_state()
-        known_agents = state.setdefault("agents", state.get("users", {}))
+        known_agents = state.get("agents", {})
         requested = str(agent_id or "").strip()
         if requested:
             if not (agents_root / requested).is_dir():
                 raise AgentNotFoundError(f"agent not found in backup repo: {requested}")
-            if requested not in known_agents:
-                raise AgentNotFoundError(
-                    f"agent '{requested}' exists in the backup but not in local state. "
-                    "Create the agent (or 'clawie backup import' a state snapshot) first."
-                )
             targets = [requested]
         else:
             targets = sorted(entry.name for entry in agents_root.iterdir() if entry.is_dir())
@@ -299,10 +298,33 @@ class BackupOpsMixin:
         restored: dict[str, dict[str, int]] = {}
         skipped: list[dict[str, str]] = []
         for token in targets:
+            agent_root = agents_root / token
             if token not in known_agents:
-                skipped.append({"agent_id": token, "reason": "not in local state"})
-                continue
-            prompts_restored = self._restore_agent_prompts(token, agents_root / token / "prompts")
+                created, reason = self._restore_agent_from_backup_manifest(token, agent_root)
+                if not created:
+                    if requested:
+                        if reason == "not in local state and backup has no manifest":
+                            raise AgentNotFoundError(
+                                f"agent '{token}' exists in the backup but not in local state and "
+                                "the backup has no manifest to recreate it"
+                            )
+                        raise SetupError(f"could not restore agent '{token}' from backup manifest: {reason}")
+                    skipped.append({"agent_id": token, "reason": reason})
+                    continue
+                if reason:
+                    skipped.append({"agent_id": token, "reason": reason})
+                state = self.store.read_state()
+                known_agents = state.get("agents", {})
+                if token not in known_agents:
+                    if requested:
+                        raise SetupError(
+                            f"agent '{token}' exists in the backup but not in local state and "
+                            "manifest reconcile did not create it"
+                        )
+                    skipped.append({"agent_id": token, "reason": "manifest reconcile did not create agent"})
+                    continue
+
+            prompts_restored = self._restore_agent_prompts(token, agent_root / "prompts")
             if apply_to_disk and prompts_restored:
                 try:
                     self.write_agent_core_prompts_to_disk(token)
@@ -314,7 +336,7 @@ class BackupOpsMixin:
             workspace_restored = 0
             if include_workspace:
                 workspace_restored = self._restore_agent_workspace(
-                    token, agents_root / token / "workspace", skipped
+                    token, agent_root / "workspace", skipped
                 )
             restored[token] = {"prompts": prompts_restored, "workspace_files": workspace_restored}
 
@@ -353,7 +375,7 @@ class BackupOpsMixin:
         files_written += 1
 
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         for token, agent in sorted(agents.items()):
             if not isinstance(agent, dict):
                 continue
@@ -363,12 +385,81 @@ class BackupOpsMixin:
                 continue
             agent_root = agents_dir / safe_id
             provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
+            files_written += self._write_agent_manifest_backup(agent_root, safe_id, agent)
             files_written += self._write_agent_prompt_backups(agent_root, provider, agent)
             files_written += self._write_agent_workspace_backups(
                 agent_root, provider, agent, skipped, agent_id=safe_id
             )
             agents_backed_up.append(safe_id)
         return {"agents": agents_backed_up, "files": files_written, "skipped": skipped}
+
+    def _write_agent_manifest_backup(self, agent_root: Path, agent_id: str, agent: dict[str, Any]) -> int:
+        manifest = self._agent_manifest_from_state(agent_id, agent)
+        target = agent_root / "manifest.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(manifest.to_json(), encoding="utf-8")
+        return 1
+
+    def _agent_manifest_from_state(self, agent_id: str, agent: dict[str, Any]) -> AgentManifest:
+        info = agent.get("agent", {}) if isinstance(agent.get("agent", {}), dict) else {}
+        role = str(info.get("role", "worker")).strip().lower()
+        if role not in {"worker", "control"}:
+            role = "worker"
+        model_tier = str(info.get("model_tier", "balanced")).strip().lower()
+        if model_tier not in {"fast", "balanced", "power"}:
+            model_tier = "balanced"
+
+        channels: list[ChannelSpec] = []
+        for row in agent.get("channels", []):
+            if not isinstance(row, dict):
+                continue
+            kind = str(row.get("kind", "")).strip().lower()
+            name = str(row.get("name", "")).strip()
+            if not kind or not name:
+                continue
+            if self._is_sensitive_manifest_channel(kind, name):
+                continue
+            channels.append(ChannelSpec(kind=kind, name=name))
+
+        sync = self._normalize_credential_sync_state(
+            agent.get("credential_sync"),
+            default_when_missing=True,
+        )
+        shared_provider_auth = bool(sync.get("shared_provider_auth", False))
+        credentials = [
+            CredentialRef(
+                name=str(bundle),
+                scope="shared" if str(bundle) == "provider-auth" and shared_provider_auth else "agent",
+            )
+            for bundle in sync.get("bundles", [])
+            if str(bundle).strip()
+        ]
+
+        addons = {
+            name: True
+            for name, data in self._normalize_agent_addons(agent.get("addons")).items()
+            if bool(data.get("enabled", False))
+        }
+
+        return AgentManifest(
+            id=agent_id,
+            provider=str(info.get("provider", "openclaw")).strip().lower() or "openclaw",
+            role=role,
+            model_tier=model_tier,
+            display_name=str(agent.get("display_name", agent_id)).strip() or agent_id,
+            prompts_dir=str(agent.get("manifest_prompts_dir", "prompts")).strip() or "prompts",
+            channels=channels,
+            credentials=credentials,
+            addons=addons,
+            limits={},
+        )
+
+    def _is_sensitive_manifest_channel(self, kind: str, name: str) -> bool:
+        if self._looks_like_unresolved_secret(name):
+            return True
+        if kind == "telegram" and self._looks_like_telegram_bot_token(name):
+            return True
+        return False
 
     def _write_agent_prompt_backups(self, agent_root: Path, provider: str, agent: dict[str, Any]) -> int:
         prompts = agent.get("core_prompts", {})
@@ -504,6 +595,32 @@ class BackupOpsMixin:
 
     # ── restore helpers ──────────────────────────────────────────────────
 
+    def _restore_agent_from_backup_manifest(self, agent_id: str, agent_root: Path) -> tuple[bool, str]:
+        manifest_path = agent_root / "manifest.json"
+        if not manifest_path.is_file():
+            return False, "not in local state and backup has no manifest"
+        try:
+            manifest = AgentManifest.read(manifest_path)
+        except (OSError, ManifestError, ValueError) as exc:
+            return False, f"invalid manifest: {exc}"
+        if manifest.id != agent_id:
+            return False, f"manifest id {manifest.id!r} does not match backup path {agent_id!r}"
+
+        self.write_agent_manifest(manifest)
+        result = self.reconcile_agent_manifest(manifest, dry_run=False)
+        errors = result.get("errors", [])
+        if not errors:
+            return True, ""
+
+        try:
+            self.get_agent(agent_id)
+        except AgentNotFoundError:
+            detail = "; ".join(str(row.get("error", "")) for row in errors if isinstance(row, dict))
+            return False, f"manifest reconcile failed: {detail or errors!r}"
+
+        detail = "; ".join(str(row.get("error", "")) for row in errors if isinstance(row, dict))
+        return True, f"manifest reconcile incomplete: {detail or errors!r}"
+
     def _restore_agent_prompts(self, agent_id: str, prompts_dir: Path) -> int:
         if not prompts_dir.is_dir():
             return 0
@@ -528,7 +645,7 @@ class BackupOpsMixin:
         if not workspace_backup.is_dir():
             return 0
         state = self.store.read_state()
-        agent = state.get("agents", state.get("users", {})).get(agent_id, {})
+        agent = state.get("agents", {}).get(agent_id, {})
         provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
         linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
         if not provider:

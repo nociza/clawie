@@ -64,7 +64,7 @@ declarative artifact is the spine of the redesign.
 | C4 | **Previously fixed:** prompt staging used a world-writable `/tmp` handoff. Current code disables `/tmp` prompt staging and writes prompt files directly into the managed workspace. | `_service_prompts.py` |
 | C5 | **Upstream identity is still shared by policy.** Provider-auth files are now private copies, but agents that consume the shared provider-auth bundle still act as the same upstream account; the `git` bundle can still copy the manager's `.ssh`/`.git-credentials` into agent homes. | `service.py` `CREDENTIAL_BUNDLE_SPECS` |
 | C6 | **Imperative orchestration with hand-rolled rollback** — `switch_agent_provider` is a ~250-line saga; spawn is a long imperative sequence. Correct today, fragile on the next edit. | `_service_agents.py:241` |
-| C7 | **State accretion** — `users`/`agents` duality in the hot path (~40×), `ZeroClawService` naming, version skew (`__init__` 0.1.1 vs pyproject 0.1.3). | `store.py`, `service.py:51` |
+| C7 | **State accretion** — `users`/`agents` duality in the hot path (~40×), `ZeroClawService` naming, and historical package-version skew. | `store.py`, `service.py:51` |
 | C8 | **Provider schema knowledge is smeared**, and auth coupling spans three external formats with no seam. | `_service_agents.py:594`, `auth_sources.py` |
 | C9 | **Backup restores knowledge, not a runnable agent**; **resource telemetry is thin** (pid-based, usually 0). | `_service_backup.py:390`, `_service_telemetry.py:127` |
 
@@ -133,12 +133,12 @@ Components:
 - **Delegation bridge** (§7) — `deliver()` into the live gateway.
 - **Security/trust model** (§8) — per-agent secrets; no world-relaxed stores.
 - **Control agent** (§9) — the human's interface and self-healer.
-- **clawied** (§13) — single-writer daemon hosting reconcile + the control-tool
-  RPC surface + the audit log; resolves the SQLite concurrency problem.
+- **clawied** (§13) — foreground reconcile host today; target single-writer
+  daemon hosting command IPC, the control-tool RPC surface, and the audit log.
 
 `clawied` is the larger structural bet. Phases 0–2 do **not** require it; it
-lands with the reconcile/manifest work (Phase 3) and is the natural home for the
-control-tool gates (Phase 4).
+lands incrementally with the reconcile/manifest work (Phase 3) and is the
+natural home for the control-tool gates (Phase 4).
 
 ---
 
@@ -225,15 +225,15 @@ version-pinned unit:
 - **Upstream credential sources** — readers for `codex/auth.json` (with JWT
   expiry decode) and `claude/.credentials.json`. These are *not* openclaw; they
   are the model backends. One module, contract-tested.
-- **Provider auth-store writer** — drives openclaw's own auth surface, **not**
-  hand-written JSON. As of openclaw 2026.6.2, auth lives in each agent's
+- **Provider auth-store writer** — drives openclaw's own auth store, **not**
+  hand-written legacy JSON. As of openclaw 2026.6.2, auth lives in each agent's
   `openclaw-agent.sqlite`; the `auth-profiles.json` files and `openai-codex`
   profile ids are **legacy migration input** that `openclaw doctor --fix`
-  rewrites to the canonical `openai` route. Direct linked login/status now goes
-  through `openclaw models auth login` and `openclaw models status --json`;
-  remaining import/port flows still retain legacy migration files until clawie
-  has a verified noninteractive writer for openclaw's SQLite auth store.
-  hermes drives its own auth CLI.
+  rewrites to the canonical `openai` route. Direct linked login/status uses
+  `openclaw models auth login` and `openclaw models status --json`; import/port
+  writes the native SQLite `auth_profile_store` / `auth_profile_state` rows and
+  still reads legacy JSON for migration compatibility. hermes drives its own
+  auth CLI.
 
 `render_config`, `render_addon_integration`, and `write_provider_auth` together
 hold *all* of openclaw's schema knowledge currently smeared across
@@ -388,8 +388,22 @@ scoped device token, not the shared secret.
 - A **dumb watchdog** (systemd unit, not an agent) keeps the control agent alive
   and pings the human **out-of-band** if the control agent itself is down.
 - Every control action routes through the **event log** for an audit trail.
-- **DR-aware:** the control agent knows backup is knowledge-only until Phase 3
-  graduates it (§11) and says so when proposing a restore.
+- **DR-aware:** the control agent knows backup is manifest-backed but still
+  credential-free (§11), and says so when proposing a restore.
+
+**Current implementation:** `clawied` exposes `control_request` and
+`control_confirm` IPC commands. They use `ControlGate`, execute read/safe-heal
+verbs autonomously through the daemon-owned `ClawieService`, hold destructive
+verbs pending behind nonce confirmation, and write control events to the event
+log. Confirmed `open_issue` escalation writes GitHub issues through a private
+0600 token file with local dedupe and rate limiting. Confirmed `open_pr`
+escalation opens draft GitHub pull requests from existing branches through the
+same private-token path; it does not push or merge. `clawie control watchdog`
+writes a root-owned systemd unit for `clawie clawied run` with `Restart=always`
+and an optional `OnFailure` alert command; `clawie control watchdog verify
+--exercise-restart --json` is the target-host restart proof command. Applying a
+manifest with `role: control` seeds the workspace prompts with the
+`clawie control request` and `clawie control confirm` daemon-client commands.
 
 ---
 
@@ -422,46 +436,49 @@ Phase 0 moves auth to the `openclaw models auth` CLI.
 
 ## 11. Backup & disaster recovery
 
-Today: prompts + `.md`/`memory/` workspace notes, secrets excluded, and
-`restore` requires the agent to already exist in local state — i.e.
-**knowledge-only** (C9, audit: `_service_backup.py:390`).
-
-Target: because the **manifest** (§5) fully declares an agent, the backup repo
-becomes the manifest tree (`agent.toml` + `prompts/` + captured `workspace/`).
-Restore = drop manifests → reconcile → runnable fleet (creds re-supplied
-separately and still never committed). Until that lands, the control agent
-states the limitation explicitly. Full-fidelity local `backup export` (with
-secrets, 0o600) stays as-is.
+Current: because the **manifest** (§5) declares an agent, the backup repo now
+contains `manifest.json` + `prompts/` + captured `workspace/`. Restore writes
+the manifest into the local manifest tree, reconciles missing agents through the
+service layer, then restores prompts and workspace knowledge. Credentials are
+re-supplied separately and still never committed; secret-like channel names are
+omitted from the manifest and must be re-linked. Full-fidelity local
+`backup export` (with secrets, 0o600) stays as-is.
 
 ---
 
 ## 12. Observability & telemetry
 
 - **Status is the senses** and already degrades gracefully — keep it.
-- **Fix resource telemetry (C9):** `collect_metrics` keys CPU/mem off a stored
-  `pid` that is usually 0; real liveness comes from `process_signature()` /
-  `/proc`. Until reworked, the control agent's self-heal triggers on
-  **liveness/auth/drift**, **not** on "CPU pegged." Make resource-based triggers
-  a Phase 5 item with a real metrics source.
+- **Fix resource telemetry (C9):** `collect_metrics` now samples the live
+  provider process discovered from the process table before falling back to a
+  stored pid. Process probes preserve `ps` CPU data, prefer existing Linux
+  cgroup memory accounting when available, and fall back to `/proc` RSS/memory
+  data when needed. This gives `status --refresh` better CPU/memory data for
+  managed daemons, but the control agent should still prefer
+  **liveness/auth/drift** triggers over resource thresholds until it has its own
+  runtime.
 
 ---
 
 ## 13. State, concurrency & `clawied`
 
-The control agent makes an existing latent bug acute: SQLite is single-writer
-with default journaling, but a root maintenance cron, the human CLI, and the
-control agent can all write `~/.clawie/clawie.db` at once (audit:
-`requirements.md` admits this).
+The control agent makes an existing latent bug acute: SQLite still serializes
+writes even with WAL mode and the configured busy timeout, and a root
+maintenance cron, the human CLI, and the control agent can all write
+`~/.clawie/clawie.db` at once.
 
-**Target:** a long-running local **`clawied`** daemon is the **single writer**.
-It owns the DB, runs the reconcile loop, hosts the capability-tiered control-
-tool RPC (§9), and writes the audit log. CLI and control agent become clients.
-This resolves concurrency, gives the reconcile loop a home, and is the clean
-place for the code-enforced gates.
+**Current:** `clawied` exists as a foreground manifest reconcile host. It runs
+`AgentManifest` files through `ClawieService.reconcile_agent_manifest()`, uses a
+nonblocking advisory loop lock, writes pid/status files, and exposes a local
+Unix command socket for `clawied` operations. This gives reconcile a runtime
+home and a supervisor-friendly process surface. A whitelisted service RPC also
+routes mutating CLI service operations through the daemon when it is running.
+The live store now uses an `agents` table and returns an agents-only state
+surface; existing `users` tables migrate once and are dropped.
 
-There is **no interim multi-writer compatibility layer** (Principle 1): `clawied`
-is the single writer from the start, and its state schema is defined clean from
-the manifest rather than migrated from today's `users`/`agents` SQLite shape.
+**Target:** `clawied` becomes the **single writer**. It owns the DB, hosts the
+capability-tiered control-tool RPC (§9), and writes the audit log. CLI and the
+control agent are daemon clients through the same local command socket.
 
 ---
 
@@ -482,15 +499,18 @@ Keep the **ideas** that are sound (the patterns, not the old interfaces):
 
 Cut outright (no backwards compatibility — Principle 1):
 
-- The `users`/`agents` dual key and the `state["users"]` mirror — agents only.
+- The `users`/`agents` dual key and the `state["users"]` mirror — agents only
+  in the live state surface; old `users` tables migrate once into `agents`.
 - The `create_user` / `list_users` / `get_user` / `delete_user` /
   `batch_create_users` aliases.
-- `ZeroClawService` → a clean service name; fix the `0.1.1`/`0.1.3` version skew.
-- `store.py` legacy importers/migrations (`_migrate_legacy_json`,
-  `_migrate_remove_legacy_default_channels`, `_LEGACY_HEARTBEAT_PROMPT`, the
-  `config.json`/`state.json` legacy inputs).
-- The `auth-profiles.json` / `openai-codex` writers and the `auth_sources.py`
-  JSON conversion → replaced by the `openclaw models auth` CLI.
+- `ZeroClawService` → a clean service name; keep package version reporting tied
+  to installed metadata.
+- `store.py` legacy importers/migrations remain only as one-time compatibility
+  paths for existing pre-0.1.4 installs; they are not part of the live state
+  schema.
+- The legacy `auth-profiles.json` / `openai-codex` writer path. OpenClaw
+  import/port now writes native SQLite auth rows and keeps JSON reads only as
+  migration compatibility.
 - The Unix-socket delegation transport (above) and the deprecated `dashboard`
   alias.
 - The `cli.js` binary patch (also Phase 2).
@@ -509,9 +529,9 @@ degrade-to-read-only + warn. **Unblocks everything; delivers notify-on-upgrade;
 deletes the legacy auth writers and `users`/alias cruft as it goes (Principle
 1).** Split the upstream credential sources (codex/claude) from the provider
 writer. **Also fix the live drift:** stop writing legacy
-`auth-profiles.json` / `openai-codex` ids — drive `openclaw models auth` + SQLite
-— and have `render_config` assign a per-agent `gateway.port` + `gateway.auth.token`
-so Phase 1 has an endpoint to talk to.
+`auth-profiles.json` / `openai-codex` ids — drive `openclaw models auth` and
+native SQLite auth rows — and have `render_config` assign a per-agent
+`gateway.port` + `gateway.auth.token` so Phase 1 has an endpoint to talk to.
 
 ### Phase 1 — Real delegation bridge
 Implement `OpenclawAdapter.deliver()` over the loopback WS `agent` + `agent.wait`
@@ -524,15 +544,17 @@ managed agents; demote echo REPL to `loopback`; feed real usage from
 De-relax all three shared stores; per-agent secrets at 0o600 (or 0o700 broker);
 remove the cli.js patch (per-agent `CLAUDE_CONFIG_DIR`); close the `/tmp`
 staging vector; scope the git bundle; reconcile the README claims; per-agent
-auth default. **Load-bearing; must precede Phase 4.** (Independent of 0/1.)
+auth default; add a Linux/root host-validation command that proves cross-user
+read denial on a real provisioned fleet. **Load-bearing; must precede Phase 4.**
+(Independent of 0/1.)
 
 ### Phase 3 — Workspace manifest + reconcile + `clawied`
 Define `agent.toml`; build `reconcile(desired, observed)` to retire the
-provider-switch saga and the spawn imperative; stand up `clawied` as single
-writer + reconcile host (resolves concurrency); graduate backup to manifest-
-based runnable restore; **delete** the `users`/`agents` duality, the
-`ZeroClawService` name, and the legacy migrations outright — clean schema from
-the manifest, no migration shim. (Needs 0; benefits 1.)
+provider-switch saga and the spawn imperative; stand up `clawied` first as a
+reconcile host, then as the daemon single writer; graduate backup to
+manifest-based runnable restore; **delete** the `users`/`agents` duality from
+the live state surface while retaining one-time migration for existing installs.
+(Needs 0; benefits 1.)
 
 ### Phase 4 — Control agent
 `role: control` workspace; control-tool RPC with code-enforced capability tiers
@@ -565,10 +587,9 @@ adapter in CI; real resource-metrics source for the control agent; split the
   schema (`packages/gateway-protocol/src/schema.ts`, `/reference/rpc`) and how
   clawie provisions + rotates the per-agent gateway token and the control agent's
   scoped device token.
-- **clawied scope (Phase 3):** introducing a daemon is the biggest structural
-  bet. It is committed as the single writer (Principle 1 — no interim multi-writer
-  layer); the open question is sequencing/effort, not whether to keep the old
-  multi-writer status quo alive.
+- **clawied scope (Phase 3):** the foreground reconcile host and local command
+  socket are landed. The remaining structural bet is making it the single writer
+  for ordinary mutating CLI/control-agent operations.
 - **hermes interface (Phase 5):** unknown until its runtime exists; the seam in
   §6 is our best current guess and may need a method added.
 - **Per-agent auth UX:** moving off the shared store improves isolation but adds
@@ -617,8 +638,9 @@ Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
 - Model-provider auth now lives in each agent's `openclaw-agent.sqlite`.
   `auth-profiles.json`, `auth-state.json`, and `openai-codex` ids are **legacy**,
   migrated by `openclaw doctor --fix`. Preferred: `openclaw models auth
-  login/paste-token/order`, `~/.openclaw/.env` API keys, Claude-CLI reuse, and
-  SecretRef `keyRef`/`tokenRef`.
+  login/paste-token/order`, the SQLite `auth_profile_store` /
+  `auth_profile_state` rows those commands maintain, `~/.openclaw/.env` API
+  keys, Claude-CLI reuse, and SecretRef `keyRef`/`tokenRef`.
 
 **Protocol versioning**
 - `PROTOCOL_VERSION = 4` (`packages/gateway-protocol/src/version.ts`); `connect`
@@ -637,20 +659,19 @@ Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
 ## Appendix B — implementation status
 
 Tracks what has landed on `claude/great-meitner-m564jm` against the roadmap. The
-suite is green at every commit (298 → 395 tests).
+suite is green at every commit (298 → 443 tests).
 
 | Phase | Status | Landed |
 |---|---|---|
-| **0** Adapter seam + version gate | **Mostly done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; direct openclaw login/status uses `models auth`/`models status`; `ZeroClawService`→`ClawieService`; `clawie runtime version`. **Remaining:** replace imported/ported openclaw auth migration files with a verified native writer. |
+| **0** Adapter seam + version gate | **Mostly done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; direct openclaw login/status uses `models auth`/`models status`; imported/ported OpenClaw auth writes native SQLite auth rows; `ZeroClawService`→`ClawieService`; `clawie runtime version`. |
 | **1** Real delegation bridge | **Core done** | per-agent gateway endpoint (port + token) written into `openclaw.json`, token redacted from backups; `deliver_to_agent()` via the gateway (adapter-driven, injectable runner); `clawie delegation deliver` |
-| **2** Trust / security | **Mostly done** | `cli.js` binary patch removed; provider-auth and addon-auth caches are private manager-side stores; agents receive owned `0600` credential copies instead of symlinks; shared toolchain is no longer world-writable; `/tmp` prompt staging is disabled. **Remaining:** per-agent auth default / UX and real multi-user host verification |
-| **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`. **Remaining:** the `clawied` single-writer daemon and wiring reconcile into the service to retire the provider-switch saga |
-| **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed). **Remaining:** the control-agent runtime (RPC surface, GitHub escalation, watchdog), gated behind Phase 2 |
-| **5** Hardening + hermes | **Seam done** | `HermesAdapter` + a parametrized adapter contract test prove extensibility. hermes is an honest scaffold (read-only until pinned to real source). **Remaining:** real hermes contract; resource telemetry; `cli.py` split |
+| **2** Trust / security | **Mostly done** | `cli.js` binary patch removed; provider-auth and addon-auth caches are private manager-side stores; agents receive owned `0600` credential copies instead of symlinks; shared toolchain is no longer world-writable; `/tmp` prompt staging is disabled; credential bundles now default to empty so shared provider auth is explicit opt-in; `clawie health` verifies shared-auth store privacy and copied provider-auth file modes/symlinks; `clawie health --host-validate --json` now performs the Linux/root multi-user validation proof when run on a real fleet; `docs/proofs/host-validation-linux-container-2026-06-14.md` captures container-level Linux/root proof. **Remaining:** capture the proof on the target production host with real provisioned agents |
+| **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`; `clawie/_service_reconcile.py` applies manifests through service operations for provider, tier, channels, credential bundles, and addons; `clawie/_service_backup.py` writes per-agent `manifest.json` and uses it to recreate missing agents during restore; `clawie/store.py` uses an `agents` table and an agents-only state surface, with one-time migration from old `users` tables; `clawie/daemon.py` provides a foreground `clawied` reconcile loop with pid/status files, an advisory loop lock, a local command socket, whitelisted service-call IPC for mutating CLI service operations, and control-tool IPC; `clawie clawied ...` commands use IPC when the daemon is running; SQLite uses WAL plus a busy timeout. |
+| **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed); `clawie/daemon.py` — `control_request` / `control_confirm` runtime RPC executing read/safe-heal verbs, confirmed destructive verbs, and confirmed GitHub `open_issue` / `open_pr` escalation through daemon-owned service calls with event-log audit; `clawie/cli.py` — `clawie control request` / `control confirm` daemon-client commands for live control workspaces plus `clawie production verify` for aggregate proof gates and `--all-provider-contracts` production-delivery adapter checks; `clawie/_service_escalation.py` validates the private GitHub token file, dedupes issues/PRs, and rate-limits new issue/PR creation; `clawie/_service_watchdog.py` renders/install/removes/verifies the systemd watchdog and optional alert unit for `clawied`. |
+| **5** Hardening + provider matrix | **Seam done** | `HermesAdapter` + a parametrized adapter contract test prove extensibility; provider metadata now distinguishes verified production delivery from lifecycle/auth integrations; managed-agent refresh metrics now use live provider processes instead of usually-empty stored pids, preserve `ps` CPU, prefer cgroup memory accounting, and fall back to `/proc` RSS/memory. openclaw is the verified production delivery surface. picoclaw/zeroclaw and hermes are gated for delegated-task delivery until pinned to real source. **Remaining:** real contracts for those experimental delivery adapters; `cli.py` split |
 
-**Deferred with rationale:** Phase 2 still needs a real multi-user host pass and
-the UX change from shared-provider auth by default to per-agent auth by default.
-Phase 3's `clawied` daemon and Phase 4's control-agent runtime are large new
-subsystems for subsequent focused sessions; their pure cores (reconcile, the
-gate) are landed and tested, so the runtimes have a verified foundation to build
-on.
+**Deferred with rationale:** Phase 2 still needs target-host multi-user host
+validation even though the Linux/root container proof passes. Phase 4's tested
+core has runnable local surfaces; real fleet acceptance still depends on the
+target-host Phase 2 validation and
+`production verify --exercise-watchdog-restart --all-provider-contracts` proof.

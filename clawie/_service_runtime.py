@@ -650,7 +650,7 @@ class RuntimeOpsMixin:
         self._refresh_managed_agent_provider_alignment(agent_id)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -929,19 +929,142 @@ class RuntimeOpsMixin:
             return None
         cmd = ["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss="]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        cgroup_probe = self._probe_process_cgroup(pid)
         if result.returncode != 0 or not result.stdout.strip():
-            return None
+            return cgroup_probe or self._probe_process_procfs(pid)
         parts = result.stdout.strip().split()
         if len(parts) < 3:
-            return None
+            return cgroup_probe or self._probe_process_procfs(pid)
         try:
-            return {
+            probe = {
                 "cpu_percent": float(parts[0]),
                 "mem_percent": float(parts[1]),
                 "rss_kb": int(parts[2]),
             }
+            if cgroup_probe is not None:
+                probe["mem_percent"] = float(cgroup_probe["mem_percent"])
+                probe["rss_kb"] = int(cgroup_probe["rss_kb"])
+            return probe
         except ValueError:
+            return cgroup_probe or self._probe_process_procfs(pid)
+
+    @staticmethod
+    def _probe_process_cgroup(
+        pid: int,
+        proc_root: Path = Path("/proc"),
+        cgroup_root: Path = Path("/sys/fs/cgroup"),
+    ) -> dict[str, Any] | None:
+        if pid <= 0:
             return None
+        for cgroup_dir in RuntimeOpsMixin._process_memory_cgroup_dirs(pid, proc_root, cgroup_root):
+            usage_bytes = RuntimeOpsMixin._read_positive_int_file(cgroup_dir / "memory.current")
+            if usage_bytes <= 0:
+                usage_bytes = RuntimeOpsMixin._read_positive_int_file(cgroup_dir / "memory.usage_in_bytes")
+            if usage_bytes <= 0:
+                continue
+            memory_kb = int((usage_bytes + 1023) // 1024)
+            mem_total_kb = RuntimeOpsMixin._read_proc_mem_total_kb(proc_root)
+            mem_percent = round((memory_kb / mem_total_kb) * 100, 2) if mem_total_kb > 0 else 0.0
+            return {"cpu_percent": 0.0, "mem_percent": mem_percent, "rss_kb": memory_kb}
+        return None
+
+    @staticmethod
+    def _process_memory_cgroup_dirs(
+        pid: int,
+        proc_root: Path,
+        cgroup_root: Path,
+    ) -> list[Path]:
+        try:
+            cgroup_text = (proc_root / str(pid) / "cgroup").read_text(encoding="utf-8")
+        except OSError:
+            return []
+
+        dirs: list[Path] = []
+        seen: set[str] = set()
+        for line in cgroup_text.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) != 3:
+                continue
+            _hierarchy, controllers_text, cgroup_path = parts
+            rel_parts = [
+                part
+                for part in cgroup_path.strip().split("/")
+                if part and part not in {".", ".."}
+            ]
+            controllers = {item.strip() for item in controllers_text.split(",") if item.strip()}
+            candidates: list[Path] = []
+            if not controllers:
+                candidates.append(cgroup_root.joinpath(*rel_parts))
+            elif "memory" in controllers:
+                candidates.append(cgroup_root.joinpath("memory", *rel_parts))
+                candidates.append(cgroup_root.joinpath(*rel_parts))
+            for candidate in candidates:
+                key = str(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                dirs.append(candidate)
+        return dirs
+
+    @staticmethod
+    def _probe_process_procfs(pid: int, proc_root: Path = Path("/proc")) -> dict[str, Any] | None:
+        if pid <= 0:
+            return None
+        status_path = proc_root / str(pid) / "status"
+        try:
+            status_text = status_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+        rss_kb = 0
+        for line in status_text.splitlines():
+            if not line.startswith("VmRSS:"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    rss_kb = int(parts[1])
+                except ValueError:
+                    rss_kb = 0
+            break
+        if rss_kb <= 0:
+            return None
+
+        mem_total_kb = RuntimeOpsMixin._read_proc_mem_total_kb(proc_root)
+        mem_percent = round((rss_kb / mem_total_kb) * 100, 2) if mem_total_kb > 0 else 0.0
+        return {"cpu_percent": 0.0, "mem_percent": mem_percent, "rss_kb": rss_kb}
+
+    @staticmethod
+    def _read_proc_mem_total_kb(proc_root: Path = Path("/proc")) -> int:
+        try:
+            meminfo_text = (proc_root / "meminfo").read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        for line in meminfo_text.splitlines():
+            if not line.startswith("MemTotal:"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return max(0, int(parts[1]))
+                except ValueError:
+                    return 0
+            break
+        return 0
+
+    @staticmethod
+    def _read_positive_int_file(path: Path) -> int:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0
+        if not text or text == "max":
+            return 0
+        try:
+            value = int(text.split()[0])
+        except ValueError:
+            return 0
+        return value if value > 0 else 0
 
     def _service_command(self, provider: str, action: str, linux_user: str) -> list[str]:
         # Check permission before resolving the executable: a missing-root error

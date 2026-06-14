@@ -146,7 +146,7 @@ class CredentialOpsMixin:
         if token.startswith("@local:"):
             raise ValueError("credential bundle policy is only supported for managed agents")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -179,7 +179,7 @@ class CredentialOpsMixin:
             raise ValueError("bundle is required")
         bundle_id = selected_bundle[0]
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -222,7 +222,7 @@ class CredentialOpsMixin:
         if token.startswith("@local:"):
             raise ValueError("credential sync is only supported for managed agents")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -296,7 +296,7 @@ class CredentialOpsMixin:
         if token.startswith("@local:"):
             raise ValueError("credential revoke is only supported for managed agents")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")

@@ -118,5 +118,29 @@ def test_reconcile_addons() -> None:
 def test_reconcile_handles_empty_observed() -> None:
     m = AgentManifest(id="a", provider="openclaw", model_tier="fast")
     plan = reconcile_plan(m, None)
+    assert plan[0] == ReconcileAction("ensure_agent", {"agent_id": "a"})
     assert any(a.kind == "set_provider" for a in plan)
-    assert isinstance(plan[0], ReconcileAction)
+
+
+def test_reconcile_credentials_by_bundle_reference() -> None:
+    m = AgentManifest(
+        id="a",
+        credentials=[
+            CredentialRef("provider-auth", "shared"),
+            CredentialRef("git", "agent"),
+        ],
+    )
+    observed = {
+        "provider": "openclaw",
+        "model_tier": "balanced",
+        "channels": [],
+        "credential_bundles": ["git"],
+        "addons": {},
+    }
+
+    plan = reconcile_plan(m, observed)
+
+    assert ReconcileAction(
+        "set_credentials",
+        {"from": ["git"], "to": ["git", "provider-auth"]},
+    ) in plan

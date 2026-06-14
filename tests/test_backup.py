@@ -1,9 +1,11 @@
 """Tests for the git-backed knowledge backup, credential porting, and related hardening."""
 from __future__ import annotations
 
+import base64
 import builtins
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,12 +17,33 @@ from clawie.auth_sources import (
     extract_provider_auth_profiles,
 )
 from clawie.cli import main
+from clawie.manifest import AgentManifest
 from clawie.service import AgentNotFoundError, SetupError, ClawieService
 from clawie.store import StateStore
 
 
 def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
+
+
+def _fake_jwt(payload: dict[str, object]) -> str:
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode("utf-8")).decode("utf-8").rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"{header}.{body}.sig"
+
+
+def _read_openclaw_native_profiles(home: Path) -> dict[str, Any]:
+    db_path = home / ".openclaw" / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    return json.loads(str(row[0]))["profiles"]
 
 
 def make_service(tmp_path: Path, provider: str = "openclaw", api_key: str = "") -> ClawieService:
@@ -133,7 +156,12 @@ def test_backup_run_commits_redacted_snapshot_and_prompts(tmp_path: Path) -> Non
     assert "123456:" + "a" * 35 not in raw
     snapshot = json.loads(raw)
     assert "events" not in snapshot["state"]
+    assert "users" not in snapshot["state"]
     assert "backup_last_run_at" not in snapshot["config"]
+    manifest = AgentManifest.read(repo / "agents" / "alice" / "manifest.json")
+    assert manifest.id == "alice"
+    assert manifest.provider == "openclaw"
+    assert manifest.channels == []
     assert (repo / "agents" / "alice" / "prompts" / "SOUL.md").exists()
 
     # No knowledge changed: the second run must not create a commit.
@@ -302,17 +330,53 @@ def test_backup_restore_unknown_agent_errors(tmp_path: Path) -> None:
         service.backup_restore("ghost")
 
 
-def test_backup_restore_skips_agents_missing_from_state(tmp_path: Path) -> None:
+def test_backup_restore_recreates_agents_from_manifest(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     make_agent(service)
     make_agent(service, agent_id="bob")
+    state = service.store.read_state()
+    state["agents"]["bob"]["channels"] = [{"kind": "chat", "name": "ops", "enabled": True}]
+    state["agents"]["bob"]["credential_sync"] = {"bundles": ["git"], "shared_provider_auth": False}
+    state["agents"]["bob"]["agent"]["model_tier"] = "fast"
+    service.store.write_state(state)
+    service.set_agent_core_prompt("bob", "MEMORY.md", "bob knows the restore path", sync_to_disk=False)
+
     service.backup_init(tmp_path / "repo")
     service.backup_run()
 
     service.delete_agent("bob")
+    result = service.backup_restore(apply_to_disk=False)
+    assert "alice" in result["restored"]
+    assert result["restored"]["bob"]["prompts"] >= 1
+    assert not any(row["agent_id"] == "bob" for row in result["skipped"])
+
+    restored = service.get_agent("bob")
+    assert restored["agent"]["provider"] == "openclaw"
+    assert restored["agent"]["model_tier"] == "fast"
+    assert restored["channels"] == [
+        {"kind": "chat", "name": "ops", "enabled": True, "external_id": "bob:chat:1"}
+    ]
+    assert restored["credential_sync"]["bundles"] == ["git"]
+    assert service.get_agent_core_prompt("bob", "MEMORY.md")["content"] == "bob knows the restore path"
+    assert (service.agent_manifest_path("bob")).is_file()
+
+
+def test_backup_restore_skips_legacy_agents_missing_from_state(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    make_agent(service, agent_id="bob")
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    service.backup_run()
+
+    (repo / "agents" / "bob" / "manifest.json").unlink()
+    service.delete_agent("bob")
     result = service.backup_restore()
     assert "alice" in result["restored"]
-    assert any(row["agent_id"] == "bob" for row in result["skipped"])
+    assert any(
+        row["agent_id"] == "bob" and row["reason"] == "not in local state and backup has no manifest"
+        for row in result["skipped"]
+    )
 
 
 def test_backup_restore_requires_backup_data(tmp_path: Path) -> None:
@@ -433,7 +497,7 @@ def seed_openclaw_shared_auth(service: ClawieService, source_home: Path) -> None
         json.dumps(
             {
                 "tokens": {
-                    "access_token": "acc-tok",
+                    "access_token": _fake_jwt({"exp": 1893456000}),
                     "refresh_token": "ref-tok",
                     "id_token": "",
                     "account_id": "acct-9",
@@ -453,14 +517,14 @@ def test_auth_port_openclaw_to_picoclaw(tmp_path: Path, monkeypatch: MonkeyPatch
     seed_openclaw_shared_auth(service, tmp_path / "source-home")
 
     result = service.port_shared_auth("openclaw", "picoclaw")
-    assert result["profiles"] == ["openai-codex:default"]
+    assert result["profiles"] == ["openai:default"]
 
     native = json.loads((shared / ".picoclaw" / "auth.json").read_text(encoding="utf-8"))
-    assert native["credentials"]["openai"]["access_token"] == "acc-tok"
+    assert native["credentials"]["openai"]["access_token"] == _fake_jwt({"exp": 1893456000})
     assert native["credentials"]["openai"]["refresh_token"] == "ref-tok"
     profiles = json.loads((shared / ".picoclaw" / "auth-profiles.json").read_text(encoding="utf-8"))
-    assert profiles["active_profiles"]["openai-codex"] == "openai-codex:default"
-    assert profiles["profiles"]["openai-codex:default"]["access_token"] == "acc-tok"
+    assert profiles["active_profiles"]["openai"] == "openai:default"
+    assert profiles["profiles"]["openai:default"]["access_token"] == _fake_jwt({"exp": 1893456000})
 
     events = service.store.read_state()["events"]
     assert any(event["type"] == "auth.ported" for event in events)
@@ -490,11 +554,13 @@ def test_auth_port_picoclaw_to_openclaw(tmp_path: Path, monkeypatch: MonkeyPatch
 
     result = service.port_shared_auth("picoclaw", "openclaw")
     assert result["profiles"] == ["anthropic-claude:default"]
-    profiles = json.loads((shared / ".openclaw" / "auth-profiles.json").read_text(encoding="utf-8"))
-    profile = profiles["profiles"]["anthropic-claude:default"]
-    assert profile["access_token"] == "claude-tok"
-    assert profile["refresh_token"] == "claude-ref"
-    assert profiles["active_profiles"]["anthropic-claude"] == "anthropic-claude:default"
+    profiles = _read_openclaw_native_profiles(shared)
+    profile = profiles["anthropic:default"]
+    assert profile["access"] == "claude-tok"
+    assert profile["refresh"] == "claude-ref"
+    assert profile["provider"] == "anthropic"
+    assert profile["type"] == "oauth"
+    assert not (shared / ".openclaw" / "auth-profiles.json").exists()
 
 
 def test_auth_port_same_provider_rejected(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

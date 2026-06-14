@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from clawie.addon_integration import inject_addon_tools_snippet, remove_addon_tools_snippet
 from clawie.providers import (
     get_provider,
     provider_names,
@@ -20,6 +22,30 @@ _AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class AgentOpsMixin:
+    _CONTROL_AGENTS_MARKER = "<!-- clawie-control-boot-begin -->"
+    _CONTROL_AGENTS_MARKER_END = "<!-- clawie-control-boot-end -->"
+    _CONTROL_AGENTS_SNIPPET = (
+        "<!-- clawie-control-boot-begin -->\n"
+        "6. If your manifest role is `control`, read the Clawie control RPC section in "
+        "`TOOLS.md` before taking fleet actions. Use daemon-backed control commands; "
+        "do not edit state files directly or approve your own pending nonce.\n"
+        "<!-- clawie-control-boot-end -->"
+    )
+    _CONTROL_TOOLS_SNIPPET = (
+        "## Clawie Control RPC\n\n"
+        "This workspace is the fleet control agent. Use `clawie clawied status --json` "
+        "to verify that the daemon is running before taking control-plane actions.\n\n"
+        "- Autonomous read/safe-heal actions go through `clawie control request <verb> "
+        "--args-json '<json-object>' --json`.\n"
+        "- Destructive and outward actions return `pending_confirmation` with a nonce. "
+        "Show the full JSON to an allowlisted operator and wait for them to run "
+        "`clawie control confirm <verb> --nonce <nonce> --confirmer <handle> "
+        "--args-json '<same-json-object>' --json`.\n"
+        "- Never approve your own nonce, never bypass `clawied`, and never edit "
+        "`state.json` or SQLite files directly.\n"
+        "- For `open_pr`, request a pull request from an existing pushed branch only; "
+        "do not push branches or merge changes from the control workspace.\n"
+    )
 
     @staticmethod
     def _validate_agent_id(agent_id: str) -> str:
@@ -56,8 +82,7 @@ class AgentOpsMixin:
             raise ValueError("channel_strategy must be one of: new, migrate")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
-        state["users"] = agents
+        agents = state.setdefault("agents", {})
         if agent_id in agents:
             raise AgentExistsError(f"agent already exists: {agent_id}")
 
@@ -145,6 +170,7 @@ class AgentOpsMixin:
             "heartbeat_seconds": int(source_agent_defaults.get("heartbeat_seconds", 30)),
             "pid": int(source_agent_defaults.get("pid", 0)),
             "plugins": plugins,
+            "role": "worker",
             "model_tier": "balanced",
         }
         if clone_from and not core_prompts:
@@ -171,6 +197,7 @@ class AgentOpsMixin:
             "addons": self._normalize_agent_addons(source_addons),
             "agent": agent,
         }
+        self._sync_control_role_workspace(agent_state)
         agents[agent_id] = agent_state
         moved_from_clone = 0
         if transfer_from_clone and clone_from:
@@ -202,7 +229,7 @@ class AgentOpsMixin:
     def list_agents(self) -> list[dict[str, Any]]:
         self._refresh_managed_agent_provider_alignments()
         state = self.store.read_state()
-        agents = list(state.setdefault("agents", state.get("users", {})).values())
+        agents = list(state.setdefault("agents", {}).values())
         for agent in agents:
             self._hydrate_agent_controls(agent)
         return sorted(
@@ -228,7 +255,7 @@ class AgentOpsMixin:
 
     def get_agent(self, agent_id: str) -> dict[str, Any]:
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -252,7 +279,7 @@ class AgentOpsMixin:
             raise ValueError("provider is required")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -493,7 +520,7 @@ class AgentOpsMixin:
         if not plugin_name:
             raise ValueError("plugin is required")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -519,7 +546,7 @@ class AgentOpsMixin:
     def toggle_agent_autostart(self, agent_id: str) -> dict[str, Any]:
         self._require_setup()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -546,7 +573,7 @@ class AgentOpsMixin:
         needs a distinct loopback port (mirrors display VNC port allocation).
         """
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         used: set[int] = set()
         for row in agents.values():
             if not isinstance(row, dict):
@@ -1049,7 +1076,7 @@ class AgentOpsMixin:
         if os.geteuid() != 0:
             raise SetupError("ensure_agent_permissions requires root. Re-run with sudo.")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -1120,7 +1147,7 @@ class AgentOpsMixin:
     def delete_agent(self, agent_id: str) -> None:
         self._require_setup()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         if agent_id not in agents:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
         del agents[agent_id]
@@ -1135,7 +1162,7 @@ class AgentOpsMixin:
     def purge_agent(self, agent_id: str) -> dict[str, Any]:
         self._require_setup()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -1224,7 +1251,7 @@ class AgentOpsMixin:
         if daemon_map is None:
             daemon_map = self._running_provider_daemons_by_user()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         dirty = False
         for token, agent in agents.items():
             if agent_id and token != agent_id:
@@ -1444,6 +1471,65 @@ class AgentOpsMixin:
             merged[token] = bool(value)
         return merged
 
+    @classmethod
+    def _inject_marked_prompt_snippet(
+        cls,
+        content: str,
+        begin: str,
+        end: str,
+        snippet: str,
+    ) -> str:
+        body = str(content or "")
+        block = str(snippet).rstrip()
+        pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
+        if pattern.search(body):
+            return pattern.sub(block, body)
+        sep = "\n\n" if body.strip() else ""
+        return body.rstrip() + sep + block + "\n"
+
+    @classmethod
+    def _remove_marked_prompt_snippet(cls, content: str, begin: str, end: str) -> str:
+        body = str(content or "")
+        if not body.strip():
+            return ""
+        pattern = re.compile(
+            r"\n*" + re.escape(begin) + r".*?" + re.escape(end) + r"\n*",
+            re.DOTALL,
+        )
+        return pattern.sub("\n", body).rstrip() + "\n"
+
+    def _sync_control_role_workspace(self, agent_state: dict[str, Any]) -> None:
+        agent = agent_state.setdefault("agent", {})
+        role = str(agent.get("role", "worker")).strip().lower() or "worker"
+        if role not in {"worker", "control"}:
+            role = "worker"
+        agent["role"] = role
+        prompts = agent_state.setdefault("core_prompts", {})
+        if not isinstance(prompts, dict):
+            prompts = {}
+            agent_state["core_prompts"] = prompts
+        tools_md = str(prompts.get("TOOLS.md", "") or "")
+        agents_md = str(prompts.get("AGENTS.md", "") or "")
+        if role == "control":
+            prompts["TOOLS.md"] = inject_addon_tools_snippet(
+                tools_md,
+                "control",
+                self._CONTROL_TOOLS_SNIPPET.rstrip(),
+            )
+            prompts["AGENTS.md"] = self._inject_marked_prompt_snippet(
+                agents_md,
+                self._CONTROL_AGENTS_MARKER,
+                self._CONTROL_AGENTS_MARKER_END,
+                self._CONTROL_AGENTS_SNIPPET,
+            )
+            return
+        prompts["TOOLS.md"] = remove_addon_tools_snippet(tools_md, "control")
+        prompts["AGENTS.md"] = self._remove_marked_prompt_snippet(
+            agents_md,
+            self._CONTROL_AGENTS_MARKER,
+            self._CONTROL_AGENTS_MARKER_END,
+        )
+
     def _hydrate_agent_controls(self, agent_state: dict[str, Any]) -> None:
         channels = agent_state.get("channels", [])
         if isinstance(channels, list):
@@ -1471,14 +1557,14 @@ class AgentOpsMixin:
         )
         agent_state["addons"] = self._normalize_agent_addons(agent_state.get("addons"))
         self._seed_delegation_skill(agent_state["core_prompts"], agent["plugins"])
+        self._sync_control_role_workspace(agent_state)
 
     def set_agent_model_tier(self, agent_id: str, tier: str = "") -> str:
         """Set or cycle the model tier for *agent_id*. Returns the new tier."""
         from clawie.delegation import VALID_TIER_NAMES
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
-        state["users"] = agents
+        agents = state.setdefault("agents", {})
         agent_state = agents.get(agent_id)
         if not agent_state:
             raise AgentNotFoundError(f"agent not found: {agent_id}")

@@ -5,10 +5,24 @@
 #   ./install.sh          # install for current user
 #   sudo ./install.sh     # install system-wide shim + for root
 #
+# Optional environment:
+#   PYTHON_VERSION=3.11              # choose uv-managed Python (default: 3.12)
+#   CLAWIE_ALLOW_UNSUPPORTED_OS=1    # development-only bypass for non-Linux
+#
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_VERSION="3.12"
+PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
+
+OS_NAME="$(uname -s)"
+if [ "${OS_NAME}" != "Linux" ] && [ "${CLAWIE_ALLOW_UNSUPPORTED_OS:-}" != "1" ]; then
+    cat >&2 <<EOF
+Error: clawie is Linux-only. It relies on Linux users, systemd, and Unix sockets.
+Set CLAWIE_ALLOW_UNSUPPORTED_OS=1 only for development tasks that do not use
+runtime isolation, watchdogs, or production verification.
+EOF
+    exit 1
+fi
 
 # Ensure uv is available
 if ! command -v uv &>/dev/null; then
@@ -30,6 +44,7 @@ echo "Installed: ${CLAWIE_BIN}"
 # If running as root, also create/update the system-wide shim
 if [ "$(id -u)" -eq 0 ]; then
     SHIM="/usr/local/bin/clawie"
+    mkdir -p "$(dirname "${SHIM}")"
     cat > "${SHIM}" <<SHIM_EOF
 #!/usr/bin/env bash
 set -euo pipefail

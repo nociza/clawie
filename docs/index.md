@@ -9,7 +9,7 @@ clawie manages multiple AI agents across providers from one CLI. It handles agen
 ## Key features
 
 - **Agent orchestration** with recursive delegation, model tiers, and context budgets
-- **Multi-provider support** for openclaw, picoclaw, and zeroclaw
+- **Provider-aware support** with production delegated-task delivery verified for openclaw, plus picoclaw/zeroclaw lifecycle and auth migration support
 - **Runtime isolation** via per-agent Linux users and scoped credentials
 - **Continuous knowledge backup** to a git repo — prompts and agent memory, secrets excluded
 - **Credential porting** between claws: authorize once, move sessions across providers
@@ -21,7 +21,7 @@ clawie manages multiple AI agents across providers from one CLI. It handles agen
 
 ```bash
 uv tool install clawie
-clawie config set --provider picoclaw --subscription pro
+clawie config set --provider openclaw --subscription pro
 clawie agent create alice --template baseline
 clawie status
 ```

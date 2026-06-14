@@ -1,26 +1,30 @@
 # Providers & Auth
 
-clawie supports three providers. Each agent runs on exactly one provider at a time, but you can switch with a single command.
+clawie tracks three provider integrations. Each agent has exactly one provider
+assigned at a time, but production delegated-task delivery is currently
+source-pinned only for openclaw. picoclaw and zeroclaw lifecycle/auth support is
+kept for migration and experimentation until their delivery contracts are
+verified.
 
 ## Supported providers
 
-| Provider | Runtime | Default Auth | Install |
-|----------|---------|-------------|---------|
-| **zeroclaw** | zeroclaw-agent | linked | brew |
-| **picoclaw** | picoclaw-agent | linked | brew |
-| **openclaw** | openclaw-agent | none | pnpm |
+| Provider | Runtime | Default Auth | Install | Delegated-task delivery |
+|----------|---------|-------------|---------|-------------------------|
+| **openclaw** | openclaw-agent | none | pnpm | production verified |
+| **picoclaw** | picoclaw-agent | linked | brew | gated until source-pinned |
+| **zeroclaw** | zeroclaw-agent | linked | brew | gated until source-pinned |
 
 ## Setup
 
 ```bash
 # Set the global provider
-clawie config set --provider picoclaw --subscription pro --workspace production
+clawie config set --provider openclaw --subscription pro --workspace production
 
 # Install a runtime
-clawie runtime install picoclaw
+clawie runtime install openclaw
 
 # Override provider per agent
-clawie agent create alice --provider zeroclaw
+clawie agent create alice --provider openclaw
 ```
 
 ## Auth modes
@@ -93,10 +97,12 @@ Agents with shared auth enabled use their private copy of the shared store.
 
 ## Provider switching
 
-Switch a managed agent to a different provider in one command:
+Switch a managed agent to a different provider in one command. Production
+delegated-task delivery remains available only when the resulting provider has a
+verified delivery adapter.
 
 ```bash
-sudo clawie agent provider set alice picoclaw
+sudo clawie agent provider set alice openclaw
 ```
 
 This handles the full cutover:

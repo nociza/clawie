@@ -45,7 +45,7 @@ Copy core prompt files between agents:
 clawie agent prompt copy alice bob
 ```
 
-Core prompts include SOUL.md, IDENTITY.md, AGENTS.md, TOOLS.md, MEMORY.md, and DELEGATION.md. These are seeded automatically based on the provider.
+Core prompts include SOUL.md, IDENTITY.md, AGENTS.md, TOOLS.md, MEMORY.md, and DELEGATION.md. These are seeded automatically based on the provider. Manifests with `role: control` add a marked control RPC block to AGENTS.md and TOOLS.md.
 
 ## Credentials
 
@@ -53,13 +53,14 @@ Credential sync uses a bundle model. Available bundles:
 
 | Bundle | Contents |
 |--------|----------|
-| `provider-auth` | Provider auth files copied privately into the agent home (.codex/auth.json, auth-profiles.json) |
+| `provider-auth` | Provider auth files copied privately into the agent home (.codex/auth.json plus provider-native auth stores such as OpenClaw's openclaw-agent.sqlite) |
 | `git` | .gitconfig, .git-credentials, .config/gh, .ssh |
 
 ```bash
 clawie agent credentials list
 clawie agent credentials show alice
-clawie agent credentials set alice git --include-defaults
+clawie agent credentials set alice provider-auth
+clawie agent credentials set alice git
 sudo clawie agent credentials sync alice
 sudo clawie agent credentials revoke alice git
 ```

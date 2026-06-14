@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,10 +24,20 @@ from clawie.addon_auth import parse_gws_status_output
 from clawie.provider_channels import OpenClawChannelAdapter
 from clawie.service import SetupError, ClawieService
 from clawie.store import StateStore
+import clawie._service_watchdog as watchdog_module
 
 
 def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
+
+
+def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    with raises(SystemExit) as exc:
+        main(["--config-dir", str(tmp_path), "--version"])
+
+    assert exc.value.code == 0
+    assert "clawie 0.1.4" in capsys.readouterr().out
+    assert not (tmp_path / "clawie.db").exists()
 
 
 def _fake_jwt(payload: dict[str, object]) -> str:
@@ -34,6 +46,20 @@ def _fake_jwt(payload: dict[str, object]) -> str:
     header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode("utf-8")).decode("utf-8").rstrip("=")
     body = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("utf-8").rstrip("=")
     return f"{header}.{body}.sig"
+
+
+def _read_openclaw_native_profiles(home: Path) -> dict[str, Any]:
+    db_path = home / ".openclaw" / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    return json.loads(str(row[0]))["profiles"]
 
 
 def _fake_telegram_token() -> str:
@@ -81,7 +107,7 @@ def test_setup_openclaw_without_api_key(
     assert code == 0
     assert "provider: openclaw" in output
     assert "auth_mode: none" in output
-    assert "api_url: https://api.openclaw.example/v1" in output
+    assert "api_url: <not set>" in output
     assert "spawn_password_default: not set" in output
     assert "runtime_installed: True" in output
 
@@ -89,7 +115,587 @@ def test_setup_openclaw_without_api_key(
     status_output = capsys.readouterr().out
     assert status == 0
     assert "configured: True" in status_output
-    assert "api_url: https://api.openclaw.example/v1" in status_output
+    assert "api_url: <not set>" in status_output
+
+
+def test_config_set_control_github_escalation(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    token_path = tmp_path / "github-token"
+    code = run_cli(
+        tmp_path,
+        "config",
+        "set",
+        "--control-github-repo",
+        "octo/example",
+        "--control-github-token-path",
+        str(token_path),
+        "--control-operator",
+        "@op",
+        "--control-issue-label",
+        "clawie-control",
+        "--control-github-rate-limit-seconds",
+        "42",
+    )
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "github_repo: octo/example" in output
+    assert "operator_allowlist: @op" in output
+    config = ClawieService(StateStore(config_dir=tmp_path)).store.read_config()
+    assert config["control_github_repo"] == "octo/example"
+    assert config["control_github_token_path"] == str(token_path)
+    assert config["control_operator_allowlist"] == ["@op"]
+    assert config["control_github_issue_labels"] == ["clawie-control"]
+    assert config["control_github_rate_limit_seconds"] == 42
+
+
+def test_control_watchdog_install_writes_systemd_units(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        auth_mode="none",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    unit_dir = tmp_path / "systemd"
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_dir / "clawie-control-watchdog.service",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+    monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+
+    def fake_which(name: str) -> str | None:
+        if name == "clawie":
+            return "/usr/bin/clawie"
+        if name == "systemctl":
+            return "/bin/systemctl"
+        return None
+
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+
+    monkeypatch.setattr(watchdog_module.shutil, "which", fake_which)
+    monkeypatch.setattr(watchdog_module.subprocess, "run", fake_run)
+
+    result = service.control_watchdog_install(
+        interval_seconds=9,
+        notify_command="printf alert",
+    )
+
+    unit_text = (unit_dir / "clawie-control-watchdog.service").read_text(encoding="utf-8")
+    alert_text = (unit_dir / "clawie-control-alert.service").read_text(encoding="utf-8")
+    assert result["enabled"] is True
+    assert result["started"] is True
+    assert "Description=Clawie control watchdog" in unit_text
+    assert "OnFailure=clawie-control-alert.service" in unit_text
+    assert "/usr/bin/clawie --config-dir" in unit_text
+    assert "clawied run --interval 9" in unit_text
+    assert "Restart=always" in unit_text
+    assert "printf alert" in alert_text
+    assert ["systemctl", "daemon-reload"] in calls
+    assert ["systemctl", "enable", "--now", "clawie-control-watchdog.service"] in calls
+
+
+def test_control_watchdog_install_fails_when_systemd_start_fails(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        auth_mode="none",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    unit_dir = tmp_path / "systemd"
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_dir / "clawie-control-watchdog.service",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+    monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(watchdog_module.shutil, "which", lambda name: "/bin/systemctl" if name == "systemctl" else None)
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if cmd[1:3] == ["enable", "--now"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "unit failed")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(watchdog_module.subprocess, "run", fake_run)
+
+    with raises(SetupError, match="failed to enable/start control watchdog: unit failed"):
+        service.control_watchdog_install(interval_seconds=9)
+
+    config = service.store.read_config()
+    assert config["control_watchdog_enabled"] is False
+
+
+def test_control_watchdog_install_no_start_does_not_mark_enabled(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        auth_mode="none",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    unit_dir = tmp_path / "systemd"
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_dir / "clawie-control-watchdog.service",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+    monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(watchdog_module.shutil, "which", lambda name: "/bin/systemctl" if name == "systemctl" else None)
+    calls: list[list[str]] = []
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(watchdog_module.subprocess, "run", fake_run)
+
+    result = service.control_watchdog_install(interval_seconds=9, start=False)
+
+    assert result["enabled"] is False
+    assert result["started"] is False
+    assert service.store.read_config()["control_watchdog_enabled"] is False
+    assert (unit_dir / "clawie-control-watchdog.service").is_file()
+    assert ["systemctl", "enable", "--now", "clawie-control-watchdog.service"] not in calls
+
+
+def test_control_watchdog_cli_status(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    unit_dir = tmp_path / "systemd"
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_dir / "clawie-control-watchdog.service",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+    monkeypatch.setattr(watchdog_module.shutil, "which", lambda _name: None)
+
+    code = run_cli(tmp_path, "control", "watchdog", "status")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "unit_file_exists: False" in output
+    assert "active: unavailable" in output
+
+
+def test_control_watchdog_verify_exercises_systemd_restart(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        auth_mode="none",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    unit_path = unit_dir / "clawie-control-watchdog.service"
+    unit_path.write_text(
+        "\n".join(
+            [
+                "[Service]",
+                f"ExecStart=/bin/bash -lc '/usr/bin/clawie --config-dir {tmp_path} clawied run --interval 9'",
+                "Restart=always",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_path,
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+
+    show_calls = {"count": 0}
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        if name == "systemctl":
+            return "/bin/systemctl"
+        return None
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        if cmd[1:3] == ["is-active", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+        if cmd[1:3] == ["is-enabled", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(cmd, 0, "enabled\n", "")
+        if cmd[1:3] == ["show", "clawie-control-watchdog.service"]:
+            show_calls["count"] += 1
+            pid = "111" if show_calls["count"] == 1 else "222"
+            restarts = "1" if show_calls["count"] == 1 else "2"
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                f"ActiveState=active\nSubState=running\nMainPID={pid}\nNRestarts={restarts}\nRestart=always\n",
+                "",
+            )
+        if cmd[1:4] == ["kill", "--signal=SIGTERM", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "unexpected command")
+
+    monkeypatch.setattr(watchdog_module.shutil, "which", fake_which)
+    monkeypatch.setattr(watchdog_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(watchdog_module.time, "sleep", lambda _seconds: None)
+
+    code = run_cli(
+        tmp_path,
+        "control",
+        "watchdog",
+        "verify",
+        "--exercise-restart",
+        "--timeout",
+        "1",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["status"] == "passed"
+    assert payload["restart_exercised"] is True
+    assert ["systemctl", "kill", "--signal=SIGTERM", "clawie-control-watchdog.service"] in calls
+    assert any(
+        row["message"] == "systemd restarted the watchdog service"
+        for row in payload["checks"]
+    )
+
+
+def test_control_watchdog_verify_accepts_quoted_config_dir(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "state with spaces"
+    service = ClawieService(StateStore(config_dir=config_dir))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        auth_mode="none",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    unit_dir = tmp_path / "systemd"
+    unit_dir.mkdir()
+    unit_path = unit_dir / "clawie-control-watchdog.service"
+    unit_path.write_text(
+        service._control_watchdog_unit_contents(interval_seconds=9, notify_command=""),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_UNIT_FILE",
+        unit_path,
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "CONTROL_WATCHDOG_ALERT_UNIT_FILE",
+        unit_dir / "clawie-control-alert.service",
+    )
+
+    def fake_which(name: str) -> str | None:
+        if name == "systemctl":
+            return "/bin/systemctl"
+        return None
+
+    def fake_run(
+        cmd: list[str],
+        capture_output: bool,
+        text: bool,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if cmd[1:3] == ["is-active", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(cmd, 0, "active\n", "")
+        if cmd[1:3] == ["is-enabled", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(cmd, 0, "enabled\n", "")
+        if cmd[1:3] == ["show", "clawie-control-watchdog.service"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                "ActiveState=active\nSubState=running\nMainPID=111\nNRestarts=1\nRestart=always\n",
+                "",
+            )
+        return subprocess.CompletedProcess(cmd, 1, "", "unexpected command")
+
+    monkeypatch.setattr(watchdog_module.shutil, "which", fake_which)
+    monkeypatch.setattr(watchdog_module.subprocess, "run", fake_run)
+
+    code = run_cli(
+        config_dir,
+        "control",
+        "watchdog",
+        "verify",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert payload["status"] == "passed"
+    assert any(
+        row["message"] == "unit ExecStart points at this config directory"
+        for row in payload["checks"]
+    )
+
+
+def test_production_verify_json_aggregates_target_host_proofs(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "healthy", "checks": [{"status": "pass", "message": "ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "host_validation_report",
+        lambda self: {"status": "passed", "checks": [{"status": "pass", "message": "host ok"}]},
+    )
+
+    def fake_watchdog_verify(
+        self: ClawieService,
+        *,
+        exercise_restart: bool = False,
+        timeout_seconds: int = 30,
+    ) -> dict[str, object]:
+        calls["exercise_restart"] = exercise_restart
+        calls["timeout_seconds"] = timeout_seconds
+        return {
+            "status": "passed",
+            "checks": [{"status": "pass", "message": "watchdog ok"}],
+            "restart_exercised": exercise_restart,
+        }
+
+    monkeypatch.setattr(ClawieService, "control_watchdog_verify", fake_watchdog_verify)
+
+    code = run_cli(
+        tmp_path,
+        "production",
+        "verify",
+        "--exercise-watchdog-restart",
+        "--watchdog-timeout",
+        "7",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    checks = {row["name"]: row for row in payload["checks"]}
+    assert code == 0
+    assert calls == {"exercise_restart": True, "timeout_seconds": 7}
+    assert payload["status"] == "passed"
+    assert payload["all_provider_contracts"] is False
+    assert checks["doctor"]["status"] == "pass"
+    assert checks["host_validation"]["status"] == "pass"
+    assert checks["watchdog"]["status"] == "pass"
+    assert checks["watchdog_restart_exercise"]["status"] == "pass"
+    assert checks["runtime_adapter_openclaw"]["status"] == "pass"
+
+
+def test_production_verify_all_provider_contracts_checks_verified_delivery_surface(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "healthy", "checks": [{"status": "pass", "message": "ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "host_validation_report",
+        lambda self: {"status": "passed", "checks": [{"status": "pass", "message": "host ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "control_watchdog_verify",
+        lambda self, **kwargs: {
+            "status": "passed",
+            "checks": [{"status": "pass", "message": "watchdog ok"}],
+            "restart_exercised": bool(kwargs.get("exercise_restart", False)),
+        },
+    )
+
+    code = run_cli(
+        tmp_path,
+        "production",
+        "verify",
+        "--exercise-watchdog-restart",
+        "--all-provider-contracts",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    checks = {row["name"]: row for row in payload["checks"]}
+    assert code == 0
+    assert payload["status"] == "passed"
+    assert payload["all_provider_contracts"] is True
+    assert checks["watchdog_restart_exercise"]["status"] == "pass"
+    assert checks["runtime_adapter_openclaw"]["status"] == "pass"
+    assert "runtime_adapter_picoclaw" not in checks
+    assert "runtime_adapter_zeroclaw" not in checks
+
+
+def test_production_verify_requires_watchdog_restart_exercise(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "healthy", "checks": [{"status": "pass", "message": "ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "host_validation_report",
+        lambda self: {"status": "passed", "checks": [{"status": "pass", "message": "host ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "control_watchdog_verify",
+        lambda self, **_kwargs: {
+            "status": "passed",
+            "checks": [{"status": "pass", "message": "watchdog ok"}],
+            "restart_exercised": False,
+        },
+    )
+
+    code = run_cli(tmp_path, "production", "verify", "--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    checks = {row["name"]: row for row in payload["checks"]}
+    assert code == 1
+    assert payload["status"] == "failed"
+    assert checks["watchdog"]["status"] == "pass"
+    assert checks["watchdog_restart_exercise"]["status"] == "fail"
+    assert "--exercise-watchdog-restart" in checks["watchdog_restart_exercise"]["message"]
+
+
+def test_production_verify_configured_provider_without_delivery_adapter_fails(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="picoclaw",
+        auth_mode="api_key",
+        api_key="test-key",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.picoclaw.example/v1",
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "healthy", "checks": [{"status": "pass", "message": "ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "host_validation_report",
+        lambda self: {"status": "passed", "checks": [{"status": "pass", "message": "host ok"}]},
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "control_watchdog_verify",
+        lambda self, **kwargs: {
+            "status": "passed",
+            "checks": [{"status": "pass", "message": "watchdog ok"}],
+            "restart_exercised": bool(kwargs.get("exercise_restart", False)),
+        },
+    )
+
+    code = run_cli(
+        tmp_path,
+        "production",
+        "verify",
+        "--exercise-watchdog-restart",
+        "--all-provider-contracts",
+        "--json",
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    checks = {row["name"]: row for row in payload["checks"]}
+    assert code == 1
+    assert payload["status"] == "failed"
+    assert checks["runtime_adapter_picoclaw"]["status"] == "fail"
+    assert "does not have a verified delegated-task delivery adapter" in checks["runtime_adapter_picoclaw"]["message"]
 
 
 def test_runtime_install_cli(
@@ -1263,6 +1869,7 @@ def test_prompt_write_permission_error_does_not_stage_to_tmp(
     state = service.store.read_state()
     state["agents"]["alice"] = agent
     service.store.write_state(state)
+    service.set_agent_credential_bundles("alice", ["provider-auth"])
 
     home = tmp_path / "alice-home"
     home.mkdir()
@@ -1328,7 +1935,7 @@ def test_store_migrates_legacy_default_channels_from_baseline_and_agents(tmp_pat
             (json.dumps(legacy_baseline, sort_keys=True), "baseline"),
         )
         conn.execute(
-            "INSERT OR REPLACE INTO users(user_id, payload) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO agents(agent_id, payload) VALUES (?, ?)",
             ("alice", json.dumps(legacy_agent, sort_keys=True)),
         )
         conn.execute("DELETE FROM config WHERE key = ?", ("schema_version",))
@@ -1340,7 +1947,7 @@ def test_store_migrates_legacy_default_channels_from_baseline_and_agents(tmp_pat
     alice = state["agents"]["alice"]
     assert baseline["channels"] == []
     assert alice["channels"] == [{"kind": "telegram", "name": "team", "enabled": True}]
-    assert store.read_config()["schema_version"] == 1
+    assert store.read_config()["schema_version"] == 2
 
 
 def test_store_falls_back_to_tmp_when_home_is_unwritable(
@@ -1470,7 +2077,8 @@ def test_agents_credentials_commands_show_and_set(tmp_path: Path, capsys: Captur
     code = run_cli(tmp_path, "agent", "credentials", "show", "alice")
     output = capsys.readouterr().out
     assert code == 0
-    assert "selected: provider-auth" in output
+    assert "selected: <none>" in output
+    assert "provider-auth" in output
 
     code = run_cli(
         tmp_path,
@@ -1478,8 +2086,8 @@ def test_agents_credentials_commands_show_and_set(tmp_path: Path, capsys: Captur
         "credentials",
         "set",
         "alice",
+        "provider-auth",
         "git",
-        "--include-defaults",
     )
     output = capsys.readouterr().out
     assert code == 0
@@ -1490,6 +2098,33 @@ def test_agents_credentials_commands_show_and_set(tmp_path: Path, capsys: Captur
     assert code == 0
     assert "provider-auth" in output
     assert "git" in output
+
+
+def test_new_agents_do_not_select_shared_provider_auth_by_default(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    policy = service.get_agent_credential_sync("alice")
+
+    assert agent["credential_sync"]["bundles"] == []
+    assert agent["credential_sync"]["shared_provider_auth"] is False
+    assert policy["selected_bundles"] == []
+    assert all(not bool(row["default"]) for row in policy["bundles"])
 
 
 def test_service_syncs_and_revokes_selected_credential_bundles(
@@ -1519,6 +2154,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     state = service.store.read_state()
     state["agents"]["alice"] = agent
     service.store.write_state(state)
+    service.set_agent_credential_bundles("alice", ["provider-auth"])
 
     source_home = tmp_path / "source-home"
     source_home.mkdir(parents=True)
@@ -1529,7 +2165,7 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
                 "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": None,
                 "tokens": {
-                    "access_token": "tok",
+                    "access_token": _fake_jwt({"exp": 1893456000}),
                     "refresh_token": "ref",
                     "id_token": "",
                     "account_id": "acct-1",
@@ -1603,6 +2239,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     state = service.store.read_state()
     state["agents"]["alice"] = agent
     service.store.write_state(state)
+    service.set_agent_credential_bundles("alice", ["provider-auth"])
 
     source_home = tmp_path / "source-home"
     (source_home / ".codex").mkdir(parents=True)
@@ -1612,7 +2249,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
                 "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": None,
                 "tokens": {
-                    "access_token": "tok",
+                    "access_token": _fake_jwt({"exp": 1893456000}),
                     "refresh_token": "ref",
                     "id_token": "",
                     "account_id": "acct-1",
@@ -1648,7 +2285,7 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     payload = json.loads(profile_path.read_text(encoding="utf-8"))
     assert payload["active_profiles"]["openai-codex"] == "openai-codex:default"
     native_payload = json.loads(native_path.read_text(encoding="utf-8"))
-    assert native_payload["credentials"]["openai"]["access_token"] == "tok"
+    assert native_payload["credentials"]["openai"]["access_token"] == _fake_jwt({"exp": 1893456000})
     assert (target_home / ".picoclaw" / "auth.json").is_file()
     assert not (target_home / ".picoclaw" / "auth.json").is_symlink()
     assert (target_home / ".picoclaw" / "auth.json").stat().st_mode & 0o777 == 0o600
@@ -1691,7 +2328,7 @@ def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
                 "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": None,
                 "tokens": {
-                    "access_token": "tok",
+                    "access_token": _fake_jwt({"exp": 1893456000}),
                     "refresh_token": "ref",
                     "id_token": "",
                     "account_id": "acct-1",
@@ -1710,8 +2347,13 @@ def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
     result = service.import_shared_auth("openclaw", source="codex", source_home=source_home)
 
     assert result["auth"]["auth_status"] == "ready"
-    openclaw_payload = json.loads(locked_profile.read_text(encoding="utf-8"))
-    assert openclaw_payload["profiles"]["openai-codex:default"]["access"] == "tok"
+    profiles = _read_openclaw_native_profiles(shared_home)
+    profile = profiles["openai:default"]
+    assert profile["access"] == _fake_jwt({"exp": 1893456000})
+    assert profile["refresh"] == "ref"
+    assert profile["provider"] == "openai"
+    assert profile["type"] == "oauth"
+    assert locked_profile.read_text(encoding="utf-8") == "{}"
     assert (locked_profile.stat().st_mode & 0o777) == 0o600
 
 
@@ -1756,7 +2398,7 @@ def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
                 "auth_mode": "chatgpt",
                 "OPENAI_API_KEY": None,
                 "tokens": {
-                    "access_token": "tok",
+                    "access_token": _fake_jwt({"exp": 1893456000}),
                     "refresh_token": "ref",
                     "id_token": "",
                     "account_id": "acct-1",
@@ -1784,10 +2426,13 @@ def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
     assert prepared["source"] == "codex"
     assert prepared["source_home"] == str(source_home)
     assert prepared["auth"]["auth_status"] == "ready"
-    assert (shared_home / ".openclaw" / "auth-profiles.json").exists()
-    assert (target_home / ".openclaw" / "auth-profiles.json").is_file()
-    assert not (target_home / ".openclaw" / "auth-profiles.json").is_symlink()
-    assert (target_home / ".openclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
+    shared_profiles = _read_openclaw_native_profiles(shared_home)
+    assert shared_profiles["openai:default"]["access"] == _fake_jwt({"exp": 1893456000})
+    native_db = target_home / ".openclaw" / "agents" / "main" / "agent" / "openclaw-agent.sqlite"
+    assert native_db.is_file()
+    assert not native_db.is_symlink()
+    assert native_db.stat().st_mode & 0o777 == 0o600
+    assert _read_openclaw_native_profiles(target_home)["openai:default"]["refresh"] == "ref"
 
 
 def test_prepare_linked_auth_for_provider_switch_fails_when_no_source_credentials(
@@ -1960,6 +2605,7 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
         provider="picoclaw",
     )
     agent["agent"]["linux_user"] = "fixture-sync"
+    agent["credential_sync"] = {"bundles": ["provider-auth"], "shared_provider_auth": True}
     target_home = tmp_path / "fixture-sync-home"
     target_home.mkdir(parents=True)
     (shared_home / ".codex").mkdir(parents=True)
@@ -2949,6 +3595,258 @@ def test_dashboard_status_prefers_service_status(
     snapshot = service.performance_snapshot(refresh=False)
     row = next(r for r in snapshot["rows"] if r["agent_id"] == "alice")
     assert row["status"] == "running"
+
+
+def test_doctor_flags_insecure_shared_provider_auth_copy(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    agent["credential_sync"] = {"bundles": ["provider-auth"], "shared_provider_auth": True}
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+    home = tmp_path / "alice-home"
+    auth_file = home / ".codex" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text("{}", encoding="utf-8")
+    os.chmod(auth_file, 0o644)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+
+    report = service.doctor()
+    messages = [str(row.get("message", "")) for row in report["checks"]]
+
+    assert report["status"] == "unhealthy"
+    assert any("Provider auth file is not private" in message for message in messages)
+
+
+def test_doctor_verifies_private_shared_provider_auth_copy(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[{"kind": "telegram", "name": "team"}],
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    agent["credential_sync"] = {"bundles": ["provider-auth"], "shared_provider_auth": True}
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+    home = tmp_path / "alice-home"
+    auth_file = home / ".codex" / "auth.json"
+    auth_file.parent.mkdir(parents=True)
+    auth_file.write_text("{}", encoding="utf-8")
+    os.chmod(auth_file, 0o600)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+
+    report = service.doctor()
+    messages = [str(row.get("message", "")) for row in report["checks"]]
+
+    assert any("Private provider auth copies verified for: alice" in message for message in messages)
+    assert not any(row["status"] == "fail" for row in report["checks"])
+
+
+def test_host_validation_skips_without_linux_proc(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(service, "_linux_proc_available", lambda: False)
+
+    report = service.host_validation_report()
+
+    assert report["status"] == "skipped"
+    assert report["checks"] == [
+        {
+            "status": "skip",
+            "message": "Host validation requires Linux with /proc available",
+        }
+    ]
+
+
+def test_host_validation_passes_private_cross_user_layout(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    homes: dict[str, Path] = {}
+    for agent_id in ("alice", "bob"):
+        agent = service.create_agent(
+            agent_id=agent_id,
+            display_name=None,
+            template="baseline",
+            clone_from=None,
+            channel_strategy="new",
+            channels=[{"kind": "telegram", "name": "team"}],
+            agent_version="1.0.0",
+        )
+        agent["agent"]["linux_user"] = agent_id
+        home = tmp_path / f"{agent_id}-home"
+        auth_file = home / ".codex" / "auth.json"
+        auth_file.parent.mkdir(parents=True)
+        auth_file.write_text("{}", encoding="utf-8")
+        os.chmod(home, 0o700)
+        os.chmod(auth_file, 0o600)
+        homes[agent_id] = home
+        state = service.store.read_state()
+        state["agents"][agent_id] = agent
+        service.store.write_state(state)
+
+    class PwdRow:
+        def __init__(self, home: Path) -> None:
+            self.pw_dir = str(home)
+
+    monkeypatch.setattr(service, "_linux_proc_available", lambda: True)
+    monkeypatch.setattr("clawie.service.os.geteuid", lambda: 0)
+    monkeypatch.setattr("clawie.service.pwd.getpwnam", lambda user: PwdRow(homes[user]))
+    monkeypatch.setattr(service, "_path_unreadable_as_user", lambda path, linux_user: (True, ""))
+
+    report = service.host_validation_report()
+
+    assert report["status"] == "passed"
+    messages = [row["message"] for row in report["checks"]]
+    assert any("Found 2 managed agents across 2 Linux users" in message for message in messages)
+    assert any("alice cannot read" in message for message in messages)
+    assert any("bob cannot read" in message for message in messages)
+
+
+def test_host_validation_fails_when_cross_user_read_is_allowed(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    homes: dict[str, Path] = {}
+    for agent_id in ("alice", "bob"):
+        agent = service.create_agent(
+            agent_id=agent_id,
+            display_name=None,
+            template="baseline",
+            clone_from=None,
+            channel_strategy="new",
+            channels=[{"kind": "telegram", "name": "team"}],
+            agent_version="1.0.0",
+        )
+        agent["agent"]["linux_user"] = agent_id
+        home = tmp_path / f"{agent_id}-home"
+        home.mkdir(parents=True)
+        os.chmod(home, 0o700)
+        homes[agent_id] = home
+        state = service.store.read_state()
+        state["agents"][agent_id] = agent
+        service.store.write_state(state)
+
+    class PwdRow:
+        def __init__(self, home: Path) -> None:
+            self.pw_dir = str(home)
+
+    monkeypatch.setattr(service, "_linux_proc_available", lambda: True)
+    monkeypatch.setattr("clawie.service.os.geteuid", lambda: 0)
+    monkeypatch.setattr("clawie.service.pwd.getpwnam", lambda user: PwdRow(homes[user]))
+    monkeypatch.setattr(service, "_path_unreadable_as_user", lambda path, linux_user: (False, "readable"))
+
+    report = service.host_validation_report()
+
+    assert report["status"] == "failed"
+    assert any("can read or probe failed" in row["message"] for row in report["checks"])
+
+
+def test_health_host_validate_json_uses_validation_exit_codes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "host_validation_report",
+        lambda self: {"status": "skipped", "checks": [{"status": "skip", "message": "needs linux"}]},
+    )
+
+    code = run_cli(tmp_path, "health", "--host-validate", "--json")
+    payload = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert payload["status"] == "skipped"
+    assert payload["checks"][0]["message"] == "needs linux"
+
+
+def test_health_text_exits_nonzero_when_doctor_is_unhealthy(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "unhealthy", "checks": [{"status": "fail", "message": "missing config"}]},
+    )
+
+    code = run_cli(tmp_path, "health")
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "overall: unhealthy" in output
+    assert "missing config" in output
+
+
+def test_health_text_allows_degraded_doctor_with_warning(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "doctor",
+        lambda self: {"status": "degraded", "checks": [{"status": "warn", "message": "no agents"}]},
+    )
+
+    code = run_cli(tmp_path, "health")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "overall: degraded" in output
+    assert "no agents" in output
 
 
 def test_dashboard_refresh_updates_local_service_status(
@@ -5439,6 +6337,7 @@ def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
         return Result()
 
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(service, "_probe_process_cgroup", lambda pid: None)
     snapshot = service.performance_snapshot(refresh=False)
     row = next(r for r in snapshot["rows"] if r["agent_id"] == "teleclaw")
 
@@ -5451,6 +6350,147 @@ def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
     assert row["cpu_percent"] == 1.5
     assert row["mem_percent"] == 2.5
     assert row["rss_kb"] == 4096
+
+
+def test_collect_metrics_uses_live_provider_process_when_stored_pid_is_empty(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    agent = service.create_agent(
+        agent_id="teleclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    agent["agent"]["linux_user"] = "teleclaw"
+    agent["agent"]["pid"] = 0
+    state = service.store.read_state()
+    state["agents"]["teleclaw"] = agent
+    service.store.write_state(state)
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            return Result(stdout="teleclaw 4321 /home/linuxbrew/.linuxbrew/bin/openclaw gateway run\n")
+        if cmd[:2] == ["ps", "-p"]:
+            return Result(stdout=" 3.5  4.5  8192\n")
+        return Result()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(service, "_probe_process_cgroup", lambda pid: None)
+
+    result = service.collect_metrics()
+    metric = service.store.latest_metrics(limit_per_user=1)["teleclaw"][0]
+    updated = service.get_agent("teleclaw")
+
+    assert result["sampled"] == 1
+    assert metric["status"] == "running"
+    assert metric["cpu_percent"] == 3.5
+    assert metric["mem_percent"] == 4.5
+    assert metric["rss_kb"] == 8192
+    assert updated["agent"]["pid"] == 4321
+
+
+def test_probe_process_procfs_parses_rss_and_memory_percent(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    pid_dir = proc / "123"
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "status").write_text(
+        "Name:\topenclaw\nVmRSS:\t2048 kB\n",
+        encoding="utf-8",
+    )
+    (proc / "meminfo").write_text("MemTotal:       4096 kB\n", encoding="utf-8")
+
+    probe = ClawieService._probe_process_procfs(123, proc_root=proc)
+
+    assert probe == {"cpu_percent": 0.0, "mem_percent": 50.0, "rss_kb": 2048}
+
+
+def test_probe_process_cgroup_v2_parses_memory_current(tmp_path: Path) -> None:
+    proc = tmp_path / "proc"
+    cgroup_root = tmp_path / "sys" / "fs" / "cgroup"
+    pid_dir = proc / "123"
+    cgroup_dir = cgroup_root / "user.slice" / "user-1000.slice" / "openclaw.service"
+    pid_dir.mkdir(parents=True)
+    cgroup_dir.mkdir(parents=True)
+    (pid_dir / "cgroup").write_text(
+        "0::/user.slice/user-1000.slice/openclaw.service\n",
+        encoding="utf-8",
+    )
+    (proc / "meminfo").write_text("MemTotal:       8192 kB\n", encoding="utf-8")
+    (cgroup_dir / "memory.current").write_text("4194304\n", encoding="utf-8")
+
+    probe = ClawieService._probe_process_cgroup(123, proc_root=proc, cgroup_root=cgroup_root)
+
+    assert probe == {"cpu_percent": 0.0, "mem_percent": 50.0, "rss_kb": 4096}
+
+
+def test_probe_process_prefers_cgroup_memory_over_ps_rss(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+
+    class Result:
+        returncode = 0
+        stdout = " 7.5  1.0  1024\n"
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(
+        service,
+        "_probe_process_cgroup",
+        lambda pid: {"cpu_percent": 0.0, "mem_percent": 12.5, "rss_kb": 8192},
+    )
+
+    assert service._probe_process(123) == {
+        "cpu_percent": 7.5,
+        "mem_percent": 12.5,
+        "rss_kb": 8192,
+    }
+
+
+def test_probe_process_falls_back_to_procfs(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: Result())
+    monkeypatch.setattr(service, "_probe_process_cgroup", lambda pid: None)
+    monkeypatch.setattr(
+        service,
+        "_probe_process_procfs",
+        lambda pid: {"cpu_percent": 0.0, "mem_percent": 1.25, "rss_kb": 512},
+    )
+
+    assert service._probe_process(123) == {
+        "cpu_percent": 0.0,
+        "mem_percent": 1.25,
+        "rss_kb": 512,
+    }
 
 
 def test_local_claw_service_action_updates_local_state(
@@ -6339,6 +7379,41 @@ def test_status_command_json_output(tmp_path: Path, capsys: CaptureFixture[str])
     payload = json.loads(capsys.readouterr().out)
     assert payload["setup"]["provider"] == "openclaw"
     assert "agents" in payload
+
+
+def test_status_command_partial_section_error_still_exits_zero(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    def boom(self: ClawieService) -> dict[str, object]:
+        raise RuntimeError("maintenance exploded")
+
+    monkeypatch.setattr(ClawieService, "maintenance_status", boom)
+    assert run_cli(tmp_path, "status", "--json") == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["maintenance"] == {"error": "maintenance exploded"}
+    assert "checks" in payload["health"]
+
+
+def test_status_command_fatal_state_root_error_exits_nonzero(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "unrelated.txt").write_text("keep", encoding="utf-8")
+    shared.chmod(0o755)
+
+    code = run_cli(shared, "status", "--json")
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "refusing to change permissions on non-clawie state directory" in payload["setup"]["error"]
+    assert shared.stat().st_mode & 0o777 == 0o755
 
 
 def test_agent_create_and_show_print_requested_model_tier(

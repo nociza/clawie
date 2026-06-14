@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "api_url": "https://api.openclaw.example/v1",
+    "api_url": "",
     "api_key": "",
     "provider": "openclaw",
     "auth_mode": "none",
-    "schema_version": 1,
+    "schema_version": 2,
     "provider_credentials": {},
     "local_service_state": {},
     "channel_pool": [],
@@ -32,6 +32,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "backup_auto_push": True,
     "backup_last_run_at": "",
     "backup_last_commit": "",
+    "control_operator_allowlist": [],
+    "control_github_repo": "",
+    "control_github_token_path": "",
+    "control_github_issue_labels": ["clawie-control"],
+    "control_github_rate_limit_seconds": 3600,
+    "control_watchdog_enabled": False,
+    "control_watchdog_interval_seconds": 60,
+    "control_watchdog_notify_command": "",
 }
 
 DEFAULT_STATE: dict[str, Any] = {
@@ -51,13 +59,14 @@ DEFAULT_STATE: dict[str, Any] = {
 
 
 class StateStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     LEGACY_DEFAULT_CHANNELS: tuple[tuple[str, str], ...] = (
         ("chat", "support"),
         ("email", "inbox"),
     )
 
     def __init__(self, config_dir: str | Path | None = None) -> None:
+        self._explicit_config_dir = config_dir is not None
         self._allow_tmp_fallback = config_dir is None and "CLAWIE_HOME" not in os.environ
         if config_dir is None:
             root = self._default_root()
@@ -78,8 +87,8 @@ class StateStore:
                     name TEXT PRIMARY KEY,
                     payload TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS events (
@@ -132,6 +141,7 @@ class StateStore:
                 """
             )
             conn.commit()
+        self._migrate_users_table_to_agents()
         self._seed_defaults()
         self._migrate_legacy_json()
         self._migrate_schema()
@@ -165,7 +175,7 @@ class StateStore:
         state = copy.deepcopy(DEFAULT_STATE)
         with self._connect() as conn:
             template_rows = conn.execute("SELECT name, payload FROM templates").fetchall()
-            user_rows = conn.execute("SELECT user_id, payload FROM users").fetchall()
+            agent_rows = conn.execute("SELECT agent_id, payload FROM agents").fetchall()
             event_rows = conn.execute(
                 "SELECT timestamp, type, message, context FROM events ORDER BY id ASC"
             ).fetchall()
@@ -177,9 +187,8 @@ class StateStore:
             state["templates"] = copy.deepcopy(DEFAULT_STATE["templates"])
 
         state["agents"] = {}
-        for row in user_rows:
-            state["agents"][str(row["user_id"])] = self._decode_json_obj(str(row["payload"]))
-        state["users"] = state["agents"]
+        for row in agent_rows:
+            state["agents"][str(row["agent_id"])] = self._decode_json_obj(str(row["payload"]))
 
         state["events"] = []
         for row in event_rows:
@@ -197,14 +206,14 @@ class StateStore:
     def write_state(self, payload: dict[str, Any]) -> None:
         self.ensure()
         templates = payload.get("templates", {})
-        agents = payload.get("agents", payload.get("users", {}))
+        agents = payload.get("agents", {})
         events = payload.get("events", [])
         if not isinstance(templates, dict) or not isinstance(agents, dict) or not isinstance(events, list):
             raise ValueError("state payload must include templates/agents/events")
 
         with self._connect() as conn:
             conn.execute("DELETE FROM templates")
-            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM agents")
             conn.execute("DELETE FROM events")
 
             for name, template in templates.items():
@@ -215,7 +224,7 @@ class StateStore:
 
             for agent_id, agent in agents.items():
                 conn.execute(
-                    "INSERT INTO users(user_id, payload) VALUES (?, ?)",
+                    "INSERT INTO agents(agent_id, payload) VALUES (?, ?)",
                     (str(agent_id), json.dumps(agent, sort_keys=True)),
                 )
 
@@ -586,10 +595,10 @@ class StateStore:
         if not self.db_path.exists():
             return
         with self._connect() as conn:
-            has_users = int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]) > 0
+            has_agents = int(conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]) > 0
             has_events = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]) > 0
 
-        if has_users or has_events:
+        if has_agents or has_events:
             return
 
         if self.config_path.exists():
@@ -607,8 +616,29 @@ class StateStore:
         if current < 1:
             self._migrate_remove_legacy_default_channels()
             current = 1
+        if current < 2:
+            current = 2
         if current != self._stored_schema_version():
             self._write_schema_version(current)
+
+    def _migrate_users_table_to_agents(self) -> None:
+        with self._connect() as conn:
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            if "users" not in tables:
+                return
+            rows = conn.execute("SELECT user_id, payload FROM users").fetchall()
+            for row in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO agents(agent_id, payload) VALUES (?, ?)",
+                    (str(row["user_id"]), str(row["payload"])),
+                )
+            conn.execute("DROP TABLE users")
+            conn.commit()
 
     def _stored_schema_version(self) -> int:
         with self._connect() as conn:
@@ -651,7 +681,7 @@ class StateStore:
     def _migrate_remove_legacy_default_channels(self) -> None:
         with self._connect() as conn:
             template_rows = conn.execute("SELECT name, payload FROM templates").fetchall()
-            user_rows = conn.execute("SELECT user_id, payload FROM users").fetchall()
+            agent_rows = conn.execute("SELECT agent_id, payload FROM agents").fetchall()
 
             for row in template_rows:
                 name = str(row["name"])
@@ -670,8 +700,8 @@ class StateStore:
                     (json.dumps(payload, sort_keys=True), name),
                 )
 
-            for row in user_rows:
-                agent_id = str(row["user_id"])
+            for row in agent_rows:
+                agent_id = str(row["agent_id"])
                 payload = self._decode_json_obj(str(row["payload"]))
                 channels = payload.get("channels", [])
                 if not isinstance(channels, list):
@@ -681,7 +711,7 @@ class StateStore:
                     continue
                 payload["channels"] = filtered
                 conn.execute(
-                    "UPDATE users SET payload = ? WHERE user_id = ?",
+                    "UPDATE agents SET payload = ? WHERE agent_id = ?",
                     (json.dumps(payload, sort_keys=True), agent_id),
                 )
 
@@ -689,8 +719,14 @@ class StateStore:
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_root_dir()
-        conn = sqlite3.connect(self.db_path)
+        if self.db_path.is_symlink():
+            raise PermissionError(f"clawie database must not be a symlink: {self.db_path}")
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        self._harden_db_files()
         return conn
 
     def _set_root(self, root: Path) -> None:
@@ -700,6 +736,7 @@ class StateStore:
         self.state_path = self.root / "state.json"  # legacy migration input
 
     def _ensure_root_dir(self) -> None:
+        existed = self.root.exists() or self.root.is_symlink()
         try:
             self.root.mkdir(parents=True, exist_ok=True)
         except PermissionError:
@@ -707,7 +744,107 @@ class StateStore:
                 raise
             fallback = self._fallback_root()
             self._set_root(fallback)
+            existed = self.root.exists() or self.root.is_symlink()
             self.root.mkdir(parents=True, exist_ok=True)
+        self._harden_root_permissions(created=not existed)
+
+    def _harden_root_permissions(self, *, created: bool) -> None:
+        if self.root.is_symlink():
+            raise PermissionError(f"clawie state root must not be a symlink: {self.root}")
+        try:
+            current_mode = int(self.root.stat().st_mode) & 0o777
+        except OSError:
+            return
+        if current_mode != 0o700:
+            if self._explicit_config_dir and not created and not self._is_repairable_state_root():
+                raise PermissionError(
+                    "refusing to change permissions on non-clawie state directory: "
+                    f"{self.root}. Use a dedicated empty directory, CLAWIE_HOME, or --config-dir."
+                )
+        owner = self._sudo_user_owner_for_path(self.root)
+        if owner is not None:
+            try:
+                os.chown(self.root, owner[0], owner[1])
+            except OSError:
+                pass
+        if current_mode != 0o700:
+            os.chmod(self.root, 0o700)
+
+    def _is_repairable_state_root(self) -> bool:
+        try:
+            resolved = self.root.resolve()
+        except OSError:
+            return False
+        reserved = {Path("/").resolve(), Path(tempfile.gettempdir()).resolve()}
+        try:
+            reserved.add(Path("/tmp").resolve())
+        except OSError:
+            pass
+        if resolved in reserved:
+            return False
+        markers = {
+            "clawie.db",
+            "clawie.db-wal",
+            "clawie.db-shm",
+            "config.json",
+            "state.json",
+            "clawied-status.json",
+            "clawied.pid",
+            "clawied.lock",
+            "clawied.sock",
+            "manifests",
+            "shared-provider-auth",
+            "shared-addon-auth",
+            "shared-toolchain",
+        }
+        try:
+            entries = list(self.root.iterdir())
+        except OSError:
+            return False
+        if not entries:
+            return True
+        return any(entry.name in markers for entry in entries)
+
+    def _harden_db_files(self) -> None:
+        for path in (
+            self.db_path,
+            self.db_path.with_name(self.db_path.name + "-wal"),
+            self.db_path.with_name(self.db_path.name + "-shm"),
+        ):
+            try:
+                if path.exists() and not path.is_symlink():
+                    owner = self._sudo_user_owner_for_path(path)
+                    if owner is not None:
+                        try:
+                            os.chown(path, owner[0], owner[1])
+                        except OSError:
+                            pass
+                    os.chmod(path, 0o600)
+            except OSError:
+                continue
+
+    @staticmethod
+    def _sudo_user_owner_for_path(path: Path) -> tuple[int, int] | None:
+        if os.geteuid() != 0:
+            return None
+        sudo_user = str(os.environ.get("SUDO_USER", "")).strip()
+        if not sudo_user or sudo_user == "root":
+            return None
+        try:
+            row = pwd.getpwnam(sudo_user)
+        except KeyError:
+            return None
+        home = Path(row.pw_dir).expanduser()
+        try:
+            resolved_home = home.resolve()
+            resolved_path = path.resolve()
+        except OSError:
+            return None
+        try:
+            resolved_path.relative_to(resolved_home)
+        except ValueError:
+            return None
+        return int(row.pw_uid), int(row.pw_gid)
 
     @staticmethod
     def _fallback_root() -> Path:

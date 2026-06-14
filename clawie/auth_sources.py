@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -194,10 +195,11 @@ def extract_provider_auth_profiles(payload: dict[str, Any]) -> list[dict[str, st
         upstream = str(raw.get("provider", "")).strip()
         if not token or not upstream:
             continue
-        access_token = str(raw.get("access_token", raw.get("access", "")) or "").strip()
+        access_token = str(raw.get("access_token", raw.get("access", raw.get("token", ""))) or "").strip()
         refresh_token = str(raw.get("refresh_token", raw.get("refresh", "")) or "").strip()
         id_token = str(raw.get("id_token", "") or "").strip()
-        if not any((access_token, refresh_token, id_token)):
+        api_key = str(raw.get("api_key", raw.get("key", "")) or "").strip()
+        if not any((access_token, refresh_token, id_token, api_key)):
             continue
         kind = str(raw.get("kind", raw.get("type", "oauth")) or "oauth").strip().lower() or "oauth"
         expires_at = str(raw.get("expires_at", "") or "").strip()
@@ -214,11 +216,92 @@ def extract_provider_auth_profiles(payload: dict[str, Any]) -> list[dict[str, st
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "id_token": id_token,
+                "api_key": api_key,
                 "expires_at": expires_at,
                 "updated_at": str(raw.get("updated_at", "") or "").strip(),
             }
         )
     rows.sort(key=lambda row: (row["profile_id"] in active_ids, row["profile_id"]))
+    return rows
+
+
+def extract_openclaw_sqlite_auth_profiles(path: Path) -> list[dict[str, str]]:
+    """Convert OpenClaw's native ``openclaw-agent.sqlite`` auth store rows.
+
+    OpenClaw persists auth profile secrets as a single JSON blob in
+    ``auth_profile_store.store_json`` with ``store_key='primary'``. This parser
+    intentionally mirrors only the public credential union used by OpenClaw's
+    auth profile types, and returns clawie's normalized import shape.
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(path)
+        row = conn.execute(
+            "SELECT store_json FROM auth_profile_store WHERE store_key = ?",
+            ("primary",),
+        ).fetchone()
+    except sqlite3.Error:
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+    if not row or not row[0]:
+        return []
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return []
+    profiles = payload.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return []
+
+    rows: list[dict[str, str]] = []
+    for profile_id, raw in sorted(profiles.items()):
+        if not isinstance(raw, dict):
+            continue
+        provider = str(raw.get("provider", "")).strip()
+        if not provider:
+            continue
+        kind = str(raw.get("type", "")).strip().lower()
+        if kind == "api_key":
+            api_key = str(raw.get("key", "") or "").strip()
+            if not api_key:
+                continue
+            access_token = ""
+            refresh_token = ""
+            id_token = ""
+        elif kind == "token":
+            access_token = str(raw.get("token", "") or "").strip()
+            refresh_token = ""
+            id_token = ""
+            api_key = ""
+            if not access_token:
+                continue
+        elif kind == "oauth":
+            access_token = str(raw.get("access", "") or "").strip()
+            refresh_token = str(raw.get("refresh", "") or "").strip()
+            id_token = str(raw.get("idToken", "") or "").strip()
+            api_key = ""
+            if not any((access_token, refresh_token, id_token)):
+                continue
+        else:
+            continue
+        rows.append(
+            {
+                "source": "port",
+                "upstream_provider": provider,
+                "profile_name": str(raw.get("displayName", "default") or "default").strip() or "default",
+                "profile_id": str(profile_id).strip(),
+                "kind": kind,
+                "account_id": str(raw.get("accountId", "") or "").strip(),
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "id_token": id_token,
+                "api_key": api_key,
+                "expires_at": _epoch_millis_to_iso(raw.get("expires")),
+                "updated_at": "",
+            }
+        )
     return rows
 
 

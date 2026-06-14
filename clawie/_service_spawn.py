@@ -52,7 +52,7 @@ class SpawnOpsMixin:
             raise ValueError("agent_id is required")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         if agent_id in agents:
             raise AgentExistsError(f"agent already exists: {agent_id}")
         if template not in state.get("templates", {}):
@@ -204,7 +204,7 @@ class SpawnOpsMixin:
                 "ssh_login_disabled": bool(ssh_login_disabled),
             },
         )
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agents[agent_id] = agent_state
         self.store.write_state(state)
         return {

@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import pwd
+import subprocess
 
 # Kept importable as ``clawie.service.shutil`` so tests can monkeypatch
 # ``clawie.service.shutil.which``; the shutil module object is shared, so this
@@ -33,6 +34,9 @@ from clawie._service_prompts import PromptOpsMixin
 from clawie._service_agents import AgentOpsMixin
 from clawie._service_telemetry import TelemetryOpsMixin
 from clawie._service_delegation import DelegationOpsMixin
+from clawie._service_reconcile import ReconcileOpsMixin
+from clawie._service_escalation import ControlEscalationMixin
+from clawie._service_watchdog import ControlWatchdogMixin
 
 # Sections aggregated by ``status_snapshot`` / ``clawie status``, in display order.
 STATUS_SECTIONS: tuple[str, ...] = (
@@ -61,6 +65,9 @@ class ClawieService(
     AgentOpsMixin,
     TelemetryOpsMixin,
     DelegationOpsMixin,
+    ReconcileOpsMixin,
+    ControlEscalationMixin,
+    ControlWatchdogMixin,
 ):
     EVENT_LIMIT = 2000
     SSHD_DENY_USERS_FILE = Path("/etc/ssh/sshd_config.d/99-clawie-deny-users.conf")
@@ -74,6 +81,8 @@ class ClawieService(
     SHARED_TOOLCHAIN_DIR = Path("/var/lib/clawie/toolchain")
     MAINTENANCE_CRON_FILE = Path("/etc/cron.d/clawie-maintenance")
     MAINTENANCE_LOG_FILE = Path("/var/log/clawie-maintenance.log")
+    CONTROL_WATCHDOG_UNIT_FILE = Path("/etc/systemd/system/clawie-control-watchdog.service")
+    CONTROL_WATCHDOG_ALERT_UNIT_FILE = Path("/etc/systemd/system/clawie-control-alert.service")
     SHARED_CLAUDE_SUBDIRS = (
         "backups",
         "cache",
@@ -138,8 +147,8 @@ class ClawieService(
     CREDENTIAL_BUNDLE_SPECS: tuple[dict[str, Any], ...] = (
         {
             "id": "provider-auth",
-            "label": "provider auth sessions (.codex/auth.json + auth-profiles.json)",
-            "default": True,
+            "label": "provider auth sessions (.codex/auth.json + provider auth stores)",
+            "default": False,
             "kind": "provider",
         },
         {
@@ -157,7 +166,7 @@ class ClawieService(
         "provider_auth": "provider-auth",
         "git": "git",
     }
-    DEFAULT_CREDENTIAL_BUNDLES: tuple[str, ...] = ("provider-auth",)
+    DEFAULT_CREDENTIAL_BUNDLES: tuple[str, ...] = ()
     ADDON_ALIASES: dict[str, str] = {
         "googleworkspace": "gws",
         "google-workspace": "gws",
@@ -349,7 +358,7 @@ class ClawieService(
             }
         )
 
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         if agents:
             checks.append({"status": "pass", "message": f"{len(agents)} agent(s) provisioned"})
         else:
@@ -361,6 +370,7 @@ class ClawieService(
                 "status": "warn",
                 "message": "Agents without channels: " + ", ".join(no_channels),
             })
+        checks.extend(self._host_isolation_checks(agents))
 
         overall = "healthy"
         if any(check["status"] == "fail" for check in checks):
@@ -369,6 +379,469 @@ class ClawieService(
             overall = "degraded"
 
         return {"status": overall, "checks": checks}
+
+    def _host_isolation_checks(self, agents: dict[str, Any]) -> list[dict[str, str]]:
+        checks: list[dict[str, str]] = []
+        shared_home = self._shared_provider_auth_home()
+        if shared_home.exists():
+            try:
+                mode = int(shared_home.stat().st_mode) & 0o777
+            except OSError as exc:
+                checks.append({"status": "warn", "message": f"Cannot inspect shared provider auth store: {exc}"})
+            else:
+                if mode & 0o077:
+                    checks.append(
+                        {
+                            "status": "fail",
+                            "message": f"Shared provider auth store is not private: {shared_home} mode {mode:o}",
+                        }
+                    )
+                else:
+                    checks.append({"status": "pass", "message": "Shared provider auth store is private"})
+
+        consumers: list[str] = []
+        verified: list[str] = []
+        for aid, agent in sorted(agents.items()):
+            self._hydrate_agent_controls(agent)
+            sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
+            if not bool(sync.get("shared_provider_auth", False)):
+                continue
+            consumers.append(str(aid))
+            home = self._agent_linux_home(agent)
+            if home is None or not home.exists():
+                checks.append({"status": "warn", "message": f"Cannot inspect provider auth for {aid}: home missing"})
+                continue
+            copied = 0
+            unsafe = False
+            for rel in self._credential_bundle_paths("provider-auth"):
+                path = home / rel
+                if path.is_symlink():
+                    unsafe = True
+                    checks.append({"status": "fail", "message": f"Provider auth path is a symlink: {path}"})
+                    continue
+                if not path.exists() or not path.is_file():
+                    continue
+                copied += 1
+                try:
+                    mode = int(path.stat().st_mode) & 0o777
+                except OSError as exc:
+                    unsafe = True
+                    checks.append({"status": "warn", "message": f"Cannot inspect provider auth path {path}: {exc}"})
+                    continue
+                if mode & 0o077:
+                    unsafe = True
+                    checks.append({"status": "fail", "message": f"Provider auth file is not private: {path} mode {mode:o}"})
+            if copied == 0:
+                checks.append({"status": "warn", "message": f"Agent {aid} uses shared provider auth but has no copied provider auth files"})
+            elif not unsafe:
+                verified.append(str(aid))
+
+        if consumers and verified:
+            checks.append({"status": "pass", "message": "Private provider auth copies verified for: " + ", ".join(verified)})
+        elif not consumers:
+            checks.append({"status": "pass", "message": "No agents consume shared provider auth"})
+        return checks
+
+    def host_validation_report(self) -> dict[str, Any]:
+        """Run Linux/root-only host isolation validation against provisioned agents.
+
+        This is intentionally separate from ``doctor``: normal health checks are
+        read-only and portable, while this proof requires root so it can attempt
+        cross-user access checks with the real OS users.
+        """
+        checks: list[dict[str, str]] = []
+        if not self._linux_proc_available():
+            return {
+                "status": "skipped",
+                "checks": [
+                    {
+                        "status": "skip",
+                        "message": "Host validation requires Linux with /proc available",
+                    }
+                ],
+            }
+        if not hasattr(os, "geteuid") or os.geteuid() != 0:
+            return {
+                "status": "skipped",
+                "checks": [
+                    {
+                        "status": "skip",
+                        "message": "Host validation requires root so cross-user read checks can run",
+                    }
+                ],
+            }
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", {})
+        managed = self._host_validation_managed_agents(agents)
+        distinct_users = {row["linux_user"] for row in managed}
+        if len(distinct_users) < 2:
+            checks.append(
+                {
+                    "status": "fail",
+                    "message": "Host validation requires at least two managed Linux-user agents",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "status": "pass",
+                    "message": f"Found {len(managed)} managed agents across {len(distinct_users)} Linux users",
+                }
+            )
+
+        for row in managed:
+            checks.extend(self._host_validation_agent_checks(row))
+
+        cross_user_checks = 0
+        for reader in managed:
+            for target in managed:
+                if reader["linux_user"] == target["linux_user"]:
+                    continue
+                for path in self._host_validation_sensitive_paths(target):
+                    cross_user_checks += 1
+                    ok, detail = self._path_unreadable_as_user(path, reader["linux_user"])
+                    if ok:
+                        checks.append(
+                            {
+                                "status": "pass",
+                                "message": f"{reader['linux_user']} cannot read {path}",
+                            }
+                        )
+                    else:
+                        message = f"{reader['linux_user']} can read or probe failed for {path}"
+                        if detail:
+                            message = f"{message}: {detail}"
+                        checks.append({"status": "fail", "message": message})
+        if len(distinct_users) >= 2 and cross_user_checks == 0:
+            checks.append(
+                {
+                    "status": "fail",
+                    "message": "No sensitive host paths were available for cross-user read validation",
+                }
+            )
+
+        status = "passed"
+        if any(row["status"] == "fail" for row in checks):
+            status = "failed"
+        elif any(row["status"] == "warn" for row in checks):
+            status = "degraded"
+        elif any(row["status"] == "skip" for row in checks):
+            status = "skipped"
+        return {"status": status, "checks": checks}
+
+    def production_readiness_report(
+        self,
+        *,
+        exercise_watchdog_restart: bool = False,
+        watchdog_timeout_seconds: int = 30,
+        all_provider_contracts: bool = False,
+    ) -> dict[str, Any]:
+        """Aggregate the target-host proof gates required for production.
+
+        This report is deliberately stricter than ``doctor``. Normal health can
+        be useful on a developer machine, but production readiness requires
+        target-host isolation proof, watchdog restart proof, and no registered
+        production provider lacking a source-pinned delivery adapter contract.
+        """
+        checks: list[dict[str, Any]] = []
+
+        def add(name: str, status: str, message: str, evidence: dict[str, Any] | None = None) -> None:
+            row: dict[str, Any] = {"name": name, "status": status, "message": message}
+            if evidence is not None:
+                row["evidence"] = evidence
+            checks.append(row)
+
+        try:
+            doctor = self.doctor()
+        except Exception as exc:  # noqa: BLE001 - readiness reports all failed gates.
+            add("doctor", "fail", "standard health checks could not run", {"error": str(exc)})
+        else:
+            doctor_status = str(doctor.get("status", "unknown"))
+            if doctor_status == "healthy":
+                add("doctor", "pass", "standard health checks are healthy", doctor)
+            elif doctor_status == "degraded":
+                add("doctor", "warn", "standard health checks are degraded", doctor)
+            else:
+                add("doctor", "fail", "standard health checks are not healthy", doctor)
+
+        try:
+            host = self.host_validation_report()
+        except Exception as exc:  # noqa: BLE001 - readiness reports all failed gates.
+            add("host_validation", "fail", "Linux/root host isolation proof could not run", {"error": str(exc)})
+        else:
+            host_status = str(host.get("status", "unknown"))
+            if host_status == "passed":
+                add("host_validation", "pass", "Linux/root host isolation proof passed", host)
+            else:
+                add(
+                    "host_validation",
+                    "fail",
+                    "Linux/root host isolation proof did not pass",
+                    host,
+                )
+
+        try:
+            watchdog = self.control_watchdog_verify(
+                exercise_restart=exercise_watchdog_restart,
+                timeout_seconds=watchdog_timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness reports all failed gates.
+            add("watchdog", "fail", "systemd watchdog proof could not run", {"error": str(exc)})
+        else:
+            watchdog_status = str(watchdog.get("status", "unknown"))
+            if watchdog_status == "passed":
+                add("watchdog", "pass", "systemd watchdog proof passed", watchdog)
+                if bool(watchdog.get("restart_exercised", False)):
+                    add(
+                        "watchdog_restart_exercise",
+                        "pass",
+                        "systemd watchdog restart was exercised",
+                        watchdog,
+                    )
+                else:
+                    add(
+                        "watchdog_restart_exercise",
+                        "fail",
+                        "production readiness requires --exercise-watchdog-restart",
+                        watchdog,
+                    )
+            else:
+                add("watchdog", "fail", "systemd watchdog proof did not pass", watchdog)
+
+        try:
+            checks.extend(
+                self._production_runtime_adapter_contract_checks(
+                    all_provider_contracts=all_provider_contracts,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - readiness reports all failed gates.
+            add(
+                "runtime_adapters",
+                "fail",
+                "runtime adapter contract checks could not run",
+                {"error": str(exc)},
+            )
+
+        status = "passed"
+        if any(row["status"] == "fail" for row in checks):
+            status = "failed"
+        elif any(row["status"] == "warn" for row in checks):
+            status = "degraded"
+        return {
+            "status": status,
+            "generated_at": now_iso(),
+            "checks": checks,
+            "exercise_watchdog_restart": bool(exercise_watchdog_restart),
+            "all_provider_contracts": bool(all_provider_contracts),
+        }
+
+    def _production_runtime_adapter_contract_checks(
+        self,
+        *,
+        all_provider_contracts: bool = False,
+    ) -> list[dict[str, Any]]:
+        from clawie.adapters import AdapterError, get_adapter
+        from clawie.providers import verified_delivery_provider_names
+
+        providers: set[str] = set()
+        if all_provider_contracts:
+            providers.update(verified_delivery_provider_names())
+        config = self.store.read_config()
+        provider = str(config.get("provider", "") or "").strip().lower()
+        if provider:
+            providers.add(provider)
+        state = self.store.read_state()
+        agents = state.get("agents", {})
+        if isinstance(agents, dict):
+            for payload in agents.values():
+                if not isinstance(payload, dict):
+                    continue
+                info = payload.get("agent", {})
+                if not isinstance(info, dict):
+                    continue
+                provider = str(info.get("provider", "") or "").strip().lower()
+                if provider:
+                    providers.add(provider)
+        if not providers:
+            providers.add("openclaw")
+
+        checks: list[dict[str, Any]] = []
+        for provider in sorted(providers):
+            checks.append(self._production_runtime_adapter_contract_check(provider, get_adapter))
+        return checks
+
+    @staticmethod
+    def _production_runtime_adapter_contract_check(provider: str, get_adapter: Any) -> dict[str, Any]:
+        from clawie.adapters import AdapterError
+        from clawie.providers import get_provider
+
+        name = f"runtime_adapter_{provider}"
+        try:
+            spec = get_provider(provider)
+        except ValueError:
+            spec = None
+        if spec is not None and not bool(spec.verified_delivery):
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} does not have a verified delegated-task delivery adapter",
+                "evidence": {
+                    "provider": provider,
+                    "runtime": spec.runtime,
+                    "delivery_note": spec.delivery_note,
+                },
+            }
+        try:
+            adapter = get_adapter(provider)
+        except AdapterError as exc:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"No verified delivery adapter is registered for provider {provider}",
+                "evidence": {"provider": provider, "error": str(exc)},
+            }
+        models = {
+            "fast": str(adapter.TIER_MODELS.get("fast", "") or "").strip(),
+            "balanced": str(adapter.TIER_MODELS.get("balanced", "") or "").strip(),
+            "power": str(adapter.TIER_MODELS.get("power", "") or "").strip(),
+        }
+        evidence: dict[str, Any] = {
+            "provider": provider,
+            "adapter": str(getattr(adapter, "name", "") or "").strip(),
+            "contract_verified": bool(getattr(adapter, "CONTRACT_VERIFIED", False)),
+            "models": models,
+            "default_model": str(getattr(adapter, "DEFAULT_MODEL", "") or "").strip(),
+        }
+        if not evidence["contract_verified"]:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} adapter contract is not source-pinned",
+                "evidence": evidence,
+            }
+        if not all(models.values()) or not evidence["default_model"]:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} adapter model mapping is incomplete",
+                "evidence": evidence,
+            }
+        try:
+            adapter.tier_to_model("balanced")
+        except AdapterError as exc:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} adapter refuses model selection: {exc}",
+                "evidence": evidence,
+            }
+        return {
+            "name": name,
+            "status": "pass",
+            "message": f"Provider {provider} adapter contract is verified",
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _linux_proc_available() -> bool:
+        return os.name == "posix" and Path("/proc").exists()
+
+    def _host_validation_managed_agents(self, agents: dict[str, Any]) -> list[dict[str, Any]]:
+        managed: list[dict[str, Any]] = []
+        for aid, payload in sorted(agents.items()):
+            if not isinstance(payload, dict):
+                continue
+            self._hydrate_agent_controls(payload)
+            info = payload.setdefault("agent", {})
+            if bool(info.get("local_user", False)):
+                continue
+            linux_user = str(info.get("linux_user", "")).strip()
+            if not linux_user:
+                continue
+            managed.append(
+                {
+                    "agent_id": str(aid),
+                    "linux_user": linux_user,
+                    "home": self._agent_linux_home(payload),
+                    "payload": payload,
+                }
+            )
+        return managed
+
+    def _host_validation_agent_checks(self, row: dict[str, Any]) -> list[dict[str, str]]:
+        checks: list[dict[str, str]] = []
+        agent_id = str(row.get("agent_id", ""))
+        linux_user = str(row.get("linux_user", ""))
+        home = row.get("home")
+        try:
+            pwd.getpwnam(linux_user)
+        except KeyError:
+            checks.append({"status": "fail", "message": f"Linux user does not exist for {agent_id}: {linux_user}"})
+        else:
+            checks.append({"status": "pass", "message": f"Linux user exists for {agent_id}: {linux_user}"})
+
+        if not isinstance(home, Path) or not home.exists():
+            checks.append({"status": "fail", "message": f"Home directory is missing for {agent_id}: {home}"})
+            return checks
+        if home.is_symlink():
+            checks.append({"status": "fail", "message": f"Home directory is a symlink for {agent_id}: {home}"})
+        try:
+            mode = int(home.stat().st_mode) & 0o777
+        except OSError as exc:
+            checks.append({"status": "fail", "message": f"Cannot inspect home mode for {agent_id}: {exc}"})
+        else:
+            if mode & 0o077:
+                checks.append({"status": "fail", "message": f"Home directory is not private for {agent_id}: {home} mode {mode:o}"})
+            else:
+                checks.append({"status": "pass", "message": f"Home directory is private for {agent_id}: {home}"})
+
+        for path in self._host_validation_credential_paths(row):
+            if path.is_symlink():
+                checks.append({"status": "fail", "message": f"Credential path is a symlink for {agent_id}: {path}"})
+                continue
+            try:
+                mode = int(path.stat().st_mode) & 0o777
+            except OSError as exc:
+                checks.append({"status": "fail", "message": f"Cannot inspect credential path for {agent_id}: {path}: {exc}"})
+                continue
+            if mode & 0o077:
+                checks.append({"status": "fail", "message": f"Credential file is not private for {agent_id}: {path} mode {mode:o}"})
+            else:
+                checks.append({"status": "pass", "message": f"Credential file is private for {agent_id}: {path}"})
+        return checks
+
+    def _host_validation_sensitive_paths(self, row: dict[str, Any]) -> list[Path]:
+        home = row.get("home")
+        if not isinstance(home, Path) or not home.exists():
+            return []
+        paths = [home]
+        paths.extend(self._host_validation_credential_paths(row))
+        return paths
+
+    def _host_validation_credential_paths(self, row: dict[str, Any]) -> list[Path]:
+        home = row.get("home")
+        if not isinstance(home, Path):
+            return []
+        paths: list[Path] = []
+        for rel in self._credential_bundle_paths("provider-auth"):
+            path = home / rel
+            if path.exists() or path.is_symlink():
+                paths.append(path)
+        return paths
+
+    def _path_unreadable_as_user(self, path: Path, linux_user: str) -> tuple[bool, str]:
+        try:
+            cmd = self._wrap_user_command(
+                ["test", "!", "-r", str(path)],
+                linux_user,
+                purpose="host validation",
+            )
+        except SetupError as exc:
+            return False, str(exc)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        output = "\n".join(part.strip() for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+        return result.returncode == 0, output
 
     def list_events(self, limit: int = 20) -> list[dict[str, Any]]:
         state = self.store.read_state()
@@ -503,10 +976,10 @@ class ClawieService(
 
             merged_state = copy.deepcopy(current_state)
             merged_state.setdefault("templates", {})
-            merged_state.setdefault("agents", merged_state.get("users", {}))
+            merged_state.setdefault("agents", {})
             merged_state.setdefault("events", [])
             merged_state["templates"].update(state.get("templates", {}))
-            merged_state["agents"].update(state.get("agents", state.get("users", {})))
+            merged_state["agents"].update(state.get("agents", {}))
             merged_state["events"] = (
                 merged_state["events"] + state.get("events", [])
             )[-self.EVENT_LIMIT :]

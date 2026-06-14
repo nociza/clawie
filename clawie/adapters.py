@@ -190,6 +190,7 @@ class GatewayCliAdapter:
     PROTOCOL_MAX = 1
     TIER_MODELS: dict[str, str] = {}
     DEFAULT_MODEL = ""
+    CONTRACT_VERIFIED = True
 
     # --- version policy ------------------------------------------------------
 
@@ -253,7 +254,13 @@ class GatewayCliAdapter:
     # --- models --------------------------------------------------------------
 
     def tier_to_model(self, tier: str) -> str:
-        return self.TIER_MODELS.get(str(tier).strip().lower(), self.DEFAULT_MODEL)
+        model = str(self.TIER_MODELS.get(str(tier).strip().lower(), self.DEFAULT_MODEL) or "").strip()
+        if not model:
+            raise AdapterError(
+                f"{self.name} has no verified model mapping; runtime writes are disabled "
+                "until the adapter contract is pinned"
+            )
+        return model
 
     # --- delivery (the bridge) ----------------------------------------------
 
@@ -430,6 +437,7 @@ class HermesAdapter(GatewayCliAdapter):
     MAX_SUPPORTED_EXCLUSIVE = Version(9999, 0, 1)
     TIER_MODELS = {"fast": "", "balanced": "", "power": ""}
     DEFAULT_MODEL = ""
+    CONTRACT_VERIFIED = False
 
 
 # ---------------------------------------------------------------------------

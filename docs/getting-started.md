@@ -4,7 +4,8 @@
 
 - **Linux** (Debian/Ubuntu recommended) — clawie uses Linux users, systemd, and Unix domain sockets. Not compatible with macOS or Windows.
 - **Python 3.10+**
-- **Root/sudo** for runtime isolation (optional — agent creation and the dashboard work without it)
+- **Root/sudo** for runtime isolation (optional — agent creation and `clawie status` work without it)
+- **Consistent state root** — normal `sudo clawie ...` uses the invoking user's `~/.clawie`; set `CLAWIE_HOME` or `--config-dir` for custom deployments.
 
 See [Requirements & Limitations](requirements.md) for full details.
 
@@ -25,7 +26,7 @@ Python 3.10 installs `tomli`; Python 3.11+ uses only the standard library.
 Set your provider and workspace:
 
 ```bash
-clawie config set --provider picoclaw --subscription pro --workspace production
+clawie config set --provider openclaw --subscription pro --workspace production
 ```
 
 Or run the interactive setup:
@@ -43,10 +44,12 @@ clawie config show
 ## Install a provider runtime
 
 ```bash
-clawie runtime install picoclaw
+clawie runtime install openclaw
 ```
 
-Supported providers: `openclaw`, `picoclaw`, `zeroclaw`.
+Production delegated-task delivery is verified for `openclaw`. `picoclaw` and
+`zeroclaw` lifecycle/auth support is available, but delegated-task delivery is
+gated until those runtime contracts are source-pinned.
 
 ## Create your first agent
 
@@ -64,7 +67,7 @@ clawie agent create alice \
   --template baseline \
   --channel-strategy new \
   --model-tier power \
-  --provider picoclaw
+  --provider openclaw
 ```
 
 ## Check fleet status

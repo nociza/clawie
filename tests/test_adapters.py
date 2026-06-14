@@ -289,16 +289,40 @@ def test_adapter_contract(name: str) -> None:
         adapter.gateway_config_patch(port=1, token="")
     # token + models
     assert len(adapter.new_gateway_token()) >= 16
-    assert isinstance(adapter.tier_to_model("balanced"), str)
+    has_model_map = any(str(model).strip() for model in adapter.TIER_MODELS.values()) or bool(
+        str(adapter.DEFAULT_MODEL).strip()
+    )
+    if has_model_map:
+        assert isinstance(adapter.tier_to_model("balanced"), str)
+    else:
+        with pytest.raises(AdapterError):
+            adapter.tier_to_model("balanced")
     # delivery
-    cmd = adapter.deliver_command("a", Task("t1", "hi"), timeout=10)
-    assert cmd[0] == adapter.binary and "agent" in cmd and "--json" in cmd
+    if has_model_map:
+        cmd = adapter.deliver_command("a", Task("t1", "hi"), timeout=10)
+        assert cmd[0] == adapter.binary and "agent" in cmd and "--json" in cmd
+    else:
+        with pytest.raises(AdapterError):
+            adapter.deliver_command("a", Task("t1", "hi"), timeout=10)
     good = adapter.parse_reply('{"payloads":[{"text":"ok"}]}')
     assert isinstance(good, Reply) and good.ok and good.output == "ok"
     assert adapter.parse_reply("").ok is False
     # auth / readiness
     assert adapter.auth_login_command("openai")[0] == adapter.binary
     assert adapter.readiness_command()[0] == adapter.binary
+
+
+def test_hermes_adapter_fails_closed_until_contract_is_verified() -> None:
+    adapter = get_adapter("hermes")
+
+    gate = adapter.version_gate("hermes 0.1.0")
+
+    assert gate.degraded is True
+    assert "read-only" in gate.message
+    with pytest.raises(AdapterError, match="no verified model mapping"):
+        adapter.tier_to_model("balanced")
+    with pytest.raises(AdapterError, match="no verified model mapping"):
+        adapter.deliver_command("ops", Task("t1", "hi"), timeout=10)
 
 
 def test_openclaw_satisfies_protocol(adapter: OpenclawAdapter) -> None:

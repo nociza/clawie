@@ -12,11 +12,11 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Agent orchestration** — Delegate tasks across agents in recursive trees with automatic tier-based routing. Fast agents handle lookups, power agents handle analysis, balanced agents handle everything else.
 
-**Multi-provider fleet** — Run agents on openclaw, picoclaw, or zeroclaw. Switch providers with a single command. Authorize once, copy private credential material into eligible agent homes, and port sessions between claws with `clawie auth port`.
+**Provider-aware fleet** — Production delegated-task delivery is source-pinned for openclaw. picoclaw and zeroclaw lifecycle/auth support remains available for migration and experimentation, with delivery gated until their runtime contracts are pinned. Authorize once, copy private credential material into eligible agent homes, and port sessions between claws with `clawie auth port`.
 
 **Linux isolation** — Each agent gets its own Linux user and home directory. Credential files are copied into agent homes with private modes; agents do not read or mutate shared auth/cache files.
 
-**Continuous knowledge backup** — Agent prompts and memory are mirrored into a git repo on every maintenance pass, with secrets redacted and credentials excluded. Restore one agent or the whole fleet with `clawie backup restore`.
+**Continuous knowledge backup** — Agent manifests, prompts, and memory are mirrored into a git repo on every maintenance pass, with secrets redacted and credentials excluded. Restore one agent or the whole fleet with `clawie backup restore`.
 
 **Unified status** — One read-only `clawie status` command shows agent status, runtimes, auth, delegation trees, backup, and health across your entire fleet — with `--json` for scripting and `--watch` for a live view.
 
@@ -26,6 +26,7 @@ You have multiple agents across providers. Each needs its own config, credential
 - **Python 3.10+**
 - **Python dependencies** — stdlib on Python 3.11+; Python 3.10 installs `tomli` for TOML parsing.
 - **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and `clawie status` work without root.
+- **State root under sudo** — normal `sudo clawie ...` uses the invoking user's `~/.clawie` via `SUDO_USER`. For service accounts or custom layouts, set `CLAWIE_HOME` or pass `--config-dir` consistently.
 - **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
 - **Terminal**: UTF-8 with color support for `status` output.
 
@@ -39,7 +40,7 @@ uv tool install -e .          # from source
 ## Quick start
 
 ```bash
-clawie config set --provider picoclaw --subscription pro
+clawie config set --provider openclaw --subscription pro
 clawie agent create alice --template baseline
 clawie status
 ```
@@ -85,7 +86,7 @@ clawie delegation tree --agent-id p
 clawie delegation status
 
 # Providers & runtime
-clawie config set --provider picoclaw
+clawie config set --provider openclaw
 sudo clawie runtime create alice --user alice
 clawie runtime detect
 
@@ -102,6 +103,12 @@ clawie backup restore --agent alice
 
 # Status
 clawie status
+
+# Production acceptance for the configured host
+sudo clawie production verify --exercise-watchdog-restart --json
+
+# Release acceptance for the verified delivery surface
+sudo clawie production verify --exercise-watchdog-restart --all-provider-contracts --json
 ```
 
 ## Status
@@ -134,7 +141,9 @@ clawie backup restore --agent alice   # bring knowledge back after a loss
 ```
 
 Secrets are redacted from the snapshot and credential files are never
-collected; `clawie backup export` exists for full-fidelity local snapshots.
+collected. Missing local agent records are recreated from the backed-up
+manifest before prompts and workspace knowledge are restored; `clawie backup
+export` exists for full-fidelity local snapshots.
 See [docs/backup.md](docs/backup.md).
 
 ## Limitations
@@ -143,7 +152,7 @@ See [docs/backup.md](docs/backup.md).
 - **Single machine** — all agent communication is over localhost Unix sockets. No network/multi-host delegation.
 - **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
 - **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout.
-- **SQLite storage** — single-writer, not designed for concurrent multi-process access to the same state directory.
+- **SQLite storage** — uses an agents-only state table, WAL, and a busy timeout; `clawied` hosts manifest reconcile cycles, mutating CLI service operations, and a capability-gated control-tool RPC. Linux/root host validation has container proof, and the built wheel has a Colima Linux/systemd `production verify --exercise-watchdog-restart` proof in `docs/proofs/`. Repeat that verifier on any different deployment host before accepting that host; picoclaw/zeroclaw delegated-task delivery remains gated until their runtime contracts are source-pinned.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.
@@ -172,4 +181,4 @@ uv run --with pytest pytest -q
 
 ## License
 
-MIT
+Apache-2.0

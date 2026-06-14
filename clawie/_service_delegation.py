@@ -256,9 +256,9 @@ class DelegationOpsMixin:
         """Run maintenance tasks: sync credentials and write configured prompts for all managed agents."""
         self._require_setup()
 
-        # First, refresh the shared auth store from the freshest source (codex).
-        # This converts codex OAuth tokens into openclaw/picoclaw auth-profiles
-        # so agents get a live token instead of a stale copy.
+        # First, refresh the shared auth store from the freshest source.
+        # This converts source OAuth tokens into provider-native shared auth
+        # stores so agents get a live token instead of a stale copy.
         src_home = self._default_source_home()
         auth_refresh = "skipped"
         for source_type in ("codex", "claude"):
@@ -270,7 +270,7 @@ class DelegationOpsMixin:
                 continue
 
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         results: dict[str, dict[str, str]] = {}
         errors = 0
         skipped = 0
@@ -558,7 +558,7 @@ class DelegationOpsMixin:
 
         task = Task(task_id=uuid.uuid4().hex, message=str(message), tier=str(tier or "balanced"))
         cmd = adapter.deliver_command(agent_id, task, timeout=timeout)
-        runner = run or self._default_deliver_runner(linux_user)
+        runner = run or self._default_deliver_runner(provider, linux_user)
         stdout = runner(cmd)
         reply = adapter.parse_reply(stdout)
 
@@ -581,11 +581,12 @@ class DelegationOpsMixin:
         self.store.write_state(state)
         return result
 
-    def _default_deliver_runner(self, linux_user: str) -> Callable[[list[str]], str]:
+    def _default_deliver_runner(self, provider: str, linux_user: str) -> Callable[[list[str]], str]:
         """Run an adapter delivery command in the agent user's service env."""
+        provider_name = str(provider).strip().lower()
 
         def _run(cmd: list[str]) -> str:
-            executable = self._resolve_provider_executable("openclaw")
+            executable = self._resolve_provider_executable(provider_name)
             argv = [executable, *list(cmd)[1:]]
             wrapped = self._wrap_user_command(argv, linux_user, purpose="agent delegation")
             result = subprocess.run(
@@ -597,7 +598,7 @@ class DelegationOpsMixin:
             )
             if result.returncode != 0 and not str(result.stdout).strip():
                 detail = (result.stderr or "").strip() or f"exit {result.returncode}"
-                raise SetupError(f"openclaw agent delivery failed: {detail}")
+                raise SetupError(f"{provider_name} agent delivery failed: {detail}")
             return result.stdout
 
         return _run

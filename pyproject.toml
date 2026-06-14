@@ -8,12 +8,34 @@ version = "0.1.4"
 description = "Local CLI control plane for provisioning, orchestrating, and monitoring AI agent fleets"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Clawie Team" }]
+keywords = ["agents", "ai", "automation", "cli", "control-plane", "orchestration"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
 dependencies = [
     # TOML parsing for provider channel discovery; stdlib tomllib exists on 3.11+.
     "tomli>=2.0; python_version < '3.11'",
 ]
+
+[project.urls]
+Documentation = "https://github.com/nociza/clawie#readme"
+Issues = "https://github.com/nociza/clawie/issues"
+Source = "https://github.com/nociza/clawie"
 
 [project.scripts]
 clawie = "clawie.cli:main"

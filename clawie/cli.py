@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from clawie import __version__
 from clawie.providers import get_provider, provider_names
 from clawie.service import (
     SetupError,
@@ -38,10 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--config-dir",
         help="Override state directory (default: ~/.clawie)",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the installed clawie version and exit",
+    )
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{status,config,agent,channel,runtime,auth,addon,delegation,maintenance,health,event,backup,dashboard}",
+        metavar="{status,config,agent,channel,runtime,auth,addon,delegation,maintenance,control,clawied,production,health,event,backup,dashboard}",
     )
 
     _build_config_parser(subparsers)
@@ -52,6 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
     _build_addon_parser(subparsers)
     _build_delegation_parser(subparsers)
     _build_maintenance_parser(subparsers)
+    _build_control_parser(subparsers)
+    _build_clawied_parser(subparsers)
+    _build_production_parser(subparsers)
 
     status = subparsers.add_parser(
         "status",
@@ -100,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
         "health",
         help="Run health checks",
     )
+    health.add_argument(
+        "--host-validate",
+        action="store_true",
+        help="Run Linux/root multi-user host isolation validation",
+    )
+    health.add_argument("--json", action="store_true", help="Emit the report as JSON")
     health.set_defaults(func=cmd_health)
 
     event = subparsers.add_parser(
@@ -594,7 +610,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     credentials_set.add_argument(
         "--include-defaults",
         action="store_true",
-        help="Start from default bundles, then add explicit selections",
+        help="Start from configured default bundles (currently empty), then add explicit selections",
     )
     credentials_set.set_defaults(func=cmd_agents_credentials_set)
 
@@ -624,7 +640,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     credentials_sync.add_argument(
         "--include-defaults",
         action="store_true",
-        help="When using --bundle, include default bundles too",
+        help="When using --bundle, include configured default bundles too (currently empty)",
     )
     credentials_sync.add_argument(
         "--source-home",
@@ -1019,7 +1035,7 @@ def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     create.add_argument(
         "--no-default-credentials",
         action="store_true",
-        help="Do not include default credential bundles when syncing on create",
+        help="Compatibility flag; default credential bundles are empty",
     )
     create.add_argument(
         "--no-delegation",
@@ -1195,12 +1211,37 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--api-url",
-        help="API base URL (defaults to the selected provider endpoint)",
+        help="Optional API base URL for direct API-key integrations",
     )
     parser.add_argument(
         "--install-runtime",
         action="store_true",
         help="Record local runtime as installed",
+    )
+    parser.add_argument(
+        "--control-github-repo",
+        help="GitHub repo for confirmed control-agent escalation (owner/name)",
+    )
+    parser.add_argument(
+        "--control-github-token-path",
+        help="Path to a 0600 GitHub token file for control-agent escalation",
+    )
+    parser.add_argument(
+        "--control-operator",
+        action="append",
+        dest="control_operators",
+        help="Allowlisted operator handle for destructive/outward control confirmations",
+    )
+    parser.add_argument(
+        "--control-issue-label",
+        action="append",
+        dest="control_issue_labels",
+        help="Label to apply to control-agent GitHub issues",
+    )
+    parser.add_argument(
+        "--control-github-rate-limit-seconds",
+        type=int,
+        help="Minimum seconds between new non-duplicate control-agent GitHub issues or PRs",
     )
     parser.add_argument(
         "--interactive",
@@ -1279,17 +1320,51 @@ def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
         workspace = _prompt_with_default("Workspace", workspace)
         api_url = _prompt_with_default("API URL", api_url or provider_spec.default_api_url)
 
-    config = service.setup(
-        provider=provider,
-        api_key=api_key,
-        auth_mode=auth_mode,
-        spawn_password=spawn_password,
-        clear_spawn_password=bool(args.clear_spawn_password),
-        subscription=subscription or "starter",
-        workspace=workspace or "default",
-        api_url=api_url or provider_spec.default_api_url,
-        install_runtime=bool(args.install_runtime),
+    config = _clawied_service_call_or_unavailable(
+        service,
+        "setup",
+        {
+            "provider": provider,
+            "api_key": api_key,
+            "auth_mode": auth_mode,
+            "spawn_password": spawn_password,
+            "clear_spawn_password": bool(args.clear_spawn_password),
+            "subscription": subscription or "starter",
+            "workspace": workspace or "default",
+            "api_url": api_url or provider_spec.default_api_url,
+            "install_runtime": bool(args.install_runtime),
+        },
     )
+    if config is _CLAWIED_UNAVAILABLE:
+        config = service.setup(
+            provider=provider,
+            api_key=api_key,
+            auth_mode=auth_mode,
+            spawn_password=spawn_password,
+            clear_spawn_password=bool(args.clear_spawn_password),
+            subscription=subscription or "starter",
+            workspace=workspace or "default",
+            api_url=api_url or provider_spec.default_api_url,
+            install_runtime=bool(args.install_runtime),
+        )
+    control_kwargs = {
+        "github_repo": getattr(args, "control_github_repo", None),
+        "github_token_path": getattr(args, "control_github_token_path", None),
+        "operators": getattr(args, "control_operators", None),
+        "issue_labels": getattr(args, "control_issue_labels", None),
+        "rate_limit_seconds": getattr(args, "control_github_rate_limit_seconds", None),
+    }
+    control_kwargs = {key: value for key, value in control_kwargs.items() if value is not None}
+    control_settings: dict[str, Any] = {}
+    if control_kwargs:
+        result = _clawied_service_call_or_unavailable(
+            service,
+            "configure_control_escalation",
+            control_kwargs,
+        )
+        if result is _CLAWIED_UNAVAILABLE:
+            result = service.configure_control_escalation(**control_kwargs)
+        control_settings = result
     status = service.setup_status()
 
     print_success("Clawie config updated")
@@ -1299,13 +1374,24 @@ def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
             f"provider: {config.get('provider', '')}",
             f"workspace: {config.get('workspace', '')}",
             f"subscription: {config.get('subscription', '')}",
-            f"api_url: {config.get('api_url', '')}",
+            f"api_url: {config.get('api_url', '') or '<not set>'}",
             f"auth_mode: {config.get('auth_mode', '')}",
             f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
             f"runtime_installed: {status.get('runtime_installed', False)}",
             f"api_key: {status.get('api_key', '')}",
         ],
     )
+    if control_settings:
+        print_panel(
+            "Control",
+            [
+                f"github_repo: {control_settings.get('github_repo', '') or '<not set>'}",
+                f"github_token_path: {control_settings.get('github_token_path', '') or '<not set>'}",
+                f"operator_allowlist: {', '.join(control_settings.get('operator_allowlist', [])) or '<none>'}",
+                f"issue_labels: {', '.join(control_settings.get('issue_labels', [])) or '<none>'}",
+                f"rate_limit_seconds: {control_settings.get('rate_limit_seconds', 0)}",
+            ],
+        )
     return 0
 
 
@@ -1323,7 +1409,7 @@ def _print_setup_status(service: ClawieService) -> int:
             f"provider: {status.get('provider', '')}",
             f"workspace: {status.get('workspace', '')}",
             f"subscription: {status.get('subscription', '')}",
-            f"api_url: {status.get('api_url', '')}",
+            f"api_url: {status.get('api_url', '') or '<not set>'}",
             f"auth_mode: {status.get('auth_mode', '')}",
             f"api_key: {status.get('api_key', '')}",
             f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
@@ -1364,7 +1450,13 @@ def cmd_shared_auth_show(args: argparse.Namespace, service: ClawieService) -> in
 
 def cmd_shared_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
-    payload = service.shared_auth_login(provider)
+    payload = _clawied_service_call_or_unavailable(
+        service,
+        "shared_auth_login",
+        {"provider": provider},
+    )
+    if payload is _CLAWIED_UNAVAILABLE:
+        payload = service.shared_auth_login(provider)
     action = str(payload.get("action_performed", "login"))
     if action == "status":
         print_success(f"Shared auth already ready for {provider}")
@@ -1381,11 +1473,21 @@ def cmd_shared_auth_login(args: argparse.Namespace, service: ClawieService) -> i
 
 def cmd_shared_auth_import(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
-    result = service.import_shared_auth(
-        provider,
-        source=str(args.source),
-        source_home=args.source_home,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "import_shared_auth",
+        {
+            "provider": provider,
+            "source": str(args.source),
+            "source_home": _resolve_optional_path_arg(args.source_home),
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.import_shared_auth(
+            provider,
+            source=str(args.source),
+            source_home=args.source_home,
+        )
     print_success(f"Imported {result.get('source', '')} auth into shared store for {provider}")
     print_info(f"Shared home: {result.get('home', '')}")
     updated_paths = result.get("updated_paths", [])
@@ -1406,7 +1508,13 @@ def cmd_shared_auth_import(args: argparse.Namespace, service: ClawieService) -> 
 
 
 def cmd_shared_auth_port(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.port_shared_auth(args.from_provider, args.to_provider)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "port_shared_auth",
+        {"from_provider": args.from_provider, "to_provider": args.to_provider},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.port_shared_auth(args.from_provider, args.to_provider)
     profiles = result.get("profiles", [])
     print_success(
         f"Ported {len(profiles)} auth profile(s) from "
@@ -1432,7 +1540,13 @@ def cmd_shared_auth_port(args: argparse.Namespace, service: ClawieService) -> in
 
 def cmd_shared_auth_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = str(args.agent_id or "").strip() or None
-    result = service.apply_shared_auth_links(agent_id=agent_id)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "apply_shared_auth_links",
+        {"agent_id": agent_id},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.apply_shared_auth_links(agent_id=agent_id)
     target = agent_id or "eligible agents"
     print_success(f"Applied shared auth copies for {target}")
     print_info(f"Shared home: {result.get('home', '')}")
@@ -1507,7 +1621,13 @@ def cmd_addons_show(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_addons_install(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
-    payload = service.install_addon(addon)
+    payload = _clawied_service_call_or_unavailable(
+        service,
+        "install_addon",
+        {"addon": addon},
+    )
+    if payload is _CLAWIED_UNAVAILABLE:
+        payload = service.install_addon(addon)
     print_success(f"Installed addon {payload.get('addon', addon)}")
     _print_addon_status(service.get_addon_status(addon), title="Addon")
     return 0
@@ -1524,7 +1644,13 @@ def cmd_addon_auth_show(args: argparse.Namespace, service: ClawieService) -> int
 
 def cmd_addon_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
-    payload = service.shared_addon_auth_login(addon)
+    payload = _clawied_service_call_or_unavailable(
+        service,
+        "shared_addon_auth_login",
+        {"addon": addon},
+    )
+    if payload is _CLAWIED_UNAVAILABLE:
+        payload = service.shared_addon_auth_login(addon)
     action = str(payload.get("action_performed", "login"))
     if action == "status":
         print_success(f"Shared addon auth already ready for {addon}")
@@ -1538,11 +1664,21 @@ def cmd_addon_auth_login(args: argparse.Namespace, service: ClawieService) -> in
 
 def cmd_addon_auth_import(args: argparse.Namespace, service: ClawieService) -> int:
     addon = _resolve_required_value(args.addon, field_name="addon")
-    result = service.import_shared_addon_auth(
-        addon,
-        source_home=args.source_home,
-        source_agent=args.from_agent,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "import_shared_addon_auth",
+        {
+            "addon": addon,
+            "source_home": _resolve_optional_path_arg(args.source_home),
+            "source_agent": args.from_agent,
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.import_shared_addon_auth(
+            addon,
+            source_home=args.source_home,
+            source_agent=args.from_agent,
+        )
     print_success(f"Imported shared addon auth for {addon}")
     print_info(f"Config dir: {result.get('config_dir', '')}")
     updated_paths = result.get("updated_paths", [])
@@ -1567,22 +1703,43 @@ def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
         plugin_overrides["delegation"] = False
-    agent = service.create_agent(
-        agent_id=agent_id,
-        display_name=args.display_name,
-        template=args.template,
-        clone_from=args.clone_from,
-        channel_strategy=args.channel_strategy,
-        channels=channels,
-        agent_version=args.agent_version,
-        provider=args.provider,
-        plugin_overrides=plugin_overrides or None,
+    agent = _clawied_service_call_or_unavailable(
+        service,
+        "create_agent",
+        {
+            "agent_id": agent_id,
+            "display_name": args.display_name,
+            "template": args.template,
+            "clone_from": args.clone_from,
+            "channel_strategy": args.channel_strategy,
+            "channels": channels,
+            "agent_version": args.agent_version,
+            "provider": args.provider,
+            "plugin_overrides": plugin_overrides or None,
+        },
     )
+    if agent is _CLAWIED_UNAVAILABLE:
+        agent = service.create_agent(
+            agent_id=agent_id,
+            display_name=args.display_name,
+            template=args.template,
+            clone_from=args.clone_from,
+            channel_strategy=args.channel_strategy,
+            channels=channels,
+            agent_version=args.agent_version,
+            provider=args.provider,
+            plugin_overrides=plugin_overrides or None,
+        )
     tier = getattr(args, "model_tier", None)
     if tier:
-        agent.setdefault("agent", {})["model_tier"] = service.set_agent_model_tier(
-            agent_id, tier
+        model_tier = _clawied_service_call_or_unavailable(
+            service,
+            "set_agent_model_tier",
+            {"agent_id": agent_id, "tier": tier},
         )
+        if model_tier is _CLAWIED_UNAVAILABLE:
+            model_tier = service.set_agent_model_tier(agent_id, tier)
+        agent.setdefault("agent", {})["model_tier"] = model_tier
     print_success(f"Provisioned agent {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -1595,22 +1752,43 @@ def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
         plugin_overrides["delegation"] = False
-    agent = service.create_agent(
-        agent_id=agent_id,
-        display_name=args.display_name,
-        template="baseline",
-        clone_from=from_agent,
-        channel_strategy=args.channel_strategy,
-        channels=channels,
-        agent_version=args.agent_version,
-        provider=args.provider,
-        plugin_overrides=plugin_overrides or None,
+    agent = _clawied_service_call_or_unavailable(
+        service,
+        "create_agent",
+        {
+            "agent_id": agent_id,
+            "display_name": args.display_name,
+            "template": "baseline",
+            "clone_from": from_agent,
+            "channel_strategy": args.channel_strategy,
+            "channels": channels,
+            "agent_version": args.agent_version,
+            "provider": args.provider,
+            "plugin_overrides": plugin_overrides or None,
+        },
     )
+    if agent is _CLAWIED_UNAVAILABLE:
+        agent = service.create_agent(
+            agent_id=agent_id,
+            display_name=args.display_name,
+            template="baseline",
+            clone_from=from_agent,
+            channel_strategy=args.channel_strategy,
+            channels=channels,
+            agent_version=args.agent_version,
+            provider=args.provider,
+            plugin_overrides=plugin_overrides or None,
+        )
     tier = getattr(args, "model_tier", None)
     if tier:
-        agent.setdefault("agent", {})["model_tier"] = service.set_agent_model_tier(
-            agent_id, tier
+        model_tier = _clawied_service_call_or_unavailable(
+            service,
+            "set_agent_model_tier",
+            {"agent_id": agent_id, "tier": tier},
         )
+        if model_tier is _CLAWIED_UNAVAILABLE:
+            model_tier = service.set_agent_model_tier(agent_id, tier)
+        agent.setdefault("agent", {})["model_tier"] = model_tier
     print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -1619,11 +1797,21 @@ def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
 def cmd_agents_clone_prompts(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
-    updated = service.clone_agent_prompts(
-        from_agent=from_agent,
-        to_agent=to_agent,
-        apply_to_disk=not bool(args.no_apply_to_disk),
+    updated = _clawied_service_call_or_unavailable(
+        service,
+        "clone_agent_prompts",
+        {
+            "from_agent": from_agent,
+            "to_agent": to_agent,
+            "apply_to_disk": not bool(args.no_apply_to_disk),
+        },
     )
+    if updated is _CLAWIED_UNAVAILABLE:
+        updated = service.clone_agent_prompts(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            apply_to_disk=not bool(args.no_apply_to_disk),
+        )
     print_success(f"Cloned core prompts {from_agent} -> {to_agent}")
     _print_agent(updated)
     return 0
@@ -1678,11 +1866,21 @@ def cmd_agents_credentials_show(args: argparse.Namespace, service: ClawieService
 def cmd_agents_credentials_set(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
-    agent = service.set_agent_credential_bundles(
-        agent_id,
-        bundles=bundles,
-        include_defaults=bool(args.include_defaults),
+    agent = _clawied_service_call_or_unavailable(
+        service,
+        "set_agent_credential_bundles",
+        {
+            "agent_id": agent_id,
+            "bundles": bundles,
+            "include_defaults": bool(args.include_defaults),
+        },
     )
+    if agent is _CLAWIED_UNAVAILABLE:
+        agent = service.set_agent_credential_bundles(
+            agent_id,
+            bundles=bundles,
+            include_defaults=bool(args.include_defaults),
+        )
     selected = ", ".join(agent.get("credential_sync", {}).get("bundles", [])) or "<none>"
     print_success(f"Updated credential bundles for {agent_id}")
     print_info(f"Selected bundles: {selected}")
@@ -1692,12 +1890,23 @@ def cmd_agents_credentials_set(args: argparse.Namespace, service: ClawieService)
 def cmd_agents_credentials_sync(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     override_bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
-    result = service.sync_agent_credentials(
-        agent_id,
-        source_home=args.source_home,
-        bundles=override_bundles or None,
-        include_defaults=bool(args.include_defaults),
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "sync_agent_credentials",
+        {
+            "agent_id": agent_id,
+            "source_home": _resolve_optional_path_arg(args.source_home),
+            "bundles": override_bundles or None,
+            "include_defaults": bool(args.include_defaults),
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.sync_agent_credentials(
+            agent_id,
+            source_home=args.source_home,
+            bundles=override_bundles or None,
+            include_defaults=bool(args.include_defaults),
+        )
     print_success(f"Synced credentials for {agent_id}")
     print_info(f"Source home: {result.get('source_home', '')}")
     print_info("Bundles: " + (", ".join(result.get("bundles", [])) or "<none>"))
@@ -1712,10 +1921,16 @@ def cmd_agents_credentials_sync(args: argparse.Namespace, service: ClawieService
 def cmd_agents_credentials_revoke(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     bundles = _resolve_bundles(getattr(args, "bundles", []), args.bundle)
-    result = service.revoke_agent_credentials(
-        agent_id,
-        bundles=bundles or None,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "revoke_agent_credentials",
+        {"agent_id": agent_id, "bundles": bundles or None},
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.revoke_agent_credentials(
+            agent_id,
+            bundles=bundles or None,
+        )
     print_success(f"Revoked credential access for {agent_id}")
     print_info("Revoked bundles: " + (", ".join(result.get("bundles", [])) or "<none>"))
     print_info("Remaining bundles: " + (", ".join(result.get("remaining_bundles", [])) or "<none>"))
@@ -1762,7 +1977,13 @@ def cmd_agents_addons_enable(args: argparse.Namespace, service: ClawieService) -
     addon = _resolve_required_value(args.addon, field_name="addon")
 
     if is_service_addon(addon):
-        result = service.enable_agent_addon(agent_id, addon)
+        result = _clawied_service_call_or_unavailable(
+            service,
+            "enable_agent_addon",
+            {"agent_id": agent_id, "addon": addon},
+        )
+        if result is _CLAWIED_UNAVAILABLE:
+            result = service.enable_agent_addon(agent_id, addon)
         if result.get("already_enabled"):
             print_info(f"Display already enabled for {agent_id}")
         else:
@@ -1790,13 +2011,25 @@ def cmd_agents_addons_enable(args: argparse.Namespace, service: ClawieService) -
                 f"No shared {addon} credentials are ready. Run shared login now?",
                 default=False,
             )
-    result = service.enable_agent_addon(
-        agent_id,
-        addon,
-        source_home=args.source_home,
-        source_agent=args.from_agent,
-        login_if_missing=login_if_missing,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "enable_agent_addon",
+        {
+            "agent_id": agent_id,
+            "addon": addon,
+            "source_home": _resolve_optional_path_arg(args.source_home),
+            "source_agent": args.from_agent,
+            "login_if_missing": login_if_missing,
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.enable_agent_addon(
+            agent_id,
+            addon,
+            source_home=args.source_home,
+            source_agent=args.from_agent,
+            login_if_missing=login_if_missing,
+        )
     print_success(f"Enabled addon {result.get('addon', addon)} for {agent_id}")
     linked = result.get("linked_paths", [])
     if linked:
@@ -1814,7 +2047,13 @@ def cmd_agents_addons_disable(args: argparse.Namespace, service: ClawieService) 
 
     agent_id = _resolve_agent_id(args.agent_id)
     addon = _resolve_required_value(args.addon, field_name="addon")
-    result = service.disable_agent_addon(agent_id, addon)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "disable_agent_addon",
+        {"agent_id": agent_id, "addon": addon},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.disable_agent_addon(agent_id, addon)
 
     if is_service_addon(addon):
         print_success(f"Disabled display :{result.get('display_number', '')} for {agent_id}")
@@ -1840,7 +2079,13 @@ def cmd_agents_addons_disable(args: argparse.Namespace, service: ClawieService) 
 def cmd_agents_addons_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     addons = [str(args.addon).strip()] if str(args.addon or "").strip() else None
-    result = service.apply_agent_addons(agent_id, addons=addons)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "apply_agent_addons",
+        {"agent_id": agent_id, "addons": addons},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.apply_agent_addons(agent_id, addons=addons)
     print_success(f"Applied addons for {agent_id}")
     print_info("Addons: " + ", ".join(str(item) for item in result.get("addons", [])))
     linked = result.get("linked_paths", [])
@@ -1861,7 +2106,13 @@ def cmd_agents_auth_show(args: argparse.Namespace, service: ClawieService) -> in
 
 def cmd_agents_auth_login(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
-    payload = service.agent_auth_login(agent_id)
+    payload = _clawied_service_call_or_unavailable(
+        service,
+        "agent_auth_login",
+        {"agent_id": agent_id},
+    )
+    if payload is _CLAWIED_UNAVAILABLE:
+        payload = service.agent_auth_login(agent_id)
     action = str(payload.get("action_performed", "login"))
     if action == "status":
         print_info(f"Linked login already ready for {agent_id}")
@@ -1876,7 +2127,13 @@ def cmd_agents_auth_login(args: argparse.Namespace, service: ClawieService) -> i
 def cmd_agents_service(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     action = _resolve_required_value(args.agent_service_command, field_name="action")
-    result = service.agent_service_action(agent_id, action)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "agent_service_action",
+        {"agent_id": agent_id, "action": action},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.agent_service_action(agent_id, action)
     verb = {"start": "Started", "stop": "Stopped", "restart": "Restarted", "status": "Status"}.get(action, action)
     if action == "status":
         print_info(
@@ -1896,13 +2153,25 @@ def cmd_agents_service(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_agents_apply_prompts(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
-    result = service.apply_staged_prompts(agent_id)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "apply_staged_prompts",
+        {"agent_id": agent_id},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.apply_staged_prompts(agent_id)
     applied = result.get("applied", [])
     if applied:
         print_success(f"Applied {len(applied)} prompt(s) for {agent_id}: {', '.join(applied)}")
         # Restart the service so the gateway picks up updated workspace files.
         try:
-            restart = service.agent_service_action(agent_id, "restart")
+            restart = _clawied_service_call_or_unavailable(
+                service,
+                "agent_service_action",
+                {"agent_id": agent_id, "action": "restart"},
+            )
+            if restart is _CLAWIED_UNAVAILABLE:
+                restart = service.agent_service_action(agent_id, "restart")
             print_success(f"Restarted service for {agent_id} ({restart.get('service_status', 'unknown')})")
         except Exception as exc:
             print_info(f"Could not restart service: {exc}")
@@ -1915,7 +2184,13 @@ def cmd_agents_apply_prompts(args: argparse.Namespace, service: ClawieService) -
 def cmd_agents_fix_permissions(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     manager = getattr(args, "manager", "") or ""
-    result = service.ensure_agent_permissions(agent_id, manager_user=manager)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "ensure_agent_permissions",
+        {"agent_id": agent_id, "manager_user": manager},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.ensure_agent_permissions(agent_id, manager_user=manager)
     changes = result.get("changes", [])
     if changes:
         print_success(
@@ -1935,7 +2210,13 @@ def cmd_agents_fix_permissions(args: argparse.Namespace, service: ClawieService)
 def cmd_agents_provider_set(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
     provider = _resolve_required_value(args.provider, field_name="provider")
-    result = service.switch_agent_provider(agent_id, provider)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "switch_agent_provider",
+        {"agent_id": agent_id, "provider": provider},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.switch_agent_provider(agent_id, provider)
     agent = result["agent"]
     if bool(result.get("changed", True)):
         print_success(f"Changed provider for {agent_id} to {agent.get('agent', {}).get('provider', '')}")
@@ -2021,7 +2302,13 @@ def cmd_agents_show(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_agents_delete(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
-    service.delete_agent(agent_id)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "delete_agent",
+        {"agent_id": agent_id},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        service.delete_agent(agent_id)
     print_success(f"Deleted agent {agent_id}")
     return 0
 
@@ -2038,7 +2325,13 @@ def cmd_agents_batch_create(args: argparse.Namespace, service: ClawieService) ->
             raise ValueError(f"batch entry at index {idx} must be an object")
         entries.append(row)
 
-    result = service.batch_create_agents(entries)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "batch_create_agents",
+        {"entries": entries},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.batch_create_agents(entries)
     print_panel(
         "Batch Create",
         [
@@ -2061,11 +2354,17 @@ def cmd_agents_batch_create(args: argparse.Namespace, service: ClawieService) ->
 
 def cmd_channel_apply(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
-    agent = service.bootstrap_channels(
-        agent_id=agent_id,
-        preset=args.preset,
-        replace=args.replace,
+    agent = _clawied_service_call_or_unavailable(
+        service,
+        "bootstrap_channels",
+        {"agent_id": agent_id, "preset": args.preset, "replace": bool(args.replace)},
     )
+    if agent is _CLAWIED_UNAVAILABLE:
+        agent = service.bootstrap_channels(
+            agent_id=agent_id,
+            preset=args.preset,
+            replace=args.replace,
+        )
     print_success(
         f"Applied {args.preset} preset for {agent_id} ({len(agent.get('channels', []))} channels)"
     )
@@ -2075,11 +2374,17 @@ def cmd_channel_apply(args: argparse.Namespace, service: ClawieService) -> int:
 def cmd_channel_move(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
-    agent = service.migrate_channels(
-        from_agent=from_agent,
-        to_agent=to_agent,
-        replace=args.replace,
+    agent = _clawied_service_call_or_unavailable(
+        service,
+        "migrate_channels",
+        {"from_agent": from_agent, "to_agent": to_agent, "replace": bool(args.replace)},
     )
+    if agent is _CLAWIED_UNAVAILABLE:
+        agent = service.migrate_channels(
+            from_agent=from_agent,
+            to_agent=to_agent,
+            replace=args.replace,
+        )
     print_success(
         f"Migrated channels {from_agent} -> {to_agent} ({len(agent.get('channels', []))} channels)"
     )
@@ -2091,22 +2396,43 @@ def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
         plugin_overrides["delegation"] = False
-    result = service.spawn_linux_user(
-        agent_id=agent_id,
-        linux_user=args.linux_user,
-        copy_configs=not bool(args.skip_config_copy),
-        source_home=args.source_home,
-        template=args.template,
-        agent_version=args.agent_version,
-        provider=args.provider,
-        password=args.password,
-        password_hash=args.password_hash,
-        use_global_password=not bool(args.no_global_password),
-        clone_from_agent=args.clone_from_agent,
-        credential_bundles=list(args.credential_bundle or []),
-        include_default_credentials=not bool(args.no_default_credentials),
-        plugin_overrides=plugin_overrides or None,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "spawn_linux_user",
+        {
+            "agent_id": agent_id,
+            "linux_user": args.linux_user,
+            "copy_configs": not bool(args.skip_config_copy),
+            "source_home": _resolve_optional_path_arg(args.source_home),
+            "template": args.template,
+            "agent_version": args.agent_version,
+            "provider": args.provider,
+            "password": args.password,
+            "password_hash": args.password_hash,
+            "use_global_password": not bool(args.no_global_password),
+            "clone_from_agent": args.clone_from_agent,
+            "credential_bundles": list(args.credential_bundle or []),
+            "include_default_credentials": not bool(args.no_default_credentials),
+            "plugin_overrides": plugin_overrides or None,
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.spawn_linux_user(
+            agent_id=agent_id,
+            linux_user=args.linux_user,
+            copy_configs=not bool(args.skip_config_copy),
+            source_home=args.source_home,
+            template=args.template,
+            agent_version=args.agent_version,
+            provider=args.provider,
+            password=args.password,
+            password_hash=args.password_hash,
+            use_global_password=not bool(args.no_global_password),
+            clone_from_agent=args.clone_from_agent,
+            credential_bundles=list(args.credential_bundle or []),
+            include_default_credentials=not bool(args.no_default_credentials),
+            plugin_overrides=plugin_overrides or None,
+        )
     print_success(
         f"Spawned linux user {result['linux_user']} and provisioned {result['agent']['agent_id']}"
     )
@@ -2141,7 +2467,13 @@ def cmd_agent_purge(args: argparse.Namespace, service: ClawieService) -> int:
             ) from None
         if confirmation not in {"y", "yes"}:
             raise ValueError("purge cancelled by user")
-    result = service.purge_agent(agent_id)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "purge_agent",
+        {"agent_id": agent_id},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.purge_agent(agent_id)
     print_success(f"Purged agent {result.get('agent_id', '')}")
     linux_user = str(result.get("linux_user", "")).strip()
     if linux_user:
@@ -2160,7 +2492,7 @@ def cmd_status(args: argparse.Namespace, service: ClawieService) -> int:
     interval = max(1, int(getattr(args, "interval", 2) or 2))
     refresh = bool(getattr(args, "refresh", False)) or watch
 
-    def render_once() -> None:
+    def render_once() -> dict[str, Any]:
         snapshot = service.status_snapshot(
             agent_id=agent_id, sections=sections, refresh=refresh
         )
@@ -2168,6 +2500,7 @@ def cmd_status(args: argparse.Namespace, service: ClawieService) -> int:
             print(json.dumps(snapshot, indent=2, default=str))
         else:
             _print_status(snapshot)
+        return snapshot
 
     # --watch gives a simple, non-curses live view (clear + reprint). When the
     # output is not a TTY (piped/redirected) we fall back to a single snapshot.
@@ -2176,7 +2509,10 @@ def cmd_status(args: argparse.Namespace, service: ClawieService) -> int:
             while True:
                 sys.stdout.write("\033[2J\033[H")  # clear screen, cursor home
                 sys.stdout.flush()
-                render_once()
+                snapshot = render_once()
+                exit_code = _status_snapshot_exit_code(snapshot)
+                if exit_code:
+                    return exit_code
                 print()
                 print_info(f"watching every {interval}s — press Ctrl-C to exit")
                 time.sleep(interval)
@@ -2184,8 +2520,8 @@ def cmd_status(args: argparse.Namespace, service: ClawieService) -> int:
             print()
         return 0
 
-    render_once()
-    return 0
+    snapshot = render_once()
+    return _status_snapshot_exit_code(snapshot)
 
 
 def cmd_dashboard(args: argparse.Namespace, service: ClawieService) -> int:
@@ -2207,6 +2543,23 @@ def _status_section_error(payload: Any) -> str | None:
     if isinstance(payload, dict) and "error" in payload and len(payload) == 1:
         return str(payload["error"])
     return None
+
+
+def _status_snapshot_exit_code(snapshot: dict[str, Any]) -> int:
+    for payload in snapshot.values():
+        error = _status_section_error(payload)
+        if error is not None and _fatal_status_error(error):
+            return 1
+    return 0
+
+
+def _fatal_status_error(error: str) -> bool:
+    fatal_prefixes = (
+        "refusing to change permissions on non-clawie state directory:",
+        "clawie state root must not be a symlink:",
+        "clawie database must not be a symlink:",
+    )
+    return error.startswith(fatal_prefixes)
 
 
 def _print_status(snapshot: dict[str, Any]) -> None:
@@ -2460,7 +2813,13 @@ def cmd_runtime_detect(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_runtime_install(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
-    result = service.install_provider_runtime(provider)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "install_provider_runtime",
+        {"provider": provider},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.install_provider_runtime(provider)
     if bool(result.get("already_present", False)):
         print_info(f"Runtime already available for {provider}")
     else:
@@ -2529,7 +2888,13 @@ def cmd_runtime_status(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_runtime_login(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
-    payload = service.local_claw_auth_login(provider)
+    payload = _clawied_service_call_or_unavailable(
+        service,
+        "local_claw_auth_login",
+        {"provider": provider},
+    )
+    if payload is _CLAWIED_UNAVAILABLE:
+        payload = service.local_claw_auth_login(provider)
     action = str(payload.get("action_performed", "login"))
     if action == "status":
         print_info(f"Linked login already ready for {provider}")
@@ -2544,7 +2909,13 @@ def cmd_runtime_login(args: argparse.Namespace, service: ClawieService) -> int:
 def cmd_runtime_service(args: argparse.Namespace, service: ClawieService) -> int:
     provider = _resolve_required_value(args.provider, field_name="provider")
     action = _resolve_required_value(args.runtime_service_command, field_name="action")
-    result = service.local_claw_service_action(provider, action)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "local_claw_service_action",
+        {"provider": provider, "action": action},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.local_claw_service_action(provider, action)
     verb = {"start": "Started", "stop": "Stopped", "restart": "Restarted", "status": "Status"}.get(action, action)
     if action == "status":
         print_info(
@@ -2560,11 +2931,18 @@ def cmd_runtime_service(args: argparse.Namespace, service: ClawieService) -> int
 
 
 def cmd_health(args: argparse.Namespace, service: ClawieService) -> int:
-    report = service.doctor()
+    host_validate = bool(getattr(args, "host_validate", False))
+    report = service.host_validation_report() if host_validate else service.doctor()
     status = str(report.get("status", "unknown"))
 
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(report, indent=2, default=str))
+        if host_validate and status != "passed":
+            return 2 if status == "skipped" else 1
+        return 0 if status in {"healthy", "degraded", "passed"} else 1
+
     print_panel(
-        "Doctor",
+        "Host Validation" if host_validate else "Doctor",
         [f"overall: {status}"],
     )
 
@@ -2573,6 +2951,16 @@ def cmd_health(args: argparse.Namespace, service: ClawieService) -> int:
         rows.append([str(check.get("status", "")), str(check.get("message", ""))])
     if rows:
         print_table(["status", "check"], rows)
+
+    if host_validate:
+        if status == "passed":
+            print_success("Host validation passed")
+            return 0
+        if status == "skipped":
+            print_warning("Host validation skipped")
+            return 2
+        print_error("Host validation did not pass")
+        return 1
 
     if status == "healthy":
         print_success("All critical checks passed")
@@ -2605,11 +2993,22 @@ def cmd_events_list(args: argparse.Namespace, service: ClawieService) -> int:
 
 
 def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.backup_init(
-        repo_path=(str(args.path).strip() or None) if args.path else None,
-        remote=args.remote,
-        enable=not bool(args.no_auto),
+    repo_path = _resolve_optional_path_arg(args.path)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "backup_init",
+        {
+            "repo_path": repo_path,
+            "remote": args.remote,
+            "enable": not bool(args.no_auto),
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.backup_init(
+            repo_path=repo_path,
+            remote=args.remote,
+            enable=not bool(args.no_auto),
+        )
     if result.get("created"):
         print_success(f"Created backup repo at {result.get('repo', '')}")
     else:
@@ -2629,7 +3028,13 @@ def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
 
 
 def cmd_backup_run(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.backup_run(message=str(args.message or ""), push=args.push)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "backup_run",
+        {"message": str(args.message or ""), "push": args.push},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.backup_run(message=str(args.message or ""), push=args.push)
     if result.get("changed"):
         print_success(f"Backup committed {str(result.get('commit', ''))[:10]} in {result.get('repo', '')}")
     else:
@@ -2662,11 +3067,21 @@ def cmd_backup_status(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_backup_restore(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = (str(args.agent or "").strip()) or None
-    result = service.backup_restore(
-        agent_id=agent_id,
-        apply_to_disk=not bool(args.no_apply_to_disk),
-        include_workspace=not bool(args.no_workspace),
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "backup_restore",
+        {
+            "agent_id": agent_id,
+            "apply_to_disk": not bool(args.no_apply_to_disk),
+            "include_workspace": not bool(args.no_workspace),
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.backup_restore(
+            agent_id=agent_id,
+            apply_to_disk=not bool(args.no_apply_to_disk),
+            include_workspace=not bool(args.no_workspace),
+        )
     restored = result.get("restored", {})
     print_success(f"Restored {len(restored)} agent(s) from {result.get('repo', '')}")
     for token, counts in sorted(restored.items()):
@@ -2688,7 +3103,13 @@ def cmd_state_export(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_state_import(args: argparse.Namespace, service: ClawieService) -> int:
     source = _resolve_required_value(args.input, field_name="input")
-    service.import_state(source, merge=bool(args.merge))
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "import_state",
+        {"input_path": _resolve_path_arg(source), "merge": bool(args.merge)},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        service.import_state(source, merge=bool(args.merge))
     if args.merge:
         print_success(f"State merged from {source}")
     else:
@@ -2918,6 +3339,17 @@ def _read_json_file(path: str) -> Any:
         return json.load(handle)
 
 
+def _resolve_path_arg(value: str | Path) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def _resolve_optional_path_arg(value: str | Path | None) -> str | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    return _resolve_path_arg(token)
+
+
 def _resolve_required_value(
     value: str | None,
     *,
@@ -2971,13 +3403,25 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ClawieService) -> i
     import json as _json
 
     payload = _json.loads(args.payload)
-    result = service.delegate_task(
-        parent_id=args.parent,
-        child_id=args.child,
-        payload=payload,
-        timeout=args.timeout,
-        model_tier=getattr(args, "tier", "") or "",
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "delegate_task",
+        {
+            "parent_id": args.parent,
+            "child_id": args.child,
+            "payload": payload,
+            "timeout": args.timeout,
+            "model_tier": getattr(args, "tier", "") or "",
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.delegate_task(
+            parent_id=args.parent,
+            child_id=args.child,
+            payload=payload,
+            timeout=args.timeout,
+            model_tier=getattr(args, "tier", "") or "",
+        )
     print_panel(
         "Delegation Result",
         [
@@ -2991,12 +3435,23 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ClawieService) -> i
 
 
 def cmd_delegation_deliver(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.deliver_to_agent(
-        args.agent,
-        args.message,
-        tier=getattr(args, "tier", "balanced") or "balanced",
-        timeout=args.timeout,
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "deliver_to_agent",
+        {
+            "agent_id": args.agent,
+            "message": args.message,
+            "tier": getattr(args, "tier", "balanced") or "balanced",
+            "timeout": args.timeout,
+        },
     )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.deliver_to_agent(
+            args.agent,
+            args.message,
+            tier=getattr(args, "tier", "balanced") or "balanced",
+            timeout=args.timeout,
+        )
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result.get("ok") else 1
@@ -3042,13 +3497,25 @@ def cmd_delegation_tasks(args: argparse.Namespace, service: ClawieService) -> in
 
 
 def cmd_delegation_spawn_session(args: argparse.Namespace, service: ClawieService) -> int:
-    info = service.spawn_session_agent(
-        parent_id=args.parent,
-        child_id=args.child,
-        timeout=getattr(args, "timeout", 300.0),
-        model_tier=getattr(args, "tier", "") or "",
-        detached=True,
+    info = _clawied_service_call_or_unavailable(
+        service,
+        "spawn_session_agent",
+        {
+            "parent_id": args.parent,
+            "child_id": args.child,
+            "timeout": getattr(args, "timeout", 300.0),
+            "model_tier": getattr(args, "tier", "") or "",
+            "detached": True,
+        },
     )
+    if info is _CLAWIED_UNAVAILABLE:
+        info = service.spawn_session_agent(
+            parent_id=args.parent,
+            child_id=args.child,
+            timeout=getattr(args, "timeout", 300.0),
+            model_tier=getattr(args, "tier", "") or "",
+            detached=True,
+        )
     print_success(f"Session agent {info['agent_id']} spawned under {args.parent}")
     print_panel(
         "Session Agent",
@@ -3067,7 +3534,13 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ClawieServic
 
 
 def cmd_delegation_stop_session(args: argparse.Namespace, service: ClawieService) -> int:
-    service.stop_session_agent(parent_id=args.parent, child_id=args.child)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "stop_session_agent",
+        {"parent_id": args.parent, "child_id": args.child},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        service.stop_session_agent(parent_id=args.parent, child_id=args.child)
     print_success(f"Stopped session agent {args.child}")
     return 0
 
@@ -3091,7 +3564,13 @@ def cmd_delegation_session_agents(args: argparse.Namespace, service: ClawieServi
 
 
 def cmd_delegation_cleanup(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.cleanup_delegation()
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "cleanup_delegation",
+        {},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.cleanup_delegation()
     removed = result.get("removed_sockets", [])
     active = result.get("active_agents", [])
     if removed:
@@ -3117,6 +3596,533 @@ def cmd_delegation_status(args: argparse.Namespace, service: ClawieService) -> i
             f"age={a['age_seconds']}s  {a['socket']}"
         )
     return 0
+
+
+def _build_clawied_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    clawied = subparsers.add_parser(
+        "clawied",
+        help="Run or inspect the local manifest reconcile daemon",
+    )
+    clawied_sub = clawied.add_subparsers(
+        dest="clawied_command",
+        required=True,
+        metavar="{reconcile,run,status,stop}",
+    )
+
+    reconcile = clawied_sub.add_parser(
+        "reconcile",
+        help="Reconcile one manifest or all manifests once",
+    )
+    reconcile.add_argument("--manifest", help="Path to an agent manifest JSON file")
+    reconcile.add_argument("--agent", help="Reconcile the stored manifest for one agent")
+    reconcile.add_argument("--dry-run", action="store_true", help="Plan without applying changes")
+    reconcile.add_argument("--json", action="store_true", help="Emit JSON")
+    reconcile.set_defaults(func=cmd_clawied_reconcile)
+
+    run = clawied_sub.add_parser(
+        "run",
+        help="Run the foreground clawied reconcile loop",
+    )
+    run.add_argument("--once", action="store_true", help="Run one reconcile cycle and exit")
+    run.add_argument("--interval", type=float, default=60.0, help="Seconds between reconcile cycles")
+    run.add_argument("--dry-run", action="store_true", help="Plan each cycle without applying changes")
+    run.add_argument("--json", action="store_true", help="Emit JSON for --once or final status")
+    run.set_defaults(func=cmd_clawied_run)
+
+    status = clawied_sub.add_parser(
+        "status",
+        help="Show clawied pid and last reconcile status",
+    )
+    status.add_argument("--json", action="store_true", help="Emit JSON")
+    status.set_defaults(func=cmd_clawied_status)
+
+    stop = clawied_sub.add_parser(
+        "stop",
+        help="Send SIGTERM to the running clawied process",
+    )
+    stop.add_argument("--json", action="store_true", help="Emit JSON")
+    stop.set_defaults(func=cmd_clawied_stop)
+
+
+def cmd_clawied_reconcile(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    manifest = str(getattr(args, "manifest", "") or "").strip()
+    agent = str(getattr(args, "agent", "") or "").strip()
+    if manifest and agent:
+        raise ValueError("use either --manifest or --agent, not both")
+    daemon = Clawied(service)
+    payload = {"manifest": manifest, "agent": agent, "dry_run": bool(args.dry_run)}
+    result: Any | None = _clawied_ipc_request_or_none(daemon, "reconcile", payload)
+    if result is None:
+        if manifest:
+            result = service.reconcile_agent_manifest(Path(manifest), dry_run=bool(args.dry_run))
+        elif agent:
+            result = service.reconcile_agent_manifest(service.agent_manifest_path(agent), dry_run=bool(args.dry_run))
+        else:
+            result = service.reconcile_all_manifests(dry_run=bool(args.dry_run))
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        _print_clawied_reconcile_result(result, dry_run=bool(args.dry_run))
+    return _clawied_result_exit_code(result, dry_run=bool(args.dry_run))
+
+
+def cmd_clawied_run(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    daemon = Clawied(service, interval_seconds=float(getattr(args, "interval", 60.0)))
+    dry_run = bool(getattr(args, "dry_run", False))
+    if bool(getattr(args, "once", False)):
+        result = _clawied_ipc_request_or_none(daemon, "run_once", {"dry_run": dry_run})
+        if result is None:
+            result = daemon.run_forever(dry_run=dry_run, max_cycles=1)
+    else:
+        print_info(f"Starting clawied foreground loop (interval={daemon.interval_seconds:g}s)")
+        result = daemon.run_forever(dry_run=dry_run)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif bool(getattr(args, "once", False)):
+        last = result.get("last", {})
+        print_success(f"clawied cycle complete: {last.get('status', result.get('status', 'ok'))}")
+        print_info(f"manifests: {last.get('manifests', 0)}  errors: {last.get('errors', 0)}")
+    return 1 if _clawied_status_has_errors(result) else 0
+
+
+def cmd_clawied_status(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    daemon = Clawied(service)
+    result = _clawied_ipc_request_or_none(daemon, "status", {})
+    if result is None:
+        result = daemon.status()
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        running = "running" if result.get("running") else "stopped"
+        print_panel(
+            "clawied",
+            [
+                f"status: {running}",
+                f"pid: {result.get('pid', 0)}",
+                f"pid_file: {result.get('pid_file', '')}",
+                f"status_file: {result.get('status_file', '')}",
+            ],
+        )
+    return 0
+
+
+def cmd_clawied_stop(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    daemon = Clawied(service)
+    result = _clawied_ipc_request_or_none(daemon, "stop", {})
+    if result is None:
+        result = daemon.stop()
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    elif result.get("stopped"):
+        print_success(f"Sent SIGTERM to clawied pid {result.get('pid', 0)}")
+    else:
+        print_info("clawied is not running")
+    return 0
+
+
+def _print_clawied_reconcile_result(result: Any, *, dry_run: bool) -> None:
+    rows = _clawied_result_rows(result)
+    if not rows:
+        print_info("No agent manifests found.")
+        return
+    for row in rows:
+        prefix = "planned" if dry_run else "reconciled"
+        print_panel(
+            f"{prefix}: {row.get('agent_id', '')}",
+            [
+                f"converged: {bool(row.get('converged', False))}",
+                f"actions: {len(row.get('actions', []))}",
+                f"applied: {len(row.get('applied', []))}",
+                f"remaining: {len(row.get('remaining', []))}",
+                f"errors: {len(row.get('errors', []))}",
+            ],
+        )
+        for action in row.get("remaining" if dry_run else "applied", []):
+            print(f"  {action.get('kind', '')}: {json.dumps(action.get('detail', {}), sort_keys=True)}")
+        for err in row.get("errors", []):
+            print_error(f"  {err.get('kind', '')}: {err.get('error', '')}")
+
+
+def _clawied_result_exit_code(result: Any, *, dry_run: bool) -> int:
+    if dry_run:
+        return 0
+    rows = _clawied_result_rows(result)
+    return 1 if any(_clawied_status_has_errors(row) for row in rows) else 0
+
+
+def _clawied_result_rows(result: Any) -> list[Any]:
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        return list(result["results"])
+    return [result]
+
+
+_CLAWIED_UNAVAILABLE = object()
+
+
+def _clawied_service_call_or_unavailable(
+    service: ClawieService,
+    method: str,
+    kwargs: dict[str, Any],
+) -> Any:
+    from clawie.daemon import Clawied
+
+    try:
+        result = Clawied(service).request(
+            "service_call",
+            {"method": method, "kwargs": kwargs},
+            timeout=300.0,
+        )
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError):
+        return _CLAWIED_UNAVAILABLE
+    return result.get("result")
+
+
+def _clawied_ipc_request_or_none(daemon: Any, command: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        return daemon.request(command, payload)
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError):
+        return None
+
+
+def _clawied_status_has_errors(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    errors = result.get("errors", 0)
+    if isinstance(errors, list):
+        if errors:
+            return True
+    elif int(errors or 0) > 0:
+        return True
+    if result.get("status") == "error":
+        return True
+    if result.get("last"):
+        return _clawied_status_has_errors(result.get("last"))
+    unconverged = int(result.get("unconverged", 0) or 0)
+    if unconverged > 0 and not bool(result.get("dry_run", False)):
+        return True
+    if result.get("converged") is False and result.get("dry_run") is False:
+        return True
+    return bool(result.get("errors"))
+
+
+def _build_control_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    control = subparsers.add_parser(
+        "control",
+        help="Manage control-agent runtime helpers",
+    )
+    control_sub = control.add_subparsers(
+        dest="control_command",
+        required=True,
+        metavar="{request,confirm,watchdog}",
+    )
+    request = control_sub.add_parser(
+        "request",
+        help="Submit a control RPC request to clawied",
+    )
+    _add_positional_argument(
+        request,
+        "verb",
+        metavar="VERB",
+        help_text="Control verb, such as status, reconcile, open_issue, or open_pr",
+    )
+    request.add_argument(
+        "--args-json",
+        default="{}",
+        help="JSON object passed as verb arguments",
+    )
+    request.add_argument("--json", action="store_true", help="Emit JSON")
+    request.set_defaults(func=cmd_control_request)
+
+    confirm = control_sub.add_parser(
+        "confirm",
+        help="Confirm a pending destructive/outward control RPC request",
+    )
+    _add_positional_argument(
+        confirm,
+        "verb",
+        metavar="VERB",
+        help_text="Control verb being confirmed",
+    )
+    confirm.add_argument(
+        "--nonce",
+        required=True,
+        help="Nonce returned by `clawie control request`",
+    )
+    confirm.add_argument(
+        "--confirmer",
+        required=True,
+        help="Allowlisted operator handle confirming the request",
+    )
+    confirm.add_argument(
+        "--args-json",
+        default="{}",
+        help="Same JSON object used for the original request",
+    )
+    confirm.add_argument("--json", action="store_true", help="Emit JSON")
+    confirm.set_defaults(func=cmd_control_confirm)
+
+    watchdog = control_sub.add_parser(
+        "watchdog",
+        help="Manage the systemd watchdog for clawied/control RPC",
+    )
+    watchdog_sub = watchdog.add_subparsers(
+        dest="control_watchdog_command",
+        required=True,
+        metavar="{install,status,verify,remove}",
+    )
+    install = watchdog_sub.add_parser(
+        "install",
+        help="Install and optionally start the systemd watchdog (requires sudo)",
+    )
+    install.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Seconds between clawied reconcile cycles (default: 60)",
+    )
+    install.add_argument(
+        "--notify-command",
+        default="",
+        help="Optional shell command run by a systemd OnFailure alert unit",
+    )
+    install.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Write unit files but do not enable/start the watchdog",
+    )
+    install.set_defaults(func=cmd_control_watchdog_install)
+
+    status = watchdog_sub.add_parser("status", help="Show watchdog unit status")
+    status.set_defaults(func=cmd_control_watchdog_status)
+
+    verify = watchdog_sub.add_parser(
+        "verify",
+        help="Verify watchdog unit state and optionally exercise systemd restart",
+    )
+    verify.add_argument(
+        "--exercise-restart",
+        action="store_true",
+        help="Kill the watchdog process and wait for systemd to restart it",
+    )
+    verify.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Seconds to wait for restart proof when --exercise-restart is set",
+    )
+    verify.add_argument("--json", action="store_true", help="Emit JSON")
+    verify.set_defaults(func=cmd_control_watchdog_verify)
+
+    remove = watchdog_sub.add_parser(
+        "remove",
+        help="Disable and remove the watchdog unit (requires sudo)",
+    )
+    remove.set_defaults(func=cmd_control_watchdog_remove)
+
+
+def _build_production_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    production = subparsers.add_parser(
+        "production",
+        help="Verify production-readiness proof gates",
+    )
+    production_sub = production.add_subparsers(
+        dest="production_command",
+        required=True,
+        metavar="{verify}",
+    )
+    verify = production_sub.add_parser(
+        "verify",
+        help="Run aggregate production-readiness checks",
+    )
+    verify.add_argument(
+        "--exercise-watchdog-restart",
+        action="store_true",
+        help="Required for production pass: kill the watchdog process and wait for systemd to restart it",
+    )
+    verify.add_argument(
+        "--watchdog-timeout",
+        type=int,
+        default=30,
+        help="Seconds to wait for watchdog restart proof",
+    )
+    verify.add_argument(
+        "--all-provider-contracts",
+        action="store_true",
+        help="Check every verified production delivery provider contract, not just configured providers",
+    )
+    verify.add_argument("--json", action="store_true", help="Emit JSON")
+    verify.set_defaults(func=cmd_production_verify)
+
+
+def cmd_control_request(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    verb = str(getattr(args, "verb", "") or "").strip()
+    if not verb:
+        raise ValueError("control verb is required")
+    payload = {
+        "verb": verb,
+        "args": _parse_json_object_arg(str(getattr(args, "args_json", "{}") or "{}"), "--args-json"),
+    }
+    result = _clawied_ipc_request_or_none(Clawied(service), "control_request", payload)
+    if result is None:
+        raise SetupError("clawied is not running; start `clawie clawied run` before using control RPC")
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        _print_control_rpc_result("Control Request", result)
+    return 2 if str(result.get("decision", "")) == "deny" else 0
+
+
+def cmd_control_confirm(args: argparse.Namespace, service: ClawieService) -> int:
+    from clawie.daemon import Clawied
+
+    verb = str(getattr(args, "verb", "") or "").strip()
+    if not verb:
+        raise ValueError("control verb is required")
+    payload = {
+        "verb": verb,
+        "nonce": str(getattr(args, "nonce", "") or "").strip(),
+        "confirmer": str(getattr(args, "confirmer", "") or "").strip(),
+        "args": _parse_json_object_arg(str(getattr(args, "args_json", "{}") or "{}"), "--args-json"),
+    }
+    result = _clawied_ipc_request_or_none(Clawied(service), "control_confirm", payload)
+    if result is None:
+        raise SetupError("clawied is not running; start `clawie clawied run` before using control RPC")
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        _print_control_rpc_result("Control Confirm", result)
+    return 2 if str(result.get("decision", "")) == "deny" else 0
+
+
+def _parse_json_object_arg(raw: str, label: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} must be a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return parsed
+
+
+def _print_control_rpc_result(title: str, result: dict[str, Any]) -> None:
+    lines = [
+        f"decision: {result.get('decision', '')}",
+        f"tier: {result.get('tier', '')}",
+        f"allowed: {bool(result.get('allowed', False))}",
+    ]
+    if result.get("nonce"):
+        lines.append(f"nonce: {result.get('nonce', '')}")
+    if result.get("reason"):
+        lines.append(f"reason: {result.get('reason', '')}")
+    if "result" in result:
+        lines.append(f"result: {json.dumps(result.get('result'), sort_keys=True, default=str)}")
+    print_panel(title, lines)
+
+
+def cmd_control_watchdog_install(args: argparse.Namespace, service: ClawieService) -> int:
+    result = service.control_watchdog_install(
+        interval_seconds=int(getattr(args, "interval", 60) or 60),
+        notify_command=str(getattr(args, "notify_command", "") or ""),
+        start=not bool(getattr(args, "no_start", False)),
+    )
+    print_success("Control watchdog installed")
+    print_panel(
+        "Watchdog",
+        [
+            f"unit_file: {result.get('unit_file', '')}",
+            f"alert_unit_file: {result.get('alert_unit_file', '') or '<none>'}",
+            f"interval_seconds: {result.get('interval_seconds', 0)}",
+            f"enabled: {result.get('enabled', False)}",
+            f"started: {result.get('started', False)}",
+        ],
+    )
+    return 0
+
+
+def cmd_control_watchdog_status(args: argparse.Namespace, service: ClawieService) -> int:
+    _ = args
+    result = service.control_watchdog_status()
+    print_panel(
+        "Watchdog",
+        [
+            f"enabled: {result.get('enabled', False)}",
+            f"unit_file_exists: {result.get('unit_file_exists', False)}",
+            f"unit_file: {result.get('unit_file', '')}",
+            f"alert_unit_file_exists: {result.get('alert_unit_file_exists', False)}",
+            f"active: {result.get('active', 'unknown')}",
+            f"systemd_enabled: {result.get('systemd_enabled', 'unknown')}",
+            f"interval_seconds: {result.get('interval_seconds', 0)}",
+            f"notify_command_configured: {result.get('notify_command_configured', False)}",
+        ],
+    )
+    return 0
+
+
+def cmd_control_watchdog_verify(args: argparse.Namespace, service: ClawieService) -> int:
+    result = service.control_watchdog_verify(
+        exercise_restart=bool(getattr(args, "exercise_restart", False)),
+        timeout_seconds=int(getattr(args, "timeout", 30) or 30),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        lines = [
+            f"status: {result.get('status', 'unknown')}",
+            f"restart_exercised: {result.get('restart_exercised', False)}",
+            f"unit_file: {result.get('unit_file', '')}",
+        ]
+        for row in result.get("checks", []):
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"{row.get('status', '')}: {row.get('message', '')}")
+        print_panel("Watchdog Verify", lines)
+    return 0 if result.get("status") == "passed" else 1
+
+
+def cmd_control_watchdog_remove(args: argparse.Namespace, service: ClawieService) -> int:
+    _ = args
+    result = service.control_watchdog_remove()
+    if result.get("removed"):
+        print_success("Control watchdog removed")
+        print_info("Removed: " + ", ".join(str(item) for item in result.get("removed", [])))
+    else:
+        print_info("Control watchdog was not installed")
+    return 0
+
+
+def cmd_production_verify(args: argparse.Namespace, service: ClawieService) -> int:
+    result = service.production_readiness_report(
+        exercise_watchdog_restart=bool(getattr(args, "exercise_watchdog_restart", False)),
+        watchdog_timeout_seconds=int(getattr(args, "watchdog_timeout", 30) or 30),
+        all_provider_contracts=bool(getattr(args, "all_provider_contracts", False)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    else:
+        lines = [
+            f"status: {result.get('status', 'unknown')}",
+            f"exercise_watchdog_restart: {result.get('exercise_watchdog_restart', False)}",
+            f"all_provider_contracts: {result.get('all_provider_contracts', False)}",
+        ]
+        for row in result.get("checks", []):
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"{row.get('status', '')}: {row.get('name', '')} - {row.get('message', '')}")
+        print_panel("Production Readiness", lines)
+    return 0 if result.get("status") == "passed" else 1
 
 
 def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -3161,7 +4167,13 @@ def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.Ar
 
 def cmd_maintenance_enable(args: argparse.Namespace, service: ClawieService) -> int:
     interval = getattr(args, "interval", 4)
-    result = service.maintenance_enable(interval_hours=interval)
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "maintenance_enable",
+        {"interval_hours": interval},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.maintenance_enable(interval_hours=interval)
     print_success(f"Maintenance cron enabled (every {result['interval_hours']}h)")
     print_info(f"Cron file: {result['cron_file']}")
     print_info(f"Binary: {result['clawie_binary']}")
@@ -3170,7 +4182,13 @@ def cmd_maintenance_enable(args: argparse.Namespace, service: ClawieService) -> 
 
 
 def cmd_maintenance_disable(args: argparse.Namespace, service: ClawieService) -> int:
-    result = service.maintenance_disable()
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "maintenance_disable",
+        {},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.maintenance_disable()
     if result["removed"]:
         print_success("Maintenance cron job removed")
     else:
@@ -3194,7 +4212,13 @@ def cmd_maintenance_run(args: argparse.Namespace, service: ClawieService) -> int
     import datetime
 
     print(f"[{datetime.datetime.now(datetime.timezone.utc).isoformat()}] clawie maintenance run")
-    result = service.maintenance_run()
+    result = _clawied_service_call_or_unavailable(
+        service,
+        "maintenance_run",
+        {},
+    )
+    if result is _CLAWIED_UNAVAILABLE:
+        result = service.maintenance_run()
     print(f"  Auth refresh: {result.get('auth_refresh', 'n/a')}")
     for agent_id, entry in result.get("results", {}).items():
         creds = entry.get("credentials", "")

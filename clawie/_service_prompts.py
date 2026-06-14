@@ -24,7 +24,7 @@ class PromptOpsMixin:
         """
         self._require_setup()
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -90,7 +90,7 @@ class PromptOpsMixin:
             return self._local_agent_view(provider)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -139,7 +139,7 @@ class PromptOpsMixin:
             provider = token.split(":", 1)[1]
             return self._local_agent_view(provider)
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -181,7 +181,7 @@ class PromptOpsMixin:
             return self._local_agent_view(provider)
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")

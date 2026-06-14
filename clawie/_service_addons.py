@@ -347,7 +347,7 @@ class AddonOpsMixin:
     def _collect_used_display_numbers(self) -> list[int]:
         """Gather display numbers already allocated to agents."""
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         used: list[int] = []
         for agent in agents.values():
             addons = agent.get("addons", {})
@@ -373,7 +373,7 @@ class AddonOpsMixin:
         self.ensure_addon_installed("display")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -477,7 +477,7 @@ class AddonOpsMixin:
             raise ValueError("agent_id is required")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -598,7 +598,7 @@ class AddonOpsMixin:
         if not token:
             raise ValueError("agent_id is required")
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -679,7 +679,7 @@ class AddonOpsMixin:
         linked_agents = self._shared_addon_agent_ids(spec.name)
         active_displays: list[dict[str, Any]] = []
         state = self.store.read_state()
-        agents = state.get("agents", state.get("users", {}))
+        agents = state.get("agents", {})
         for aid, agent_data in sorted(agents.items()):
             addons = agent_data.get("addons", {})
             display_data = addons.get("display", {})
@@ -886,7 +886,7 @@ class AddonOpsMixin:
             )
         shared_dir = self._shared_addon_config_dir(name)
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         updated_agents: list[str] = []
         skipped_agents: list[str] = []
         linked_paths: list[str] = []
@@ -950,7 +950,7 @@ class AddonOpsMixin:
         if token.startswith("@local:"):
             raise ValueError("addon management is only supported for managed agents")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -1075,7 +1075,7 @@ class AddonOpsMixin:
                 )
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -1142,7 +1142,7 @@ class AddonOpsMixin:
                 raise SetupError(f"required executable '{exe}' not found in PATH")
 
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(agent_id)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
@@ -1203,7 +1203,7 @@ class AddonOpsMixin:
             result["agent"] = self.get_dashboard_agent(token)
             return result
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -1262,7 +1262,7 @@ class AddonOpsMixin:
         if not token or token.startswith("@local:"):
             raise ValueError("addon management is only supported for managed agents")
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         agent = agents.get(token)
         if not agent:
             raise AgentNotFoundError(f"agent not found: {token}")
@@ -1346,7 +1346,7 @@ class AddonOpsMixin:
         name = self._canonical_addon(addon)
         rows: list[str] = []
         state = self.store.read_state()
-        agents = state.setdefault("agents", state.get("users", {}))
+        agents = state.setdefault("agents", {})
         for aid, agent in sorted(agents.items()):
             self._hydrate_agent_controls(agent)
             addons = self._normalize_agent_addons(agent.get("addons"))
@@ -1367,7 +1367,7 @@ class AddonOpsMixin:
             if token.startswith("@local:"):
                 raise ValueError("source_agent must be a managed agent")
             state = self.store.read_state()
-            agents = state.setdefault("agents", state.get("users", {}))
+            agents = state.setdefault("agents", {})
             agent = agents.get(token)
             if not agent:
                 raise AgentNotFoundError(f"agent not found: {token}")

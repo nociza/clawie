@@ -1,3 +1,4 @@
 include README.md
+include LICENSE
 include install.sh
 recursive-include docs *.md *.yml

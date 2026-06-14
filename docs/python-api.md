@@ -1,15 +1,15 @@
 # Python API
 
-clawie can be used programmatically from Python. The main entry points are `ZeroClawService` for agent/fleet operations and the `delegation` module for orchestration.
+clawie can be used programmatically from Python. The main entry points are `ClawieService` for agent/fleet operations and the `delegation` module for orchestration.
 
 ## Service API
 
 ```python
 from clawie.store import StateStore
-from clawie.service import ZeroClawService
+from clawie.service import ClawieService
 
 store = StateStore()  # Uses ~/.clawie by default
-service = ZeroClawService(store)
+service = ClawieService(store)
 ```
 
 ### Agent operations

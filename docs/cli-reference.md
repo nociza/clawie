@@ -96,6 +96,7 @@ clawie channel move SOURCE_AGENT TARGET_AGENT
 
 ```bash
 clawie delegation submit --parent P --child C [--payload JSON] [--timeout S] [--tier fast|balanced|power]
+clawie delegation deliver --agent A --message TEXT [--timeout S] [--tier fast|balanced|power] [--json]
 clawie delegation repl --agent-id ID [--tier fast|balanced|power]
 clawie delegation tree --agent-id ID
 clawie delegation tasks [--agent-id ID] [--status S] [--limit N]
@@ -113,6 +114,7 @@ clawie runtime install PROVIDER
 clawie runtime create AGENT_ID --user USER [--source-home PATH] [--skip-config-copy] [--credential-bundle B] [--no-default-credentials] [--password P] [--disable-ssh-login]
 clawie runtime detect
 clawie runtime status
+clawie runtime version
 clawie runtime login PROVIDER
 clawie runtime service start|stop|restart|status PROVIDER
 ```

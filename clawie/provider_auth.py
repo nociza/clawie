@@ -89,6 +89,147 @@ def parse_provider_auth_status_output(output: str) -> dict[str, Any]:
     }
 
 
+def parse_openclaw_models_status_output(output: str) -> dict[str, Any]:
+    """Parse ``openclaw models status --json`` output into clawie's auth shape.
+
+    The openclaw JSON status surface has changed across prerelease builds, so
+    this parser accepts a few equivalent shapes while staying conservative: it
+    only returns a payload when it finds an OpenAI provider record or an auth
+    record with explicit status/login fields.
+    """
+    text = str(output or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+
+    candidates = _openclaw_auth_candidates(payload)
+    if not candidates:
+        return {}
+
+    # Prefer an explicit OpenAI record over a generic auth object.
+    candidates.sort(key=lambda item: 0 if _record_names_openai(item) else 1)
+    for record in candidates:
+        parsed = _parse_openclaw_auth_record(record)
+        if parsed:
+            return parsed
+    return {}
+
+
+def _openclaw_auth_candidates(value: Any) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+
+    def visit(item: Any, *, parent_key: str = "") -> None:
+        if isinstance(item, dict):
+            if _record_names_openai(item) or _record_has_auth_status_signal(item):
+                rows.append(dict(item))
+            for key, child in item.items():
+                if str(key).strip().lower() == "openai" and isinstance(child, dict):
+                    row = dict(child)
+                    row.setdefault("provider", "openai")
+                    rows.append(row)
+                if str(key).strip().lower() == "auth" and isinstance(child, dict):
+                    merged = dict(item)
+                    merged.update(child)
+                    rows.append(merged)
+                visit(child, parent_key=str(key))
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, parent_key=parent_key)
+
+    visit(value)
+    return rows
+
+
+def _record_names_openai(record: dict[str, Any]) -> bool:
+    for key in ("provider", "name", "id", "modelProvider", "model_provider"):
+        token = str(record.get(key, "") or "").strip().lower()
+        if token in {"openai", "openai-codex"} or token.startswith("openai/"):
+            return True
+    return False
+
+
+def _record_has_auth_status_signal(record: dict[str, Any]) -> bool:
+    keys = {str(key).strip() for key in record}
+    return bool(
+        keys
+        & {
+            "auth_status",
+            "authStatus",
+            "auth_state",
+            "authState",
+            "login_required",
+            "loginRequired",
+            "authenticated",
+            "configured",
+            "ready",
+        }
+    )
+
+
+def _parse_openclaw_auth_record(record: dict[str, Any]) -> dict[str, Any]:
+    status = ""
+    for key in ("auth_status", "authStatus", "auth_state", "authState", "status", "state"):
+        if key in record:
+            status = str(record.get(key, "") or "").strip().lower()
+            break
+
+    login_required_value = _coerce_bool(record.get("login_required", record.get("loginRequired")))
+    authenticated_value = _coerce_bool(record.get("authenticated"))
+    configured_value = _coerce_bool(record.get("configured", record.get("ready")))
+
+    auth_status = ""
+    if status in {"ready", "ok", "valid", "configured", "authenticated", "active"}:
+        auth_status = "ready"
+    elif status in {"expired"}:
+        auth_status = "expired"
+    elif status in {"missing", "not_required", "not-required"}:
+        auth_status = "missing" if status == "missing" else "not_required"
+    elif status in {"unauthenticated", "not_authenticated", "not-authenticated", "login_required"}:
+        auth_status = "missing"
+
+    if not auth_status:
+        if login_required_value is True:
+            auth_status = "missing"
+        elif authenticated_value is True or configured_value is True:
+            auth_status = "ready"
+        elif authenticated_value is False or configured_value is False:
+            auth_status = "missing"
+
+    if not auth_status:
+        return {}
+
+    expires_at = str(
+        record.get("expires_at", record.get("expiresAt", record.get("expires", ""))) or ""
+    ).strip()
+    return {
+        "auth_status": auth_status,
+        "auth_profile": str(
+            record.get("auth_profile", record.get("profile", record.get("profileId", record.get("profile_id", ""))))
+            or ""
+        ).strip(),
+        "account": str(
+            record.get("account", record.get("accountId", record.get("account_id", record.get("email", ""))))
+            or ""
+        ).strip(),
+        "expires_at": expires_at,
+        "detail": str(record.get("detail", record.get("message", "")) or "").strip(),
+    }
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    token = str(value if value is not None else "").strip().lower()
+    if token in {"true", "1", "yes", "ready", "ok"}:
+        return True
+    if token in {"false", "0", "no", "missing", "unauthenticated"}:
+        return False
+    return None
+
+
 def inspect_auth_files(provider: str, home: Path | None) -> dict[str, Any]:
     if not home:
         return {}

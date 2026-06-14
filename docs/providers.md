@@ -49,7 +49,12 @@ clawie auth show
 sudo clawie auth apply
 ```
 
-Shared auth is stored in the provider's native format, so imported credentials work without extra login steps.
+For picoclaw and zeroclaw, shared auth is stored in the provider's native file
+format, so imported credentials work without extra login steps. For openclaw,
+direct `clawie auth login openclaw` uses the native `openclaw models auth`
+surface; imported or ported OAuth material is retained as legacy migration input
+for openclaw and should be refreshed through `clawie auth login openclaw` on
+hosts running current openclaw releases.
 
 ## Porting auth between claws
 

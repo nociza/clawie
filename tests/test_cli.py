@@ -12,6 +12,7 @@ from pytest import CaptureFixture, MonkeyPatch, raises
 from clawie.provider_auth import (
     auth_status_from_picoclaw_auth_json,
     auth_status_from_profiles_json,
+    parse_openclaw_models_status_output,
     parse_provider_auth_status_output,
 )
 from clawie.cli import main
@@ -182,6 +183,83 @@ def test_ensure_addon_installed_uses_service_path_for_existing_binary(tmp_path: 
 
     assert result["already_present"] is True
     assert result["executable"] == "/home/linuxbrew/.linuxbrew/bin/gws"
+
+
+def test_tool_addon_status_does_not_require_installable_executable(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(
+        service,
+        "_resolve_executable_in_service_env",
+        lambda executable, linux_user="": f"/usr/bin/{executable}",
+    )
+
+    status = service.get_addon_status("web-fetch")
+    installed = service.install_addon("web-fetch")
+
+    assert status["addon"] == "web-fetch"
+    assert status["installed"] is True
+    assert status["auth_status"] == "n/a"
+    assert status["install_method"] == "system"
+    assert installed["already_present"] is True
+    assert installed["method"] == "system"
+
+
+def test_addon_list_cli_handles_tool_addons(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "_resolve_executable_in_service_env",
+        lambda self, executable, linux_user="": f"/usr/bin/{executable}",
+    )
+
+    code = run_cli(tmp_path, "addon", "list")
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "web-fetch" in output
+    assert "n/a" in output
+
+
+def test_tool_addon_enable_disable_updates_stored_tools_prompt(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    monkeypatch.setattr(
+        service,
+        "_resolve_executable_in_service_env",
+        lambda executable, linux_user="": f"/usr/bin/{executable}",
+    )
+
+    service.enable_agent_addon("alice", "web-fetch")
+    enabled = service.get_agent("alice")["core_prompts"]["TOOLS.md"]
+    assert "clawie-web-fetch-tools-begin" in enabled
+
+    service.disable_agent_addon("alice", "web-fetch")
+    disabled = service.get_agent("alice")["core_prompts"]["TOOLS.md"]
+    assert "clawie-web-fetch-tools-begin" not in disabled
 
 
 def test_install_addon_falls_back_to_pnpm_when_npm_missing(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
@@ -3001,6 +3079,36 @@ def test_parse_provider_auth_status_output_marks_expired(tmp_path: Path) -> None
     assert parsed["detail"].lower() == "oauth"
 
 
+def test_parse_openclaw_models_status_json_prefers_openai_record() -> None:
+    parsed = parse_openclaw_models_status_output(
+        json.dumps(
+            {
+                "providers": [
+                    {"provider": "anthropic", "authStatus": "missing"},
+                    {
+                        "provider": "openai",
+                        "authStatus": "ready",
+                        "profileId": "default",
+                        "accountId": "acct-1",
+                    },
+                ]
+            }
+        )
+    )
+
+    assert parsed["auth_status"] == "ready"
+    assert parsed["auth_profile"] == "default"
+    assert parsed["account"] == "acct-1"
+
+
+def test_parse_openclaw_models_status_json_marks_login_required() -> None:
+    parsed = parse_openclaw_models_status_output(
+        json.dumps({"auth": {"provider": "openai", "loginRequired": True}})
+    )
+
+    assert parsed["auth_status"] == "missing"
+
+
 def test_auth_status_from_profiles_json_marks_expired(tmp_path: Path) -> None:
     path = tmp_path / "auth-profiles.json"
     path.write_text(
@@ -3101,6 +3209,85 @@ def test_local_claw_auth_login_refreshes_before_login(
     assert payload["auth_status"] == "ready"
     assert payload["action_performed"] == "login"
     assert [cmd[-1] for cmd in calls] == ["refresh", "login"]
+
+
+def test_openclaw_auth_login_uses_models_auth_surface(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+        auth_mode="linked",
+    )
+
+    states = iter(
+        [
+            {
+                "provider": "openclaw",
+                "auth_mode": "linked",
+                "auth_status": "expired",
+                "login_required": True,
+            },
+            {
+                "provider": "openclaw",
+                "auth_mode": "linked",
+                "auth_status": "missing",
+                "login_required": True,
+            },
+            {
+                "provider": "openclaw",
+                "auth_mode": "linked",
+                "auth_status": "ready",
+                "login_required": False,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "_inspect_provider_auth_state",
+        lambda self, **kwargs: dict(next(states)),
+    )
+    monkeypatch.setattr(
+        ClawieService,
+        "_resolve_local_runtime_target",
+        lambda self, provider: {"linux_user": "", "home": str(tmp_path), "root": ""},
+    )
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/openclaw")
+
+    calls: list[list[str]] = []
+
+    class Result:
+        def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(cmd: list[str], **kwargs: object) -> Result:
+        calls.append(cmd)
+        if kwargs.get("capture_output"):
+            return Result(returncode=0, stdout='{"providers":[{"provider":"openai","authStatus":"missing"}]}')
+        return Result(returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    payload = service.local_claw_auth_login("openclaw")
+
+    assert payload["auth_status"] == "ready"
+    assert calls[0] == ["/usr/bin/openclaw", "models", "status", "--json"]
+    assert calls[1] == [
+        "/usr/bin/openclaw",
+        "models",
+        "auth",
+        "login",
+        "--provider",
+        "openai",
+        "--set-default",
+    ]
 
 
 def test_set_agent_provider_updates_runtime_and_auth_mode(
@@ -3783,8 +3970,8 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     assert config["agents"]["defaults"]["heartbeat"]["directPolicy"] == "block"
     assert config["agents"]["defaults"]["heartbeat"]["lightContext"] is True
     assert config["agents"]["defaults"]["heartbeat"]["ackMaxChars"] == 300
-    assert config["auth"]["profiles"]["openai-codex:default"]["provider"] == "openai-codex"
-    assert config["auth"]["order"]["openai-codex"][0] == "openai-codex:default"
+    assert "openai-codex:default" not in config.get("auth", {}).get("profiles", {})
+    assert "openai-codex" not in config.get("auth", {}).get("order", {})
     assert config["channels"]["defaults"]["heartbeat"] == {
         "showOk": False,
         "showAlerts": False,

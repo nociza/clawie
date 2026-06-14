@@ -228,12 +228,12 @@ version-pinned unit:
 - **Provider auth-store writer** — drives openclaw's own auth surface, **not**
   hand-written JSON. As of openclaw 2026.6.2, auth lives in each agent's
   `openclaw-agent.sqlite`; the `auth-profiles.json` files and `openai-codex`
-  profile ids clawie writes today are **legacy migration input** that `openclaw
-  doctor --fix` rewrites to the canonical `openai` route. So
-  `write_provider_auth` should call `openclaw models auth login/paste-token/order`
-  (and use SecretRef `keyRef`/`tokenRef` for static keys) instead of writing the
-  deprecated JSON. **This is a live version-drift bug to fix in Phase 0**, not a
-  future risk. hermes drives its own auth CLI.
+  profile ids are **legacy migration input** that `openclaw doctor --fix`
+  rewrites to the canonical `openai` route. Direct linked login/status now goes
+  through `openclaw models auth login` and `openclaw models status --json`;
+  remaining import/port flows still retain legacy migration files until clawie
+  has a verified noninteractive writer for openclaw's SQLite auth store.
+  hermes drives its own auth CLI.
 
 `render_config`, `render_addon_integration`, and `write_provider_auth` together
 hold *all* of openclaw's schema knowledge currently smeared across
@@ -641,7 +641,7 @@ suite is green at every commit (298 → 395 tests).
 
 | Phase | Status | Landed |
 |---|---|---|
-| **0** Adapter seam + version gate | **Done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; `ZeroClawService`→`ClawieService`; `clawie runtime version` |
+| **0** Adapter seam + version gate | **Mostly done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; direct openclaw login/status uses `models auth`/`models status`; `ZeroClawService`→`ClawieService`; `clawie runtime version`. **Remaining:** replace imported/ported openclaw auth migration files with a verified native writer. |
 | **1** Real delegation bridge | **Core done** | per-agent gateway endpoint (port + token) written into `openclaw.json`, token redacted from backups; `deliver_to_agent()` via the gateway (adapter-driven, injectable runner); `clawie delegation deliver` |
 | **2** Trust / security | **Mostly done** | `cli.js` binary patch removed; provider-auth and addon-auth caches are private manager-side stores; agents receive owned `0600` credential copies instead of symlinks; shared toolchain is no longer world-writable; `/tmp` prompt staging is disabled. **Remaining:** per-agent auth default / UX and real multi-user host verification |
 | **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`. **Remaining:** the `clawied` single-writer daemon and wiring reconcile into the service to retire the provider-switch saga |

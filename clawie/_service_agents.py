@@ -855,33 +855,16 @@ class AgentOpsMixin:
 
         if auth_mode == "linked":
             auth_cfg = config.get("auth", {})
-            if not isinstance(auth_cfg, dict):
-                auth_cfg = {}
-            profiles = auth_cfg.get("profiles", {})
-            if not isinstance(profiles, dict):
-                profiles = {}
-            profiles.setdefault(
-                "openai-codex:default",
-                {
-                    "provider": "openai-codex",
-                    "mode": "oauth",
-                },
-            )
-            auth_cfg["profiles"] = profiles
-            order = auth_cfg.get("order", {})
-            if not isinstance(order, dict):
-                order = {}
-            existing_order = order.get("openai-codex", [])
-            order["openai-codex"] = [
-                "openai-codex:default",
-                *[
-                    str(item).strip()
-                    for item in existing_order
-                    if str(item).strip() and str(item).strip() != "openai-codex:default"
-                ],
-            ]
-            auth_cfg["order"] = order
-            config["auth"] = auth_cfg
+            if isinstance(auth_cfg, dict):
+                profiles = auth_cfg.get("profiles", {})
+                if isinstance(profiles, dict):
+                    profiles.pop("openai-codex:default", None)
+                    auth_cfg["profiles"] = profiles
+                order = auth_cfg.get("order", {})
+                if isinstance(order, dict):
+                    order.pop("openai-codex", None)
+                    auth_cfg["order"] = order
+                config["auth"] = auth_cfg
         elif auth_mode == "api_key":
             models_cfg = config.get("models", {})
             if not isinstance(models_cfg, dict):

@@ -108,6 +108,22 @@ class AddonOpsMixin:
 
         if isinstance(spec, ServiceAddonSpec):
             return self._install_service_addon(spec)
+        if isinstance(spec, ToolAddonSpec):
+            missing = [exe for exe in spec.check_executables if not self._resolve_executable_in_service_env(exe)]
+            if missing:
+                raise SetupError(
+                    f"addon '{spec.name}' requires executable(s) already on PATH: {', '.join(missing)}"
+                )
+            return {
+                "addon": spec.name,
+                "installed": False,
+                "already_present": True,
+                "method": "system",
+                "package": ", ".join(spec.check_executables),
+                "executable": ", ".join(
+                    self._resolve_executable_in_service_env(exe) or exe for exe in spec.check_executables
+                ),
+            }
 
         executable = self._resolve_executable_in_service_env(spec.executable)
         if executable:
@@ -620,6 +636,26 @@ class AddonOpsMixin:
         spec = get_addon(name)
         if isinstance(spec, ServiceAddonSpec):
             return self._get_service_addon_status(spec)
+        if isinstance(spec, ToolAddonSpec):
+            resolved = [
+                self._resolve_executable_in_service_env(exe)
+                for exe in spec.check_executables
+            ]
+            installed = all(bool(item) for item in resolved) if spec.check_executables else True
+            return {
+                "addon": spec.name,
+                "label": spec.label,
+                "description": spec.description,
+                "installed": installed,
+                "executable": ", ".join(item for item in resolved if item),
+                "install_method": "system",
+                "install_package": ", ".join(spec.check_executables),
+                "auth_status": "n/a",
+                "auth_detail": "tool addon (no auth required)",
+                "config_dir": "",
+                "shared_scope": "system",
+                "linked_agents": self._shared_addon_agent_ids(spec.name),
+            }
         auth = self.shared_addon_auth_status(spec.name)
         executable = self._resolve_executable_in_service_env(spec.executable)
         return {
@@ -730,11 +766,16 @@ class AddonOpsMixin:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
-        if isinstance(spec, ServiceAddonSpec):
+        if isinstance(spec, (ServiceAddonSpec, ToolAddonSpec)):
+            detail = (
+                "tool addon (no auth required)"
+                if isinstance(spec, ToolAddonSpec)
+                else "service addon (no auth required)"
+            )
             return {
                 "addon": spec.name,
                 "auth_status": "n/a",
-                "detail": "service addon (no auth required)",
+                "detail": detail,
                 "action_performed": "status",
                 "login_required": False,
                 "linked_agents": self._shared_addon_agent_ids(spec.name),
@@ -787,8 +828,9 @@ class AddonOpsMixin:
         if not name:
             raise ValueError("addon is required")
         spec = get_addon(name)
-        if isinstance(spec, ServiceAddonSpec):
-            raise ValueError(f"addon '{spec.name}' is a service addon and does not use credential import")
+        if isinstance(spec, (ServiceAddonSpec, ToolAddonSpec)):
+            kind = "tool" if isinstance(spec, ToolAddonSpec) else "service"
+            raise ValueError(f"addon '{spec.name}' is a {kind} addon and does not use credential import")
         self.ensure_addon_installed(spec.name)
         src_home, src_linux_user, source_label = self._resolve_addon_source(source_home=source_home, source_agent=source_agent)
         src_config = src_home / spec.target_config_rel
@@ -949,7 +991,11 @@ class AddonOpsMixin:
                 continue
 
             if isinstance(spec, ToolAddonSpec):
-                tool_installed = all(shutil.which(exe) for exe in spec.check_executables) if spec.check_executables else True
+                tool_installed = (
+                    all(self._resolve_executable_in_service_env(exe) for exe in spec.check_executables)
+                    if spec.check_executables
+                    else True
+                )
                 rows.append({
                     "addon": spec.name,
                     "label": spec.label,
@@ -1092,7 +1138,7 @@ class AddonOpsMixin:
     def _enable_tool_addon(self, agent_id: str, spec: ToolAddonSpec) -> dict[str, Any]:
         """Enable a lightweight tool addon (no auth, no service — just TOOLS.md injection)."""
         for exe in spec.check_executables:
-            if not shutil.which(exe):
+            if not self._resolve_executable_in_service_env(exe):
                 raise SetupError(f"required executable '{exe}' not found in PATH")
 
         state = self.store.read_state()
@@ -1168,8 +1214,15 @@ class AddonOpsMixin:
         addons = self._normalize_agent_addons(agent.get("addons"))
         addon_state = dict(addons.get(spec.name, {}))
         removed: list[str] = []
-        if linux_user and home is not None and home.exists() and self._can_manage_linux_user(linux_user):
+        if (
+            not isinstance(spec, ToolAddonSpec)
+            and linux_user
+            and home is not None
+            and home.exists()
+            and self._can_manage_linux_user(linux_user)
+        ):
             removed = self._revoke_addon_from_home(spec.name, home)
+        if linux_user and home is not None and home.exists() and self._can_manage_linux_user(linux_user):
             # ── Remove addon tools/env from agent home ──
             provider = str(info.get("provider", "")).strip().lower()
             if provider and (spec.tools_snippet or spec.env_exports):
@@ -1179,6 +1232,10 @@ class AddonOpsMixin:
         addon_state["enabled"] = False
         addon_state["last_revoked_at"] = now_iso()
         addon_state["last_applied_paths"] = []
+        if isinstance(spec, ToolAddonSpec) and spec.tools_snippet:
+            prompts = agent.setdefault("core_prompts", {})
+            tools_md = str(prompts.get("TOOLS.md", ""))
+            prompts["TOOLS.md"] = remove_addon_tools_snippet(tools_md, spec.name)
         addons[spec.name] = addon_state
         agent["addons"] = addons
         info["last_sync"] = now_iso()
@@ -1224,6 +1281,32 @@ class AddonOpsMixin:
         addon_state_map = self._normalize_agent_addons(agent.get("addons"))
         for name in selected:
             if is_service_addon(name):
+                continue
+            spec = get_addon(name)
+            if isinstance(spec, ToolAddonSpec):
+                for exe in spec.check_executables:
+                    if not self._resolve_executable_in_service_env(exe):
+                        raise SetupError(f"required executable '{exe}' not found in PATH")
+                if provider := str(info.get("provider", "")).strip().lower():
+                    self._apply_addon_agent_integration(
+                        spec.name,
+                        provider=provider,
+                        home=home,
+                        linux_user=linux_user,
+                        context={},
+                    )
+                addon_state = dict(addon_state_map.get(name, {}))
+                addon_state["enabled"] = True
+                addon_state["last_applied_at"] = now_iso()
+                addon_state_map[name] = addon_state
+                if spec.tools_snippet:
+                    prompts = agent.setdefault("core_prompts", {})
+                    tools_md = str(prompts.get("TOOLS.md", ""))
+                    prompts["TOOLS.md"] = inject_addon_tools_snippet(
+                        tools_md,
+                        spec.name,
+                        spec.tools_snippet,
+                    )
                 continue
             if str(self.shared_addon_auth_status(name).get("auth_status", "")).strip().lower() != "ready":
                 raise SetupError(

@@ -19,6 +19,7 @@ from clawie.provider_auth import (
     inspect_auth_files,
     login_required,
     parse_iso_timestamp,
+    parse_openclaw_models_status_output,
     parse_provider_auth_status_output,
 )
 from clawie.providers import (
@@ -981,6 +982,21 @@ class ProviderAuthMixin:
     def _provider_auth_command(self, provider: str, action: str, linux_user: str) -> list[str]:
         spec = get_provider(provider)
         executable = self._resolve_provider_executable(spec.name)
+        if spec.name == "openclaw":
+            from clawie.adapters import OpenclawAdapter
+
+            adapter = OpenclawAdapter()
+            if action == "login":
+                base = adapter.auth_login_command(
+                    "openai",
+                    set_default=True,
+                    openclaw_bin=executable,
+                )
+            elif action in {"refresh", "status"}:
+                base = adapter.readiness_command(openclaw_bin=executable)
+            else:
+                base = [executable, "models", "auth", action]
+            return self._wrap_user_command(base, linux_user, purpose="auth control")
         if action == "login":
             base = [executable, *spec.auth_login_command]
         elif action == "refresh":
@@ -1136,7 +1152,12 @@ class ProviderAuthMixin:
         output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
         if not output and result.returncode != 0:
             return None
-        parsed = parse_provider_auth_status_output(output)
+        if provider == "openclaw":
+            parsed = parse_openclaw_models_status_output(output)
+            if not parsed:
+                parsed = parse_provider_auth_status_output(output)
+        else:
+            parsed = parse_provider_auth_status_output(output)
         if not parsed:
             return None
         parsed["source"] = "cli"

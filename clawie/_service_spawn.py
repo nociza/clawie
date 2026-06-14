@@ -7,6 +7,7 @@ import pwd
 import secrets
 import shutil
 import subprocess
+import sys
 import warnings
 from pathlib import Path
 from typing import Any
@@ -659,10 +660,103 @@ class SpawnOpsMixin:
         child_id: str,
         timeout: float = 300.0,
         model_tier: str = "",
+        detached: bool = False,
     ) -> dict[str, Any]:
         from clawie.delegation import DEFAULT_TIER
 
+        parent_id = self._validate_agent_id(parent_id)
+        child_id = self._validate_agent_id(child_id)
         tier = model_tier or DEFAULT_TIER
+        if detached:
+            existing = self.store.read_session_agent(parent_id, child_id)
+            if existing:
+                status = self._session_record_with_liveness(existing)
+                if status.get("running"):
+                    raise ValueError(f"session agent already exists: {child_id}")
+                self.store.delete_session_agent(parent_id, child_id)
+
+            session_dir = self.store.root / "session-agents"
+            session_dir.mkdir(parents=True, exist_ok=True)
+            log_path = session_dir / f"{parent_id}-{child_id}.log"
+            socket_path = self._delegation_socket_path(child_id)
+            if self._socket_alive(socket_path):
+                raise ValueError(f"delegation socket already active for: {child_id}")
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "clawie",
+                "--config-dir",
+                str(self.store.root),
+                "delegation",
+                "repl",
+                "--agent-id",
+                child_id,
+                "--tier",
+                tier,
+            ]
+            with log_path.open("ab") as log:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            ready_timeout = min(max(float(timeout), 0.5), 5.0)
+            if not self._wait_for_session_socket(
+                child_id,
+                timeout=ready_timeout,
+                pid=int(proc.pid),
+            ):
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"session agent failed to start: {child_id}; see {log_path}"
+                )
+
+            created_at = now_iso()
+            self.store.write_session_agent(
+                parent_agent_id=parent_id,
+                child_agent_id=child_id,
+                pid=int(proc.pid),
+                depth=1,
+                status="running",
+                model_tier=tier,
+                socket_path=str(socket_path),
+                log_path=str(log_path),
+                created_at=created_at,
+                updated_at=created_at,
+            )
+            self._persist_session_tree(parent_id)
+            state = self.store.read_state()
+            self._event(
+                state,
+                "session.agent.spawned",
+                f"Session agent {child_id} spawned under {parent_id}",
+                {
+                    "parent": parent_id,
+                    "child": child_id,
+                    "model_tier": tier,
+                    "pid": int(proc.pid),
+                },
+            )
+            self.store.write_state(state)
+            return {
+                "agent_id": child_id,
+                "parent_id": parent_id,
+                "depth": 1,
+                "status": "running",
+                "session": True,
+                "model_tier": tier,
+                "pid": int(proc.pid),
+                "socket": str(socket_path),
+                "log": str(log_path),
+            }
+
         mgr = self._get_session_manager(parent_id)
         info = mgr.spawn(child_id, timeout=timeout, model_tier=tier)
         state = self.store.read_state()

@@ -57,6 +57,7 @@ def _use_short_delegation_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
     dlg_dir = Path(tempfile.mkdtemp(prefix="clawie-dlg-"))
     _SHORT_DELEGATION_DIRS.append(dlg_dir)
     monkeypatch.setattr("clawie.delegation.DELEGATION_DIR", dlg_dir)
+    monkeypatch.setenv("CLAWIE_DELEGATION_DIR", str(dlg_dir))
     return dlg_dir
 
 
@@ -1056,6 +1057,95 @@ class TestSessionCLI:
         output = capsys.readouterr().out
         assert code == 0
         assert "No session agents" in output
+
+    def test_spawn_session_survives_next_cli_command(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dlg_dir = _use_short_delegation_dir(monkeypatch)
+        config_dir = tmp_path / "state"
+        spawned = False
+        try:
+            code = run_cli(
+                config_dir,
+                "delegation",
+                "spawn-session",
+                "--parent",
+                "parent",
+                "--child",
+                "child-1",
+                "--tier",
+                "fast",
+                "--timeout",
+                "5",
+            )
+            output = capsys.readouterr().out
+            assert code == 0
+            assert "child-1" in output
+            assert "pid:" in output
+            spawned = True
+
+            code = run_cli(
+                config_dir,
+                "delegation",
+                "session-agents",
+                "--parent",
+                "parent",
+            )
+            output = capsys.readouterr().out
+            assert code == 0
+            assert "child-1" in output
+            assert "running=True" in output
+
+            code = run_cli(
+                config_dir,
+                "delegation",
+                "submit",
+                "--parent",
+                "parent",
+                "--child",
+                "child-1",
+                "--payload",
+                '{"msg":"hi"}',
+                "--timeout",
+                "5",
+            )
+            output = capsys.readouterr().out
+            assert code == 0
+            assert '"msg": "hi"' in output
+
+            code = run_cli(
+                config_dir,
+                "delegation",
+                "tasks",
+                "--agent-id",
+                "parent",
+                "--status",
+                "completed",
+            )
+            output = capsys.readouterr().out
+            assert code == 0
+            assert "child-1" in output
+        finally:
+            if spawned:
+                run_cli(
+                    config_dir,
+                    "delegation",
+                    "stop-session",
+                    "--parent",
+                    "parent",
+                    "--child",
+                    "child-1",
+                )
+                capsys.readouterr()
+
+        socket_path = dlg_dir / "child-1.sock"
+        deadline = time.monotonic() + 2.0
+        while socket_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not socket_path.exists()
 
     def test_tree_uses_ascii_art(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

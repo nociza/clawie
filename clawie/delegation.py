@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-DELEGATION_DIR = Path("/tmp/clawie-delegation")
+DELEGATION_DIR = Path(os.environ.get("CLAWIE_DELEGATION_DIR", "/tmp/clawie-delegation"))
 
 # ---------------------------------------------------------------------------
 # Default DELEGATION.md skill content -- auto-loaded for agents with the
@@ -970,19 +970,23 @@ class AgentREPL:
         except (OSError, AttributeError):
             self._running = False
             return
-        while self._running:
-            conn = self.bus.accept(timeout=POLL_INTERVAL)
-            if conn is None:
-                continue
-            try:
-                self._handle_connection(conn)
-            except (ConnectionError, OSError):
-                pass
-            finally:
+        try:
+            while self._running:
+                conn = self.bus.accept(timeout=POLL_INTERVAL)
+                if conn is None:
+                    continue
                 try:
-                    conn.close()
-                except OSError:
+                    self._handle_connection(conn)
+                except (ConnectionError, OSError):
                     pass
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+        finally:
+            self._running = False
+            self.bus.close()
 
     def start_background(self) -> threading.Thread:
         """Start the REPL loop in a daemon thread."""

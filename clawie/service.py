@@ -223,6 +223,7 @@ class ClawieService(
 
     def __init__(self, store: StateStore) -> None:
         self.store = store
+        self._session_managers: dict[str, Any] = {}
 
     def setup(
         self,

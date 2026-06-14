@@ -54,11 +54,19 @@ result = service.delegate_task(
     model_tier="fast",
 )
 
-# Spawn session agents
+# Spawn an in-process session agent
 info = service.spawn_session_agent(
     parent_id="planner",
     child_id="researcher",
     model_tier="power",
+)
+
+# Spawn a CLI-style detached local REPL process
+info = service.spawn_session_agent(
+    parent_id="planner",
+    child_id="researcher",
+    model_tier="power",
+    detached=True,
 )
 
 # Stop session agents

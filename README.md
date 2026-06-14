@@ -60,6 +60,8 @@ clawie delegation submit --parent planner --child worker --tier fast --payload '
 
 # Spawn session sub-agents on the fly
 clawie delegation spawn-session --parent planner --child researcher --tier power
+clawie delegation submit --parent planner --child researcher --payload '{"task":"analyze"}'
+clawie delegation stop-session --parent planner --child researcher
 
 # See the delegation tree
 clawie delegation tree --agent-id planner

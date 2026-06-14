@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import os
+import signal
 import shutil
+import socket
 import subprocess
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable
 from clawie.service_common import SetupError, now_iso
 
@@ -349,8 +353,178 @@ class DelegationOpsMixin:
 
     def session_tree_lines(self, parent_id: str) -> list[str]:
         if parent_id not in self._session_managers:
-            return []
+            records = self.list_session_agents(parent_id)
+            if not records:
+                data = self.store.read_delegation_tree(parent_id) or {}
+                if not data:
+                    return []
+                from clawie.delegation import render_tree_ascii
+
+                return render_tree_ascii(data, root_id=parent_id)
+            data = self._session_tree_data(parent_id, records)
+            from clawie.delegation import render_tree_ascii
+
+            return render_tree_ascii(data, root_id=parent_id)
         return self._session_managers[parent_id].tree_lines()
+
+    def _delegation_socket_path(self, agent_id: str) -> Path:
+        from clawie.delegation import DELEGATION_DIR
+
+        return DELEGATION_DIR / f"{agent_id}.sock"
+
+    def _pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                return False
+        except ChildProcessError:
+            pass
+        except OSError:
+            pass
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    def _socket_alive(self, path: str | Path) -> bool:
+        socket_path = Path(path)
+        if not socket_path.exists():
+            return False
+        sock: socket.socket | None = None
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.2)
+            sock.connect(str(socket_path))
+            return True
+        except OSError:
+            return False
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _wait_for_session_socket(
+        self,
+        agent_id: str,
+        *,
+        timeout: float,
+        pid: int = 0,
+    ) -> bool:
+        deadline = time.monotonic() + max(0.1, timeout)
+        path = self._delegation_socket_path(agent_id)
+        while time.monotonic() < deadline:
+            if pid > 0 and not self._pid_alive(pid):
+                return False
+            if self._socket_alive(path):
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _session_record_with_liveness(self, record: dict[str, Any]) -> dict[str, Any]:
+        item = dict(record)
+        pid = int(item.get("pid", 0) or 0)
+        socket_path = str(item.get("socket_path") or self._delegation_socket_path(str(item.get("child_agent_id", ""))))
+        socket_is_alive = self._socket_alive(socket_path)
+        pid_is_alive = self._pid_alive(pid) if pid else socket_is_alive
+        running = bool(socket_is_alive and pid_is_alive)
+        item["running"] = running
+        item["socket_alive"] = socket_is_alive
+        item["pid_alive"] = pid_is_alive
+        item["agent_id"] = str(item.get("child_agent_id", ""))
+        item["parent_id"] = str(item.get("parent_agent_id", ""))
+        item["session"] = True
+        if running:
+            item["status"] = "running"
+        elif str(item.get("status", "")) == "stopped":
+            item["status"] = "stopped"
+        else:
+            item["status"] = "stale"
+        return item
+
+    def _session_tree_data(
+        self,
+        parent_id: str,
+        records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        from clawie.delegation import DelegationTree
+
+        tree = DelegationTree()
+        tree.register(parent_id, "", "root", depth=0)
+        tree.update_status(parent_id, "running")
+        for record in records:
+            child_id = str(record.get("agent_id") or record.get("child_agent_id") or "")
+            if not child_id:
+                continue
+            depth = int(record.get("depth", 1) or 1)
+            model_tier = str(record.get("model_tier", "") or "")
+            try:
+                tree.register(
+                    child_id,
+                    parent_id,
+                    f"session:{child_id}",
+                    depth=depth,
+                    model_tier=model_tier,
+                )
+            except ValueError:
+                continue
+            tree.update_status(child_id, "running" if record.get("running") else "failed")
+        return tree.to_dict()
+
+    def _persist_session_tree(self, parent_id: str) -> None:
+        records = [
+            self._session_record_with_liveness(row)
+            for row in self.store.read_session_agents(parent_id)
+        ]
+        if records:
+            self.store.write_delegation_tree(parent_id, self._session_tree_data(parent_id, records))
+
+    def _mark_delegation_tree_status(
+        self,
+        root_agent_id: str,
+        agent_id: str,
+        status: str,
+    ) -> None:
+        data = self.store.read_delegation_tree(root_agent_id) or {}
+        if not data:
+            return
+        from clawie.delegation import DelegationTree
+
+        tree = DelegationTree.from_dict(data)
+        if tree.get_node(agent_id) is None:
+            return
+        tree.update_status(agent_id, status)
+        self.store.write_delegation_tree(root_agent_id, tree.to_dict())
+
+    def _shutdown_session_process(self, parent_id: str, child_id: str, pid: int) -> None:
+        from clawie.delegation import DelegationCoordinator
+
+        if self._socket_alive(self._delegation_socket_path(child_id)):
+            coordinator = DelegationCoordinator(parent_id)
+            coordinator.shutdown_child(child_id)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if not self._socket_alive(self._delegation_socket_path(child_id)):
+                    return
+                time.sleep(0.05)
+
+        if pid > 0 and self._pid_alive(pid):
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    return
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    if not self._pid_alive(pid):
+                        return
+                    time.sleep(0.05)
 
     # ── Gateway delivery bridge ───────────────────────────────────────────
     #

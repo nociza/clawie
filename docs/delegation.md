@@ -52,7 +52,8 @@ clawie delegation repl --agent-id worker --tier balanced
 
 ### Spawn session sub-agents
 
-Lightweight sub-agents that run as background threads (no root required):
+Lightweight sub-agents that run as detached local REPL processes from the CLI
+(no root required):
 
 ```bash
 clawie delegation spawn-session --parent planner --child researcher --tier power
@@ -67,6 +68,12 @@ clawie delegation session-agents --parent planner
 # Stop one
 clawie delegation stop-session --parent planner --child formatter
 ```
+
+The CLI records the child process and socket in clawie's state directory, so a
+session agent spawned by one command can be listed, delegated to, and stopped by
+later commands. In the Python API, `SessionAgentManager` keeps the same behavior
+as before: sub-agents run as background threads inside the current process and
+stop when that process exits unless you stop them explicitly.
 
 ### View the delegation tree
 

@@ -1512,10 +1512,7 @@ class AgentOpsMixin:
 
         tier = model_tier or DEFAULT_TIER
 
-        def _default_handler(msg: Any, repl: Any) -> dict[str, Any]:
-            return {"echo": msg.payload, "agent": agent_id}
-
-        repl = AgentREPL(agent_id, handler=handler or _default_handler, model_tier=tier)
+        repl = AgentREPL(agent_id, handler=handler, model_tier=tier)
         import signal
 
         def _shutdown(*_a: Any) -> None:
@@ -1526,8 +1523,29 @@ class AgentOpsMixin:
         repl.start()
 
     def stop_session_agent(self, parent_id: str, child_id: str) -> None:
-        mgr = self._get_session_manager(parent_id)
-        mgr.stop_agent(child_id)
+        stopped = False
+        if parent_id in self._session_managers:
+            before = {
+                str(item.get("agent_id", ""))
+                for item in self._session_managers[parent_id].list_agents()
+            }
+            self._session_managers[parent_id].stop_agent(child_id)
+            stopped = child_id in before
+
+        record = self.store.read_session_agent(parent_id, child_id)
+        if record:
+            pid = int(record.get("pid", 0) or 0)
+            self._shutdown_session_process(parent_id, child_id, pid)
+            self.store.delete_session_agent(parent_id, child_id)
+            if self.store.read_session_agents(parent_id):
+                self._persist_session_tree(parent_id)
+            else:
+                self._mark_delegation_tree_status(parent_id, child_id, "completed")
+            stopped = True
+
+        if not stopped:
+            raise ValueError(f"session agent not found: {child_id}")
+
         state = self.store.read_state()
         self._event(
             state,
@@ -1538,11 +1556,40 @@ class AgentOpsMixin:
         self.store.write_state(state)
 
     def stop_all_session_agents(self, parent_id: str) -> None:
+        stopped_children: list[str] = []
         if parent_id in self._session_managers:
+            stopped_children.extend(
+                str(item.get("agent_id", ""))
+                for item in self._session_managers[parent_id].list_agents()
+                if str(item.get("agent_id", ""))
+            )
             self._session_managers[parent_id].stop_all()
             del self._session_managers[parent_id]
+        for record in self.store.read_session_agents(parent_id):
+            child_id = str(record.get("child_agent_id", ""))
+            if not child_id:
+                continue
+            self._shutdown_session_process(parent_id, child_id, int(record.get("pid", 0) or 0))
+            self.store.delete_session_agent(parent_id, child_id)
+            stopped_children.append(child_id)
+        if self.store.read_session_agents(parent_id):
+            self._persist_session_tree(parent_id)
+        else:
+            for child_id in stopped_children:
+                self._mark_delegation_tree_status(parent_id, child_id, "completed")
 
     def list_session_agents(self, parent_id: str) -> list[dict[str, Any]]:
-        if parent_id not in self._session_managers:
-            return []
-        return self._session_managers[parent_id].list_agents()
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        if parent_id in self._session_managers:
+            for item in self._session_managers[parent_id].list_agents():
+                agent_id = str(item.get("agent_id", ""))
+                if agent_id:
+                    seen.add(agent_id)
+                rows.append(item)
+        for record in self.store.read_session_agents(parent_id):
+            child_id = str(record.get("child_agent_id", ""))
+            if child_id in seen:
+                continue
+            rows.append(self._session_record_with_liveness(record))
+        return rows

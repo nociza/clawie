@@ -116,6 +116,19 @@ class StateStore:
                     tree_data TEXT DEFAULT '{}',
                     updated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS session_agents (
+                    parent_agent_id TEXT NOT NULL,
+                    child_agent_id TEXT NOT NULL,
+                    pid INTEGER DEFAULT 0,
+                    depth INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'running',
+                    model_tier TEXT DEFAULT '',
+                    socket_path TEXT DEFAULT '',
+                    log_path TEXT DEFAULT '',
+                    created_at TEXT DEFAULT '',
+                    updated_at TEXT DEFAULT '',
+                    PRIMARY KEY(parent_agent_id, child_agent_id)
+                );
                 """
             )
             conn.commit()
@@ -416,6 +429,107 @@ class StateStore:
                 (root_agent_id,),
             )
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Session agent metadata
+    # ------------------------------------------------------------------
+
+    def write_session_agent(
+        self,
+        *,
+        parent_agent_id: str,
+        child_agent_id: str,
+        pid: int = 0,
+        depth: int = 1,
+        status: str = "running",
+        model_tier: str = "",
+        socket_path: str = "",
+        log_path: str = "",
+        created_at: str = "",
+        updated_at: str = "",
+    ) -> None:
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO session_agents
+                (parent_agent_id, child_agent_id, pid, depth, status, model_tier,
+                 socket_path, log_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    parent_agent_id,
+                    child_agent_id,
+                    int(pid),
+                    int(depth),
+                    status,
+                    model_tier,
+                    socket_path,
+                    log_path,
+                    created_at,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+
+    def read_session_agents(
+        self, parent_agent_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.ensure()
+        params: list[Any] = []
+        where = ""
+        if parent_agent_id:
+            where = " WHERE parent_agent_id = ?"
+            params.append(parent_agent_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM session_agents{where} ORDER BY created_at ASC",
+                params,
+            ).fetchall()
+        return [self._session_agent_row(row) for row in rows]
+
+    def read_session_agent(
+        self, parent_agent_id: str, child_agent_id: str
+    ) -> dict[str, Any] | None:
+        self.ensure()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM session_agents
+                WHERE parent_agent_id = ? AND child_agent_id = ?
+                """,
+                (parent_agent_id, child_agent_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._session_agent_row(row)
+
+    def delete_session_agent(self, parent_agent_id: str, child_agent_id: str) -> None:
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM session_agents
+                WHERE parent_agent_id = ? AND child_agent_id = ?
+                """,
+                (parent_agent_id, child_agent_id),
+            )
+            conn.commit()
+
+    @staticmethod
+    def _session_agent_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "parent_agent_id": str(row["parent_agent_id"]),
+            "child_agent_id": str(row["child_agent_id"]),
+            "pid": int(row["pid"]),
+            "depth": int(row["depth"]),
+            "status": str(row["status"]),
+            "model_tier": str(row["model_tier"] or ""),
+            "socket_path": str(row["socket_path"] or ""),
+            "log_path": str(row["log_path"] or ""),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
 
     @staticmethod
     def _read_json(path: Path, fallback: dict[str, Any]) -> dict[str, Any]:

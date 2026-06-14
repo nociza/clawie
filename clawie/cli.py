@@ -3047,6 +3047,7 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ClawieServic
         child_id=args.child,
         timeout=getattr(args, "timeout", 300.0),
         model_tier=getattr(args, "tier", "") or "",
+        detached=True,
     )
     print_success(f"Session agent {info['agent_id']} spawned under {args.parent}")
     print_panel(
@@ -3057,6 +3058,9 @@ def cmd_delegation_spawn_session(args: argparse.Namespace, service: ClawieServic
             f"status: {info.get('status', '')}",
             f"depth: {info.get('depth', '')}",
             f"model_tier: {info.get('model_tier', '')}",
+            *([f"pid: {info.get('pid', '')}"] if info.get("pid") else []),
+            *([f"socket: {info.get('socket', '')}"] if info.get("socket") else []),
+            *([f"log: {info.get('log', '')}"] if info.get("log") else []),
         ],
     )
     return 0
@@ -3077,6 +3081,7 @@ def cmd_delegation_session_agents(args: argparse.Namespace, service: ClawieServi
         print(
             f"  {a['agent_id']:20} status={a['status']:10} "
             f"running={a['running']}  depth={a['depth']}"
+            f"  pid={a.get('pid', 0)}"
         )
     tree_lines = service.session_tree_lines(args.parent)
     if tree_lines:

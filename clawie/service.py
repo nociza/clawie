@@ -325,7 +325,7 @@ class ClawieService(
             checks.append(
                 {
                     "status": "fail",
-                    "message": "Provider credentials are missing. Run setup.",
+                    "message": "Provider credentials are missing. Run 'clawie config set'.",
                 }
             )
 
@@ -522,7 +522,7 @@ class ClawieService(
         provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
         credentials = self._provider_auth(provider)
         if not self._is_provider_configured(provider, credentials):
-            raise SetupError("setup is incomplete. Run 'clawie setup'.")
+            raise SetupError("setup is incomplete. Run 'clawie config set'.")
 
     def _event(
         self,

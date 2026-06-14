@@ -24,7 +24,13 @@ Options:
 | `--credential-bundle` | Additional credential bundles to sync |
 | `--no-default-credentials` | Skip the default `provider-auth` bundle |
 | `--password` | Set a password for the Linux user |
-| `--disable-ssh-login` | Prevent SSH login to this user |
+| `--password-hash` | Set a pre-hashed Linux password |
+| `--no-global-password` | Ignore the configured global spawn password |
+| `--from-agent` | Clone state from an existing agent |
+| `--provider` | Override the configured provider |
+| `--no-delegation` | Disable the delegation skill for the spawned agent |
+
+Spawned users are denied SSH login automatically.
 
 ## Credential bundles
 

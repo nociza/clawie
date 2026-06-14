@@ -1580,7 +1580,9 @@ def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
     )
     tier = getattr(args, "model_tier", None)
     if tier:
-        service.set_agent_model_tier(agent_id, tier)
+        agent.setdefault("agent", {})["model_tier"] = service.set_agent_model_tier(
+            agent_id, tier
+        )
     print_success(f"Provisioned agent {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -1606,7 +1608,9 @@ def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
     )
     tier = getattr(args, "model_tier", None)
     if tier:
-        service.set_agent_model_tier(agent_id, tier)
+        agent.setdefault("agent", {})["model_tier"] = service.set_agent_model_tier(
+            agent_id, tier
+        )
     print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
     _print_agent(agent)
     return 0
@@ -2278,6 +2282,7 @@ def _print_status_agents(payload: Any) -> None:
             str(row.get("agent_id", "")),
             str(row.get("status", "")),
             str(row.get("provider", "")),
+            str(row.get("model_tier", "")),
             f"{row.get('channels', 0)}/{row.get('channels_total', 0)}",
             str(row.get("cpu_percent", 0)),
             str(row.get("mem_percent", 0)),
@@ -2286,7 +2291,7 @@ def _print_status_agents(payload: Any) -> None:
         for row in rows
     ]
     print_table(
-        ["agent_id", "status", "provider", "channels", "cpu%", "mem%", "version"],
+        ["agent_id", "status", "provider", "tier", "channels", "cpu%", "mem%", "version"],
         table,
     )
     for row in rows:
@@ -2717,6 +2722,7 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"provider_status: {agent.get('agent', {}).get('provider_status', 'ok')}",
             f"provider_issue: {agent.get('agent', {}).get('provider_issue', '')}",
             f"provider_remediation: {agent.get('agent', {}).get('provider_remediation', '')}",
+            f"model_tier: {agent.get('agent', {}).get('model_tier', 'balanced')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
             f"auth_status: {agent.get('agent', {}).get('auth_status', 'unknown')}",
             f"auth_profile: {agent.get('agent', {}).get('auth_profile', '')}",

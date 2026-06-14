@@ -6301,7 +6301,7 @@ def test_status_snapshot_includes_all_sections(tmp_path: Path) -> None:
     snapshot = _configured_service(tmp_path).status_snapshot()
     for section in (
         "setup", "health", "agents", "runtimes",
-        "auth", "delegation", "maintenance", "events",
+        "auth", "delegation", "maintenance", "backup", "events",
     ):
         assert section in snapshot
     assert "generated_at" in snapshot
@@ -6339,6 +6339,39 @@ def test_status_command_json_output(tmp_path: Path, capsys: CaptureFixture[str])
     payload = json.loads(capsys.readouterr().out)
     assert payload["setup"]["provider"] == "openclaw"
     assert "agents" in payload
+
+
+def test_agent_create_and_show_print_requested_model_tier(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    assert run_cli(tmp_path, "agent", "create", "alice", "--model-tier", "fast") == 0
+    create_output = capsys.readouterr().out
+    assert "model_tier: fast" in create_output
+
+    assert run_cli(tmp_path, "agent", "show", "alice") == 0
+    show_output = capsys.readouterr().out
+    assert "model_tier: fast" in show_output
+
+
+def test_status_agents_include_model_tier(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "alice", "--model-tier", "power") == 0
+    capsys.readouterr()
+
+    snapshot = ClawieService(StateStore(config_dir=tmp_path)).status_snapshot(sections=["agents"])
+    assert snapshot["agents"]["rows"][0]["model_tier"] == "power"
+
+    assert run_cli(tmp_path, "status", "agents") == 0
+    output = capsys.readouterr().out
+    assert "tier" in output
+    assert "power" in output
 
 
 def test_status_command_section_argument(tmp_path: Path, capsys: CaptureFixture[str]) -> None:

@@ -92,7 +92,7 @@ clawie relies on Linux-specific system calls and tools throughout:
 - Unix domain sockets (`AF_UNIX`) for agent IPC
 - `/tmp` for socket and mailbox files
 - `pwd` module for user lookup
-- `crypt` module for password hashing
+- `crypt` module or `openssl` executable for SHA512 password hashing
 
 There is no platform detection or fallback for macOS or Windows.
 

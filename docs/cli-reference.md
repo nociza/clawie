@@ -43,7 +43,7 @@ clawie agent create-batch FILE
 ### agent prompt
 
 ```bash
-clawie agent prompt copy SOURCE TARGET [--apply-to-disk]
+clawie agent prompt copy SOURCE TARGET [--no-apply-to-disk]
 ```
 
 ### agent auth
@@ -111,7 +111,7 @@ clawie delegation session-agents --parent P
 
 ```bash
 clawie runtime install PROVIDER
-clawie runtime create AGENT_ID --user USER [--source-home PATH] [--skip-config-copy] [--credential-bundle B] [--no-default-credentials] [--password P] [--disable-ssh-login]
+clawie runtime create AGENT_ID [--user USER] [--source-home PATH] [--skip-config-copy] [--credential-bundle B] [--no-default-credentials] [--password P] [--password-hash H] [--no-global-password] [--from-agent A] [--provider P] [--no-delegation]
 clawie runtime detect
 clawie runtime status
 clawie runtime version

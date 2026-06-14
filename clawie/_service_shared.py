@@ -78,24 +78,24 @@ class SharedInfraMixin:
         except PermissionError:
             root = self.store.root / "shared-provider-auth"
             root.mkdir(parents=True, exist_ok=True)
-        self._relax_shared_path_permissions(root)
+        self._harden_private_path_permissions(root)
         for rel in shared_auth_paths_for_providers(provider_names()):
             parent = (root / rel).parent
             parent.mkdir(parents=True, exist_ok=True)
-            self._relax_shared_path_permissions(parent)
+            self._harden_private_path_permissions(parent)
         return root
 
-    def _relax_shared_provider_auth_permissions(self) -> None:
+    def _harden_shared_provider_auth_permissions(self) -> None:
         root = self._shared_provider_auth_home()
         if not root.exists():
             return
-        self._relax_shared_path_permissions(root)
+        self._harden_private_path_permissions(root)
         for rel in shared_auth_paths_for_providers(provider_names()):
             path = root / rel
             if path.parent.exists():
-                self._relax_shared_path_permissions(path.parent)
+                self._harden_private_path_permissions(path.parent)
             if path.exists():
-                self._relax_shared_path_permissions(path)
+                self._harden_private_path_permissions(path)
 
     def _shared_toolchain_home(self) -> Path:
         preferred = self.SHARED_TOOLCHAIN_DIR
@@ -117,7 +117,7 @@ class SharedInfraMixin:
             root = self.store.root / "shared-toolchain"
             root.mkdir(parents=True, exist_ok=True)
         (root / "bin").mkdir(parents=True, exist_ok=True)
-        self._relax_path_tree_permissions(root)
+        self._harden_shared_toolchain_permissions(root)
         return root
 
     def _shared_toolchain_path_entries(self) -> list[str]:
@@ -143,7 +143,7 @@ class SharedInfraMixin:
         except PermissionError:
             root = self.store.root / "shared-addon-auth"
             root.mkdir(parents=True, exist_ok=True)
-        self._relax_path_tree_permissions(root)
+        self._harden_private_tree_permissions(root)
         return root
 
     def _shared_addon_config_dir(self, addon: str) -> Path:
@@ -153,40 +153,66 @@ class SharedInfraMixin:
     def _ensure_shared_addon_config_dir(self, addon: str) -> Path:
         root = self._shared_addon_config_dir(addon)
         root.mkdir(parents=True, exist_ok=True)
-        self._relax_path_tree_permissions(root)
+        self._harden_private_tree_permissions(root)
         return root
 
-    def _relax_shared_addon_permissions(self, addon: str | None = None) -> None:
+    def _harden_shared_addon_permissions(self, addon: str | None = None) -> None:
         root = self._shared_addon_auth_home()
         if addon:
             root = self._shared_addon_config_dir(addon)
         if not root.exists():
             return
-        self._relax_path_tree_permissions(root)
+        self._harden_private_tree_permissions(root)
 
     @staticmethod
-    def _relax_shared_path_permissions(path: Path) -> None:
+    def _harden_private_path_permissions(path: Path) -> None:
+        """Make a credential/config path private to its owner.
+
+        Shared auth stores are a manager-side cache, not a cross-user secret
+        transport. Agents receive owned copies, so the cache itself should never
+        be world-readable.
+        """
         try:
+            target_mode = 0o700 if path.is_dir() else 0o600
             current_mode = int(path.stat().st_mode) & 0o777
-            if path.is_dir():
-                target_mode = 0o777
-            else:
-                # Preserve execute bits for toolchain binaries/scripts while still relaxing readability/writability.
-                target_mode = 0o666 | (current_mode & 0o111)
             if current_mode != target_mode:
                 os.chmod(path, target_mode)
         except OSError:
             return
 
     @classmethod
-    def _relax_path_tree_permissions(cls, path: Path) -> None:
+    def _harden_private_tree_permissions(cls, path: Path) -> None:
         if not path.exists():
             return
-        cls._relax_shared_path_permissions(path)
+        cls._harden_private_path_permissions(path)
         if not path.is_dir():
             return
         for child in path.rglob("*"):
-            cls._relax_shared_path_permissions(child)
+            cls._harden_private_path_permissions(child)
+
+    @staticmethod
+    def _harden_shared_toolchain_path_permissions(path: Path) -> None:
+        try:
+            if path.is_dir():
+                target_mode = 0o755
+            else:
+                current_mode = int(path.stat().st_mode) & 0o777
+                target_mode = 0o644 | (current_mode & 0o111)
+            current_mode = int(path.stat().st_mode) & 0o777
+            if current_mode != target_mode:
+                os.chmod(path, target_mode)
+        except OSError:
+            return
+
+    @classmethod
+    def _harden_shared_toolchain_permissions(cls, path: Path) -> None:
+        if not path.exists():
+            return
+        cls._harden_shared_toolchain_path_permissions(path)
+        if not path.is_dir():
+            return
+        for child in path.rglob("*"):
+            cls._harden_shared_toolchain_path_permissions(child)
 
     @staticmethod
     def _read_json_file(path: Path) -> dict[str, Any]:
@@ -251,8 +277,8 @@ class SharedInfraMixin:
             else:
                 dst.unlink()
         shutil.copy2(src, dst)
-        self._relax_shared_path_permissions(dst.parent)
-        self._relax_shared_path_permissions(dst)
+        self._harden_private_path_permissions(dst.parent)
+        self._harden_private_path_permissions(dst)
         return True
 
     @staticmethod
@@ -300,7 +326,7 @@ class SharedInfraMixin:
             else:
                 shutil.rmtree(dst)
         shutil.copytree(src, dst)
-        self._relax_path_tree_permissions(dst)
+        self._harden_private_tree_permissions(dst)
         return [str(dst)]
 
     def _linux_home_for_user(self, linux_user: str) -> Path | None:

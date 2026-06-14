@@ -241,7 +241,7 @@ class AddonOpsMixin:
             ).strip()
             raise SetupError(f"installed gcloud but version check failed: {output or f'exit {verify.returncode}'}")
 
-        self._relax_path_tree_permissions(root)
+        self._harden_shared_toolchain_permissions(root)
         state = self.store.read_state()
         self._event(
             state,
@@ -767,7 +767,7 @@ class AddonOpsMixin:
             raise SetupError(f"{spec.name} {action} failed with exit code {result.returncode}")
 
         updated = self._materialize_shared_addon_credentials(spec.name, source_config_dir=config_dir, linux_user="")
-        self._relax_shared_addon_permissions(spec.name)
+        self._harden_shared_addon_permissions(spec.name)
         applied = self.apply_shared_addon_links(spec.name)
         payload = self.shared_addon_auth_status(spec.name)
         payload["action_performed"] = "login"
@@ -809,7 +809,7 @@ class AddonOpsMixin:
                 f"no portable {spec.name} credentials were found in {src_config}. "
                 f"Log in with 'clawie addon auth login {spec.name}' first."
             )
-        self._relax_shared_addon_permissions(spec.name)
+        self._harden_shared_addon_permissions(spec.name)
         applied = self.apply_shared_addon_links(spec.name)
         auth = self.shared_addon_auth_status(spec.name)
         return {
@@ -1351,10 +1351,11 @@ class AddonOpsMixin:
             return [str(target)] if copied else []
         payload = parse_gws_exported_credentials(result.stdout)
         self._write_json_file(target, payload)
-        self._relax_shared_addon_permissions(spec.name)
+        self._harden_shared_addon_permissions(spec.name)
         return [str(target)]
 
     def _ensure_shared_addon_links(self, addon: str, *, target_home: Path, username: str) -> list[str]:
+        """Copy shared addon credentials into an agent-owned config directory."""
         spec = get_addon(addon)
         src = self._shared_addon_config_dir(spec.name)
         if not src.exists():
@@ -1362,20 +1363,14 @@ class AddonOpsMixin:
         target = target_home / spec.target_config_rel
         target.parent.mkdir(parents=True, exist_ok=True)
         self._chown_tree(target.parent, username)
-        if target.is_symlink():
-            try:
-                if target.resolve() == src.resolve():
-                    return [str(target)]
-            except OSError:
-                pass
-            target.unlink(missing_ok=True)
-        elif target.exists():
+        if target.exists() or target.is_symlink():
             if target.is_dir():
                 shutil.rmtree(target)
             else:
                 target.unlink()
-        target.symlink_to(src, target_is_directory=True)
-        self._chown_path(target, username)
+        shutil.copytree(src, target)
+        self._harden_private_tree_permissions(target)
+        self._chown_tree(target, username)
         return [str(target)]
 
     def _revoke_addon_from_home(self, addon: str, target_home: Path) -> list[str]:

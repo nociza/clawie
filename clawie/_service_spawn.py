@@ -273,6 +273,7 @@ class SpawnOpsMixin:
         return updated
 
     def _ensure_shared_claude_links(self, target_home: Path, username: str) -> list[str]:
+        """Copy seeded Claude config into an agent home as private files."""
         if not target_home.exists():
             return []
         if not os.access(target_home, os.W_OK | os.X_OK):
@@ -284,20 +285,22 @@ class SpawnOpsMixin:
         ]
         updated: list[str] = []
         for dst, src in targets:
-            if dst.is_symlink():
-                try:
-                    if dst.resolve() == src.resolve():
-                        continue
-                except OSError:
-                    pass
-                dst.unlink(missing_ok=True)
-            elif dst.exists():
+            if not src.exists():
+                continue
+            if dst.exists() or dst.is_symlink():
                 if dst.is_dir():
                     shutil.rmtree(dst)
                 else:
                     dst.unlink()
-            dst.symlink_to(src, target_is_directory=src.is_dir())
-            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False, capture_output=True)
+            if src.is_dir():
+                shutil.copytree(src, dst)
+                self._harden_private_tree_permissions(dst)
+                self._chown_tree(dst, username)
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                self._harden_private_path_permissions(dst)
+                self._chown_path(dst, username)
             updated.append(str(dst))
         return updated
 
@@ -329,12 +332,13 @@ class SpawnOpsMixin:
         ]
         for src, dst in mapping:
             if src.exists() and not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
                 updated.append(str(dst))
             if dst.exists():
                 current_mode = int(dst.stat().st_mode) & 0o777
-                if current_mode != 0o666:
-                    os.chmod(dst, 0o666)
+                if current_mode != 0o600:
+                    os.chmod(dst, 0o600)
                     if str(dst) not in updated:
                         updated.append(str(dst))
         return updated
@@ -368,18 +372,14 @@ class SpawnOpsMixin:
             if self._write_managed_text(path, content, 0o644):
                 updated.append(str(path))
 
-        # Directories that benefit from the sticky bit (any user can create
-        # their own entries but cannot delete other users' entries).
-        sticky_dirs = {"session-env", "projects", "tasks", "plans", "file-history", "todos"}
-
         shared_paths = [self.SHARED_CLAUDE_DIR]
         for token in self.SHARED_CLAUDE_SUBDIRS:
             shared_paths.append(self.SHARED_CLAUDE_DIR / token)
         for path in shared_paths:
             existed = path.exists()
             path.mkdir(parents=True, exist_ok=True)
-            target_mode = 0o1777 if path.name in sticky_dirs else 0o777
-            current_mode = int(path.stat().st_mode) & 0o1777
+            target_mode = 0o700
+            current_mode = int(path.stat().st_mode) & 0o777
             if (not existed) or current_mode != target_mode:
                 os.chmod(path, target_mode)
                 updated.append(str(path))
@@ -389,8 +389,8 @@ class SpawnOpsMixin:
             for child in self.SHARED_CLAUDE_DIR.iterdir():
                 if child.is_dir():
                     try:
-                        target_mode = 0o1777 if child.name in sticky_dirs else 0o777
-                        current_mode = int(child.stat().st_mode) & 0o1777
+                        target_mode = 0o700
+                        current_mode = int(child.stat().st_mode) & 0o777
                         if current_mode != target_mode:
                             os.chmod(child, target_mode)
                             if str(child) not in updated:
@@ -401,8 +401,8 @@ class SpawnOpsMixin:
                 if child.is_file() and not child.name.startswith("."):
                     try:
                         current_mode = int(child.stat().st_mode) & 0o777
-                        if current_mode != 0o666:
-                            os.chmod(child, 0o666)
+                        if current_mode != 0o600:
+                            os.chmod(child, 0o600)
                             if str(child) not in updated:
                                 updated.append(str(child))
                     except OSError:

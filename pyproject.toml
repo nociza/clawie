@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawie"
 version = "0.1.3"
-description = "CLI + TUI control plane for ZeroClaw provisioning and channel operations"
+description = "CLI control plane for openclaw agent provisioning and channel operations"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Clawie Team" }]
 dependencies = [
     # TOML parsing for provider channel discovery; stdlib tomllib exists on 3.11+.

@@ -14,11 +14,13 @@ from clawie.service_common import SetupError, AgentNotFoundError, now_iso, _defa
 class PromptOpsMixin:
 
     def apply_staged_prompts(self, agent_id: str) -> dict[str, Any]:
-        """Apply staged prompt files to an agent workspace.
+        """Apply prompt files from state directly to an agent workspace.
 
-        Runs the pickup shell snippet as the agent's linux_user so it has
-        write access to the workspace.  Requires root when linux_user differs
-        from the current user.
+        Older clawie releases used a world-writable /tmp handoff when the
+        manager user could not write the agent workspace. That is intentionally
+        disabled: core prompts are authority-bearing input, so applying them
+        now requires direct write access as root, the agent user, or a manager
+        user already granted workspace permissions.
         """
         self._require_setup()
         state = self.store.read_state()
@@ -32,33 +34,17 @@ class PromptOpsMixin:
         if not provider:
             raise SetupError(f"agent '{agent_id}' has no provider configured")
         linux_user = str(agent_info.get("linux_user", "")).strip()
-        spec = get_provider(provider)
-        pickup = self._staged_prompt_pickup_shell(provider, spec.state_dir, spec.workspace_dir)
-        cmd = self._user_shell_command(linux_user, pickup)
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            output = (result.stderr or result.stdout or "").strip()
-            raise SetupError(f"apply staged prompts failed: {output or f'exit {result.returncode}'}")
-        # Check what was applied by looking at what's no longer in staging
-        stage_dir = self._prompt_stage_dir(linux_user) if linux_user else None
-        remaining: list[str] = []
-        if stage_dir and stage_dir.is_dir():
-            remaining = [f.name for f in stage_dir.iterdir() if f.name.startswith(f"{provider}--")]
-        # Also write from DB to disk (may succeed now that workspace exists)
         home = self._agent_linux_home(agent)
-        if home:
-            self._write_prompt_files_for_home(provider, home, agent.get("core_prompts", {}), linux_user)
+        if not home:
+            raise SetupError(f"agent '{agent_id}' has no linux_user home to write prompts to")
+        before = self._read_core_prompts_from_home(provider, home)
+        self._write_prompt_files_for_home(provider, home, agent.get("core_prompts", {}), linux_user)
+        after = self._read_core_prompts_from_home(provider, home)
         applied = [
-            name.split("--", 1)[1] for name in
-            [f.name for f in (stage_dir.iterdir() if stage_dir and stage_dir.is_dir() else [])]
-            if name.startswith(f"{provider}--")
+            name for name, content in after.items()
+            if str(content) and str(before.get(name, "")) != str(content)
         ]
-        # If staging dir is now empty or doesn't exist, all were applied
-        prompts = agent.get("core_prompts", {})
-        prompt_names = [k for k in prompts if prompts[k]]
-        if not remaining:
-            applied = prompt_names
-        return {"agent_id": agent_id, "applied": applied, "remaining": remaining}
+        return {"agent_id": agent_id, "applied": applied, "remaining": []}
 
     def list_agent_core_prompts(self, agent_id: str) -> list[dict[str, Any]]:
         payload = self.get_dashboard_agent(agent_id)
@@ -208,23 +194,8 @@ class PromptOpsMixin:
 
     @staticmethod
     def _staged_prompt_pickup_shell(provider: str, state_dir: str, workspace_dir: str) -> str:
-        """Shell snippet that copies staged prompt files into the workspace.
-
-        Runs as the target user so it has write access to $HOME.
-        Staged files live at /tmp/clawie-prompt-stage/$USER/<provider>--<name>.
-        """
-        return (
-            f'STAGE_DIR="/tmp/clawie-prompt-stage/$USER"; '
-            f'WS="$HOME/{state_dir}/{workspace_dir}"; '
-            f'if [ -d "$STAGE_DIR" ]; then '
-            f'  mkdir -p "$WS"; '
-            f'  for f in "$STAGE_DIR"/{provider}--*; do '
-            f'    [ -f "$f" ] || continue; '
-            f'    name="${{f##*--}}"; '
-            f'    cp "$f" "$WS/$name" && rm -f "$f" 2>/dev/null; '
-            f'  done; '
-            f'fi'
-        )
+        """No-op placeholder kept for generated units from older call sites."""
+        return ":"
 
     @staticmethod
     def _provider_core_prompt_names(provider: str) -> tuple[str, ...]:
@@ -299,10 +270,6 @@ class PromptOpsMixin:
                 rows[name] = ""
         return rows
 
-    @classmethod
-    def _prompt_stage_dir(cls, linux_user: str) -> Path:
-        return cls._PROMPT_STAGE_ROOT / linux_user
-
     def _write_core_prompt_file(self, provider: str, home: Path, prompt_name: str, content: str) -> Path:
         path = self._core_prompt_path(provider, home, prompt_name)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,61 +301,22 @@ class PromptOpsMixin:
                 written.append(str(target))
             except PermissionError:
                 if linux_user:
-                    self._stage_prompt_file(linux_user, provider, name, content)
-                    staged.append(name)
+                    raise SetupError(
+                        "could not write core prompts directly to the agent workspace. "
+                        "Run with sudo/root or run 'sudo clawie agent fix-permissions "
+                        f"<agent-id>' to grant manager access; insecure /tmp prompt "
+                        "staging is disabled."
+                    )
                 else:
                     raise
-        if staged:
-            self._apply_staged_prompts_if_possible(provider, home, linux_user)
         return written
 
     def _stage_prompt_file(
         self, linux_user: str, provider: str, prompt_name: str, content: str,
     ) -> Path:
-        root = self._PROMPT_STAGE_ROOT
-        root.mkdir(parents=True, exist_ok=True, mode=0o1777)
-        try:
-            os.chmod(str(root), 0o1777)
-        except OSError:
-            pass
-        stage = self._prompt_stage_dir(linux_user)
-        # Per-user dir is 777 (no sticky) so the target user can delete files
-        # written by the manager user after copying them to the workspace.
-        stage.mkdir(parents=True, exist_ok=True, mode=0o777)
-        try:
-            os.chmod(str(stage), 0o777)
-        except OSError:
-            pass
-        target = stage / f"{provider}--{prompt_name}"
-        target.write_text(str(content), encoding="utf-8")
-        os.chmod(str(target), 0o666)
-        return target
+        raise SetupError("insecure /tmp prompt staging is disabled; write prompts directly instead")
 
     def _apply_staged_prompts_if_possible(
         self, provider: str, home: Path, linux_user: str,
     ) -> list[str]:
-        stage = self._prompt_stage_dir(linux_user)
-        if not stage.is_dir():
-            return []
-        applied: list[str] = []
-        prefix = f"{provider}--"
-        for entry in sorted(stage.iterdir()):
-            if not entry.name.startswith(prefix):
-                continue
-            prompt_name = entry.name[len(prefix):]
-            content = entry.read_text(encoding="utf-8")
-            try:
-                target = self._write_core_prompt_file(provider, home, prompt_name, content)
-                if linux_user and os.geteuid() == 0:
-                    subprocess.run(
-                        ["chown", f"{linux_user}:{linux_user}", str(target)],
-                        check=False,
-                        capture_output=True,
-                    )
-                applied.append(prompt_name)
-                entry.unlink(missing_ok=True)
-            except PermissionError:
-                continue
-        if applied and not any(stage.iterdir()):
-            stage.rmdir()
-        return applied
+        return []

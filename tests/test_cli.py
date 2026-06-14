@@ -280,14 +280,23 @@ def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
     assert downloads and downloads[0].endswith(".tar.gz")
 
 
-def test_relax_shared_path_permissions_preserves_execute_bits(tmp_path: Path) -> None:
-    path = tmp_path / "script.sh"
-    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    os.chmod(path, 0o755)
+def test_shared_toolchain_permissions_are_not_world_writable(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    toolchain = tmp_path / "toolchain"
+    bin_dir = toolchain / "bin"
+    bin_dir.mkdir(parents=True)
+    executable = bin_dir / "tool"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    os.chmod(toolchain, 0o777)
+    os.chmod(bin_dir, 0o777)
+    os.chmod(executable, 0o777)
 
-    ClawieService._relax_shared_path_permissions(path)
+    monkeypatch.setattr(ClawieService, "SHARED_TOOLCHAIN_DIR", toolchain)
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
+    service._ensure_shared_toolchain_root()
 
-    assert oct(path.stat().st_mode & 0o777) == "0o777"
+    assert (toolchain.stat().st_mode & 0o777) == 0o755
+    assert (bin_dir.stat().st_mode & 0o777) == 0o755
+    assert (executable.stat().st_mode & 0o777) == 0o755
 
 
 def test_parse_gws_status_output_marks_invalid_client_config_missing(tmp_path: Path) -> None:
@@ -1157,6 +1166,47 @@ def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys:
     assert str(dst.get("core_prompts", {}).get("SOUL.md", "")) == "source soul"
 
 
+def test_prompt_write_permission_error_does_not_stage_to_tmp(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+
+    home = tmp_path / "alice-home"
+    home.mkdir()
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+
+    def deny_write(*_args: object, **_kwargs: object) -> Path:
+        raise PermissionError("denied")
+
+    staged: list[str] = []
+
+    def fail_stage(*_args: object, **_kwargs: object) -> Path:
+        staged.append("called")
+        raise AssertionError("prompt staging should not be used")
+
+    monkeypatch.setattr(service, "_write_core_prompt_file", deny_write)
+    monkeypatch.setattr(service, "_stage_prompt_file", fail_stage)
+
+    with raises(SetupError, match="staging is disabled"):
+        service.write_agent_core_prompts_to_disk("alice")
+    assert staged == []
+
+
 def test_store_creates_sqlite_db(tmp_path: Path) -> None:
     store = StateStore(config_dir=tmp_path)
     store.ensure()
@@ -1430,8 +1480,10 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     assert "provider-auth" in sync["bundles"]
     assert "git" in sync["bundles"]
     assert (shared_home / ".codex" / "auth.json").exists()
-    assert (target_home / ".codex" / "auth.json").is_symlink()
-    assert (target_home / ".codex" / "auth.json").resolve() == (shared_home / ".codex" / "auth.json").resolve()
+    assert (shared_home / ".codex" / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (target_home / ".codex" / "auth.json").is_file()
+    assert not (target_home / ".codex" / "auth.json").is_symlink()
+    assert (target_home / ".codex" / "auth.json").stat().st_mode & 0o777 == 0o600
     assert (target_home / ".gitconfig").exists()
 
     revoked = service.revoke_agent_credentials("alice", bundles=["git"])
@@ -1519,10 +1571,16 @@ def test_import_shared_auth_from_codex_links_agents_and_exposes_status(
     assert payload["active_profiles"]["openai-codex"] == "openai-codex:default"
     native_payload = json.loads(native_path.read_text(encoding="utf-8"))
     assert native_payload["credentials"]["openai"]["access_token"] == "tok"
-    assert (target_home / ".picoclaw" / "auth.json").is_symlink()
-    assert (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".picoclaw" / "auth.json").is_file()
+    assert not (target_home / ".picoclaw" / "auth.json").is_symlink()
+    assert (target_home / ".picoclaw" / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (target_home / ".picoclaw" / "auth-profiles.json").is_file()
+    assert not (target_home / ".picoclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".picoclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
     assert not (target_home / ".zeroclaw" / "auth-profiles.json").is_symlink()
-    assert (target_home / ".codex" / "auth.json").is_symlink()
+    assert (target_home / ".codex" / "auth.json").is_file()
+    assert not (target_home / ".codex" / "auth.json").is_symlink()
+    assert (target_home / ".codex" / "auth.json").stat().st_mode & 0o777 == 0o600
     assert ["chown", "alice:alice", str(target_home / ".picoclaw")] in calls
 
     status = service.agent_auth_status("alice")
@@ -1576,7 +1634,7 @@ def test_import_shared_auth_from_codex_replaces_unwritable_shared_profile(
     assert result["auth"]["auth_status"] == "ready"
     openclaw_payload = json.loads(locked_profile.read_text(encoding="utf-8"))
     assert openclaw_payload["profiles"]["openai-codex:default"]["access"] == "tok"
-    assert (locked_profile.stat().st_mode & 0o666) == 0o666
+    assert (locked_profile.stat().st_mode & 0o777) == 0o600
 
 
 def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
@@ -1649,7 +1707,9 @@ def test_prepare_linked_auth_for_provider_switch_imports_codex_from_source_home(
     assert prepared["source_home"] == str(source_home)
     assert prepared["auth"]["auth_status"] == "ready"
     assert (shared_home / ".openclaw" / "auth-profiles.json").exists()
-    assert (target_home / ".openclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".openclaw" / "auth-profiles.json").is_file()
+    assert not (target_home / ".openclaw" / "auth-profiles.json").is_symlink()
+    assert (target_home / ".openclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_prepare_linked_auth_for_provider_switch_fails_when_no_source_credentials(
@@ -1867,7 +1927,9 @@ def test_prepare_picoclaw_home_backfills_missing_shared_native_auth_from_codex(
     )
 
     assert (shared_home / ".picoclaw" / "auth.json").exists()
-    assert (target_home / ".picoclaw" / "auth.json").is_symlink()
+    assert (target_home / ".picoclaw" / "auth.json").is_file()
+    assert not (target_home / ".picoclaw" / "auth.json").is_symlink()
+    assert (target_home / ".picoclaw" / "auth.json").stat().st_mode & 0o777 == 0o600
     config = json.loads((target_home / ".picoclaw" / "config.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["token"] == _fake_telegram_token()
 
@@ -2279,20 +2341,21 @@ def test_ensure_system_shared_runtime_seeds_claude_and_profiles(
     assert (profile_dir / "zz-fnm.sh").exists()
     assert (profile_dir / "20-claude-shared.sh").exists()
     assert "CLAUDE_CONFIG_DIR" in (profile_dir / "20-claude-shared.sh").read_text(encoding="utf-8")
+    assert "unset CLAUDE_CONFIG_DIR" in (profile_dir / "20-claude-shared.sh").read_text(encoding="utf-8")
     assert "unset XDG_RUNTIME_DIR" in (profile_dir / "zz-fnm.sh").read_text(encoding="utf-8")
 
     shared_credentials = shared_dir / ".credentials.json"
     shared_state = shared_dir / ".claude.json"
     assert shared_credentials.exists()
     assert shared_state.exists()
-    assert (shared_credentials.stat().st_mode & 0o777) == 0o666
-    assert (shared_state.stat().st_mode & 0o777) == 0o666
+    assert (shared_credentials.stat().st_mode & 0o777) == 0o600
+    assert (shared_state.stat().st_mode & 0o777) == 0o600
 
     assert str(shared_credentials) in updated
     assert str(profile_dir / "20-claude-shared.sh") in updated
 
 
-def test_ensure_shared_claude_links_points_home_to_shared_store(
+def test_ensure_shared_claude_links_copies_private_config_to_home(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -2318,6 +2381,7 @@ def test_ensure_shared_claude_links_points_home_to_shared_store(
         return Result()
 
     monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(ClawieService, "SHARED_CLAUDE_DIR", shared_dir)
 
     service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
@@ -2325,12 +2389,16 @@ def test_ensure_shared_claude_links_points_home_to_shared_store(
 
     assert str(target_home / ".claude") in updated
     assert str(target_home / ".claude.json") in updated
-    assert (target_home / ".claude").is_symlink()
-    assert (target_home / ".claude.json").is_symlink()
-    assert (target_home / ".claude").resolve() == shared_dir.resolve()
-    assert (target_home / ".claude.json").resolve() == (shared_dir / ".claude.json").resolve()
-    assert ["chown", "-h", "sam:sam", str(target_home / ".claude")] in calls
-    assert ["chown", "-h", "sam:sam", str(target_home / ".claude.json")] in calls
+    assert (target_home / ".claude").is_dir()
+    assert not (target_home / ".claude").is_symlink()
+    assert (target_home / ".claude" / ".claude.json").exists()
+    assert (target_home / ".claude.json").is_file()
+    assert not (target_home / ".claude.json").is_symlink()
+    assert (target_home / ".claude" / ".claude.json").read_text(encoding="utf-8") == '{"userID":"u1"}\n'
+    assert (target_home / ".claude.json").read_text(encoding="utf-8") == '{"userID":"u1"}\n'
+    assert (target_home / ".claude.json").stat().st_mode & 0o777 == 0o600
+    assert ["chown", "sam:sam", str(target_home / ".claude")] in calls
+    assert ["chown", "sam:sam", str(target_home / ".claude.json")] in calls
 
 
 def test_service_toggles_channel_plugin_and_autostart(tmp_path: Path) -> None:
@@ -2430,8 +2498,11 @@ def test_enable_agent_addon_imports_shared_gws_and_links_agent_home(
     assert result["addon"] == "gws"
     assert result["pending"] is False
     assert (shared_dir / "credentials.json").exists()
-    assert (target_home / ".config" / "gws").is_symlink()
-    assert (target_home / ".config" / "gws").resolve() == shared_dir.resolve()
+    assert (shared_dir / "credentials.json").stat().st_mode & 0o777 == 0o600
+    assert (target_home / ".config" / "gws").is_dir()
+    assert not (target_home / ".config" / "gws").is_symlink()
+    assert (target_home / ".config" / "gws" / "credentials.json").is_file()
+    assert (target_home / ".config" / "gws" / "credentials.json").stat().st_mode & 0o777 == 0o600
 
     addon_payload = service.get_agent_addons("alice")
     row = next(item for item in addon_payload["addons"] if item["addon"] == "gws")
@@ -2521,7 +2592,10 @@ def test_enable_agent_addon_can_trigger_shared_login_when_requested(
 
     assert calls == ["gws"]
     assert result["pending"] is False
-    assert (target_home / ".config" / "gws").is_symlink()
+    assert (target_home / ".config" / "gws").is_dir()
+    assert not (target_home / ".config" / "gws").is_symlink()
+    assert (target_home / ".config" / "gws" / "credentials.json").is_file()
+    assert (target_home / ".config" / "gws" / "credentials.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_get_agent_addons_reports_permission_for_other_linux_user(
@@ -3136,7 +3210,7 @@ def test_set_agent_provider_prefers_linked_auth_when_shared_provider_auth_is_rea
     assert info["auth_mode"] == "linked"
 
 
-def test_agent_auth_status_prefers_linked_for_shared_openclaw_auth_even_when_state_says_none(
+def test_agent_auth_status_reports_missing_until_shared_auth_is_copied(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -3191,7 +3265,8 @@ def test_agent_auth_status_prefers_linked_for_shared_openclaw_auth_even_when_sta
     status = service.agent_auth_status("teleclaw")
 
     assert status["auth_mode"] == "linked"
-    assert status["auth_status"] == "expired"
+    assert status["auth_status"] == "missing"
+    assert status["source"] == "none"
     assert status["shared_provider_auth"] is True
 
 
@@ -3256,7 +3331,9 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["agents"]["defaults"]["model"] == "openai/gpt-5.4"
-    assert (home / ".openclaw" / "auth-profiles.json").is_symlink()
+    assert (home / ".openclaw" / "auth-profiles.json").is_file()
+    assert not (home / ".openclaw" / "auth-profiles.json").is_symlink()
+    assert (home / ".openclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
     agent_auth = home / ".openclaw" / "agents" / "main" / "agent" / "auth-profiles.json"
     assert agent_auth.is_file()
     assert not agent_auth.is_symlink()

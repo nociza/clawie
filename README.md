@@ -12,9 +12,9 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Agent orchestration** — Delegate tasks across agents in recursive trees with automatic tier-based routing. Fast agents handle lookups, power agents handle analysis, balanced agents handle everything else.
 
-**Multi-provider fleet** — Run agents on openclaw, picoclaw, or zeroclaw. Switch providers with a single command. Authorize once, share credentials across agents, and port sessions between claws with `clawie auth port`.
+**Multi-provider fleet** — Run agents on openclaw, picoclaw, or zeroclaw. Switch providers with a single command. Authorize once, copy private credential material into eligible agent homes, and port sessions between claws with `clawie auth port`.
 
-**Linux isolation** — Each agent gets its own Linux user, home directory, and credential scope. No agent sees another's secrets.
+**Linux isolation** — Each agent gets its own Linux user and home directory. Credential files are copied into agent homes with private modes; agents do not read or mutate shared auth/cache files.
 
 **Continuous knowledge backup** — Agent prompts and memory are mirrored into a git repo on every maintenance pass, with secrets redacted and credentials excluded. Restore one agent or the whole fleet with `clawie backup restore`.
 
@@ -24,7 +24,7 @@ You have multiple agents across providers. Each needs its own config, credential
 
 - **Linux** (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, and `/tmp` — no macOS or Windows support.
 - **Python 3.10+**
-- **No external Python dependencies** — stdlib only.
+- **Python dependencies** — stdlib on Python 3.11+; Python 3.10 installs `tomli` for TOML parsing.
 - **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and `clawie status` work without root.
 - **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
 - **Terminal**: UTF-8 with color support for `status` output.
@@ -88,10 +88,10 @@ sudo clawie runtime create alice --user alice
 clawie runtime detect
 
 # Credentials
-clawie auth login picoclaw                        # authorize the shared store once
+clawie auth login picoclaw                        # authorize the manager-side store once
 clawie auth import openclaw --from codex          # adopt an existing session
 clawie auth port --from openclaw --to picoclaw    # port sessions between claws
-sudo clawie auth apply                            # link into all eligible agents
+sudo clawie auth apply                            # copy private auth files into eligible agents
 
 # Backup (git-backed, continuously maintained)
 clawie backup init --remote git@github.com:you/agent-backup.git

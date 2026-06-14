@@ -53,7 +53,7 @@ Credential sync uses a bundle model. Available bundles:
 
 | Bundle | Contents |
 |--------|----------|
-| `provider-auth` | Shared auth files (.codex/auth.json, auth-profiles.json) |
+| `provider-auth` | Provider auth files copied privately into the agent home (.codex/auth.json, auth-profiles.json) |
 | `git` | .gitconfig, .git-credentials, .config/gh, .ssh |
 
 ```bash

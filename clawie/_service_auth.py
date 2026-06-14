@@ -41,8 +41,8 @@ class ProviderAuthMixin:
         existing = self._read_json_file(target)
         payload = merge_provider_auth_profile(existing, imported)
         self._write_replaceable_json_file(target, payload)
-        self._relax_shared_path_permissions(target.parent)
-        self._relax_shared_path_permissions(target)
+        self._harden_private_path_permissions(target.parent)
+        self._harden_private_path_permissions(target)
         return [str(target)]
 
     def _write_picoclaw_auth_store(self, imported: dict[str, str]) -> list[str]:
@@ -51,8 +51,8 @@ class ProviderAuthMixin:
         existing = self._read_json_file(target)
         payload = merge_picoclaw_auth_store(existing, imported)
         self._write_replaceable_json_file(target, payload)
-        self._relax_shared_path_permissions(target.parent)
-        self._relax_shared_path_permissions(target)
+        self._harden_private_path_permissions(target.parent)
+        self._harden_private_path_permissions(target)
         return [str(target)]
 
     def _write_provider_auth_profiles(
@@ -95,6 +95,13 @@ class ProviderAuthMixin:
         return self._dedupe_paths(updated)
 
     def _ensure_shared_provider_auth_links(self, target_home: Path, username: str) -> list[str]:
+        """Copy shared provider auth into an agent home as private owned files.
+
+        Kept under the historical "links" name because callers and event keys
+        use it, but this no longer creates symlinks. The shared store is only a
+        manager-side cache; each agent gets its own 0600 copy so agents cannot
+        read or mutate one another's auth sessions through a shared inode.
+        """
         if not target_home.exists():
             return []
         shared_home = self._ensure_shared_provider_auth_root()
@@ -103,23 +110,20 @@ class ProviderAuthMixin:
             src = shared_home / rel
             if not self._path_exists(src):
                 continue
+            if rel == ".openclaw/auth-profiles.json":
+                self._repair_openclaw_auth_store(src)
             dst = target_home / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             self._chown_tree(dst.parent, username)
-            if dst.is_symlink():
-                try:
-                    if dst.resolve() == src.resolve():
-                        continue
-                except OSError:
-                    pass
-                dst.unlink(missing_ok=True)
-            elif dst.exists():
+            if dst.exists() or dst.is_symlink():
                 if dst.is_dir():
                     shutil.rmtree(dst)
                 else:
                     dst.unlink()
-            dst.symlink_to(src)
-            subprocess.run(["chown", "-h", f"{username}:{username}", str(dst)], check=False, capture_output=True)
+            shutil.copy2(src, dst)
+            self._harden_private_path_permissions(dst.parent)
+            self._harden_private_path_permissions(dst)
+            self._chown_tree(dst, username)
             updated.append(str(dst))
         return updated
 
@@ -185,6 +189,7 @@ class ProviderAuthMixin:
             else:
                 target.unlink()
         shutil.copy2(source, target)
+        self._harden_private_path_permissions(target)
         self._chown_tree(target, linux_user)
 
     def _repair_openclaw_auth_store(self, path: Path) -> bool:
@@ -244,6 +249,7 @@ class ProviderAuthMixin:
 
         if changed:
             self._write_json_file(path, payload)
+            self._harden_private_path_permissions(path)
         return changed
 
     def shared_auth_status(self, provider: str) -> dict[str, Any]:
@@ -291,7 +297,7 @@ class ProviderAuthMixin:
             linux_user="",
             home=shared_home,
         )
-        self._relax_shared_provider_auth_permissions()
+        self._harden_shared_provider_auth_permissions()
         applied = self.apply_shared_auth_links()
         payload.update(
             {
@@ -347,7 +353,7 @@ class ProviderAuthMixin:
         else:
             raise ValueError("source must be one of: provider, codex, claude")
 
-        self._relax_shared_provider_auth_permissions()
+        self._harden_shared_provider_auth_permissions()
         applied = self.apply_shared_auth_links()
         auth = self.shared_auth_status(name)
         restart_required_agents = (
@@ -368,12 +374,13 @@ class ProviderAuthMixin:
         }
 
     def port_shared_auth(self, from_provider: str, to_provider: str) -> dict[str, Any]:
-        """Port shared linked-auth sessions from one claw provider to another.
+        """Port shared provider-auth sessions from one claw provider to another.
 
         Reads the shared auth store for *from_provider*, normalizes every
         usable profile, and merges them into *to_provider*'s shared auth store
         (including picoclaw's native ``auth.json`` when applicable). Agents
-        that consume the shared provider-auth bundle are re-linked afterwards.
+        that consume the shared provider-auth bundle receive fresh private
+        copies afterwards.
         """
         self._require_setup()
         src = get_provider(str(from_provider).strip().lower())
@@ -394,7 +401,7 @@ class ProviderAuthMixin:
         updated: list[str] = []
         for profile in profiles:
             updated.extend(self._write_provider_auth_profiles([dst.name], profile))
-        self._relax_shared_provider_auth_permissions()
+        self._harden_shared_provider_auth_permissions()
         applied = self.apply_shared_auth_links()
         auth = self.shared_auth_status(dst.name)
 
@@ -616,8 +623,8 @@ class ProviderAuthMixin:
             allow_defaults=True,
         )
         auth_mode = str(auth.get("auth_mode", get_provider(provider).default_auth_mode))
-        inspect_linux_user = "" if shared_provider_auth else linux_user
-        inspect_home = self._shared_provider_auth_home() if shared_provider_auth else home
+        inspect_linux_user = linux_user
+        inspect_home = home
         payload = self._inspect_provider_auth_state(
             provider=provider,
             auth_mode=auth_mode,
@@ -670,7 +677,7 @@ class ProviderAuthMixin:
             {
                 "agent_id": token,
                 "linux_user": linux_user,
-                "home": str(self._shared_provider_auth_home() if shared_provider_auth else (home or "")),
+                "home": str(home or ""),
                 "shared_provider_auth": shared_provider_auth,
                 "local_user": False,
             }

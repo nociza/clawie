@@ -119,8 +119,11 @@ class ClawieService(
     )
     GLOBAL_CLAUDE_PROFILE_CONTENT = "\n".join(
         [
-            "# Managed by clawie: shared Claude Code auth/config directory.",
-            'export CLAUDE_CONFIG_DIR="/var/lib/clawie/claude-shared"',
+            "# Managed by clawie: use each user's private Claude Code config directory.",
+            "# Older clawie releases exported CLAUDE_CONFIG_DIR=/var/lib/clawie/claude-shared.",
+            'if [ "${CLAUDE_CONFIG_DIR:-}" = "/var/lib/clawie/claude-shared" ]; then',
+            "  unset CLAUDE_CONFIG_DIR",
+            "fi",
             "",
         ]
     )
@@ -187,7 +190,6 @@ class ClawieService(
             "  esac",
             "fi",
             'export PNPM_HOME="$HOMEBREW_PREFIX/bin"',
-            'export CLAUDE_CONFIG_DIR="/var/lib/clawie/claude-shared"',
             'export CLAWIE_SHARED_TOOLCHAIN="/var/lib/clawie/toolchain"',
             'if [ -d "$CLAWIE_SHARED_TOOLCHAIN/bin" ]; then',
             '  case ":$PATH:" in',
@@ -540,9 +542,6 @@ class ClawieService(
         )
         if len(events) > self.EVENT_LIMIT:
             state["events"] = events[-self.EVENT_LIMIT :]
-
-    # ── prompt staging ──────────────────────────────────────────────
-    _PROMPT_STAGE_ROOT = Path("/tmp/clawie-prompt-stage")
 
     _DELEGATION_AGENTS_MARKER = "<!-- clawie-delegation-boot-begin -->"
     _DELEGATION_AGENTS_MARKER_END = "<!-- clawie-delegation-boot-end -->"

@@ -59,10 +59,10 @@ declarative artifact is the spine of the redesign.
 | # | Crack | Evidence |
 |---|---|---|
 | C1 | Delegation has **no brain connected** — every REPL handler echoes; the real LLM is the gateway daemon, which never listens on the delegation socket. Tiers/budgets are simulated (`model_id="fast"`, `len//4`). | `delegation.py:935`, `_service_agents.py:1516` |
-| C2 | **Secrets are world-relaxed, systematically.** `_relax_shared_path_permissions` sets all three shared stores (provider-auth, addon-auth, toolchain) to 0o777 dirs / 0o666 files, then symlinks them into every agent home. OAuth access+refresh tokens are world read/write. | `_service_shared.py:167`, `:88` |
-| C3 | **clawie patches a vendored binary** (`@anthropic-ai/claude-code/cli.js`, `mode:384`→`438`) to weaken file modes — guaranteed to break on upgrade and a security regression. | `_service_spawn.py:323` |
-| C4 | **Prompt injection via world-writable `/tmp`.** Staged prompts (0o666 in a 0o777 dir) are copied into an agent's workspace as core prompts by maintenance. | `_service_prompts.py:345` |
-| C5 | **Isolation claim is false.** README says "no agent sees another's secrets," but the shared-store happy path gives all agents one upstream identity, world-readable; the `git` bundle copies the manager's `.ssh`/`.git-credentials` into agent homes. | `README.md:17`, `service.py` `CREDENTIAL_BUNDLE_SPECS` |
+| C2 | **Previously fixed:** shared credential stores were world-relaxed and symlinked into agent homes. Current code keeps provider/addon caches manager-private and copies `0600` files into agent homes; shared toolchain paths are `0755`/non-world-writable files. | `_service_shared.py`, `_service_auth.py`, `_service_addons.py` |
+| C3 | **Previously fixed:** clawie patched a vendored Claude binary (`@anthropic-ai/claude-code/cli.js`, `mode:384`→`438`) to weaken file modes. Current code seeds per-user Claude state with private modes instead. | `_service_spawn.py` |
+| C4 | **Previously fixed:** prompt staging used a world-writable `/tmp` handoff. Current code disables `/tmp` prompt staging and writes prompt files directly into the managed workspace. | `_service_prompts.py` |
+| C5 | **Upstream identity is still shared by policy.** Provider-auth files are now private copies, but agents that consume the shared provider-auth bundle still act as the same upstream account; the `git` bundle can still copy the manager's `.ssh`/`.git-credentials` into agent homes. | `service.py` `CREDENTIAL_BUNDLE_SPECS` |
 | C6 | **Imperative orchestration with hand-rolled rollback** — `switch_agent_provider` is a ~250-line saga; spawn is a long imperative sequence. Correct today, fragile on the next edit. | `_service_agents.py:241` |
 | C7 | **State accretion** — `users`/`agents` duality in the hot path (~40×), `ZeroClawService` naming, version skew (`__init__` 0.1.1 vs pyproject 0.1.3). | `store.py`, `service.py:51` |
 | C8 | **Provider schema knowledge is smeared**, and auth coupling spans three external formats with no seam. | `_service_agents.py:594`, `auth_sources.py` |
@@ -84,8 +84,8 @@ declarative artifact is the spine of the redesign.
 4. **Providers are adapters.** openclaw is the reference adapter; core knows no
    provider's file schema. Adding hermes is a new file.
 5. **Trust precedes autonomy.** The security fixes (Phase 2) gate the control
-   agent (Phase 4). Never hand an LLM root + repo-write while tokens are
-   world-writable.
+   agent (Phase 4). Never hand an LLM root + repo-write while credentials are
+   broadly shared or weakly scoped.
 6. **Gate in code, not in the prompt.** Capability limits and confirmations are
    enforced by the tool/RPC layer, because prompt-only boundaries fail under
    injection.
@@ -308,10 +308,10 @@ This is the load-bearing section; Phase 4 must not ship before it.
 
 | Fix | From → To | Source |
 |---|---|---|
-| **Stop world-relaxing stores** | `_relax_shared_path_permissions` (0o777/0o666 on provider-auth, addon-auth, toolchain) → per-agent links/copies at **0o600**, or a 0o700 broker process that hands tokens to the agent user only | audit: `_service_shared.py:167` (C2) |
+| **Stop world-relaxing stores** | previous world-relaxed provider-auth/addon-auth/toolchain stores → manager-private caches plus per-agent **0o600** copies; shared toolchain directories `0755`, files non-world-writable | C2 |
 | **Per-agent auth by default** | one shared upstream identity for all → each agent references its own profile (`scope="agent"`); shared is explicit opt-in | C5 |
 | **Remove the binary patch** | rewriting `claude-code/cli.js` modes → per-agent `CLAUDE_CONFIG_DIR` with 0o600 credentials | `_service_spawn.py:323` (C3) |
-| **Close the `/tmp` inject vector** | staging at 0o666 in 0o777 `/tmp` dir, picked up as core prompts → stage inside the manageable boundary (agent-owned 0o700), validate provenance/ownership before apply | `_service_prompts.py:345` (C4) |
+| **Close the `/tmp` inject vector** | previous `/tmp` prompt handoff → direct workspace writes only; sudo or manager group access is required when normal permissions block writes | C4 |
 | **Scope the git bundle** | copying the manager's `.ssh`/`.git-credentials` into agent homes → per-agent deploy keys / no implicit identity copy | C5 |
 | **Reconcile the claims** | README "no agent sees another's secrets" → make it true, or state the real model plainly | `README.md:17` |
 | **Control-plane token** | (new) the control agent's GitHub token is a dedicated **0o600** secret **outside** every shared/relaxed store; never a credential bundle or addon | §9, C2 |
@@ -643,14 +643,14 @@ suite is green at every commit (298 → 395 tests).
 |---|---|---|
 | **0** Adapter seam + version gate | **Done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; `ZeroClawService`→`ClawieService`; `clawie runtime version` |
 | **1** Real delegation bridge | **Core done** | per-agent gateway endpoint (port + token) written into `openclaw.json`, token redacted from backups; `deliver_to_agent()` via the gateway (adapter-driven, injectable runner); `clawie delegation deliver` |
-| **2** Trust / security | **Partial** | `cli.js` binary patch removed. **Remaining:** de-relax the three shared stores (needs a `clawie` shared-group mechanism + real multi-user verification), close the `/tmp` prompt-staging vector, per-agent auth default |
+| **2** Trust / security | **Mostly done** | `cli.js` binary patch removed; provider-auth and addon-auth caches are private manager-side stores; agents receive owned `0600` credential copies instead of symlinks; shared toolchain is no longer world-writable; `/tmp` prompt staging is disabled. **Remaining:** per-agent auth default / UX and real multi-user host verification |
 | **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`. **Remaining:** the `clawied` single-writer daemon and wiring reconcile into the service to retire the provider-switch saga |
 | **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed). **Remaining:** the control-agent runtime (RPC surface, GitHub escalation, watchdog), gated behind Phase 2 |
 | **5** Hardening + hermes | **Seam done** | `HermesAdapter` + a parametrized adapter contract test prove extensibility. hermes is an honest scaffold (read-only until pinned to real source). **Remaining:** real hermes contract; resource telemetry; `cli.py` split |
 
-**Deferred with rationale:** Phase 2's store de-relax would ship an unverifiable
-permission change to the credential store — it needs a new shared-group mechanism
-and a real multi-user host to verify, so landing it blind is too risky. Phase 3's
-`clawied` daemon and Phase 4's control-agent runtime are large new subsystems for
-subsequent focused sessions; their pure cores (reconcile, the gate) are landed and
-tested, so the runtimes have a verified foundation to build on.
+**Deferred with rationale:** Phase 2 still needs a real multi-user host pass and
+the UX change from shared-provider auth by default to per-agent auth by default.
+Phase 3's `clawied` daemon and Phase 4's control-agent runtime are large new
+subsystems for subsequent focused sessions; their pure cores (reconcile, the
+gate) are landed and tested, so the runtimes have a verified foundation to build
+on.

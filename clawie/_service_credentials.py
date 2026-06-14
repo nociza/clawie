@@ -425,7 +425,7 @@ class CredentialOpsMixin:
             requested_provider=requested_provider,
         )
         updated.extend(self._ensure_shared_provider_auth_links(target_home=target_home, username=username))
-        self._relax_shared_provider_auth_permissions()
+        self._harden_shared_provider_auth_permissions()
         return self._dedupe_paths(updated)
 
     def _copy_selected_paths(

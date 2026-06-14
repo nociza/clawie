@@ -28,7 +28,7 @@ clawie status
 
 ## Requirements
 
-Linux with Python 3.10+. No external Python dependencies. Root/sudo needed for runtime isolation. See [Requirements & Limitations](requirements.md) for full details.
+Linux with Python 3.10+. Python 3.10 installs `tomli`; Python 3.11+ uses only the standard library. Root/sudo needed for runtime isolation. See [Requirements & Limitations](requirements.md) for full details.
 
 ## Documentation
 

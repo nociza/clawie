@@ -32,7 +32,7 @@ Credentials are synced in scoped bundles:
 
 | Bundle | Contents |
 |--------|----------|
-| `provider-auth` (default) | .codex/auth.json, auth-profiles.json, shared auth links |
+| `provider-auth` (default) | .codex/auth.json and provider auth stores copied into the agent home as private files |
 | `git` | .gitconfig, .git-credentials, .config/gh, .ssh |
 
 ```bash
@@ -62,7 +62,7 @@ sudo clawie agent credentials sync alice git --source-home /home/admin
 sudo clawie agent credentials revoke alice git
 ```
 
-Revoking removes the credential files from the agent home and updates the policy so they stay revoked until re-enabled.
+Revoking removes the credential files from the agent home and updates the policy so they stay revoked until re-enabled. Shared provider-auth and addon-auth caches are manager-side only; agents receive owned copies rather than symlinks to shared credential files.
 
 ## Detect installed runtimes
 

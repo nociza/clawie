@@ -71,7 +71,7 @@ Porting:
   picoclaw's native `auth.json`),
 - merges them into the target store in the target's native format, keeping
   the active profile active,
-- re-links all agents that consume the shared provider-auth bundle, and
+- copies provider auth into all agents that consume the shared provider-auth bundle, and
 - tells you which agents need a service restart to pick up the new auth.
 
 If the source store is empty you'll get a pointer to `clawie auth login` /
@@ -84,7 +84,7 @@ clawie agent auth show alice
 sudo clawie agent auth login alice
 ```
 
-Agents with shared auth linked will use the shared store automatically.
+Agents with shared auth enabled use their private copy of the shared store.
 
 ## Provider switching
 

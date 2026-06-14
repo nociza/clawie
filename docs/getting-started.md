@@ -18,7 +18,7 @@ uv tool install clawie
 uv tool install -e .
 ```
 
-No external Python dependencies — stdlib only.
+Python 3.10 installs `tomli`; Python 3.11+ uses only the standard library.
 
 ## Configure
 

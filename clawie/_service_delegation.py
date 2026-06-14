@@ -204,7 +204,7 @@ class DelegationOpsMixin:
         return {"enabled": False, "removed": removed}
 
     def maintenance_run(self) -> dict[str, Any]:
-        """Run maintenance tasks: sync credentials and apply staged prompts for all managed agents."""
+        """Run maintenance tasks: sync credentials and write configured prompts for all managed agents."""
         self._require_setup()
 
         # First, refresh the shared auth store from the freshest source (codex).
@@ -250,11 +250,11 @@ class DelegationOpsMixin:
             else:
                 entry["credentials"] = "skipped (no bundles)"
 
-            # Apply staged prompts
+            # Write configured prompts directly into the agent workspace.
             try:
                 applied = self.apply_staged_prompts(agent_id)
                 count = len(applied.get("applied", []))
-                entry["prompts"] = f"ok ({count} applied)" if count else "ok (none staged)"
+                entry["prompts"] = f"ok ({count} applied)" if count else "ok (no changes)"
             except Exception as exc:
                 entry["prompts"] = f"error: {exc}"
                 errors += 1

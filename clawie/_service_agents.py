@@ -14,7 +14,7 @@ from clawie.providers import (
 )
 from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
 
-# Agent IDs become file names (prompt staging, backups), channel prefixes, and
+# Agent IDs become file names, backup paths, channel prefixes, and
 # default Linux usernames; keep them path- and shell-safe.
 _AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -1060,7 +1060,7 @@ class AgentOpsMixin:
         unaffected—only group bits are widened.
 
         After running this once (with sudo), the manager can write prompt
-        files, update configs, and apply staged prompts without root.
+        files and update configs without root.
         """
         self._require_setup()
         if os.geteuid() != 0:

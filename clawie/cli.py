@@ -786,7 +786,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
     apply_prompts_parser = service_sub.add_parser(
         "apply-prompts",
-        help="Apply staged prompt files to an agent workspace (may require sudo)",
+        help="Write configured prompt files to an agent workspace (may require sudo)",
     )
     _add_positional_argument(
         apply_prompts_parser,
@@ -1434,7 +1434,7 @@ def cmd_shared_auth_apply(args: argparse.Namespace, service: ClawieService) -> i
     agent_id = str(args.agent_id or "").strip() or None
     result = service.apply_shared_auth_links(agent_id=agent_id)
     target = agent_id or "eligible agents"
-    print_success(f"Applied shared auth links for {target}")
+    print_success(f"Applied shared auth copies for {target}")
     print_info(f"Shared home: {result.get('home', '')}")
     updated_agents = result.get("updated_agents", [])
     print_info("Updated agents: " + (", ".join(str(item) for item in updated_agents) or "<none>"))
@@ -1904,7 +1904,7 @@ def cmd_agents_apply_prompts(args: argparse.Namespace, service: ClawieService) -
             print_info(f"Could not restart service: {exc}")
             print_info("Run 'clawie agent service restart " + agent_id + "' manually.")
     else:
-        print_info(f"No staged prompts to apply for {agent_id}")
+        print_info(f"No prompt changes to apply for {agent_id}")
     return 0
 
 
@@ -3110,7 +3110,7 @@ def cmd_delegation_status(args: argparse.Namespace, service: ClawieService) -> i
 def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     maint = subparsers.add_parser(
         "maintenance",
-        help="Manage periodic maintenance cron jobs (credential sync, prompt apply)",
+        help="Manage periodic maintenance cron jobs (credential sync, prompt sync)",
     )
     maint_sub = maint.add_subparsers(
         dest="maintenance_command",
@@ -3142,7 +3142,7 @@ def _build_maintenance_parser(subparsers: argparse._SubParsersAction[argparse.Ar
 
     maint_run = maint_sub.add_parser(
         "run",
-        help="Run maintenance tasks now (sync credentials, apply staged prompts)",
+        help="Run maintenance tasks now (sync credentials, write configured prompts)",
     )
     maint_run.set_defaults(func=cmd_maintenance_run)
 

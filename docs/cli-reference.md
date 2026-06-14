@@ -63,6 +63,7 @@ clawie agent provider set AGENT_ID PROVIDER
 
 ```bash
 clawie agent service start|stop|restart|status AGENT_ID
+clawie agent service apply-prompts AGENT_ID
 ```
 
 ### agent credentials
@@ -143,12 +144,12 @@ clawie addon auth import ADDON [--source-home PATH] [--from-agent A]
 clawie maintenance status
 clawie maintenance enable [--interval N]   # install the maintenance cron (root)
 clawie maintenance disable                 # remove the cron (root)
-clawie maintenance run                     # sync credentials, apply prompts, run backup
+clawie maintenance run                     # sync credentials, write prompts, run backup
 ```
 
-Each pass refreshes shared auth, syncs agent credentials, applies staged
-prompts, and — when backup is enabled — commits knowledge changes to the
-backup repo.
+Each pass refreshes shared auth, syncs private credential copies into agent
+homes, writes configured prompts directly when it has permission, and — when
+backup is enabled — commits knowledge changes to the backup repo.
 
 ## dashboard (deprecated)
 

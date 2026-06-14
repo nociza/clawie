@@ -14,7 +14,7 @@ automatically**. Credentials never enter the repo.
 
 What is deliberately **excluded**:
 
-- Credential material — auth files, symlinks into the shared auth store,
+- Credential material — auth files, copied provider/addon credential material,
   key/PEM files, and any file whose name looks credential-like
   (`*token*`, `*secret*`, `*auth*`, ...). A `.gitignore` safety net backs
   this up at the git layer.
@@ -38,7 +38,7 @@ clawie backup run
 sudo clawie maintenance enable --interval 4
 ```
 
-Every maintenance pass now syncs credentials, applies staged prompts, **and
+Every maintenance pass now syncs credentials, writes configured prompts, **and
 commits/pushes knowledge changes**. `clawie status` shows the backup section
 alongside everything else.
 
@@ -90,7 +90,7 @@ output and the `maintenance.run` event both record the backup outcome:
 ```
 $ clawie maintenance run
   Auth refresh: ok (codex from /home/you)
-  alice: credentials=ok  prompts=ok (none staged)  [ok]
+  alice: credentials=ok  prompts=ok (no changes)  [ok]
   Backup: ok (commit 3887d3a2c6)
   Total: 1 agents, 0 skipped, 0 errors
 ```

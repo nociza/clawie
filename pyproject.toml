@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawie"
-version = "0.1.5"
+version = "0.1.6"
 description = "Local CLI control plane for provisioning, orchestrating, and monitoring AI agent fleets"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Clawie Team" }]
 keywords = ["agents", "ai", "automation", "cli", "control-plane", "orchestration"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",

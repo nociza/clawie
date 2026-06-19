@@ -97,7 +97,7 @@ agent's sensitive paths. A skipped or failed report is not production evidence.
 The repository includes a Linux/root container proof in
 [`docs/proofs/host-validation-linux-container-2026-06-14.md`](proofs/host-validation-linux-container-2026-06-14.md);
 the built wheel also has a Colima Linux/systemd aggregate proof in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.5-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-0.1.5-2026-06-14.md).
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md).
 Repeat the verifier on any different deployment host before accepting that host.
 
 For full target-host acceptance, run the aggregate verifier:

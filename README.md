@@ -152,7 +152,7 @@ See [docs/backup.md](docs/backup.md).
 - **Single machine** — all agent communication is over localhost Unix sockets. No network/multi-host delegation.
 - **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
 - **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout.
-- **SQLite storage** — uses an agents-only state table, WAL, and a busy timeout; `clawied` hosts manifest reconcile cycles, mutating CLI service operations, and a capability-gated control-tool RPC. Linux/root host validation has container proof, and the built wheel has a Colima Linux/systemd `production verify --exercise-watchdog-restart` proof in `docs/proofs/`. Repeat that verifier on any different deployment host before accepting that host; picoclaw/zeroclaw delegated-task delivery remains gated until their runtime contracts are source-pinned.
+- **SQLite storage** — uses an agents-only state table, WAL, and a busy timeout; `clawied` hosts manifest reconcile cycles, mutating CLI service operations, and a capability-gated control-tool RPC. Linux/root host validation has container proof, and the built `0.1.6` wheel has a Colima Linux/systemd `production verify --exercise-watchdog-restart --all-provider-contracts` proof in `docs/proofs/`. Repeat that verifier on any different deployment host before accepting that host; picoclaw/zeroclaw delegated-task delivery remains gated until their runtime contracts are source-pinned.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.

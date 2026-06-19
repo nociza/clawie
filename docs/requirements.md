@@ -91,7 +91,7 @@ runtime adapter contract checks. Package release acceptance should add
 source-pinned delivery adapter contract. Running without
 `--exercise-watchdog-restart` is a non-destructive dry check and cannot produce
 a production pass. The built wheel has a Colima Linux/systemd proof recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.5-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-0.1.5-2026-06-14.md);
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md);
 repeat the same verifier on any different deployment host before accepting that
 host.
 

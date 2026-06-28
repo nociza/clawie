@@ -182,3 +182,24 @@ def test_store_migrates_legacy_users_table_to_agents(tmp_path: Path) -> None:
         }
     assert "agents" in tables
     assert "users" not in tables
+
+
+def test_store_add_column_tolerates_concurrent_duplicate_column_race() -> None:
+    class FakeCursor:
+        def fetchall(self) -> list[dict[str, str]]:
+            return [{"name": "task_id"}]
+
+    class FakeConnection:
+        def execute(self, sql: str) -> FakeCursor:
+            if sql.startswith("PRAGMA table_info"):
+                return FakeCursor()
+            if sql.startswith("ALTER TABLE"):
+                raise sqlite3.OperationalError("duplicate column name: model_tier")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    StateStore._add_column_if_missing(
+        FakeConnection(),  # type: ignore[arg-type]
+        "delegation_tasks",
+        "model_tier",
+        "TEXT DEFAULT ''",
+    )

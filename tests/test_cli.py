@@ -36,7 +36,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.6" in capsys.readouterr().out
+    assert "clawie 0.1.7" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 
@@ -6373,6 +6373,33 @@ def test_performance_snapshot_includes_local_user_claw_rows(
     assert "@local:zeroclaw" in ids
 
 
+def test_performance_snapshot_survives_denied_ps_process_list(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    monkeypatch.setattr(service, "list_installed_claws", lambda source_home=None: [])
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-eo"]:
+            raise PermissionError("ps denied")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    snapshot = service.performance_snapshot(refresh=False)
+
+    assert snapshot["rows"] == []
+    assert snapshot["totals"]["agents"] == 0
+
+
 def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -6427,6 +6454,25 @@ def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
     assert row["cpu_percent"] == 1.5
     assert row["mem_percent"] == 2.5
     assert row["rss_kb"] == 4096
+
+
+def test_probe_process_falls_back_when_ps_is_denied(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    fallback = {"cpu_percent": 0.0, "mem_percent": 0.0, "rss_kb": 2048}
+
+    def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd[:2] == ["ps", "-p"]:
+            raise PermissionError("ps denied")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(service, "_probe_process_cgroup", lambda pid: None)
+    monkeypatch.setattr(service, "_probe_process_procfs", lambda pid: fallback)
+
+    assert service._probe_process(12345) == fallback
 
 
 def test_collect_metrics_uses_live_provider_process_when_stored_pid_is_empty(

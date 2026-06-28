@@ -293,19 +293,44 @@ class StateStore:
     def _migrate_delegation_schema(self) -> None:
         """Add model_tier and context_budget columns if missing."""
         with self._connect() as conn:
-            cols = {
-                str(row["name"])
-                for row in conn.execute("PRAGMA table_info(delegation_tasks)").fetchall()
-            }
-            if "model_tier" not in cols:
-                conn.execute(
-                    "ALTER TABLE delegation_tasks ADD COLUMN model_tier TEXT DEFAULT ''"
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._add_column_if_missing(
+                    conn,
+                    "delegation_tasks",
+                    "model_tier",
+                    "TEXT DEFAULT ''",
                 )
-            if "context_budget" not in cols:
-                conn.execute(
-                    "ALTER TABLE delegation_tasks ADD COLUMN context_budget TEXT DEFAULT '{}'"
+                self._add_column_if_missing(
+                    conn,
+                    "delegation_tasks",
+                    "context_budget",
+                    "TEXT DEFAULT '{}'",
                 )
-            conn.commit()
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _add_column_if_missing(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        cols = {
+            str(row["name"])
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column in cols:
+            return
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" in str(exc).lower():
+                return
+            raise
 
     # ------------------------------------------------------------------
     # Delegation task CRUD

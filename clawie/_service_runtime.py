@@ -928,8 +928,11 @@ class RuntimeOpsMixin:
         if pid <= 0:
             return None
         cmd = ["ps", "-p", str(pid), "-o", "%cpu=,%mem=,rss="]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         cgroup_probe = self._probe_process_cgroup(pid)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except OSError:
+            return cgroup_probe or self._probe_process_procfs(pid)
         if result.returncode != 0 or not result.stdout.strip():
             return cgroup_probe or self._probe_process_procfs(pid)
         parts = result.stdout.strip().split()
@@ -1335,7 +1338,10 @@ class RuntimeOpsMixin:
         }
 
     def _running_provider_daemons_by_user(self) -> dict[str, list[dict[str, Any]]]:
-        result = subprocess.run(["ps", "-eo", "user=,pid=,args="], capture_output=True, text=True, check=False)
+        try:
+            result = subprocess.run(["ps", "-eo", "user=,pid=,args="], capture_output=True, text=True, check=False)
+        except OSError:
+            return {}
         if result.returncode != 0:
             return {}
 

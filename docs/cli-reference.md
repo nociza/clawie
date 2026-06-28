@@ -259,7 +259,7 @@ production delivery provider. A production pass requires
 `--exercise-watchdog-restart`; without it the command can still report the
 structural watchdog checks, but exits nonzero because restart behavior was not
 proved. The built wheel has a Colima Linux/systemd proof recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md`](proofs/production-verify-colima-systemd-wheel-0.1.6-2026-06-14.md);
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md);
 rerun the verifier on any different deployment host before accepting that host.
 
 ## backup

@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+*.whl
+*.tar.gz
+*.egg
 *.pyc
 
 lattice/

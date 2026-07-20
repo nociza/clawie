@@ -115,8 +115,27 @@ def test_confirm_expired_denied() -> None:
     assert "expired" in result.reason
 
 
-def test_empty_allowlist_does_not_restrict_confirmer() -> None:
+def test_empty_allowlist_fails_closed() -> None:
     gate = ControlGate()  # no allowlist configured
     pending = gate.authorize("delete_agent", {})
     result = gate.confirm(pending.nonce, confirmer="anyone", verb="delete_agent", args={})
-    assert result.allowed is True
+    assert result.decision is Decision.DENY
+    assert "allowlist is empty" in result.reason
+
+
+def test_pending_confirmations_are_bounded() -> None:
+    gate = ControlGate(allowlist=["ops"], max_pending=1)
+    first = gate.authorize("delete_agent", {"agent_id": "one"})
+
+    exhausted = gate.authorize("delete_agent", {"agent_id": "two"})
+
+    assert exhausted.decision is Decision.DENY
+    assert exhausted.reason == "too many pending confirmations"
+    assert gate.pending_count() == 1
+    confirmed = gate.confirm(
+        first.nonce,
+        confirmer="ops",
+        verb="delete_agent",
+        args={"agent_id": "one"},
+    )
+    assert confirmed.allowed is True

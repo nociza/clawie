@@ -371,6 +371,47 @@ class TestAgentREPL:
         finally:
             repl.stop()
 
+    def test_timed_out_handlers_consume_bounded_worker_capacity(self) -> None:
+        release = threading.Event()
+
+        def blocked_handler(_msg: Message, _repl: AgentREPL) -> dict:
+            release.wait(timeout=5.0)
+            return {}
+
+        repl = AgentREPL("bounded-agent", handler=blocked_handler, timeout=0.02)
+        repl._worker_slots = threading.BoundedSemaphore(1)
+        first_server, first_client = socket.socketpair()
+        second_server, second_client = socket.socketpair()
+        first = Message(
+            msg_type="task_submit",
+            task_id="first",
+            parent_agent_id="caller",
+            child_agent_id="bounded-agent",
+        )
+        second = Message(
+            msg_type="task_submit",
+            task_id="second",
+            parent_agent_id="caller",
+            child_agent_id="bounded-agent",
+        )
+
+        try:
+            repl._handle_task(first_server, first)
+            assert recv_message(first_client, timeout=1.0).msg_type == "task_accepted"
+            timed_out = recv_message(first_client, timeout=1.0)
+            assert timed_out.payload["error"] == "handler timed out after 0.02s"
+
+            repl._handle_task(second_server, second)
+            exhausted = recv_message(second_client, timeout=1.0)
+            assert exhausted.msg_type == "task_error"
+            assert exhausted.payload["error"] == "handler capacity exhausted"
+        finally:
+            release.set()
+            first_server.close()
+            first_client.close()
+            second_server.close()
+            second_client.close()
+
     def test_shutdown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         dlg_dir = _use_short_delegation_dir(monkeypatch)
         repl = AgentREPL("shutdown-agent")

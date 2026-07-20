@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from clawie.cli import main
+from clawie.published_workspace import PublishedWorkspace
 from clawie.service import ClawieService
 from clawie.store import StateStore
 
@@ -143,6 +144,60 @@ def test_workspace_publish_rejects_symlink_entries(
 
     with pytest.raises(ValueError, match="cannot publish symlink"):
         service.workspace_publish(source_dir, agent_id="alice", visible_to=["bob"])
+
+
+def test_workspace_publish_uses_captured_file_when_source_is_swapped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, homes = _service_with_agents(tmp_path, monkeypatch)
+    source = homes["alice-user"] / ".openclaw" / "workspace" / "report.md"
+    source.write_text("safe report\n", encoding="utf-8")
+    outside = tmp_path / "manager-secret"
+    outside.write_text("must not leak\n", encoding="utf-8")
+    original = PublishedWorkspace._ensure_blob
+    swapped = False
+
+    def swap_after_capture(self: PublishedWorkspace, captured: Path, blob: Path) -> None:
+        nonlocal swapped
+        if not swapped:
+            source.unlink()
+            source.symlink_to(outside)
+            swapped = True
+        original(self, captured, blob)
+
+    monkeypatch.setattr(PublishedWorkspace, "_ensure_blob", swap_after_capture)
+
+    result = service.workspace_publish(source, agent_id="alice", visible_to=["bob"])
+
+    published = Path(result["path"]) / "files" / "report.md"
+    assert published.read_text(encoding="utf-8") == "safe report\n"
+    assert "must not leak" not in published.read_text(encoding="utf-8")
+
+
+def test_workspace_publish_rejects_file_modified_during_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, homes = _service_with_agents(tmp_path, monkeypatch)
+    source = homes["alice-user"] / ".openclaw" / "workspace" / "report.md"
+    source.write_text("safe report\n", encoding="utf-8")
+    source_inode = source.stat().st_ino
+    original_read = os.read
+    mutated = False
+
+    def mutate_after_source_read(fd: int, size: int) -> bytes:
+        nonlocal mutated
+        chunk = original_read(fd, size)
+        if chunk and not mutated and os.fstat(fd).st_ino == source_inode:
+            source.write_text("evil report\n", encoding="utf-8")
+            mutated = True
+        return chunk
+
+    monkeypatch.setattr("clawie.published_workspace.os.read", mutate_after_source_read)
+
+    with pytest.raises(ValueError, match="source changed while publishing"):
+        service.workspace_publish(source, agent_id="alice", visible_to=["bob"])
 
 
 def test_workspace_publish_infers_default_named_runtime_agent(

@@ -1055,6 +1055,9 @@ class AgentREPL:
         self._running = False
         self._thread: threading.Thread | None = None
         self._connection_slots = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
+        # Connection timeouts must not allow an unbounded number of handler
+        # threads to survive after their clients have gone away.
+        self._worker_slots = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
 
     def start(self) -> None:
         """Listen on socket, loop: accept -> dispatch -> respond."""
@@ -1137,6 +1140,20 @@ class AgentREPL:
         # Track inbound payload tokens
         self.context_budget.record_payload(estimate_payload_tokens(msg.payload))
 
+        if not self._worker_slots.acquire(blocking=False):
+            send_message(
+                conn,
+                Message(
+                    msg_type="task_error",
+                    task_id=msg.task_id,
+                    parent_agent_id=self.agent_id,
+                    child_agent_id=msg.parent_agent_id,
+                    depth=msg.depth,
+                    payload={"error": "handler capacity exhausted"},
+                ),
+            )
+            return
+
         # Send acceptance
         accepted = Message(
             msg_type="task_accepted",
@@ -1156,6 +1173,8 @@ class AgentREPL:
                 result_holder[0] = self.handler(msg, self)
             except Exception as exc:
                 error_holder[0] = str(exc)
+            finally:
+                self._worker_slots.release()
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()

@@ -4,7 +4,8 @@ The enforcement heart of the control agent. Every control verb has a fixed
 capability tier, and the gate decides **in code** whether a request executes —
 because a prompt-only boundary fails under injection (Principle 6). Read and
 safe-heal actions are autonomous; destructive and outward (repo) actions cannot
-execute without a nonce confirmation from an allowlisted operator.
+execute without a nonce confirmation from an authenticated, allowlisted
+operator. An empty allowlist denies every confirmation.
 
 Pure: no I/O, no LLM. The control runtime calls ``authorize`` before acting and
 only proceeds on an ``ALLOW`` decision. The LLM can *request* a destructive
@@ -19,6 +20,9 @@ import secrets
 import time
 from dataclasses import dataclass
 from enum import Enum
+
+
+MAX_PENDING_CONFIRMATIONS = 256
 
 
 class Tier(str, Enum):
@@ -102,10 +106,29 @@ class ControlGate:
       for the same verb+args, yields ``ALLOW``.
     """
 
-    def __init__(self, allowlist: list[str] | None = None, *, ttl_seconds: float = 300.0) -> None:
+    def __init__(
+        self,
+        allowlist: list[str] | None = None,
+        *,
+        ttl_seconds: float = 300.0,
+        max_pending: int = MAX_PENDING_CONFIRMATIONS,
+    ) -> None:
         self._allowlist = {str(x).strip() for x in (allowlist or []) if str(x).strip()}
         self._ttl = float(ttl_seconds)
+        self._max_pending = max(1, int(max_pending))
         self._pending: dict[str, _Pending] = {}
+
+    def set_allowlist(self, allowlist: list[str] | None) -> None:
+        """Refresh authenticated operator identities without losing pending nonces."""
+        self._allowlist = {str(x).strip() for x in (allowlist or []) if str(x).strip()}
+
+    def _prune_expired(self) -> None:
+        cutoff = time.monotonic() - self._ttl
+        self._pending = {
+            nonce: pending
+            for nonce, pending in self._pending.items()
+            if pending.created_at >= cutoff
+        }
 
     @staticmethod
     def _fingerprint(verb: str, args: dict | None) -> str:
@@ -116,6 +139,14 @@ class ControlGate:
         tier = tier_for(nverb)
         if tier in AUTONOMOUS_TIERS:
             return GateResult(Decision.ALLOW, tier, nverb, reason="autonomous tier")
+        self._prune_expired()
+        if len(self._pending) >= self._max_pending:
+            return GateResult(
+                Decision.DENY,
+                tier,
+                nverb,
+                reason="too many pending confirmations",
+            )
         nonce = secrets.token_hex(8)
         self._pending[nonce] = _Pending(
             nverb, tier, self._fingerprint(nverb, args), time.monotonic()
@@ -138,7 +169,9 @@ class ControlGate:
             return GateResult(Decision.DENY, tier_for(nverb), nverb, reason="unknown or used nonce")
         if time.monotonic() - pending.created_at > self._ttl:
             return GateResult(Decision.DENY, pending.tier, nverb, reason="confirmation expired")
-        if self._allowlist and str(confirmer).strip() not in self._allowlist:
+        if not self._allowlist:
+            return GateResult(Decision.DENY, pending.tier, nverb, reason="operator allowlist is empty")
+        if str(confirmer).strip() not in self._allowlist:
             return GateResult(Decision.DENY, pending.tier, nverb, reason="confirmer not on allowlist")
         if pending.verb != nverb:
             return GateResult(Decision.DENY, pending.tier, nverb, reason="verb mismatch")
@@ -147,4 +180,5 @@ class ControlGate:
         return GateResult(Decision.ALLOW, pending.tier, nverb, reason="confirmed by operator")
 
     def pending_count(self) -> int:
+        self._prune_expired()
         return len(self._pending)

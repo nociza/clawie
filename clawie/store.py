@@ -14,7 +14,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_key": "",
     "provider": "openclaw",
     "auth_mode": "none",
-    "schema_version": 2,
+    "schema_version": 3,
     "provider_credentials": {},
     "local_service_state": {},
     "channel_pool": [],
@@ -29,7 +29,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "backup_enabled": False,
     "backup_repo_path": "",
     "backup_remote": "",
-    "backup_auto_push": True,
+    "backup_auto_push": False,
     "backup_last_run_at": "",
     "backup_last_commit": "",
     "published_workspace_root": "",
@@ -70,7 +70,7 @@ class _RevisionedDict(dict[str, Any]):
 
 
 class StateStore:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     LEGACY_DEFAULT_CHANNELS: tuple[tuple[str, str], ...] = (
         ("chat", "support"),
         ("email", "inbox"),
@@ -707,6 +707,9 @@ class StateStore:
             current = 1
         if current < 2:
             current = 2
+        if current < 3:
+            self._migrate_disable_legacy_backup_auto_push()
+            current = 3
         if current != self._stored_schema_version():
             self._write_schema_version(current)
 
@@ -804,6 +807,20 @@ class StateStore:
                     (json.dumps(payload, sort_keys=True), agent_id),
                 )
 
+            conn.commit()
+
+    def _migrate_disable_legacy_backup_auto_push(self) -> None:
+        """Replace the pre-0.1.8 fail-open backup push default.
+
+        Earlier releases persisted ``true`` for every newly created state root,
+        so the value cannot reliably represent an operator opt-in. Operators
+        can explicitly enable it again after reviewing the backup repository.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
+                ("backup_auto_push", self._encode_value(False)),
+            )
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:

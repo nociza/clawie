@@ -8,9 +8,10 @@ The backup repository mirrors the fleet's durable knowledge:
 - ``agents/<agent_id>/workspace/`` — knowledge files captured from the live
   agent workspace (markdown notes, memory files)
 
-Credential material is never written to the repository: the snapshot is
+Credential material is excluded on a best-effort basis: the snapshot is
 redacted, workspace collection skips symlinks and credential-looking names,
-and a ``.gitignore`` safety net excludes auth file patterns.
+content is scanned for common secret formats, and a ``.gitignore`` safety net
+excludes auth file patterns. Automatic remote pushes are opt-in.
 """
 from __future__ import annotations
 
@@ -60,7 +61,8 @@ Layout:
 - `agents/<agent_id>/workspace/` — knowledge files captured from the agent workspace
 
 Events are intentionally excluded so that commits only happen when knowledge
-actually changes. Credentials are never written here; use `clawie backup export`
+actually changes. Credential-looking content is excluded on a best-effort basis;
+review the repository before enabling automatic pushes. Use `clawie backup export`
 for a full-fidelity local snapshot instead.
 
 Restore manifests, prompts, and workspace knowledge with
@@ -105,6 +107,12 @@ _SECRET_CONTENT_PATTERNS = (
     re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"),
     re.compile(rb"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
     re.compile(rb"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"),
+    re.compile(rb"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(rb"\bAIza[0-9A-Za-z_-]{20,}\b"),
+    re.compile(rb"\bnpm_[A-Za-z0-9]{20,}\b"),
+    re.compile(rb"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(rb"\bdckr_pat_[A-Za-z0-9_-]{20,}\b"),
+    re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b"),
     re.compile(
         rb"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)\b"
         rb"\s*[:=]\s*[\"']?(?!<redacted>)[A-Za-z0-9._~+/=-]{12,}"
@@ -124,7 +132,7 @@ class BackupOpsMixin:
             "repo": repo or str(self._default_backup_repo_path()),
             "repo_configured": bool(repo),
             "remote": str(config.get("backup_remote", "")).strip(),
-            "auto_push": bool(config.get("backup_auto_push", True)),
+            "auto_push": bool(config.get("backup_auto_push", False)),
             "last_run_at": str(config.get("backup_last_run_at", "")),
             "last_commit": str(config.get("backup_last_commit", "")),
         }
@@ -144,6 +152,7 @@ class BackupOpsMixin:
         *,
         remote: str | None = None,
         enable: bool = True,
+        auto_push: bool | None = None,
     ) -> dict[str, Any]:
         """Create (or adopt) the backup git repository and record its settings."""
         self._require_backup_git()
@@ -195,6 +204,8 @@ class BackupOpsMixin:
         if remote_url:
             config["backup_remote"] = remote_url
         config["backup_enabled"] = bool(enable)
+        if auto_push is not None:
+            config["backup_auto_push"] = bool(auto_push)
         self.store.write_config(config)
         self._restore_backup_repo_ownership(repo)
 
@@ -203,13 +214,20 @@ class BackupOpsMixin:
             state,
             "backup.initialized",
             f"Backup repo initialized at {repo}",
-            {"repo": str(repo), "remote": remote_url, "enabled": bool(enable), "created": created},
+            {
+                "repo": str(repo),
+                "remote": remote_url,
+                "enabled": bool(enable),
+                "auto_push": bool(config.get("backup_auto_push", False)),
+                "created": created,
+            },
         )
         self.store.write_state(state)
         return {
             "repo": str(repo),
             "remote": remote_url or str(config.get("backup_remote", "")).strip(),
             "enabled": bool(enable),
+            "auto_push": bool(config.get("backup_auto_push", False)),
             "created": created,
         }
 

@@ -200,39 +200,39 @@ class PublishedWorkspace:
         self.ensure()
         publisher = _safe_token(publisher_agent_id, field_name="publisher_agent_id")
         viewers = self._normalize_viewers([publisher, *visible_to])
-        source = Path(source_path).expanduser().resolve(strict=True)
+        requested_source = Path(source_path).expanduser()
+        if requested_source.is_symlink():
+            raise PublishedWorkspaceError(f"cannot publish symlink: {requested_source}")
+        source = requested_source.resolve(strict=True)
         if source_workspace is not None:
             workspace = Path(source_workspace).expanduser().resolve(strict=True)
             if not _is_relative_to(source, workspace):
                 raise PublishedWorkspaceError(
                     f"source path must be inside the publishing agent workspace: {workspace}"
                 )
-        files = self._collect_source_files(source)
-        tree_sha = _tree_digest(files)
-        created_at = _now_iso()
-        stamp = _path_stamp(created_at)
-        short = tree_sha[:8]
-        title_token = _slug(title, source.stem if source.is_file() else source.name)
-        publication_id = f"pub_{stamp}_{publisher}_{short}_{uuid.uuid4().hex[:8]}"
-        view_name = f"{stamp}-{title_token}-{short}"
         staging = Path(
             tempfile.mkdtemp(
-                prefix=f"{publication_id}.",
+                prefix=".capture-",
                 suffix=".staging",
                 dir=str(self.tmp_dir),
             )
         )
-        final = self.root / "publications" / publication_id
         try:
             files_dir = staging / "files"
+            files = self._collect_source_files(source, files_dir)
+            tree_sha = _tree_digest(files)
+            created_at = _now_iso()
+            stamp = _path_stamp(created_at)
+            short = tree_sha[:8]
+            title_token = _slug(title, source.stem if source.is_file() else source.name)
+            publication_id = f"pub_{stamp}_{publisher}_{short}_{uuid.uuid4().hex[:8]}"
+            view_name = f"{stamp}-{title_token}-{short}"
+            final = self.root / "publications" / publication_id
             for item in files:
                 blob_rel = self._blob_relative_path(item.sha256)
                 blob_path = self.root / blob_rel
                 self._ensure_blob(item.source, blob_path)
-                target = files_dir / item.relative_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(item.source, target)
-                self._make_readonly_file(target)
+                self._make_readonly_file(item.source)
 
             manifest = {
                 "schema": SCHEMA,
@@ -507,49 +507,163 @@ class PublishedWorkspace:
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
-    def _collect_source_files(self, source: Path) -> list[SourceFile]:
-        if source.is_symlink():
-            raise PublishedWorkspaceError(f"cannot publish symlink: {source}")
-        if source.is_file():
-            candidates = [(source, Path(source.name))]
-        elif source.is_dir():
-            candidates = []
-            for entry in sorted(source.rglob("*"), key=lambda item: str(item)):
-                if entry.is_symlink():
-                    raise PublishedWorkspaceError(f"cannot publish symlink: {entry}")
-                rel = entry.relative_to(source)
-                try:
-                    st = entry.lstat()
-                except OSError as exc:
-                    raise PublishedWorkspaceError(f"cannot inspect source path {entry}: {exc}") from exc
-                if stat.S_ISDIR(st.st_mode):
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    raise PublishedWorkspaceError(f"cannot publish special file: {entry}")
-                candidates.append((entry, rel))
-        else:
-            raise PublishedWorkspaceError(f"source path is not a regular file or directory: {source}")
+    def _collect_source_files(self, source: Path, capture_root: Path) -> list[SourceFile]:
+        """Capture source content once through no-follow descriptors.
 
+        All subsequent hashing, blob creation, and publication reads use the
+        manager-private capture, so an agent cannot swap a checked path before
+        a privileged copy.
+        """
+        capture_root.mkdir(parents=True, mode=0o700)
         files: list[SourceFile] = []
         total = 0
-        for path, rel_path in candidates:
-            rel = _safe_relative_path(rel_path)
-            st = path.stat()
-            size = int(st.st_size)
-            if size > MAX_FILE_BYTES:
-                raise PublishedWorkspaceError(f"file exceeds publish size limit: {path}")
-            total += size
-            if total > MAX_PUBLICATION_BYTES:
-                raise PublishedWorkspaceError("publication exceeds total size limit")
-            files.append(
-                SourceFile(
-                    source=path,
-                    relative_path=rel,
-                    sha256=_sha256_file(path),
-                    size=size,
-                    mode=f"{stat.S_IMODE(st.st_mode):04o}",
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        dir_flags = file_flags | getattr(os, "O_DIRECTORY", 0)
+
+        def open_directory_path(path: Path) -> int:
+            if not path.is_absolute():
+                raise PublishedWorkspaceError(f"source directory must be absolute: {path}")
+            current_fd = os.open(os.path.sep, dir_flags)
+            try:
+                for part in path.parts[1:]:
+                    next_fd = os.open(part, dir_flags, dir_fd=current_fd)
+                    os.close(current_fd)
+                    current_fd = next_fd
+                return current_fd
+            except Exception:
+                os.close(current_fd)
+                raise
+
+        def capture_file(
+            parent_fd: int,
+            name: str,
+            rel_path: Path,
+            expected: os.stat_result,
+        ) -> None:
+            nonlocal total
+            try:
+                source_fd = os.open(name, file_flags, dir_fd=parent_fd)
+            except OSError as exc:
+                raise PublishedWorkspaceError(
+                    f"cannot safely open source file {source / rel_path}: {exc}"
+                ) from exc
+            target = capture_root / _safe_relative_path(rel_path)
+            try:
+                st = os.fstat(source_fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise PublishedWorkspaceError(f"cannot publish special file: {source / rel_path}")
+                if (int(st.st_dev), int(st.st_ino)) != (
+                    int(expected.st_dev),
+                    int(expected.st_ino),
+                ):
+                    raise PublishedWorkspaceError(f"source changed while publishing: {source / rel_path}")
+                size = int(st.st_size)
+                if size > MAX_FILE_BYTES:
+                    raise PublishedWorkspaceError(f"file exceeds publish size limit: {source / rel_path}")
+                total += size
+                if total > MAX_PUBLICATION_BYTES:
+                    raise PublishedWorkspaceError("publication exceeds total size limit")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                copied = 0
+                with target.open("xb") as output:
+                    while True:
+                        chunk = os.read(source_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > MAX_FILE_BYTES or total - size + copied > MAX_PUBLICATION_BYTES:
+                            raise PublishedWorkspaceError("source changed beyond publication size limits")
+                        digest.update(chunk)
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                final_st = os.fstat(source_fd)
+                stable_fields = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
                 )
-            )
+                if copied != size or any(
+                    getattr(st, field) != getattr(final_st, field) for field in stable_fields
+                ):
+                    raise PublishedWorkspaceError(f"source changed while publishing: {source / rel_path}")
+                files.append(
+                    SourceFile(
+                        source=target,
+                        relative_path=_safe_relative_path(rel_path),
+                        sha256=digest.hexdigest(),
+                        size=copied,
+                        mode=f"{stat.S_IMODE(st.st_mode):04o}",
+                    )
+                )
+            finally:
+                os.close(source_fd)
+
+        def walk(directory_fd: int, rel_dir: Path) -> None:
+            for name in sorted(os.listdir(directory_fd)):
+                rel_path = rel_dir / name
+                try:
+                    st = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError as exc:
+                    raise PublishedWorkspaceError(
+                        f"cannot inspect source path {source / rel_path}: {exc}"
+                    ) from exc
+                if stat.S_ISLNK(st.st_mode):
+                    raise PublishedWorkspaceError(f"cannot publish symlink: {source / rel_path}")
+                if stat.S_ISDIR(st.st_mode):
+                    try:
+                        child_fd = os.open(name, dir_flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        raise PublishedWorkspaceError(
+                            f"cannot safely open source directory {source / rel_path}: {exc}"
+                        ) from exc
+                    try:
+                        opened_st = os.fstat(child_fd)
+                        if (int(opened_st.st_dev), int(opened_st.st_ino)) != (
+                            int(st.st_dev),
+                            int(st.st_ino),
+                        ):
+                            raise PublishedWorkspaceError(
+                                f"source changed while publishing: {source / rel_path}"
+                            )
+                        walk(child_fd, rel_path)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(st.st_mode):
+                    capture_file(directory_fd, name, rel_path, st)
+                else:
+                    raise PublishedWorkspaceError(f"cannot publish special file: {source / rel_path}")
+
+        try:
+            source_st = source.lstat()
+            if stat.S_ISDIR(source_st.st_mode):
+                root_fd = open_directory_path(source)
+                try:
+                    opened_st = os.fstat(root_fd)
+                    if (int(opened_st.st_dev), int(opened_st.st_ino)) != (
+                        int(source_st.st_dev),
+                        int(source_st.st_ino),
+                    ):
+                        raise PublishedWorkspaceError(f"source changed while publishing: {source}")
+                    walk(root_fd, Path())
+                finally:
+                    os.close(root_fd)
+            elif stat.S_ISREG(source_st.st_mode):
+                parent_fd = open_directory_path(source.parent)
+                try:
+                    capture_file(parent_fd, source.name, Path(source.name), source_st)
+                finally:
+                    os.close(parent_fd)
+            else:
+                raise PublishedWorkspaceError(
+                    f"source path is not a regular file or directory: {source}"
+                )
+        except OSError as exc:
+            raise PublishedWorkspaceError(f"cannot safely open source path {source}: {exc}") from exc
         if not files:
             raise PublishedWorkspaceError("source tree contains no regular files")
         return files

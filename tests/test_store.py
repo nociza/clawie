@@ -174,7 +174,7 @@ def test_store_migrates_legacy_users_table_to_agents(tmp_path: Path) -> None:
 
     assert state["agents"]["alice"] == legacy_agent
     assert "users" not in state
-    assert store.read_config()["schema_version"] == 2
+    assert store.read_config()["schema_version"] == 3
     with store._connect() as conn:
         tables = {
             str(row["name"])
@@ -182,6 +182,27 @@ def test_store_migrates_legacy_users_table_to_agents(tmp_path: Path) -> None:
         }
     assert "agents" in tables
     assert "users" not in tables
+
+
+def test_store_migrates_legacy_backup_auto_push_to_opt_in(tmp_path: Path) -> None:
+    store = StateStore(config_dir=tmp_path)
+    store.ensure()
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
+            ("schema_version", json.dumps(2)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
+            ("backup_auto_push", json.dumps(True)),
+        )
+        conn.commit()
+
+    migrated = StateStore(config_dir=tmp_path)
+    config = migrated.read_config()
+
+    assert config["schema_version"] == 3
+    assert config["backup_auto_push"] is False
 
 
 def test_store_add_column_tolerates_concurrent_duplicate_column_race() -> None:

@@ -357,13 +357,14 @@ clawied RPC layer (not the prompt):
 |---|---|---|
 | `read` | status, logs, list, tree | autonomous, logged |
 | `safe-heal` | restart service, re-apply prompts, re-sync auth, backup run | autonomous, logged |
-| `destructive` | delete/purge, credential set/revoke, provider switch | **pending-confirmation object**; resolves only on a **nonce echoed by an allowlisted human** |
+| `destructive` | delete/purge, credential set/revoke, provider switch | **pending-confirmation object**; resolves only on a nonce echoed through the operator-only socket by an allowlisted local OS principal |
 | `outward` | open issue / open PR | **preview (issue body / diff) → human approval** before submit |
 
 A destructive/outward call cannot execute without the confirmation token,
 regardless of what the model "decided" — this is the prompt-injection defense
 (Principle 6). Nonce-based confirmation prevents a poisoned log line or stray
-"yes" from self-approving.
+"yes" from self-approving. The model-facing socket accepts requests only; the
+daemon takes confirmation identity from Unix peer credentials, never request JSON.
 
 **openclaw enforces a second layer.** Connect the control agent to each gateway
 with a **scoped device token** — `operator.read` to diagnose, `operator.write`

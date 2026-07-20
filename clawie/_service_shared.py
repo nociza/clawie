@@ -8,7 +8,7 @@ import stat
 import subprocess
 from pathlib import Path
 from typing import Any
-from clawie.addons import get_addon
+from clawie.addons import get_credential_addon
 from clawie.providers import (
     provider_names,
     shared_auth_paths_for_providers,
@@ -156,7 +156,7 @@ class SharedInfraMixin:
         return root
 
     def _shared_addon_config_dir(self, addon: str) -> Path:
-        spec = get_addon(addon)
+        spec = get_credential_addon(addon)
         return self._ensure_shared_addon_auth_root() / spec.shared_config_dir
 
     def _ensure_shared_addon_config_dir(self, addon: str) -> Path:

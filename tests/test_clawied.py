@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import pwd
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -27,6 +30,9 @@ def _setup_service(tmp_path: Path) -> ClawieService:
         subscription="starter",
         workspace="default",
         api_url="https://api.openclaw.example/v1",
+    )
+    service.configure_control_escalation(
+        operators=[pwd.getpwuid(os.getuid()).pw_name],
     )
     return service
 
@@ -571,7 +577,14 @@ def test_clawied_cli_backup_init_routes_through_daemon(
     _wait_for_socket(daemon.socket_path)
 
     try:
-        code = run_cli(tmp_path, "backup", "init", str(backup_dir), "--no-auto")
+        code = run_cli(
+            tmp_path,
+            "backup",
+            "init",
+            str(backup_dir),
+            "--no-auto",
+            "--auto-push",
+        )
         output = capsys.readouterr().out
     finally:
         daemon.request("stop", {})
@@ -582,6 +595,8 @@ def test_clawied_cli_backup_init_routes_through_daemon(
     assert "Backup repo ready" in output or "Created backup repo" in output
     assert config["backup_repo_path"] == str(backup_dir.resolve())
     assert config["backup_enabled"] is False
+    assert config["backup_auto_push"] is True
+    assert "Automatic remote push: enabled" in output
     assert (backup_dir / ".git").is_dir()
 
 
@@ -742,8 +757,6 @@ def test_clawied_control_cli_request_and_confirm_use_ipc(
             "delete_agent",
             "--nonce",
             pending["nonce"],
-            "--confirmer",
-            "@op",
             "--args-json",
             '{"agent_id":"rhea"}',
             "--json",
@@ -814,7 +827,6 @@ def test_clawied_control_destructive_requires_matching_confirmation(tmp_path: Pa
             "control_confirm",
             {
                 "nonce": pending["nonce"],
-                "confirmer": "@op",
                 "verb": "delete_agent",
                 "args": {"agent_id": "other"},
             },
@@ -828,7 +840,6 @@ def test_clawied_control_destructive_requires_matching_confirmation(tmp_path: Pa
             "control_confirm",
             {
                 "nonce": pending_again["nonce"],
-                "confirmer": "@op",
                 "verb": "delete_agent",
                 "args": {"agent_id": "quinn"},
             },
@@ -848,6 +859,75 @@ def test_clawied_control_destructive_requires_matching_confirmation(tmp_path: Pa
         service.get_agent("quinn")
 
 
+def test_control_agent_socket_is_request_only(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _setup_service(tmp_path / "state")
+    _create_agent(service, "scoped")
+    short_root = Path("/tmp") / f"clawie-control-test-{os.getpid()}-{time.time_ns()}"
+    home = short_root / "home"
+    short_root.mkdir(mode=0o700)
+    home.mkdir()
+    control_socket = home / ".clawie-control" / "clawied.sock"
+    uid = os.getuid()
+    gid = os.getgid()
+    daemon = Clawied(service, interval_seconds=30)
+    monkeypatch.setattr(daemon, "_control_socket_specs", lambda: [(control_socket, uid, gid)])
+    thread = threading.Thread(target=daemon.run_forever, daemon=True)
+    thread.start()
+    _wait_for_socket(daemon.socket_path)
+    _wait_for_socket(control_socket)
+
+    try:
+        monkeypatch.setenv("CLAWIE_CONTROL_SOCKET", str(control_socket))
+        pending = daemon.request(
+            "control_request",
+            {"verb": "delete_agent", "args": {"agent_id": "scoped"}},
+        )
+        with raises(SetupError, match="only permits control_request"):
+            daemon.request(
+                "control_confirm",
+                {
+                    "nonce": pending["nonce"],
+                    "verb": "delete_agent",
+                    "args": {"agent_id": "scoped"},
+                },
+            )
+        assert service.get_agent("scoped")["agent_id"] == "scoped"
+
+        monkeypatch.delenv("CLAWIE_CONTROL_SOCKET")
+        confirmed = daemon.request(
+            "control_confirm",
+            {
+                "nonce": pending["nonce"],
+                "verb": "delete_agent",
+                "args": {"agent_id": "scoped"},
+            },
+        )
+        assert confirmed["decision"] == "allow"
+    finally:
+        monkeypatch.delenv("CLAWIE_CONTROL_SOCKET", raising=False)
+        daemon.request("stop", {})
+        thread.join(timeout=5)
+        shutil.rmtree(short_root, ignore_errors=True)
+
+
+def test_control_listener_rejects_writable_parent(tmp_path: Path) -> None:
+    service = _setup_service(tmp_path / "state")
+    daemon = Clawied(service)
+    parent = tmp_path / "unsafe-control"
+    parent.mkdir()
+    parent.chmod(0o777)
+
+    with raises(SetupError, match="must not be group/world writable"):
+        daemon._start_control_listener(
+            parent / "clawied.sock",
+            uid=os.getuid(),
+            gid=os.getgid(),
+        )
+
+
 def test_clawied_control_open_issue_requires_confirmation_and_uses_github_config(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -859,7 +939,7 @@ def test_clawied_control_open_issue_requires_confirmation_and_uses_github_config
     service.configure_control_escalation(
         github_repo="octo/example",
         github_token_path=str(token_path),
-        operators=["@op"],
+        operators=[pwd.getpwuid(os.getuid()).pw_name],
         issue_labels=["clawie-control", "bug"],
         rate_limit_seconds=0,
     )
@@ -900,7 +980,6 @@ def test_clawied_control_open_issue_requires_confirmation_and_uses_github_config
             "control_confirm",
             {
                 "nonce": pending["nonce"],
-                "confirmer": "@op",
                 "verb": "open_issue",
                 "args": args,
             },
@@ -941,7 +1020,7 @@ def test_clawied_control_open_pr_requires_confirmation_and_uses_existing_branch(
     service.configure_control_escalation(
         github_repo="https://github.com/octo/example",
         github_token_path=str(token_path),
-        operators=["@op"],
+        operators=[pwd.getpwuid(os.getuid()).pw_name],
         rate_limit_seconds=0,
     )
     calls: list[dict[str, object]] = []
@@ -984,7 +1063,6 @@ def test_clawied_control_open_pr_requires_confirmation_and_uses_existing_branch(
             "control_confirm",
             {
                 "nonce": pending["nonce"],
-                "confirmer": "@op",
                 "verb": "open_pr",
                 "args": args,
             },

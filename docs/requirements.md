@@ -66,7 +66,10 @@ whitelisted service RPC when the daemon is running, and hosts the
 capability-gated control-tool RPC for read/safe-heal and confirmed destructive
 actions. `clawie control request` and `clawie control confirm` expose that RPC
 to a live `role: control` workspace; applying a control-role manifest seeds the
-workspace prompts with the daemon-backed command path.
+workspace prompts with the daemon-backed command path. Each isolated control
+user receives a private request-only socket at
+`/run/clawie/control/<uid>-<manager-id>.sock`; only the manager socket accepts confirmation,
+and it derives the confirmer from authenticated Unix peer credentials.
 
 Root-required commands should operate on the same state root as normal user
 commands. Plain `sudo clawie ...` does this by resolving `SUDO_USER` back to the

@@ -40,14 +40,14 @@ clawie backup run
 sudo clawie maintenance enable --interval 4
 ```
 
-Every maintenance pass now syncs credentials, writes configured prompts, **and
-commits/pushes knowledge changes**. `clawie status` shows the backup section
-alongside everything else.
+Every maintenance pass now syncs credentials, writes configured prompts, and
+**commits knowledge changes locally**. Remote pushes are opt-in. `clawie status`
+shows the backup section alongside everything else.
 
 ## Commands
 
 ```bash
-clawie backup init [PATH] [--remote URL] [--no-auto]
+clawie backup init [PATH] [--remote URL] [--no-auto] [--auto-push|--no-auto-push]
 clawie backup run [--message M] [--push|--no-push]
 clawie backup status
 clawie backup restore [--agent ID] [--no-workspace] [--no-apply-to-disk]
@@ -57,9 +57,12 @@ clawie backup import PATH [--merge]
 
 - `init` creates or adopts the git repo, optionally sets `origin`, and enables
   automatic backups (skip with `--no-auto`). Re-running updates the remote.
+  Automatic remote pushes stay disabled unless `--auto-push` is explicitly set;
+  use `--no-auto-push` to disable them again.
 - `run` mirrors the current knowledge into the repo and commits **only if
-  something changed**. With a remote configured it pushes automatically
-  (`--no-push` to skip, `backup_auto_push` config to change the default).
+  something changed**. With a remote configured it pushes only when explicitly
+  requested (`--push`) or after opting in with `backup init --auto-push`. Secret
+  filtering is best-effort, so review the repository before enabling pushes.
   A failed push is reported but never fails the backup.
 - `status` is read-only: repo path, remote, HEAD, commit count, dirty flag,
   last run.

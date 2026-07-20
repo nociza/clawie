@@ -55,15 +55,8 @@ jobs:
         run: uv sync --locked --dev
       - name: Lint
         run: uv run ruff check clawie tests
-      - name: Type-check runtime and security core
-        run: >-
-          uv run mypy
-          clawie/adapters.py
-          clawie/daemon.py
-          clawie/delegation.py
-          clawie/manifest.py
-          clawie/safe_fs.py
-          clawie/store.py
+      - name: Type-check package
+        run: uv run mypy clawie
       - name: Scan source for medium and high severity findings
         run: uv run bandit -q -r clawie -ll
       - name: Audit locked production dependencies

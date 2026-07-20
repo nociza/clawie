@@ -163,6 +163,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Register the repo but do not enable automatic backups",
     )
+    backup_push_policy = backup_init.add_mutually_exclusive_group()
+    backup_push_policy.add_argument(
+        "--auto-push",
+        dest="auto_push",
+        action="store_true",
+        default=None,
+        help="Opt in to pushing new maintenance commits to the configured remote",
+    )
+    backup_push_policy.add_argument(
+        "--no-auto-push",
+        dest="auto_push",
+        action="store_false",
+        help="Disable automatic remote pushes while retaining local automatic backups",
+    )
     backup_init.set_defaults(func=cmd_backup_init)
 
     backup_run = backup_sub.add_parser(
@@ -182,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-push",
         dest="push",
         action="store_false",
-        help="Skip pushing even if a remote is configured",
+        help="Skip a configured automatic push for this run",
     )
     backup_run.set_defaults(func=cmd_backup_run)
 
@@ -1311,7 +1325,7 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
         "--control-operator",
         action="append",
         dest="control_operators",
-        help="Allowlisted operator handle for destructive/outward control confirmations",
+        help="Allowlisted local OS username or uid:<number> for control confirmations",
     )
     parser.add_argument(
         "--control-issue-label",
@@ -2849,7 +2863,7 @@ def _print_backup_status_panel(payload: dict[str, Any]) -> None:
             f"repo: {payload.get('repo', '')}",
             f"initialized: {payload.get('initialized', False)}",
             f"remote: {payload.get('remote', '') or '<none>'}",
-            f"auto_push: {payload.get('auto_push', True)}",
+            f"auto_push: {payload.get('auto_push', False)}",
             f"head: {payload.get('head', '') or '<no commits>'}",
             f"commits: {payload.get('commit_count', 0)}",
             f"dirty: {payload.get('dirty', False)}",
@@ -3236,6 +3250,7 @@ def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
             "repo_path": repo_path,
             "remote": args.remote,
             "enable": not bool(args.no_auto),
+            "auto_push": args.auto_push,
         },
     )
     if result is _CLAWIED_UNAVAILABLE:
@@ -3243,6 +3258,7 @@ def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
             repo_path=repo_path,
             remote=args.remote,
             enable=not bool(args.no_auto),
+            auto_push=args.auto_push,
         )
     if result.get("created"):
         print_success(f"Created backup repo at {result.get('repo', '')}")
@@ -3259,6 +3275,7 @@ def cmd_backup_init(args: argparse.Namespace, service: ClawieService) -> int:
             )
     else:
         print_info("Automatic backup: disabled (run 'clawie backup run' manually)")
+    print_info(f"Automatic remote push: {'enabled' if result.get('auto_push') else 'disabled'}")
     return 0
 
 
@@ -4137,8 +4154,7 @@ def _build_control_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     )
     confirm.add_argument(
         "--confirmer",
-        required=True,
-        help="Allowlisted operator handle confirming the request",
+        help="Deprecated and ignored; confirmer identity comes from the Unix peer credential",
     )
     confirm.add_argument(
         "--args-json",
@@ -4275,7 +4291,6 @@ def cmd_control_confirm(args: argparse.Namespace, service: ClawieService) -> int
     payload = {
         "verb": verb,
         "nonce": str(getattr(args, "nonce", "") or "").strip(),
-        "confirmer": str(getattr(args, "confirmer", "") or "").strip(),
         "args": _parse_json_object_arg(str(getattr(args, "args_json", "{}") or "{}"), "--args-json"),
     }
     result = _clawied_ipc_request_or_none(Clawied(service), "control_confirm", payload)

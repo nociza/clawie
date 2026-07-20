@@ -83,7 +83,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.7" in capsys.readouterr().out
+    assert "clawie 0.1.8" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 
@@ -813,6 +813,74 @@ def test_runtime_install_cli(
     assert "provider: picoclaw" in output
     assert "method: brew" in output
     assert "executable: /mock/bin/picoclaw" in output
+
+
+def test_runtime_install_rejects_unverified_existing_openclaw(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    monkeypatch.setattr(
+        service,
+        "_resolve_executable_in_service_env",
+        lambda executable, linux_user="": "/mock/bin/openclaw",
+    )
+
+    class Result:
+        returncode = 0
+        stdout = "openclaw 2027.1.0"
+        stderr = ""
+
+    monkeypatch.setattr("clawie._service_runtime.subprocess.run", lambda *args, **kwargs: Result())
+
+    with raises(SetupError, match="outside the verified delivery range"):
+        service.install_provider_runtime("openclaw")
+
+    assert not service._is_runtime_marked_installed(service.store.read_config(), "openclaw")
+
+
+def test_runtime_install_uses_pinned_openclaw_package_and_verifies_result(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        service,
+        "_resolve_executable_in_service_env",
+        lambda executable, linux_user="": "/mock/bin/pnpm" if executable == "pnpm" else None,
+    )
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda provider: "/mock/bin/openclaw")
+
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    def fake_run(command: list[str], **kwargs: object) -> Result:
+        calls.append(command)
+        if command == ["/mock/bin/openclaw", "--version"]:
+            return Result("openclaw 2026.7.1")
+        return Result("installed")
+
+    monkeypatch.setattr("clawie._service_runtime.subprocess.run", fake_run)
+
+    result = service.install_provider_runtime("openclaw")
+
+    assert calls[0] == ["/mock/bin/pnpm", "add", "-g", "openclaw@2026.7.1"]
+    assert calls[1] == ["/mock/bin/openclaw", "--version"]
+    assert result["runtime_version"] == "2026.7.1"
+
+
+def test_generated_openclaw_unit_exposes_request_only_control_socket(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+
+    unit = service._generated_user_service_unit_contents("openclaw", "/usr/bin/openclaw")
+
+    assert "Environment=CLAWIE_CONTROL_SOCKET=/run/clawie/control/%U-" in unit
+    assert ".sock" in unit
 
 
 def test_addon_install_cli(
@@ -2287,7 +2355,7 @@ def test_store_migrates_legacy_default_channels_from_baseline_and_agents(tmp_pat
     alice = state["agents"]["alice"]
     assert baseline["channels"] == []
     assert alice["channels"] == [{"kind": "telegram", "name": "team", "enabled": True}]
-    assert store.read_config()["schema_version"] == 2
+    assert store.read_config()["schema_version"] == 3
 
 
 def test_store_falls_back_to_tmp_when_home_is_unwritable(
@@ -5052,6 +5120,8 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
+        if cmd == ["/usr/bin/openclaw", "--version"]:
+            return Result(stdout="openclaw 2026.7.1")
         if cmd[:2] == ["ps", "-eo"]:
             lines: list[str] = []
             if runtime_state["zeroclaw"]:
@@ -5511,6 +5581,8 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
+        if cmd == ["/usr/bin/openclaw", "--version"]:
+            return Result(stdout="openclaw 2026.7.1")
         if cmd[:2] == ["ps", "-eo"]:
             lines: list[str] = []
             if runtime_state["zeroclaw"]:
@@ -5773,6 +5845,8 @@ def test_switch_agent_provider_succeeds_when_status_reports_running_but_ps_misse
             self.stderr = stderr
 
     def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd == ["/usr/bin/openclaw", "--version"]:
+            return Result(stdout="openclaw 2026.7.1")
         if cmd[:2] == ["ps", "-eo"]:
             return Result(stdout="")
         tail3 = cmd[-3:]
@@ -5948,6 +6022,8 @@ def test_switch_agent_provider_force_stops_lingering_zeroclaw_when_bus_control_f
             self.stderr = stderr
 
     def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd == ["/usr/bin/openclaw", "--version"]:
+            return Result(stdout="openclaw 2026.7.1")
         if cmd[:2] == ["ps", "-eo"]:
             lines: list[str] = []
             if runtime_state["zeroclaw"]:
@@ -6041,6 +6117,8 @@ def test_switch_agent_provider_fails_when_live_runtime_does_not_cut_over(
             self.stderr = stderr
 
     def fake_run(cmd: list[str], **_: object) -> object:
+        if cmd == ["/usr/bin/openclaw", "--version"]:
+            return Result(stdout="openclaw 2026.7.1")
         if cmd[:2] == ["ps", "-eo"]:
             return Result(stdout="teleclaw 4321 /usr/bin/zeroclaw daemon\n")
         tail3 = cmd[-3:]

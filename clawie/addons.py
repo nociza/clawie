@@ -263,6 +263,14 @@ def get_addon(name: str) -> Union[AddonSpec, ServiceAddonSpec, ToolAddonSpec]:
     return ADDONS[token]
 
 
+def get_credential_addon(name: str) -> AddonSpec:
+    """Return an addon that owns credential/config material."""
+    spec = get_addon(name)
+    if not isinstance(spec, AddonSpec):
+        raise ValueError(f"addon '{spec.name}' does not support credential material")
+    return spec
+
+
 def is_tool_addon(name: str) -> bool:
     token = str(name or "").strip().lower()
     spec = ADDONS.get(token)

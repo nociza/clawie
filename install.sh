@@ -31,7 +31,9 @@ if ! command -v uv &>/dev/null; then
 fi
 
 echo "Installing clawie from ${REPO_DIR} ..."
-uv tool install --force -e "${REPO_DIR}" --python "${PYTHON_VERSION}"
+# Production installs must copy a built artifact into the tool environment.
+# An editable root install would continue importing code from the checkout.
+uv tool install --force "${REPO_DIR}" --python "${PYTHON_VERSION}"
 
 # Find where uv put the binary
 CLAWIE_BIN="$(uv tool dir)/clawie/bin/clawie"
@@ -45,12 +47,7 @@ echo "Installed: ${CLAWIE_BIN}"
 if [ "$(id -u)" -eq 0 ]; then
     SHIM="/usr/local/bin/clawie"
     mkdir -p "$(dirname "${SHIM}")"
-    cat > "${SHIM}" <<SHIM_EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec ${CLAWIE_BIN} "\$@"
-SHIM_EOF
-    chmod 755 "${SHIM}"
+    ln -sfn "${CLAWIE_BIN}" "${SHIM}"
     echo "System shim updated: ${SHIM} -> ${CLAWIE_BIN}"
 fi
 

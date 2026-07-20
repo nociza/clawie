@@ -208,7 +208,7 @@ local guardrails; it does not push branches or merge changes.
 
 ```bash
 clawie control request VERB [--args-json JSON] [--json]
-clawie control confirm VERB --nonce NONCE --confirmer HANDLE [--args-json JSON] [--json]
+clawie control confirm VERB --nonce NONCE [--args-json JSON] [--json]
 clawie control watchdog install [--interval SECONDS] [--notify-command CMD] [--no-start]
 clawie control watchdog status
 sudo clawie control watchdog verify [--exercise-restart] [--timeout SECONDS] [--json]
@@ -216,9 +216,12 @@ clawie control watchdog remove
 ```
 
 `control request` and `control confirm` are thin daemon clients for the
-capability-gated control RPC. Read and safe-heal verbs execute immediately;
+capability-gated control RPC. Isolated control workspaces receive a request-only
+socket; confirmation is accepted only on the manager socket and the confirmer
+is derived from the Unix peer's OS username or `uid:<number>`. Empty operator
+allowlists fail closed. Read and safe-heal verbs execute immediately;
 destructive and outward verbs return a nonce and only execute after `confirm`
-echoes the same verb, same args, and an allowlisted confirmer.
+echoes the same verb and args from an allowlisted local principal.
 
 The watchdog commands manage a root-owned systemd unit that runs
 `clawie clawied run` with `Restart=always`. `--notify-command` writes a separate
@@ -269,7 +272,7 @@ different host.
 Git-backed knowledge backup (see [Backup & Restore](backup.md)):
 
 ```bash
-clawie backup init [PATH] [--remote URL] [--no-auto]
+clawie backup init [PATH] [--remote URL] [--no-auto] [--auto-push|--no-auto-push]
 clawie backup run [--message M] [--push|--no-push]
 clawie backup status
 clawie backup restore [--agent ID] [--no-workspace] [--no-apply-to-disk]

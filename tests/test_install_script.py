@@ -62,7 +62,8 @@ def test_install_script_allows_development_override_and_python_version(
     assert result.returncode == 0, result.stderr
     assert "Installed:" in result.stdout
     logged = log.read_text(encoding="utf-8")
-    assert f"tool install --force -e {ROOT} --python 3.11" in logged
+    assert f"tool install --force {ROOT} --python 3.11" in logged
+    assert " -e " not in f" {logged} "
 
 
 def _write_executable(path: Path, text: str) -> None:

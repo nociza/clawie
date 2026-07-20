@@ -134,8 +134,8 @@ be read. `clawie dashboard` is a deprecated alias for `clawie status --watch`.
 ## Backup
 
 Agent knowledge — core prompts, `MEMORY.md`, and workspace notes — lives in a
-git repo that clawie commits to automatically (and pushes, if a remote is
-configured) on every maintenance pass:
+git repo that clawie commits to automatically on every maintenance pass. Remote
+pushes require an explicit `--push` or `backup init --auto-push`:
 
 ```bash
 clawie backup init --remote git@github.com:you/agent-backup.git
@@ -144,8 +144,9 @@ clawie backup status                  # repo, HEAD, last run
 clawie backup restore --agent alice   # bring knowledge back after a loss
 ```
 
-Secrets are redacted from the snapshot and credential files are never
-collected. Missing local agent records are recreated from the backed-up
+Secrets are redacted from the snapshot, credential-looking content is filtered
+on a best-effort basis, and automatic remote pushes are opt-in. Review a backup
+before enabling pushes. Missing local agent records are recreated from the backed-up
 manifest before prompts and workspace knowledge are restored; `clawie backup
 export` exists for full-fidelity local snapshots.
 See [docs/backup.md](docs/backup.md).

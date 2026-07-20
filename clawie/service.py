@@ -19,6 +19,7 @@ from clawie.providers import (
     get_provider,
 )
 from clawie.store import StateStore
+from clawie.safe_fs import write_text_under
 
 # Re-exported for backwards compatibility: callers (clawie.cli, tests) import
 # these names from clawie.service.
@@ -1059,15 +1060,10 @@ class ClawieService(
         }
         target = Path(output_path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("w", encoding="utf-8") as handle:
-            json.dump(snapshot, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        # The snapshot carries unredacted credentials (api keys, password
-        # hashes); keep it private to the exporting user.
-        try:
-            os.chmod(target, 0o600)
-        except OSError:
-            pass
+        payload = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
+        # The snapshot carries unredacted credentials. Create it atomically at
+        # its final private mode and refuse symlink/special-file targets.
+        write_text_under(target.parent, target.name, payload, mode=0o600)
         return target
 
     def import_state(self, input_path: str | Path, merge: bool = False) -> None:

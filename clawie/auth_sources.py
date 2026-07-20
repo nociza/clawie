@@ -94,7 +94,7 @@ def merge_provider_auth_profile(existing: dict[str, Any], imported: dict[str, st
     if not upstream_provider or not profile_id:
         raise ValueError("imported auth profile is incomplete")
 
-    profile_payload = {
+    profile_payload: dict[str, Any] = {
         "profile_name": str(imported.get("profile_name", "default")).strip() or "default",
         "provider": upstream_provider,
         "account_id": str(imported.get("account_id", "")).strip(),

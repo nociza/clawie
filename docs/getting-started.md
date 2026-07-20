@@ -99,7 +99,10 @@ clawie backup run                 # first snapshot
 sudo clawie maintenance enable    # keep it current on every maintenance pass
 ```
 
-Credentials are never written to the backup repo. See [Backup & Restore](backup.md).
+Credential-looking content is filtered on a best-effort basis. Automatic remote
+pushes are opt-in; review the repository before enabling them with
+`clawie backup init --auto-push`. See
+[Backup & Restore](backup.md).
 
 ## What's next
 

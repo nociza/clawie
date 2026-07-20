@@ -10,7 +10,7 @@ experimentation until their delivery contracts are verified.
 
 | Provider | Runtime | Default Auth | Install | Delegated-task delivery |
 |----------|---------|-------------|---------|-------------------------|
-| **openclaw** | openclaw-agent | none | pnpm | source-pinned; live host proof required |
+| **openclaw** | openclaw-agent | none | pnpm (`openclaw@2026.7.1`) | source-pinned; live host proof required |
 | **picoclaw** | picoclaw-agent | linked | brew | gated until source-pinned |
 | **zeroclaw** | zeroclaw-agent | linked | brew | gated until source-pinned |
 

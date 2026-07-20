@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawie"
-version = "0.1.7"
+version = "0.1.8"
 description = "Local CLI control plane for provisioning, orchestrating, and monitoring AI agent fleets"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -72,6 +72,29 @@ skip_covered = true
 python_version = "3.10"
 ignore_missing_imports = true
 warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "clawie._service_addons",
+    "clawie._service_agents",
+    "clawie._service_auth",
+    "clawie._service_backup",
+    "clawie._service_channels",
+    "clawie._service_credentials",
+    "clawie._service_delegation",
+    "clawie._service_escalation",
+    "clawie._service_prompts",
+    "clawie._service_published_workspace",
+    "clawie._service_reconcile",
+    "clawie._service_runtime",
+    "clawie._service_shared",
+    "clawie._service_spawn",
+    "clawie._service_telemetry",
+    "clawie._service_watchdog",
+]
+# Service mixins are composed by ClawieService; mypy cannot see attributes
+# supplied by sibling mixins. Keep every other error category enabled.
+disable_error_code = ["attr-defined"]
 
 [tool.ruff]
 target-version = "py310"

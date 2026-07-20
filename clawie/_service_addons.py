@@ -21,7 +21,14 @@ from clawie.addon_integration import (
     remove_addon_tools_snippet,
     render_addon_env_block,
 )
-from clawie.addons import ServiceAddonSpec, ToolAddonSpec, addon_names, get_addon, is_service_addon
+from clawie.addons import (
+    ServiceAddonSpec,
+    ToolAddonSpec,
+    addon_names,
+    get_addon,
+    get_credential_addon,
+    is_service_addon,
+)
 from clawie.display import (
     allocate_display_number,
     check_display_installed,
@@ -385,6 +392,8 @@ class AddonOpsMixin:
                     "package": ", ".join(spec.apt_packages[:3]) + "...",
                     "executable": spec.check_executables[0] if spec.check_executables else "",
                 }
+            return self.install_addon(spec.name)
+        if isinstance(spec, ToolAddonSpec):
             return self.install_addon(spec.name)
         executable = self._resolve_executable_in_service_env(spec.executable)
         if executable:
@@ -1476,7 +1485,7 @@ class AddonOpsMixin:
         linux_user: str,
         config_dir: Path,
     ) -> list[str]:
-        spec = get_addon(addon)
+        spec = get_credential_addon(addon)
         env_bits: list[str] = []
         if spec.config_dir_env:
             env_bits.append(f'export {spec.config_dir_env}={shlex.quote(str(config_dir))}')
@@ -1493,7 +1502,7 @@ class AddonOpsMixin:
         source_config_dir: Path,
         linux_user: str,
     ) -> list[str]:
-        spec = get_addon(addon)
+        spec = get_credential_addon(addon)
         if spec.name != "gws":
             return []
         target_dir = self._ensure_shared_addon_config_dir(spec.name)
@@ -1523,7 +1532,7 @@ class AddonOpsMixin:
 
     def _ensure_shared_addon_links(self, addon: str, *, target_home: Path, username: str) -> list[str]:
         """Copy shared addon credentials into an agent-owned config directory."""
-        spec = get_addon(addon)
+        spec = get_credential_addon(addon)
         src = self._shared_addon_config_dir(spec.name)
         if not src.exists():
             return []
@@ -1537,7 +1546,7 @@ class AddonOpsMixin:
         return [str(target)]
 
     def _revoke_addon_from_home(self, addon: str, target_home: Path) -> list[str]:
-        spec = get_addon(addon)
+        spec = get_credential_addon(addon)
         target = target_home / spec.target_config_rel
         if not target.exists() and not target.is_symlink():
             return []
@@ -1610,11 +1619,19 @@ class AddonOpsMixin:
 
     def _resolve_addon_executable(self, addon: str) -> str:
         spec = get_addon(addon)
-        resolved = self._resolve_executable_in_service_env(spec.executable)
+        if isinstance(spec, ServiceAddonSpec):
+            executable = spec.check_executables[0] if spec.check_executables else ""
+        elif isinstance(spec, ToolAddonSpec):
+            executable = spec.check_executables[0] if spec.check_executables else ""
+        else:
+            executable = spec.executable
+        if not executable:
+            raise SetupError(f"addon '{spec.name}' does not define an executable")
+        resolved = self._resolve_executable_in_service_env(executable)
         if resolved:
             return resolved
         raise SetupError(
-            f"addon executable '{spec.executable}' was not found in PATH. Run 'clawie addon install {spec.name}' first."
+            f"addon executable '{executable}' was not found in PATH. Run 'clawie addon install {spec.name}' first."
         )
 
     @staticmethod

@@ -36,13 +36,14 @@ class AgentOpsMixin:
     )
     _CONTROL_TOOLS_SNIPPET = (
         "## Clawie Control RPC\n\n"
-        "This workspace is the fleet control agent. Use `clawie clawied status --json` "
-        "to verify that the daemon is running before taking control-plane actions.\n\n"
+        "This workspace is the fleet control agent. Its runtime receives a request-only "
+        "Unix socket through `CLAWIE_CONTROL_SOCKET`; it cannot confirm pending actions "
+        "or call generic daemon service methods.\n\n"
         "- Autonomous read/safe-heal actions go through `clawie control request <verb> "
         "--args-json '<json-object>' --json`.\n"
         "- Destructive and outward actions return `pending_confirmation` with a nonce. "
-        "Show the full JSON to an allowlisted operator and wait for them to run "
-        "`clawie control confirm <verb> --nonce <nonce> --confirmer <handle> "
+        "Show the full JSON to an allowlisted local OS operator and wait for them to run "
+        "`clawie control confirm <verb> --nonce <nonce> "
         "--args-json '<same-json-object>' --json`.\n"
         "- Never approve your own nonce, never bypass `clawied`, and never edit "
         "`state.json` or SQLite files directly.\n"
@@ -359,7 +360,8 @@ class AgentOpsMixin:
                     linux_user=linux_user,
                     agent_info=old_service_state,
                 )
-                if old_running or int(old_service_state.get("fallback_pid", 0) or 0) > 0:
+                fallback_pid = int(str(old_service_state.get("fallback_pid", 0) or 0))
+                if old_running or fallback_pid > 0:
                     stop_result = self._run_managed_provider_service_action(
                         provider=current_provider,
                         action="stop",
@@ -1272,7 +1274,7 @@ class AgentOpsMixin:
         return home
 
     def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
-        results = {"created": [], "errors": []}
+        results: dict[str, list[dict[str, Any]]] = {"created": [], "errors": []}
         for entry in entries:
             agent_id = str(entry.get("agent_id", entry.get("user_id", ""))).strip()
             if not agent_id:

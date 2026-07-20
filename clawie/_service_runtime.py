@@ -14,6 +14,7 @@ from clawie.providers import (
     get_provider,
     provider_names,
 )
+from clawie.ipc_paths import control_socket_path
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
@@ -40,6 +41,42 @@ class RuntimeOpsMixin:
         config["installed_runtimes"] = names
         config["runtime_installed"] = bool(names)
 
+    def _verify_installed_runtime_version(self, provider: str, executable: str) -> str:
+        """Fail closed before recording a verified-delivery runtime as installed."""
+        spec = get_provider(provider)
+        if not spec.verified_delivery:
+            return ""
+        from clawie.adapters import get_adapter
+
+        adapter = get_adapter(spec.name)
+        command = adapter.version_command()
+        if command:
+            command[0] = executable
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(""),
+            )
+        except OSError as exc:
+            raise SetupError(
+                f"failed to probe the installed {spec.name} runtime at {executable}: {exc}"
+            ) from exc
+        output = "\n".join(
+            str(part).strip()
+            for part in (result.stdout, result.stderr)
+            if part and str(part).strip()
+        ).strip()
+        gate = adapter.version_gate(output)
+        if result.returncode != 0 or not gate.supported:
+            raise SetupError(
+                f"installed {spec.name} runtime is outside the verified delivery range: "
+                f"{gate.message or output or f'exit {result.returncode}'}"
+            )
+        return str(gate.version or "")
+
     def install_provider_runtime(self, provider: str) -> dict[str, Any]:
         name = str(provider).strip().lower()
         if not name:
@@ -47,6 +84,7 @@ class RuntimeOpsMixin:
         spec = get_provider(name)
         executable = self._resolve_executable_in_service_env(spec.name)
         if executable:
+            runtime_version = self._verify_installed_runtime_version(spec.name, executable)
             config = self.store.read_config()
             self._mark_runtime_installed(config, spec.name)
             config["updated_at"] = now_iso()
@@ -58,6 +96,7 @@ class RuntimeOpsMixin:
                 "method": spec.install_method,
                 "package": spec.install_package or spec.name,
                 "executable": executable,
+                "runtime_version": runtime_version,
             }
 
         if spec.install_method == "brew":
@@ -82,6 +121,7 @@ class RuntimeOpsMixin:
             )
 
         executable = self._resolve_provider_executable(spec.name)
+        runtime_version = self._verify_installed_runtime_version(spec.name, executable)
         config = self.store.read_config()
         self._mark_runtime_installed(config, spec.name)
         config["updated_at"] = now_iso()
@@ -106,6 +146,7 @@ class RuntimeOpsMixin:
             "method": spec.install_method,
             "package": spec.install_package or spec.name,
             "executable": executable,
+            "runtime_version": runtime_version,
             "output": output,
         }
 
@@ -114,6 +155,7 @@ class RuntimeOpsMixin:
             executable = self._resolve_provider_executable(provider)
         except SetupError:
             return self.install_provider_runtime(provider)
+        runtime_version = self._verify_installed_runtime_version(provider, executable)
         config = self.store.read_config()
         self._mark_runtime_installed(config, provider)
         config["updated_at"] = now_iso()
@@ -125,6 +167,7 @@ class RuntimeOpsMixin:
             "method": get_provider(provider).install_method,
             "package": get_provider(provider).install_package or str(provider).strip().lower(),
             "executable": executable,
+            "runtime_version": runtime_version,
         }
 
     def _run_managed_provider_service_action(
@@ -391,7 +434,7 @@ class RuntimeOpsMixin:
             return False
         if self._provider_process_live_ps_only(provider, token):
             return True
-        return self._provider_reports_running(provider, token)
+        return bool(self._provider_reports_running(provider, token))
 
     def _live_provider_names_for_user(self, linux_user: str) -> list[str]:
         token = str(linux_user).strip()
@@ -1190,6 +1233,7 @@ class RuntimeOpsMixin:
         workspace_dir = spec.workspace_dir
         path_entries = self._service_env("").get("PATH", "")
         pickup = self._staged_prompt_pickup_shell(provider, state_dir, workspace_dir)
+        control_socket = control_socket_path(self.store.root, "%U")
         shell = (
             f'mkdir -p "$HOME/{state_dir}" "$HOME/{state_dir}/{workspace_dir}"; '
             f'cd "$HOME/{state_dir}/{workspace_dir}"; '
@@ -1206,6 +1250,7 @@ class RuntimeOpsMixin:
             "Environment=HOME=%h",
             "Environment=USER=%u",
             "Environment=LOGNAME=%u",
+            f"Environment=CLAWIE_CONTROL_SOCKET={control_socket}",
             f"Environment=PATH={path_entries}",
             f"ExecStartPre=/bin/bash -c {shlex.quote(pickup)}",
             f"ExecStart=/bin/bash -lc {shlex.quote(shell)}",

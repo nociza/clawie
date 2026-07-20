@@ -148,7 +148,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             "DELEGATION.md",
         ),
         install_method="pnpm",
-        install_package="openclaw",
+        install_package="openclaw@2026.7.1",
         service_group="daemon",
         background_command=("gateway", "run"),
         readiness_command=("models", "status"),

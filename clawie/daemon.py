@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import pwd
+import select
 import signal
 import socket
 import stat
@@ -16,6 +18,7 @@ from typing import Any
 
 from clawie import __version__
 from clawie.control import ControlGate
+from clawie.ipc_paths import CONTROL_SOCKET_ROOT, control_socket_path
 from clawie.safe_fs import read_text_under, write_text_under
 from clawie.service_common import SetupError, now_iso
 
@@ -40,7 +43,7 @@ class Clawied:
         "apply_agent_addons": frozenset({"agent_id", "addons"}),
         "apply_staged_prompts": frozenset({"agent_id"}),
         "apply_shared_auth_links": frozenset({"agent_id"}),
-        "backup_init": frozenset({"repo_path", "remote", "enable"}),
+        "backup_init": frozenset({"repo_path", "remote", "enable", "auto_push"}),
         "backup_restore": frozenset({"agent_id", "apply_to_disk", "include_workspace"}),
         "backup_run": frozenset({"message", "push"}),
         "bootstrap_channels": frozenset({"agent_id", "preset", "replace"}),
@@ -132,7 +135,6 @@ class Clawied:
         "sync_agent_credentials": frozenset({"agent_id", "source_home", "bundles", "include_defaults"}),
         "spawn_session_agent": frozenset({"parent_id", "child_id", "timeout", "model_tier", "detached"}),
     }
-
     def __init__(self, service: Any, *, interval_seconds: float = 60.0) -> None:
         self.service = service
         self.interval_seconds = max(1.0, float(interval_seconds))
@@ -144,6 +146,7 @@ class Clawied:
         self._stop = False
         self._lock_handle: Any = None
         self._server: socket.socket | None = None
+        self._control_servers: list[tuple[socket.socket, Path, int]] = []
         self._control_gate = ControlGate(allowlist=self._control_allowlist())
 
     def status(self) -> dict[str, Any]:
@@ -156,6 +159,7 @@ class Clawied:
             "status_file": str(self.status_path),
             "lock_file": str(self.lock_path),
             "socket_file": str(self.socket_path),
+            "control_socket_files": [str(path) for _server, path, _uid in self._control_servers],
             "last": last,
         }
 
@@ -202,6 +206,7 @@ class Clawied:
         try:
             while not self._stop:
                 last = self.run_once(dry_run=dry_run)
+                self._refresh_control_ipc()
                 cycles += 1
                 if max_cycles is not None and cycles >= max_cycles:
                     break
@@ -236,10 +241,12 @@ class Clawied:
     ) -> dict[str, Any]:
         """Send one command to a running clawied instance over its Unix socket."""
         request = {"command": str(command), "payload": payload or {}}
+        override = str(os.environ.get("CLAWIE_CONTROL_SOCKET", "")).strip()
+        request_socket = Path(override).expanduser() if override else self.socket_path
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client.settimeout(timeout)
         try:
-            client.connect(str(self.socket_path))
+            client.connect(str(request_socket))
             client.sendall(json.dumps(request, sort_keys=True).encode("utf-8"))
             client.shutdown(socket.SHUT_WR)
             chunks: list[bytes] = []
@@ -288,12 +295,17 @@ class Clawied:
             server.close()
             raise
         self._server = server
+        self._refresh_control_ipc()
 
     def _stop_ipc(self) -> None:
         server = self._server
         self._server = None
         if server is not None:
             server.close()
+        for control_server, path, _uid in self._control_servers:
+            control_server.close()
+            self._unlink_control_socket(path, _uid)
+        self._control_servers = []
         if self.socket_path.exists() or self.socket_path.is_symlink():
             self.socket_path.unlink()
 
@@ -302,29 +314,47 @@ class Clawied:
         if server is None:
             time.sleep(timeout)
             return
-        server.settimeout(max(0.0, timeout))
+        servers = [server, *[item[0] for item in self._control_servers]]
         try:
-            conn, _ = server.accept()
-        except socket.timeout:
+            ready, _writable, _errors = select.select(servers, [], [], max(0.0, timeout))
+        except OSError:
             return
+        if not ready:
+            return
+        selected = ready[0]
+        try:
+            conn, _ = selected.accept()
         except OSError:
             return
         with conn:
             peer_uid = self._peer_uid(conn)
-            allowed_uids = {os.geteuid(), self._state_owner()[0]}
-            if peer_uid is not None and peer_uid not in allowed_uids:
+            control_entry = next(
+                (item for item in self._control_servers if item[0] is selected),
+                None,
+            )
+            scope = "control" if control_entry is not None else "operator"
+            allowed_uids = (
+                {control_entry[2]} if control_entry is not None else {os.geteuid(), self._state_owner()[0]}
+            )
+            if peer_uid is None or peer_uid not in allowed_uids:
                 try:
                     conn.sendall(b'{"ok":false,"error":"clawied IPC peer is not authorized"}')
                 except OSError:
                     pass
                 return
-            response = self._handle_ipc_connection(conn)
+            response = self._handle_ipc_connection(conn, scope=scope, peer_uid=peer_uid)
             try:
                 conn.sendall(json.dumps(self._json_safe(response), sort_keys=True).encode("utf-8"))
             except BrokenPipeError:
                 return
 
-    def _handle_ipc_connection(self, conn: socket.socket) -> dict[str, Any]:
+    def _handle_ipc_connection(
+        self,
+        conn: socket.socket,
+        *,
+        scope: str,
+        peer_uid: int,
+    ) -> dict[str, Any]:
         try:
             request_bytes = self._recv_all(conn, max_bytes=1_000_000)
             request = json.loads(request_bytes.decode("utf-8"))
@@ -334,12 +364,21 @@ class Clawied:
             payload = request.get("payload", {})
             if not isinstance(payload, dict):
                 raise ValueError("payload must be a JSON object")
-            result = self._handle_ipc_command(command, payload)
+            result = self._handle_ipc_command(command, payload, scope=scope, peer_uid=peer_uid)
             return {"ok": True, "result": result}
         except Exception as exc:  # noqa: BLE001 - return errors to the client.
             return {"ok": False, "error": str(exc)}
 
-    def _handle_ipc_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _handle_ipc_command(
+        self,
+        command: str,
+        payload: dict[str, Any],
+        *,
+        scope: str = "operator",
+        peer_uid: int | None = None,
+    ) -> dict[str, Any]:
+        if scope == "control" and command != "control_request":
+            raise PermissionError("control-agent IPC only permits control_request")
         if command == "status":
             result = self.status()
             result["via"] = "ipc"
@@ -367,7 +406,9 @@ class Clawied:
         if command == "control_request":
             return self._handle_control_request(payload)
         if command == "control_confirm":
-            return self._handle_control_confirm(payload)
+            if peer_uid is None:
+                raise PermissionError("control confirmation requires an authenticated local peer")
+            return self._handle_control_confirm(payload, peer_uid=peer_uid)
         raise ValueError(f"unsupported clawied IPC command: {command}")
 
     def _handle_service_call(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -408,14 +449,16 @@ class Clawied:
         self._record_control_event("control.request", response)
         return response
 
-    def _handle_control_confirm(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _handle_control_confirm(self, payload: dict[str, Any], *, peer_uid: int) -> dict[str, Any]:
         verb = str(payload.get("verb", "") or "").strip()
         args = payload.get("args", {})
         if not isinstance(args, dict):
             raise ValueError("control_confirm args must be a JSON object")
+        self._control_gate.set_allowlist(self._control_allowlist())
+        confirmer = self._authenticated_operator_principal(peer_uid)
         gate = self._control_gate.confirm(
             str(payload.get("nonce", "") or ""),
-            confirmer=str(payload.get("confirmer", "") or ""),
+            confirmer=confirmer,
             verb=verb,
             args=args,
         )
@@ -426,6 +469,7 @@ class Clawied:
             "decision": gate.decision.value,
             "allowed": gate.allowed,
             "reason": gate.reason,
+            "confirmer": confirmer,
         }
         if gate.allowed:
             response["result"] = self._json_safe(self._execute_control_verb(gate.verb, args))
@@ -547,6 +591,145 @@ class Clawied:
         if isinstance(raw, str):
             return [item.strip() for item in raw.split(",") if item.strip()]
         return []
+
+    def _authenticated_operator_principal(self, peer_uid: int) -> str:
+        candidates = [f"uid:{int(peer_uid)}"]
+        try:
+            candidates.insert(0, str(pwd.getpwuid(int(peer_uid)).pw_name))
+        except KeyError:
+            pass
+        allowlist = set(self._control_allowlist())
+        return next((candidate for candidate in candidates if candidate in allowlist), candidates[0])
+
+    def _control_socket_specs(self) -> list[tuple[Path, int, int]]:
+        """Return request-only socket endpoints for isolated control users."""
+        state = self.service.store.read_state()
+        agents = state.get("agents", {})
+        if not isinstance(agents, dict):
+            return []
+        rows: list[tuple[Path, int, int]] = []
+        seen: set[Path] = set()
+        for agent in agents.values():
+            if not isinstance(agent, dict):
+                continue
+            info = agent.get("agent", {})
+            if not isinstance(info, dict) or str(info.get("role", "")).strip() != "control":
+                continue
+            linux_user = str(info.get("linux_user", "")).strip()
+            if not linux_user:
+                continue
+            try:
+                record = pwd.getpwnam(linux_user)
+            except KeyError:
+                continue
+            path = control_socket_path(self.service.store.root, int(record.pw_uid))
+            if path in seen:
+                continue
+            seen.add(path)
+            rows.append((path, int(record.pw_uid), int(record.pw_gid)))
+        return rows
+
+    def _refresh_control_ipc(self) -> None:
+        desired = {path: (uid, gid) for path, uid, gid in self._control_socket_specs()}
+        retained: list[tuple[socket.socket, Path, int]] = []
+        for server, path, uid in self._control_servers:
+            if (
+                path in desired
+                and desired[path][0] == uid
+                and self._control_listener_current(path, uid)
+            ):
+                retained.append((server, path, uid))
+                desired.pop(path, None)
+                continue
+            server.close()
+            self._unlink_control_socket(path, uid)
+        self._control_servers = retained
+        for path, (uid, gid) in desired.items():
+            self._control_servers.append(self._start_control_listener(path, uid=uid, gid=gid))
+
+    def _start_control_listener(
+        self,
+        path: Path,
+        *,
+        uid: int,
+        gid: int,
+    ) -> tuple[socket.socket, Path, int]:
+        if os.geteuid() not in {0, uid}:
+            raise SetupError(f"root is required to expose control IPC for uid {uid}")
+        parent = path.parent
+        self._ensure_control_socket_parent(parent, uid=uid)
+        if path.exists() or path.is_symlink():
+            existing = path.lstat()
+            if not stat.S_ISSOCK(existing.st_mode) or int(existing.st_uid) != uid:
+                raise SetupError(f"refusing to replace unsafe control IPC path: {path}")
+            path.unlink()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(str(path))
+            os.chmod(path, 0o600)
+            if os.geteuid() == 0:
+                os.chown(path, uid, gid)
+            server.listen(8)
+        except Exception:
+            server.close()
+            raise
+        return server, path, uid
+
+    @staticmethod
+    def _control_listener_current(path: Path, uid: int) -> bool:
+        try:
+            current = path.lstat()
+        except OSError:
+            return False
+        return stat.S_ISSOCK(current.st_mode) and int(current.st_uid) == uid
+
+    @staticmethod
+    def _unlink_control_socket(path: Path, uid: int) -> None:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISSOCK(current.st_mode) and int(current.st_uid) == uid:
+            path.unlink()
+
+    @staticmethod
+    def _validate_control_directory(path: Path, *, owner_uid: int) -> None:
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise SetupError(f"control socket directory does not exist: {path}") from exc
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            raise SetupError(f"control socket directory must be a real directory: {path}")
+        if int(current.st_uid) != owner_uid:
+            raise SetupError(f"control socket directory has unexpected owner: {path}")
+        if stat.S_IMODE(current.st_mode) & 0o022:
+            raise SetupError(f"control socket directory must not be group/world writable: {path}")
+
+    def _ensure_control_socket_parent(self, parent: Path, *, uid: int) -> None:
+        effective_uid = os.geteuid()
+        if effective_uid == 0 and parent == CONTROL_SOCKET_ROOT:
+            manager_root = CONTROL_SOCKET_ROOT.parent
+            if not manager_root.exists() and not manager_root.is_symlink():
+                manager_root.mkdir(mode=0o755)
+            self._validate_control_directory(manager_root, owner_uid=0)
+            if not parent.exists() and not parent.is_symlink():
+                parent.mkdir(mode=0o711)
+            self._validate_control_directory(parent, owner_uid=0)
+            # Execute-only access lets isolated agents reach their own 0600
+            # socket without listing or modifying the manager-owned directory.
+            os.chmod(parent, 0o711)  # nosec B103
+            return
+
+        if effective_uid == 0 and uid != 0:
+            raise SetupError(
+                f"isolated control IPC must use the manager-owned runtime directory: {CONTROL_SOCKET_ROOT}"
+            )
+
+        if parent.exists() or parent.is_symlink():
+            self._validate_control_directory(parent, owner_uid=effective_uid)
+        else:
+            parent.mkdir(mode=0o700)
+        os.chmod(parent, 0o700)
 
     @staticmethod
     def _recv_all(conn: socket.socket, *, max_bytes: int) -> bytes:
@@ -690,6 +873,13 @@ class Clawied:
         if peercred is not None:
             raw = conn.getsockopt(socket.SOL_SOCKET, peercred, struct.calcsize("3i"))
             _pid, uid, _gid = struct.unpack("3i", raw)
+            return int(uid)
+        local_peercred = getattr(socket, "LOCAL_PEERCRED", None)
+        if local_peercred is not None:
+            # Darwin's xucred starts with cr_version then cr_uid. Python does
+            # not expose SOL_LOCAL there, whose platform value is zero.
+            raw = conn.getsockopt(getattr(socket, "SOL_LOCAL", 0), local_peercred, 256)
+            _version, uid = struct.unpack_from("@II", raw)
             return int(uid)
         return None
 

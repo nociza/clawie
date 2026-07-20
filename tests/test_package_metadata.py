@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from clawie.providers import PROVIDERS
+from clawie.ipc_paths import control_socket_path
 from clawie.store import DEFAULT_CONFIG
 
 if sys.version_info >= (3, 11):
@@ -32,3 +33,17 @@ def test_runtime_defaults_do_not_ship_placeholder_api_endpoints() -> None:
     assert DEFAULT_CONFIG["api_url"] == ""
     for spec in PROVIDERS.values():
         assert spec.default_api_url == ""
+
+
+def test_verified_openclaw_runtime_install_is_version_pinned() -> None:
+    assert PROVIDERS["openclaw"].install_package == "openclaw@2026.7.1"
+
+
+def test_control_socket_paths_are_manager_scoped() -> None:
+    first = control_socket_path("/var/lib/clawie-a", 1001)
+    second = control_socket_path("/var/lib/clawie-b", 1001)
+
+    assert first.parent == Path("/run/clawie/control")
+    assert first.name.startswith("1001-")
+    assert first.suffix == ".sock"
+    assert first != second

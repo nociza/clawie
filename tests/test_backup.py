@@ -120,6 +120,20 @@ def test_backup_init_no_auto_keeps_disabled(tmp_path: Path) -> None:
     assert service.store.read_config()["backup_enabled"] is False
 
 
+def test_backup_init_auto_push_requires_explicit_opt_in(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    repo = tmp_path / "repo"
+
+    enabled = service.backup_init(repo, auto_push=True)
+    preserved = service.backup_init(repo)
+    disabled = service.backup_init(repo, auto_push=False)
+
+    assert enabled["auto_push"] is True
+    assert preserved["auto_push"] is True
+    assert disabled["auto_push"] is False
+    assert service.store.read_config()["backup_auto_push"] is False
+
+
 def test_backup_init_requires_git(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     service = make_service(tmp_path)
     monkeypatch.setattr(shutil, "which", lambda _name: None)
@@ -292,11 +306,33 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     assert "auth-profiles.json" not in committed
 
 
+def test_backup_secret_scanner_catches_common_cloud_and_registry_tokens() -> None:
+    samples = (
+        b"AWS key: AKIAIOSFODNN7EXAMPLE",
+        b"Google key: AIzaSyD-ExampleKeyMaterial123456789",
+        b"npm token: npm_abcdefghijklmnopqrstuvwxyz1234567890",
+        b"GitLab token: glpat-abcdefghijklmnopqrstuvwxyz1234",
+    )
+    assert all(ClawieService._contains_secret_material(sample) for sample in samples)
+
+
+def test_backup_remote_push_is_opt_in(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "--quiet", str(remote)], check=True)
+    service.backup_init(tmp_path / "repo", remote=str(remote))
+
+    result = service.backup_run()
+
+    assert result["pushed"] is False
+    assert service.backup_settings()["auto_push"] is False
+
+
 def test_backup_run_push_failure_is_nonfatal(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     repo = tmp_path / "repo"
     service.backup_init(repo, remote=str(tmp_path / "missing-remote.git"))
-    result = service.backup_run()
+    result = service.backup_run(push=True)
     assert result["changed"] is True
     assert result["pushed"] is False
     assert result["push_error"]
@@ -308,7 +344,7 @@ def test_backup_run_pushes_to_local_remote(tmp_path: Path) -> None:
     subprocess.run(["git", "init", "--bare", "--quiet", str(remote)], check=True)
     repo = tmp_path / "repo"
     service.backup_init(repo, remote=str(remote))
-    result = service.backup_run()
+    result = service.backup_run(push=True)
     assert result["pushed"] is True
     assert git_output(remote, "rev-parse", "HEAD") == result["commit"]
 
@@ -545,6 +581,19 @@ def test_export_import_roundtrip(tmp_path: Path) -> None:
     other.import_state(target)
     assert "alice" in other.store.read_state()["agents"]
     assert other.store.read_config()["api_key"] == "zc_live_9999"
+
+
+def test_export_state_refuses_symlink_target(tmp_path: Path) -> None:
+    service = make_service(tmp_path / "source", api_key="super-secret-api-key")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("leave me alone\n", encoding="utf-8")
+    target = tmp_path / "snapshot.json"
+    target.symlink_to(victim)
+
+    with raises(PermissionError, match="symlink|special file"):
+        service.export_state(target)
+
+    assert victim.read_text(encoding="utf-8") == "leave me alone\n"
 
 
 def test_export_import_merge_keeps_existing_agents(tmp_path: Path) -> None:

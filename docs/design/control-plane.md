@@ -1,8 +1,9 @@
-# clawie control-plane redesign — comprehensive plan
+# clawie control-plane redesign — design and implementation record
 
-> Status: **plan of record / proposed.** Nothing here is implemented yet. This
-> document is the agreed target after a ground-up review of the current code.
-> It supersedes ad-hoc decisions; phases at the end are the execution order.
+> Status: **implemented core with explicitly gated extensions.** Sections 1–16
+> preserve the design rationale; Appendices A and B describe the source-pinned
+> OpenClaw contract and current implementation. Historical audit findings are
+> labeled as such and are not statements about the current tree.
 
 ## 0. How to read this
 
@@ -226,7 +227,7 @@ version-pinned unit:
   expiry decode) and `claude/.credentials.json`. These are *not* openclaw; they
   are the model backends. One module, contract-tested.
 - **Provider auth-store writer** — drives openclaw's own auth store, **not**
-  hand-written legacy JSON. As of openclaw 2026.6.2, auth lives in each agent's
+  hand-written legacy JSON. As of OpenClaw 2026.7.1, auth lives in each agent's
   `openclaw-agent.sqlite`; the `auth-profiles.json` files and `openai-codex`
   profile ids are **legacy migration input** that `openclaw doctor --fix`
   rewrites to the canonical `openai` route. Direct linked login/status uses
@@ -263,7 +264,7 @@ parent ──`clawie delegation submit --child c`──▶ clawied
    ◀─ reply ─────────────────────────────────────────────────────────────────
 ```
 
-Design details (verified against openclaw 2026.6.2 — see Appendix A):
+Design details (verified against OpenClaw 2026.7.1 — see Appendix A):
 
 - **The endpoint is a loopback port, not a socket clawie invents.** The gateway
   is one always-on process exposing a single multiplexed port (default `18789`,
@@ -291,7 +292,8 @@ Design details (verified against openclaw 2026.6.2 — see Appendix A):
   channel history and isn't mistaken for a `HEARTBEAT_OK` poll.
 - **Budgets become real.** openclaw reports usage/cost via `sessions.usage` /
   `usage.cost`; budgets consume that instead of the `len//4` heuristic, and tier
-  → model uses real ids (`openai/gpt-5.4`, not the legacy `openai-codex/*`) (C1).
+  → model uses source-pinned ids (`openai/gpt-5.5` for fast and
+  `openai/gpt-5.6` for balanced/power, not legacy `openai-codex/*`) (C1).
 - **Echo REPL is demoted** to a `loopback` adapter for tests and the no-gateway
   dev path, preserving the existing delegation test suite.
 - **openclaw already has recursive primitives.** Its `tasks.*` ledger
@@ -602,8 +604,8 @@ adapter in CI; real resource-metrics source for the control agent; split the
 
 ## Appendix A — openclaw integration facts (verified)
 
-Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
-(openclaw `2026.6.2`). Primary sources: `docs/gateway/*`, `docs/cli/agent.md`,
+Verified by reading `github.com/openclaw/openclaw` at commit `2d2ddc43`
+(OpenClaw `2026.7.1`). Primary sources: `docs/gateway/*`, `docs/cli/agent.md`,
 `packages/gateway-protocol`.
 
 **Gateway runtime**
@@ -658,21 +660,22 @@ Verified by reading `github.com/openclaw/openclaw` at commit `e9bd90d2`
 
 ## Appendix B — implementation status
 
-Tracks what has landed on `claude/great-meitner-m564jm` against the roadmap. The
-suite is green at every commit (298 -> 491 tests).
+Tracks what has landed against the roadmap. Release claims are based on the
+current automated suite and a fresh target-host verifier, never a branch name or
+historical test count.
 
 | Phase | Status | Landed |
 |---|---|---|
 | **0** Adapter seam + version gate | **Mostly done** | `clawie/adapters.py` (`ProviderAdapter` + `GatewayCliAdapter` + `OpenclawAdapter`); version skew fixed; dead `*_user` aliases removed; model id de-legacied to `openai/*`; direct openclaw login/status uses `models auth`/`models status`; imported/ported OpenClaw auth writes native SQLite auth rows; `ZeroClawService`→`ClawieService`; `clawie runtime version`. |
 | **1** Real delegation bridge | **Core done** | per-agent gateway endpoint (port + token) written into `openclaw.json`, token redacted from backups; `deliver_to_agent()` via the gateway (adapter-driven, injectable runner); `clawie delegation deliver` |
-| **2** Trust / security | **Production proof done for the release fixture** | `cli.js` binary patch removed; provider-auth and addon-auth caches are private manager-side stores; agents receive owned `0600` credential copies instead of symlinks; shared toolchain is no longer world-writable; `/tmp` prompt staging is disabled; credential bundles now default to empty so shared provider auth is explicit opt-in; `clawie health` verifies shared-auth store privacy and copied provider-auth file modes/symlinks; `clawie health --host-validate --json` performs the Linux/root multi-user validation proof; `docs/proofs/host-validation-linux-container-2026-06-14.md` captures container-level Linux/root proof; `docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md` captures the aggregate Linux/systemd wheel proof with two managed Linux users, private homes, private provider-auth files, cross-user denial, and watchdog restart evidence. Repeat the aggregate verifier on each deployment host before accepting that host. |
+| **2** Trust / security | **Implemented; host proof required** | Privileged writes use no-follow, descriptor-relative helpers; provider/addon caches stay manager-private; agents receive owned `0600` credential copies; shared toolchains are non-world-writable; `/tmp` prompt staging is disabled; published artifacts use private canonical storage plus materialized per-agent projections; and host health checks verify per-user isolation. Historical proof files are examples only. Run the aggregate verifier on the exact release artifact and deployment host before acceptance. |
 | **3** Manifest + reconcile + clawied | **Core done** | `clawie/manifest.py` — `AgentManifest` (credentials by reference) + `reconcile_plan()` / `is_converged()`; `clawie/_service_reconcile.py` applies manifests through service operations for provider, tier, channels, credential bundles, and addons; `clawie/_service_backup.py` writes per-agent `manifest.json` and uses it to recreate missing agents during restore; `clawie/store.py` uses an `agents` table and an agents-only state surface, with one-time migration from old `users` tables; `clawie/daemon.py` provides a foreground `clawied` reconcile loop with pid/status files, an advisory loop lock, a local command socket, whitelisted service-call IPC for mutating CLI service operations, and control-tool IPC; `clawie clawied ...` commands use IPC when the daemon is running; SQLite uses WAL plus a busy timeout. |
 | **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed); `clawie/daemon.py` — `control_request` / `control_confirm` runtime RPC executing read/safe-heal verbs, confirmed destructive verbs, and confirmed GitHub `open_issue` / `open_pr` escalation through daemon-owned service calls with event-log audit; `clawie/cli.py` — `clawie control request` / `control confirm` daemon-client commands for live control workspaces plus `clawie production verify` for aggregate proof gates and `--all-provider-contracts` production-delivery adapter checks; `clawie/_service_escalation.py` validates the private GitHub token file, dedupes issues/PRs, and rate-limits new issue/PR creation; `clawie/_service_watchdog.py` renders/install/removes/verifies the systemd watchdog and optional alert unit for `clawied`. |
 | **5** Hardening + provider matrix | **Production surface scoped** | `HermesAdapter` + a parametrized adapter contract test prove extensibility; provider metadata now distinguishes verified production delivery from lifecycle/auth integrations; managed-agent refresh metrics now use live provider processes instead of usually-empty stored pids, preserve `ps` CPU, prefer cgroup memory accounting, and fall back to `/proc` RSS/memory. openclaw is the verified production delivery surface. picoclaw/zeroclaw and hermes are gated for delegated-task delivery until pinned to real source. **Deferred:** real contracts for those experimental delivery adapters; `cli.py` split |
 
-**Deferred with rationale:** The package release surface is production-ready for
-openclaw delivery on Linux/systemd hosts that pass
-`production verify --exercise-watchdog-restart --all-provider-contracts`.
+**Deferred with rationale:** The package remains Beta until the exact artifact
+and Linux/systemd deployment host pass
+`production verify --exercise-watchdog-restart --exercise-runtime-delivery --all-provider-contracts`.
 picoclaw, zeroclaw, and hermes remain lifecycle/auth or extensibility surfaces
 until their delegated-delivery contracts are source-pinned. Each deployment host
 still needs its own target-host verifier run; the Colima proof accepts the

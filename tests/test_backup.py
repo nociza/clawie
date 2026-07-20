@@ -127,6 +127,30 @@ def test_backup_init_requires_git(tmp_path: Path, monkeypatch: MonkeyPatch) -> N
         service.backup_init(tmp_path / "repo")
 
 
+def test_backup_init_refuses_unowned_nonempty_directory(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    repo = tmp_path / "existing"
+    repo.mkdir()
+    important = repo / "important.txt"
+    important.write_text("do not delete", encoding="utf-8")
+
+    with raises(SetupError, match="refusing to adopt non-empty directory"):
+        service.backup_init(repo)
+
+    assert important.read_text(encoding="utf-8") == "do not delete"
+    assert not (repo / ".git").exists()
+
+
+def test_backup_init_rejects_remote_with_embedded_secret(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    with raises(SetupError, match="embedded credentials"):
+        service.backup_init(
+            tmp_path / "repo",
+            remote="https://oauth2:supersecret@example.com/fleet.git",
+        )
+    assert not (tmp_path / "repo").exists()
+
+
 # ── backup run ──────────────────────────────────────────────────────────────
 
 
@@ -190,6 +214,41 @@ def test_backup_run_auto_initializes_default_repo(tmp_path: Path) -> None:
     assert service.store.read_config()["backup_enabled"] is False
 
 
+def test_backup_run_stages_only_clawie_managed_paths(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    first = service.backup_run()
+    unrelated = repo / "operator-notes.txt"
+    unrelated.write_text("private operator notes", encoding="utf-8")
+
+    second = service.backup_run()
+
+    assert first["changed"] is True
+    assert second["changed"] is False
+    assert "operator-notes.txt" not in git_output(repo, "ls-files")
+    assert unrelated.read_text(encoding="utf-8") == "private operator notes"
+
+
+def test_backup_run_skips_prompt_with_secret_material(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    service.set_agent_core_prompt(
+        "alice",
+        "MEMORY.md",
+        "Temporary credential: api_key=sk-sensitive-production-value-123456",
+        sync_to_disk=False,
+    )
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+
+    result = service.backup_run()
+
+    assert not (repo / "agents" / "alice" / "prompts" / "MEMORY.md").exists()
+    assert any("contains secret-like content" in row["reason"] for row in result["skipped"])
+    assert "sk-sensitive-production-value" not in git_output(repo, "show", "HEAD")
+
+
 def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -207,6 +266,9 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     (workspace / "memory" / "2026-06-09").write_text("met bob", encoding="utf-8")
     (workspace / "data.json").write_text("{}", encoding="utf-8")  # not a knowledge suffix
     (workspace / "my-token.md").write_text("secret-ish", encoding="utf-8")
+    (workspace / "innocent-name.md").write_text(
+        "API_KEY=sk-this-value-must-never-be-committed", encoding="utf-8"
+    )
     (workspace / "huge.md").write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
     (home / ".openclaw" / "auth-profiles.json").write_text("{}", encoding="utf-8")
     (workspace / "auth-link.md").symlink_to(home / ".openclaw" / "auth-profiles.json")
@@ -222,6 +284,7 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     assert (backed / "memory" / "2026-06-09").exists()
     assert not (backed / "data.json").exists()
     assert not (backed / "my-token.md").exists()
+    assert not (backed / "innocent-name.md").exists()
     assert not (backed / "huge.md").exists()
     assert not (backed / "auth-link.md").exists()
     # The provider auth store sits outside the workspace and must never appear.
@@ -381,8 +444,16 @@ def test_backup_restore_skips_legacy_agents_missing_from_state(tmp_path: Path) -
 
 def test_backup_restore_requires_backup_data(tmp_path: Path) -> None:
     service = make_service(tmp_path)
-    with raises(SetupError, match="backup repo has no agents"):
+    with raises(SetupError, match="backup repository does not exist"):
         service.backup_restore()
+
+
+def test_backup_restore_rejects_path_traversal_agent_id(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    service.backup_init(tmp_path / "repo")
+    service.backup_run()
+    with raises(ValueError, match="unsafe"):
+        service.backup_restore("../outside")
 
 
 # ── maintenance integration ─────────────────────────────────────────────────

@@ -6,13 +6,17 @@ import hashlib
 import os
 import signal
 import socket
+import stat
+import struct
+import tempfile
 import time
 import threading
 from pathlib import Path
 from typing import Any
 
 from clawie import __version__
-from clawie.control import ControlGate, Decision
+from clawie.control import ControlGate
+from clawie.safe_fs import read_text_under, write_text_under
 from clawie.service_common import SetupError, now_iso
 
 try:
@@ -203,8 +207,8 @@ class Clawied:
                     break
                 self._sleep_until_next_cycle()
         finally:
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
+            for signum, handler in previous_handlers.items():
+                signal.signal(signum, handler)
             self._stop_ipc()
             self._remove_pid()
             self._release_lock()
@@ -223,7 +227,13 @@ class Clawied:
         while not self._stop and time.monotonic() < deadline:
             self._serve_ipc_once(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
 
-    def request(self, command: str, payload: dict[str, Any] | None = None, *, timeout: float = 2.0) -> dict[str, Any]:
+    def request(
+        self,
+        command: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
         """Send one command to a running clawied instance over its Unix socket."""
         request = {"command": str(command), "payload": payload or {}}
         client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -255,13 +265,23 @@ class Clawied:
         return result if isinstance(result, dict) else {"result": result}
 
     def _start_ipc(self) -> None:
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        self.service.store.ensure()
+        self._ensure_socket_parent()
         if self.socket_path.exists() or self.socket_path.is_symlink():
+            existing = self.socket_path.lstat()
+            if not stat.S_ISSOCK(existing.st_mode):
+                raise SetupError(f"refusing to replace non-socket clawied IPC path: {self.socket_path}")
+            allowed_owners = {os.geteuid(), self._state_owner()[0]}
+            if int(existing.st_uid) not in allowed_owners:
+                raise SetupError(f"refusing to replace clawied socket owned by another user: {self.socket_path}")
             self.socket_path.unlink()
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             server.bind(str(self.socket_path))
             os.chmod(self.socket_path, 0o600)
+            owner = self._state_owner()
+            if os.geteuid() == 0:
+                os.chown(self.socket_path, owner[0], owner[1])
             server.listen(8)
             server.settimeout(0.5)
         except Exception:
@@ -290,6 +310,14 @@ class Clawied:
         except OSError:
             return
         with conn:
+            peer_uid = self._peer_uid(conn)
+            allowed_uids = {os.geteuid(), self._state_owner()[0]}
+            if peer_uid is not None and peer_uid not in allowed_uids:
+                try:
+                    conn.sendall(b'{"ok":false,"error":"clawied IPC peer is not authorized"}')
+                except OSError:
+                    pass
+                return
             response = self._handle_ipc_connection(conn)
             try:
                 conn.sendall(json.dumps(self._json_safe(response), sort_keys=True).encode("utf-8"))
@@ -535,8 +563,27 @@ class Clawied:
         return b"".join(chunks)
 
     def _acquire_lock(self) -> None:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_handle = self.lock_path.open("a+", encoding="utf-8")
+        self.service.store.ensure()
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+        except OSError as exc:
+            raise SetupError(f"could not open clawied lock safely: {self.lock_path}: {exc}") from exc
+        try:
+            lock_st = os.fstat(fd)
+            if not stat.S_ISREG(lock_st.st_mode):
+                raise SetupError(f"clawied lock is not a regular file: {self.lock_path}")
+            os.fchmod(fd, 0o600)
+            owner = self._state_owner()
+            if os.geteuid() == 0:
+                os.fchown(fd, owner[0], owner[1])
+            self._lock_handle = os.fdopen(fd, "a+", encoding="utf-8")
+            fd = -1
+        finally:
+            if fd >= 0:
+                os.close(fd)
         if fcntl is None:
             return
         try:
@@ -556,8 +603,13 @@ class Clawied:
             handle.close()
 
     def _write_pid(self) -> None:
-        self.pid_path.parent.mkdir(parents=True, exist_ok=True)
-        self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        write_text_under(
+            self.service.store.root,
+            self.pid_path.name,
+            f"{os.getpid()}\n",
+            mode=0o600,
+            owner=self._state_owner() if os.geteuid() == 0 else None,
+        )
 
     def _remove_pid(self) -> None:
         if self._read_pid() == os.getpid():
@@ -565,7 +617,14 @@ class Clawied:
 
     def _read_pid(self) -> int:
         try:
-            return int(self.pid_path.read_text(encoding="utf-8").strip() or "0")
+            return int(
+                read_text_under(
+                    self.service.store.root,
+                    self.pid_path.name,
+                    max_bytes=128,
+                ).strip()
+                or "0"
+            )
         except (OSError, ValueError):
             return 0
 
@@ -581,21 +640,58 @@ class Clawied:
             return True
         return True
 
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
+    def _read_json(self, path: Path) -> dict[str, Any]:
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(
+                read_text_under(self.service.store.root, path.name, max_bytes=16 * 1024 * 1024)
+            )
         except Exception:  # noqa: BLE001
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    @staticmethod
-    def _write_json(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        write_text_under(
+            self.service.store.root,
+            path.name,
             json.dumps(Clawied._json_safe(payload), indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
+            mode=0o600,
+            owner=self._state_owner() if os.geteuid() == 0 else None,
         )
+
+    def _state_owner(self) -> tuple[int, int]:
+        st = self.service.store.root.stat()
+        return int(st.st_uid), int(st.st_gid)
+
+    def _ensure_socket_parent(self) -> None:
+        parent = self.socket_path.parent
+        if parent == self.service.store.root:
+            return
+        if parent.exists() or parent.is_symlink():
+            parent_st = parent.lstat()
+            if stat.S_ISLNK(parent_st.st_mode) or not stat.S_ISDIR(parent_st.st_mode):
+                raise SetupError(f"clawied socket parent must be a real directory: {parent}")
+            allowed_owners = {os.geteuid(), self._state_owner()[0]}
+            if int(parent_st.st_uid) not in allowed_owners:
+                raise SetupError(f"clawied socket parent is owned by another user: {parent}")
+        else:
+            parent.mkdir(mode=0o700)
+        if os.geteuid() == 0:
+            owner = self._state_owner()
+            os.chown(parent, owner[0], owner[1])
+        os.chmod(parent, 0o700)
+
+    @staticmethod
+    def _peer_uid(conn: socket.socket) -> int | None:
+        getpeereid = getattr(conn, "getpeereid", None)
+        if callable(getpeereid):
+            uid, _gid = getpeereid()
+            return int(uid)
+        peercred = getattr(socket, "SO_PEERCRED", None)
+        if peercred is not None:
+            raw = conn.getsockopt(socket.SOL_SOCKET, peercred, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", raw)
+            return int(uid)
+        return None
 
     @staticmethod
     def _json_safe(value: Any) -> Any:
@@ -615,4 +711,4 @@ class Clawied:
         if len(str(candidate).encode("utf-8")) < 100:
             return candidate
         digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
-        return Path("/tmp") / f"clawie-clawied-{digest}.sock"
+        return Path(tempfile.gettempdir()) / f"clawie-clawied-{digest}" / "rpc.sock"

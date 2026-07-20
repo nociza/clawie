@@ -47,9 +47,9 @@ clawie config show
 clawie runtime install openclaw
 ```
 
-Production delegated-task delivery is verified for `openclaw`. `picoclaw` and
-`zeroclaw` lifecycle/auth support is available, but delegated-task delivery is
-gated until those runtime contracts are source-pinned.
+OpenClaw 2026.7.1 is the only source-pinned delegated-task contract. Before
+accepting a host, run `production verify` with both live exercises; picoclaw and
+zeroclaw lifecycle/auth support is available, but their delivery remains gated.
 
 ## Create your first agent
 

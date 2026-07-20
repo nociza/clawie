@@ -11,6 +11,7 @@ import subprocess
 # ``clawie.service.shutil.which``; the shutil module object is shared, so this
 # also patches the executable lookups performed in the runtime mixins.
 import shutil  # noqa: F401
+import uuid
 from pathlib import Path
 from typing import Any
 from clawie.providers import (
@@ -538,6 +539,7 @@ class ClawieService(
         exercise_watchdog_restart: bool = False,
         watchdog_timeout_seconds: int = 30,
         all_provider_contracts: bool = False,
+        exercise_runtime_delivery: bool = False,
     ) -> dict[str, Any]:
         """Aggregate the target-host proof gates required for production.
 
@@ -615,6 +617,7 @@ class ClawieService(
             checks.extend(
                 self._production_runtime_adapter_contract_checks(
                     all_provider_contracts=all_provider_contracts,
+                    exercise_delivery=exercise_runtime_delivery,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - readiness reports all failed gates.
@@ -636,14 +639,16 @@ class ClawieService(
             "checks": checks,
             "exercise_watchdog_restart": bool(exercise_watchdog_restart),
             "all_provider_contracts": bool(all_provider_contracts),
+            "exercise_runtime_delivery": bool(exercise_runtime_delivery),
         }
 
     def _production_runtime_adapter_contract_checks(
         self,
         *,
         all_provider_contracts: bool = False,
+        exercise_delivery: bool = False,
     ) -> list[dict[str, Any]]:
-        from clawie.adapters import AdapterError, get_adapter
+        from clawie.adapters import get_adapter
         from clawie.providers import verified_delivery_provider_names
 
         providers: set[str] = set()
@@ -670,11 +675,22 @@ class ClawieService(
 
         checks: list[dict[str, Any]] = []
         for provider in sorted(providers):
-            checks.append(self._production_runtime_adapter_contract_check(provider, get_adapter))
+            checks.append(
+                self._production_runtime_adapter_contract_check(
+                    provider,
+                    get_adapter,
+                    exercise_delivery=exercise_delivery,
+                )
+            )
         return checks
 
-    @staticmethod
-    def _production_runtime_adapter_contract_check(provider: str, get_adapter: Any) -> dict[str, Any]:
+    def _production_runtime_adapter_contract_check(
+        self,
+        provider: str,
+        get_adapter: Any,
+        *,
+        exercise_delivery: bool = False,
+    ) -> dict[str, Any]:
         from clawie.adapters import AdapterError
         from clawie.providers import get_provider
 
@@ -714,6 +730,7 @@ class ClawieService(
             "contract_verified": bool(getattr(adapter, "CONTRACT_VERIFIED", False)),
             "models": models,
             "default_model": str(getattr(adapter, "DEFAULT_MODEL", "") or "").strip(),
+            "supported_range": [str(value) for value in adapter.supported_range()],
         }
         if not evidence["contract_verified"]:
             return {
@@ -738,10 +755,106 @@ class ClawieService(
                 "message": f"Provider {provider} adapter refuses model selection: {exc}",
                 "evidence": evidence,
             }
+        if not exercise_delivery:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": (
+                    f"Provider {provider} requires --exercise-runtime-delivery; "
+                    "static adapter metadata is not production evidence"
+                ),
+                "evidence": evidence,
+            }
+
+        state = self.store.read_state()
+        candidates: list[tuple[str, str]] = []
+        agents = state.get("agents", {})
+        if isinstance(agents, dict):
+            for agent_id, payload in sorted(agents.items()):
+                if not isinstance(payload, dict):
+                    continue
+                info = payload.get("agent", {})
+                if not isinstance(info, dict):
+                    continue
+                if str(info.get("provider", "") or "").strip().lower() != provider:
+                    continue
+                candidates.append((str(agent_id), str(info.get("linux_user", "") or "").strip()))
+        if not candidates:
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} has no managed agent available for a live delivery proof",
+                "evidence": evidence,
+            }
+
+        agent_id, linux_user = candidates[0]
+        evidence["agent_id"] = agent_id
+        try:
+            executable = self._resolve_provider_executable(provider)
+
+            def run_probe(command: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+                argv = [executable, *command[1:]]
+                wrapped = self._wrap_user_command(argv, linux_user, purpose="production runtime proof")
+                return subprocess.run(
+                    wrapped,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                    env=self._service_env(linux_user),
+                )
+
+            version_probe = run_probe(adapter.version_command(), timeout=30)
+            version_text = "\n".join(
+                part.strip() for part in (version_probe.stdout, version_probe.stderr) if part.strip()
+            )
+            gate = adapter.version_gate(version_text)
+            evidence["runtime_version"] = str(gate.version) if gate.version is not None else ""
+            if version_probe.returncode != 0 or not gate.supported:
+                detail = gate.message or f"version command exited {version_probe.returncode}"
+                raise SetupError(detail)
+
+            readiness_probe = run_probe(adapter.readiness_command(executable), timeout=60)
+            if readiness_probe.returncode != 0:
+                detail = readiness_probe.stderr.strip() or f"exit {readiness_probe.returncode}"
+                raise SetupError(f"runtime readiness probe failed: {detail}")
+            try:
+                readiness = json.loads(readiness_probe.stdout)
+            except json.JSONDecodeError as exc:
+                raise SetupError(f"runtime readiness output was not JSON: {exc}") from exc
+            if not isinstance(readiness, (dict, list)):
+                raise SetupError("runtime readiness output was not a JSON object or list")
+            evidence["readiness_json"] = True
+
+            nonce = f"CLAWIE_PRODUCTION_PROBE_{uuid.uuid4().hex}"
+            delivery = self.deliver_to_agent(
+                agent_id,
+                f"Production readiness probe. Reply with this exact marker: {nonce}",
+                tier="balanced",
+                timeout=120,
+            )
+            if not bool(delivery.get("ok", False)):
+                raise SetupError(str(delivery.get("error", "live delivery failed")))
+            if nonce not in str(delivery.get("output", "")):
+                raise SetupError("live delivery reply did not contain the challenge marker")
+            if str(delivery.get("transport", "")).strip().lower() == "embedded" or str(
+                delivery.get("fallback_from", "")
+            ).strip():
+                raise SetupError("delivery fell back to embedded execution instead of the live gateway")
+            evidence["delivery_challenge_verified"] = True
+            evidence["transport"] = str(delivery.get("transport", "") or "gateway")
+        except Exception as exc:  # noqa: BLE001 - report the failed runtime proof.
+            evidence["error"] = str(exc)
+            return {
+                "name": name,
+                "status": "fail",
+                "message": f"Provider {provider} live runtime contract proof failed",
+                "evidence": evidence,
+            }
         return {
             "name": name,
             "status": "pass",
-            "message": f"Provider {provider} adapter contract is verified",
+            "message": f"Provider {provider} adapter and live delivery contract are verified",
             "evidence": evidence,
         }
 

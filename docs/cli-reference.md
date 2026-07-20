@@ -104,7 +104,7 @@ clawie channel move SOURCE_AGENT TARGET_AGENT
 ```bash
 clawie delegation submit --parent P --child C [--payload JSON] [--timeout S] [--tier fast|balanced|power]
 clawie delegation deliver --agent A --message TEXT [--timeout S] [--tier fast|balanced|power] [--json]
-clawie delegation repl --agent-id ID [--tier fast|balanced|power]
+clawie delegation repl --agent-id ID --executor-agent MANAGED_ID [--tier fast|balanced|power]
 clawie delegation tree --agent-id ID
 clawie delegation tasks [--agent-id ID] [--status S] [--limit N]
 clawie delegation status
@@ -117,8 +117,9 @@ clawie delegation session-agents --parent P
 ## workspace
 
 Published artifacts are copied from a private agent workspace into clawie's
-shared published workspace. Authorized viewers see generated read-only views at
-`~/.openclaw/workspace/published`.
+shared published workspace. Authorized viewers receive generated, disposable
+materialized projections at `~/.openclaw/workspace/published`; the immutable
+canonical copy remains in the manager-private store.
 
 ```bash
 clawie workspace status
@@ -243,7 +244,7 @@ not a TTY). Use `clawie status` instead.
 ```bash
 clawie health
 sudo clawie health --host-validate --json
-sudo clawie production verify [--exercise-watchdog-restart] [--watchdog-timeout SECONDS] [--all-provider-contracts] [--json]
+sudo clawie production verify [--exercise-watchdog-restart] [--exercise-runtime-delivery] [--watchdog-timeout SECONDS] [--all-provider-contracts] [--json]
 clawie event list [--limit N]
 ```
 
@@ -251,16 +252,17 @@ clawie event list [--limit N]
 Linux, root, and at least two managed Linux-user agents; it exits nonzero unless
 the cross-user checks pass.
 `production verify` aggregates the release proof gates: standard health,
-target-host host validation, target-host watchdog verification, and the
-source-pinned runtime adapter contract checks. By default, adapter checks cover
+target-host host validation, target-host watchdog verification, source-pinned
+runtime checks, and live gateway challenge delivery. By default, checks cover
 the configured provider and any providers already assigned to agents; add
 `--all-provider-contracts` for package release acceptance across every verified
-production delivery provider. A production pass requires
-`--exercise-watchdog-restart`; without it the command can still report the
-structural watchdog checks, but exits nonzero because restart behavior was not
-proved. The built wheel has a Colima Linux/systemd proof recorded in
+production delivery provider. A production pass requires both
+`--exercise-watchdog-restart` and `--exercise-runtime-delivery`; without them
+the command exits nonzero. The older wheel has a historical Colima
+Linux/systemd proof recorded in
 [`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md);
-rerun the verifier on any different deployment host before accepting that host.
+that predates mandatory live delivery and does not accept the current tree or a
+different host.
 
 ## backup
 

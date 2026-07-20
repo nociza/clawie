@@ -22,6 +22,11 @@ from typing import Any
 VALID_ROLES = ("worker", "control")
 VALID_TIERS = ("fast", "balanced", "power")
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_LIMIT_RANGES = {
+    "delegation_depth": (1, 10),
+    "gateway_timeout": (1, 3600),
+}
 
 
 class ManifestError(ValueError):
@@ -75,6 +80,79 @@ class AgentManifest:
         if self.model_tier not in VALID_TIERS:
             raise ManifestError(f"model_tier must be one of {VALID_TIERS}, got {self.model_tier!r}")
         self.display_name = str(self.display_name or self.id)
+        if len(self.display_name) > 200 or "\x00" in self.display_name:
+            raise ManifestError("display_name must be at most 200 characters and contain no NUL")
+        prompts = Path(str(self.prompts_dir or "prompts"))
+        if (
+            prompts.is_absolute()
+            or not prompts.parts
+            or any(part in {"", ".", ".."} for part in prompts.parts)
+        ):
+            raise ManifestError("prompts_dir must be a safe relative path")
+        self.prompts_dir = prompts.as_posix()
+
+        channel_keys: set[tuple[str, str]] = set()
+        normalized_channels: list[ChannelSpec] = []
+        for channel in self.channels:
+            kind = str(channel.kind).strip().lower()
+            name = str(channel.name).strip()
+            if not kind or not name or "\x00" in kind or "\x00" in name:
+                raise ManifestError("channel kind and name are required and may not contain NUL")
+            key = (kind, name)
+            if key in channel_keys:
+                raise ManifestError(f"duplicate channel in manifest: {kind}:{name}")
+            channel_keys.add(key)
+            allow_from = tuple(
+                dict.fromkeys(
+                    str(value).strip()
+                    for value in channel.allow_from
+                    if str(value).strip()
+                )
+            )
+            if any(len(value) > 256 or "\x00" in value for value in allow_from):
+                raise ManifestError("channel allow_from entries must be <= 256 characters and contain no NUL")
+            normalized_channels.append(ChannelSpec(kind=kind, name=name, allow_from=allow_from))
+        self.channels = normalized_channels
+
+        credential_names: set[str] = set()
+        normalized_credentials: list[CredentialRef] = []
+        for credential in self.credentials:
+            name = str(credential.name).strip().lower().replace("_", "-")
+            scope = str(credential.scope or "agent").strip().lower()
+            if not _REFERENCE_RE.fullmatch(name):
+                raise ManifestError(f"invalid credential reference name: {credential.name!r}")
+            if scope not in {"agent", "shared"}:
+                raise ManifestError("credential scope must be 'agent' or 'shared'")
+            if name in credential_names:
+                raise ManifestError(f"duplicate credential reference: {name}")
+            credential_names.add(name)
+            normalized_credentials.append(CredentialRef(name=name, scope=scope))
+        self.credentials = normalized_credentials
+
+        normalized_addons: dict[str, bool] = {}
+        for name, enabled in self.addons.items():
+            token = str(name).strip().lower()
+            if not _REFERENCE_RE.fullmatch(token):
+                raise ManifestError(f"invalid addon name: {name!r}")
+            normalized_addons[token] = bool(enabled)
+        self.addons = normalized_addons
+
+        if not isinstance(self.limits, dict):
+            raise ManifestError("limits must be a mapping")
+        unknown_limits = sorted(set(self.limits) - set(_LIMIT_RANGES))
+        if unknown_limits:
+            raise ManifestError(f"unsupported limit(s): {', '.join(str(key) for key in unknown_limits)}")
+        normalized_limits: dict[str, int] = {}
+        for limit_name, value in self.limits.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ManifestError(f"limit {limit_name} must be an integer")
+            low, high = _LIMIT_RANGES[limit_name]
+            if not low <= value <= high:
+                raise ManifestError(
+                    f"limit {limit_name} must be between {low} and {high}"
+                )
+            normalized_limits[limit_name] = value
+        self.limits = normalized_limits
 
     # --- serialization -------------------------------------------------------
 
@@ -101,23 +179,46 @@ class AgentManifest:
             raise ManifestError("manifest must be a mapping")
         if not str(data.get("id", "")).strip():
             raise ManifestError("manifest requires an 'id'")
+        raw_channels = data.get("channels", [])
+        if not isinstance(raw_channels, list):
+            raise ManifestError("channels must be a list")
+        if any(not isinstance(item, dict) for item in raw_channels):
+            raise ManifestError("every channel must be a mapping")
+        for channel in raw_channels:
+            raw_allow_from = channel.get("allow_from", [])
+            if not isinstance(raw_allow_from, list):
+                raise ManifestError("channel allow_from must be a list")
         channels = [
             ChannelSpec(
                 kind=str(c.get("kind", "")),
                 name=str(c.get("name", "")),
                 allow_from=tuple(str(x) for x in c.get("allow_from", []) if str(x).strip()),
             )
-            for c in data.get("channels", [])
-            if isinstance(c, dict)
+            for c in raw_channels
         ]
+        raw_credentials = data.get("credentials", [])
+        if not isinstance(raw_credentials, list):
+            raise ManifestError("credentials must be a list")
+        if any(not isinstance(item, dict) for item in raw_credentials):
+            raise ManifestError("every credential reference must be a mapping")
+        if any(not str(item.get("name", "")).strip() for item in raw_credentials):
+            raise ManifestError("every credential reference requires a name")
         credentials = [
-            CredentialRef(name=str(r.get("name", "")), scope=str(r.get("scope", "agent")) or "agent")
-            for r in data.get("credentials", [])
-            if isinstance(r, dict) and str(r.get("name", "")).strip()
+            CredentialRef(
+                name=str(r.get("name", "")),
+                scope=str(r.get("scope", "agent")) or "agent",
+            )
+            for r in raw_credentials
         ]
-        addons = {
-            str(k): bool(v) for k, v in dict(data.get("addons", {})).items() if str(k).strip()
-        }
+        raw_addons = data.get("addons", {})
+        raw_limits = data.get("limits", {})
+        if not isinstance(raw_addons, dict):
+            raise ManifestError("addons must be a mapping")
+        if any(not isinstance(value, bool) for value in raw_addons.values()):
+            raise ManifestError("addon values must be booleans")
+        if not isinstance(raw_limits, dict):
+            raise ManifestError("limits must be a mapping")
+        addons = {str(k): bool(v) for k, v in raw_addons.items() if str(k).strip()}
         return cls(
             id=str(data["id"]),
             provider=str(data.get("provider", "openclaw")),
@@ -128,7 +229,7 @@ class AgentManifest:
             channels=channels,
             credentials=credentials,
             addons=addons,
-            limits=dict(data.get("limits", {})),
+            limits=dict(raw_limits),
         )
 
     def to_json(self) -> str:
@@ -195,32 +296,68 @@ def reconcile_plan(desired: AgentManifest, observed: dict[str, Any] | None) -> l
 
     desired_ch = {c.key(): c for c in desired.channels}
     observed_ch = {
-        (str(c.get("kind", "")).strip().lower(), str(c.get("name", "")).strip())
+        (str(c.get("kind", "")).strip().lower(), str(c.get("name", "")).strip()): tuple(
+            str(item).strip() for item in c.get("allow_from", []) if str(item).strip()
+        )
         for c in observed.get("channels", [])
         if isinstance(c, dict)
     }
     for key, channel in sorted(desired_ch.items()):
         if key not in observed_ch:
             actions.append(
-                ReconcileAction("ensure_channel", {"kind": channel.kind, "name": channel.name})
+                ReconcileAction(
+                    "ensure_channel",
+                    {
+                        "kind": channel.kind,
+                        "name": channel.name,
+                        "allow_from": list(channel.allow_from),
+                    },
+                )
             )
-    for key in sorted(observed_ch - set(desired_ch)):
+        elif observed_ch[key] != channel.allow_from:
+            actions.append(
+                ReconcileAction(
+                    "set_channel_allow_from",
+                    {
+                        "kind": channel.kind,
+                        "name": channel.name,
+                        "from": list(observed_ch[key]),
+                        "to": list(channel.allow_from),
+                    },
+                )
+            )
+    for key in sorted(set(observed_ch) - set(desired_ch)):
         actions.append(ReconcileAction("remove_channel", {"kind": key[0], "name": key[1]}))
 
     desired_credentials = sorted(
-        {
-            ref.name.strip().lower().replace("_", "-")
-            for ref in desired.credentials
-            if ref.name.strip()
-        }
+        [{"name": ref.name, "scope": ref.scope} for ref in desired.credentials],
+        key=lambda item: (item["name"], item["scope"]),
     )
-    observed_credentials = sorted(
-        {
-            str(item).strip().lower().replace("_", "-")
-            for item in observed.get("credential_bundles", [])
-            if str(item).strip()
-        }
-    )
+    observed_refs = observed.get("credential_refs")
+    if isinstance(observed_refs, list):
+        observed_credentials = sorted(
+            [
+                {
+                    "name": str(item.get("name", "")).strip().lower().replace("_", "-"),
+                    "scope": str(item.get("scope", "agent") or "agent").strip().lower(),
+                }
+                for item in observed_refs
+                if isinstance(item, dict) and str(item.get("name", "")).strip()
+            ],
+            key=lambda item: (item["name"], item["scope"]),
+        )
+    else:
+        observed_credentials = sorted(
+            [
+                {
+                    "name": str(item).strip().lower().replace("_", "-"),
+                    "scope": "agent",
+                }
+                for item in observed.get("credential_bundles", [])
+                if str(item).strip()
+            ],
+            key=lambda item: item["name"],
+        )
     if observed_credentials != desired_credentials:
         actions.append(
             ReconcileAction(
@@ -228,6 +365,23 @@ def reconcile_plan(desired: AgentManifest, observed: dict[str, Any] | None) -> l
                 {"from": observed_credentials, "to": desired_credentials},
             )
         )
+
+    desired_identity = {
+        "display_name": desired.display_name,
+        "role": desired.role,
+        "prompts_dir": desired.prompts_dir,
+    }
+    observed_identity = {
+        "display_name": str(observed.get("display_name", desired.display_name)),
+        "role": str(observed.get("role", "worker") or "worker").strip().lower(),
+        "prompts_dir": str(observed.get("prompts_dir", "prompts") or "prompts"),
+    }
+    if desired_identity != observed_identity:
+        actions.append(ReconcileAction("sync_identity", {"from": observed_identity, "to": desired_identity}))
+
+    observed_limits = observed.get("limits", {}) if isinstance(observed.get("limits"), dict) else {}
+    if observed_limits != desired.limits:
+        actions.append(ReconcileAction("set_limits", {"from": observed_limits, "to": desired.limits}))
 
     obs_addons = dict(observed.get("addons", {}))
     for name in sorted(desired.addons):

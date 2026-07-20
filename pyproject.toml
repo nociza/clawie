@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Clawie Team" }]
 keywords = ["agents", "ai", "automation", "cli", "control-plane", "orchestration"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
@@ -24,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Systems Administration",
     "Topic :: Utilities",
 ]
@@ -32,9 +33,19 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[dependency-groups]
+dev = [
+    "bandit==1.9.4",
+    "mypy==2.3.0",
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "ruff==0.15.22",
+]
+
 [project.urls]
 Documentation = "https://github.com/nociza/clawie#readme"
 Issues = "https://github.com/nociza/clawie/issues"
+Security = "https://github.com/nociza/clawie/security/policy"
 Source = "https://github.com/nociza/clawie"
 
 [project.scripts]
@@ -46,3 +57,21 @@ include = ["clawie*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["clawie"]
+
+[tool.coverage.report]
+fail_under = 71
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_configs = true
+
+[tool.ruff]
+target-version = "py310"

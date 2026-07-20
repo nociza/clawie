@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import shlex
 import shutil
@@ -1145,6 +1146,11 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
 
     deleg_repl = delegation_sub.add_parser("repl", help="Start agent REPL (blocks)")
     deleg_repl.add_argument("--agent-id", required=True, help="Agent ID")
+    deleg_repl.add_argument(
+        "--executor-agent",
+        required=True,
+        help="Managed agent whose live gateway executes session tasks",
+    )
     deleg_repl.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
     deleg_repl.set_defaults(func=cmd_delegation_repl)
 
@@ -3713,7 +3719,11 @@ def cmd_delegation_deliver(args: argparse.Namespace, service: ClawieService) -> 
 
 
 def cmd_delegation_repl(args: argparse.Namespace, service: ClawieService) -> int:
-    service.start_agent_repl(args.agent_id, model_tier=getattr(args, "tier", "") or "")
+    service.start_agent_repl(
+        args.agent_id,
+        model_tier=getattr(args, "tier", "") or "",
+        executor_agent_id=args.executor_agent,
+    )
     return 0
 
 
@@ -4024,22 +4034,41 @@ def _clawied_service_call_or_unavailable(
 ) -> Any:
     from clawie.daemon import Clawied
 
+    daemon = Clawied(service)
     try:
-        result = Clawied(service).request(
+        result = daemon.request(
             "service_call",
             {"method": method, "kwargs": kwargs},
             timeout=300.0,
         )
-    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError):
-        return _CLAWIED_UNAVAILABLE
+    except OSError as exc:
+        if _clawied_is_genuinely_unavailable(daemon, exc):
+            return _CLAWIED_UNAVAILABLE
+        raise SetupError(f"clawied IPC failed closed: {exc}") from exc
     return result.get("result")
 
 
 def _clawied_ipc_request_or_none(daemon: Any, command: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     try:
         return daemon.request(command, payload)
-    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, OSError):
-        return None
+    except OSError as exc:
+        if _clawied_is_genuinely_unavailable(daemon, exc):
+            return None
+        raise SetupError(f"clawied IPC failed closed: {exc}") from exc
+
+
+def _clawied_is_genuinely_unavailable(daemon: Any, exc: OSError) -> bool:
+    """Allow direct-mode fallback only when no daemon endpoint exists."""
+    if not isinstance(exc, (FileNotFoundError, ConnectionRefusedError)) and getattr(
+        exc, "errno", None
+    ) not in {errno.ENOENT, errno.ECONNREFUSED}:
+        return False
+    socket_path = Path(getattr(daemon, "socket_path", ""))
+    try:
+        socket_path.lstat()
+    except (FileNotFoundError, OSError):
+        return True
+    return False
 
 
 def _clawied_status_has_errors(result: Any) -> bool:
@@ -4208,6 +4237,11 @@ def _build_production_parser(subparsers: argparse._SubParsersAction[argparse.Arg
         action="store_true",
         help="Check every verified production delivery provider contract, not just configured providers",
     )
+    verify.add_argument(
+        "--exercise-runtime-delivery",
+        action="store_true",
+        help="Required for production pass: execute a challenge-response task through each runtime gateway",
+    )
     verify.add_argument("--json", action="store_true", help="Emit JSON")
     verify.set_defaults(func=cmd_production_verify)
 
@@ -4355,6 +4389,7 @@ def cmd_production_verify(args: argparse.Namespace, service: ClawieService) -> i
         exercise_watchdog_restart=bool(getattr(args, "exercise_watchdog_restart", False)),
         watchdog_timeout_seconds=int(getattr(args, "watchdog_timeout", 30) or 30),
         all_provider_contracts=bool(getattr(args, "all_provider_contracts", False)),
+        exercise_runtime_delivery=bool(getattr(args, "exercise_runtime_delivery", False)),
     )
     if getattr(args, "json", False):
         print(json.dumps(result, indent=2, sort_keys=True, default=str))
@@ -4363,6 +4398,7 @@ def cmd_production_verify(args: argparse.Namespace, service: ClawieService) -> i
             f"status: {result.get('status', 'unknown')}",
             f"exercise_watchdog_restart: {result.get('exercise_watchdog_restart', False)}",
             f"all_provider_contracts: {result.get('all_provider_contracts', False)}",
+            f"exercise_runtime_delivery: {result.get('exercise_runtime_delivery', False)}",
         ]
         for row in result.get("checks", []):
             if not isinstance(row, dict):

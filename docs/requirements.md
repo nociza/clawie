@@ -83,17 +83,17 @@ creates a separate `OnFailure` alert unit. The unit rendering is test-covered,
 and `sudo clawie control watchdog verify --exercise-restart --json` is the
 target-host proof that systemd actually restarts the daemon.
 
-`sudo clawie production verify --exercise-watchdog-restart --json` aggregates
+`sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-delivery --json` aggregates
 the configured-host gates into one target-host report: standard health,
 Linux/root host validation, watchdog restart verification, and configured
-runtime adapter contract checks. Package release acceptance should add
+runtime checks and a live gateway challenge. Package release acceptance should add
 `--all-provider-contracts` so every verified production delivery provider has a
-source-pinned delivery adapter contract. Running without
-`--exercise-watchdog-restart` is a non-destructive dry check and cannot produce
-a production pass. The built wheel has a Colima Linux/systemd proof recorded in
+source-pinned delivery adapter contract. Running without either required
+exercise cannot produce a production pass. The older built wheel has a
+historical Colima Linux/systemd proof recorded in
 [`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md);
-repeat the same verifier on any different deployment host before accepting that
-host.
+that predates mandatory live delivery. It does not accept the hardened tree or
+any deployment host.
 
 ## Delegation system
 
@@ -102,14 +102,16 @@ host.
 | Max recursion depth | 10 levels |
 | Max children per agent | 50 |
 | Default timeout | 300 seconds (5 minutes) |
-| Socket location | `/tmp/clawie-delegation/` |
-| Socket permissions | `0o1777` (sticky bit, world-readable) |
+| Socket location | `$CLAWIE_DELEGATION_DIR`, else `$XDG_RUNTIME_DIR/clawie/delegation`, else a UID-scoped temp directory |
+| Directory/socket permissions | `0o700` / `0o600`, owner-only |
 | Wire protocol | 4-byte length-prefixed JSON over Unix domain sockets |
 | Polling interval | 100ms |
 | Heartbeat interval | 30 seconds |
-| Agent ID length limit | ~80 characters (Unix socket path limit is 108 bytes) |
+| Agent ID length limit | 64 characters with a strict safe-character grammar |
 
-A file-based mailbox fallback at `/tmp/clawie-delegation/<agent-id>/inbox/` is used when socket connections fail due to cross-user permission issues.
+A symlink-safe file mailbox under the same private per-user delegation
+directory is available for same-user fallback. Managed cross-user tasks go
+through the runtime gateway instead of a world-writable mailbox.
 
 ### Context budgets
 
@@ -148,7 +150,7 @@ Agent isolation uses Linux users:
 
 What is **not** isolated:
 - Agents share the same kernel, network stack, and hardware
-- `/tmp/clawie-delegation/` is world-readable (socket files are mode `0o777`)
+- Delegation sockets and mailboxes are owner-only and validate peer credentials where the OS exposes them
 - Provider-auth and addon-auth caches can hold one shared upstream identity. Copy isolation prevents cross-agent file access, but shared credentials still represent the same upstream account unless you configure separate source credentials.
 - Any process running as root can access all agent files
 - No network namespace, cgroup, or seccomp restrictions
@@ -158,7 +160,10 @@ This is defense-in-depth at the user level, not a security sandbox.
 
 ### SQLite write serialization
 
-The state database is SQLite with WAL mode and a 30-second busy timeout. This improves read/write coexistence for normal CLI use and maintenance, but SQLite still permits only one writer at a time. High-frequency concurrent mutation against the same `~/.clawie` directory can still queue behind the writer or fail if the timeout is exceeded.
+The state database is SQLite with WAL mode and a 30-second busy timeout. JSON
+state/config snapshots carry revisions and writes use compare-and-swap, so a
+stale service operation fails rather than overwriting a newer update. SQLite
+still permits one writer at a time; high-frequency mutations can queue or fail.
 
 ### No real tokenizer
 
@@ -166,4 +171,6 @@ Token counts for context budgets use `len(text) // 4` as an approximation. For m
 
 ### Socket path length
 
-Unix domain socket paths are limited to 108 bytes on Linux. The path format is `/tmp/clawie-delegation/<agent-id>.sock`, leaving approximately 80 characters for the agent ID. Longer IDs will fail to bind.
+Unix domain socket paths are limited on Linux. Clawie caps agent IDs at 64 safe
+characters and uses a UID-scoped fallback directory when no runtime directory
+is available. A custom `CLAWIE_DELEGATION_DIR` must still fit the OS limit.

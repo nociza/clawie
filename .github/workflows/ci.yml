@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.29"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+      - name: Run test suite
+        run: uv run pytest -q --cov=clawie --cov-report=term-missing --cov-fail-under=71
+
+  quality:
+    name: Quality and security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.29"
+          python-version: "3.14"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked --dev
+      - name: Lint
+        run: uv run ruff check clawie tests
+      - name: Type-check runtime and security core
+        run: >-
+          uv run mypy
+          clawie/adapters.py
+          clawie/daemon.py
+          clawie/delegation.py
+          clawie/manifest.py
+          clawie/safe_fs.py
+          clawie/store.py
+      - name: Scan source for medium and high severity findings
+        run: uv run bandit -q -r clawie -ll
+      - name: Audit locked production dependencies
+        run: uv audit --frozen --no-dev
+
+  package:
+    name: Build distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.29"
+          python-version: "3.14"
+          enable-cache: true
+      - name: Verify lockfile
+        run: uv lock --check
+      - name: Build wheel and source distribution
+        run: uv build
+      - name: Smoke-test built wheel
+        run: uvx --from dist/clawie-*.whl clawie --version

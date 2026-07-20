@@ -18,6 +18,7 @@ from typing import Any, Iterable
 SCHEMA = "clawie.published-workspace.v1"
 MAX_FILE_BYTES = 512 * 1024 * 1024
 MAX_PUBLICATION_BYTES = 2 * 1024 * 1024 * 1024
+_READONLY_DIRECTORY_MODE = stat.S_IRUSR | stat.S_IXUSR
 
 
 class PublishedWorkspaceError(ValueError):
@@ -126,6 +127,16 @@ class PublishedWorkspace:
         return self.root / "tmp"
 
     def ensure(self) -> None:
+        try:
+            root_st = self.root.lstat()
+        except FileNotFoundError:
+            self.root.mkdir(parents=True, mode=0o700)
+            root_st = self.root.lstat()
+        if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
+            raise PublishedWorkspaceError(
+                f"published workspace root must be a real directory: {self.root}"
+            )
+        os.chmod(self.root, 0o700)
         for rel in (
             "blobs/sha256",
             "publications",
@@ -136,7 +147,9 @@ class PublishedWorkspace:
             "snapshots",
             "tmp",
         ):
-            (self.root / rel).mkdir(parents=True, exist_ok=True)
+            directory = self.root / rel
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
         workspace_info = self.root / "WORKSPACE.json"
         if not workspace_info.exists():
             workspace_info.write_text(
@@ -152,6 +165,7 @@ class PublishedWorkspace:
                 + "\n",
                 encoding="utf-8",
             )
+        os.chmod(workspace_info, 0o600)
         with self._connect() as conn:
             conn.executescript(
                 """
@@ -365,9 +379,12 @@ class PublishedWorkspace:
                 )
                 view_name = _safe_token(str(item.get("view_name", "")), field_name="view_name")
                 target = Path(str(item.get("path", ""))).resolve(strict=True)
-                link = staging / publisher / view_name
-                link.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(target, link)
+                publication = staging / publisher / view_name
+                publication.parent.mkdir(parents=True, exist_ok=True)
+                # Views are private, materialized projections.  Symlinks into
+                # the manager's 0700 state tree either fail for real agent UIDs
+                # or force the canonical store to be exposed too broadly.
+                shutil.copytree(target, publication, symlinks=False)
                 index_rows.append(
                     {
                         "publication_id": item.get("publication_id", ""),
@@ -477,8 +494,14 @@ class PublishedWorkspace:
         return self.root / "views" / viewer
 
     def _connect(self) -> sqlite3.Connection:
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if self.root.is_symlink():
+            raise PublishedWorkspaceError(
+                f"published workspace root must be a real directory: {self.root}"
+            )
+        os.chmod(self.root, 0o700)
         conn = sqlite3.connect(self.catalog_path)
+        os.chmod(self.catalog_path, 0o600)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
@@ -655,7 +678,7 @@ class PublishedWorkspace:
     @staticmethod
     def _make_readonly_file(path: Path) -> None:
         try:
-            os.chmod(path, 0o444)
+            os.chmod(path, 0o400)
         except OSError:
             return
 
@@ -664,12 +687,12 @@ class PublishedWorkspace:
         for child in path.rglob("*"):
             if child.is_dir():
                 try:
-                    os.chmod(child, 0o555)
+                    os.chmod(child, _READONLY_DIRECTORY_MODE)
                 except OSError:
                     pass
             else:
                 cls._make_readonly_file(child)
         try:
-            os.chmod(path, 0o555)
+            os.chmod(path, _READONLY_DIRECTORY_MODE)
         except OSError:
             pass

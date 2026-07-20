@@ -65,6 +65,11 @@ def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
 
 
+def _echo_handler(message: Message, _repl: AgentREPL) -> dict:
+    """Explicit transport-only handler used by low-level delegation tests."""
+    return dict(message.payload)
+
+
 # ---------------------------------------------------------------------------
 # Message serialization
 # ---------------------------------------------------------------------------
@@ -121,6 +126,14 @@ class TestDelegationTree:
         tree = DelegationTree()
         with pytest.raises(ValueError, match="max recursion depth"):
             tree.register("deep", "parent", "t", depth=MAX_RECURSION_DEPTH)
+
+    def test_configured_depth_limit(self) -> None:
+        tree = DelegationTree(max_depth=3)
+        tree.register("root", "", "root", depth=0)
+        tree.register("child", "root", "child", depth=1)
+        tree.register("grandchild", "child", "grandchild", depth=2)
+        with pytest.raises(ValueError, match=r"depth \(3\)"):
+            tree.register("too-deep", "grandchild", "deep", depth=3)
 
     def test_cycle_detection(self) -> None:
         tree = DelegationTree()
@@ -295,7 +308,7 @@ class TestFileMailbox:
 class TestAgentREPL:
     def test_echo_handler(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         dlg_dir = _use_short_delegation_dir(monkeypatch)
-        repl = AgentREPL("echo-agent")
+        repl = AgentREPL("echo-agent", handler=_echo_handler)
         repl.start_background()
         time.sleep(0.2)  # Let REPL spin up
 
@@ -389,7 +402,7 @@ class TestDelegationFlow:
         _use_short_delegation_dir(monkeypatch)
 
         # Start child REPL
-        child_repl = AgentREPL("child-worker")
+        child_repl = AgentREPL("child-worker", handler=_echo_handler)
         child_repl.start_background()
         time.sleep(0.2)
 
@@ -408,7 +421,7 @@ class TestDelegationFlow:
         _use_short_delegation_dir(monkeypatch)
 
         # Leaf: echo handler
-        leaf_repl = AgentREPL("leaf")
+        leaf_repl = AgentREPL("leaf", handler=_echo_handler)
         leaf_repl.start_background()
         time.sleep(0.15)
 
@@ -458,7 +471,7 @@ class TestDelegationFlow:
 
         workers = []
         for i in range(3):
-            repl = AgentREPL(f"worker-{i}")
+            repl = AgentREPL(f"worker-{i}", handler=_echo_handler)
             repl.start_background()
             workers.append(repl)
         time.sleep(0.3)
@@ -996,7 +1009,7 @@ class TestSessionAgentManager:
         _use_short_delegation_dir(monkeypatch)
         mgr = SessionAgentManager("parent")
         try:
-            mgr.spawn("echo-worker")
+            mgr.spawn("echo-worker", handler=_echo_handler)
             result = mgr.delegate("echo-worker", {"msg": "hi"}, timeout=5.0)
             assert result == {"msg": "hi"}  # echo handler
         finally:
@@ -1066,6 +1079,29 @@ class TestSessionCLI:
     ) -> None:
         dlg_dir = _use_short_delegation_dir(monkeypatch)
         config_dir = tmp_path / "state"
+        state = StateStore(config_dir=config_dir).read_state()
+        state["system"] = {"status": "ready", "provider": "openclaw"}
+        state["agents"] = {
+            "parent": {
+                "agent_id": "parent",
+                "agent": {
+                    "provider": "openclaw",
+                    "linux_user": "",
+                    "model_tier": "balanced",
+                },
+            }
+        }
+        StateStore(config_dir=config_dir).write_state(state)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        fake_gateway = bin_dir / "openclaw"
+        fake_gateway.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' '{\"payloads\":[{\"text\":\"managed gateway result\"}]}'\n",
+            encoding="utf-8",
+        )
+        fake_gateway.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
         spawned = False
         try:
             code = run_cli(
@@ -1114,7 +1150,7 @@ class TestSessionCLI:
             )
             output = capsys.readouterr().out
             assert code == 0
-            assert '"msg": "hi"' in output
+            assert "managed gateway result" in output
 
             code = run_cli(
                 config_dir,
@@ -1464,6 +1500,14 @@ class TestSessionAgentTiers:
 
         _use_short_delegation_dir(monkeypatch)
         svc = ClawieService(StateStore(config_dir=tmp_path / "state"))
+        state = svc.store.read_state()
+        state["agents"] = {
+            "parent": {
+                "agent_id": "parent",
+                "agent": {"provider": "openclaw", "linux_user": ""},
+            }
+        }
+        svc.store.write_state(state)
         try:
             info = svc.spawn_session_agent("parent", "child-1", model_tier="power")
             assert info["model_tier"] == "power"
@@ -1500,6 +1544,14 @@ class TestSpawnPromptPersistence:
         monkeypatch.setattr(os, "geteuid", lambda: 0)
         monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
         monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: target_home)
+        monkeypatch.setattr(
+            "clawie._service_spawn.pwd.getpwnam",
+            lambda _user: type(
+                "PwdRow",
+                (),
+                {"pw_dir": str(target_home), "pw_uid": os.getuid(), "pw_gid": os.getgid()},
+            )(),
+        )
         monkeypatch.setattr(service, "ensure_provider_runtime", lambda _provider: {"provider": _provider})
         monkeypatch.setattr(service, "_linux_user_exists", lambda _user: False)
         monkeypatch.setattr(service, "_spawn_user_shell", lambda: "/bin/bash")
@@ -1626,9 +1678,11 @@ class TestDelegationCLITier:
             "--config-dir", "/tmp",
             "delegation", "repl",
             "--agent-id", "w",
+            "--executor-agent", "p",
             "--tier", "balanced",
         ])
         assert args.tier == "balanced"
+        assert args.executor_agent == "p"
 
     def test_parser_has_model_tier_on_create(self) -> None:
         from clawie.cli import build_parser

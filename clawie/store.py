@@ -59,6 +59,16 @@ DEFAULT_STATE: dict[str, Any] = {
 }
 
 
+class ConcurrentStateWriteError(RuntimeError):
+    """Raised instead of silently overwriting a newer state/config snapshot."""
+
+
+class _RevisionedDict(dict[str, Any]):
+    def __init__(self, *args: Any, revision: int, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._clawie_revision = int(revision)
+
+
 class StateStore:
     SCHEMA_VERSION = 2
     LEGACY_DEFAULT_CHANNELS: tuple[tuple[str, str], ...] = (
@@ -139,6 +149,12 @@ class StateStore:
                     updated_at TEXT DEFAULT '',
                     PRIMARY KEY(parent_agent_id, child_agent_id)
                 );
+                CREATE TABLE IF NOT EXISTS store_metadata (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO store_metadata(key, value) VALUES ('config_revision', 0);
+                INSERT OR IGNORE INTO store_metadata(key, value) VALUES ('state_revision', 0);
                 """
             )
             conn.commit()
@@ -150,36 +166,47 @@ class StateStore:
 
     def read_config(self) -> dict[str, Any]:
         self.ensure()
-        config = copy.deepcopy(DEFAULT_CONFIG)
+        config: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
         with self._connect() as conn:
             rows = conn.execute("SELECT key, value FROM config").fetchall()
+            revision = self._read_revision(conn, "config_revision")
         for row in rows:
             key = str(row["key"])
             if key in config:
                 config[key] = self._decode_value(str(row["value"]))
-        return config
+        return _RevisionedDict(config, revision=revision)
 
     def write_config(self, payload: dict[str, Any]) -> None:
         self.ensure()
         normalized = copy.deepcopy(DEFAULT_CONFIG)
         normalized.update(payload)
+        expected_revision = getattr(payload, "_clawie_revision", None)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_revision = self._read_revision(conn, "config_revision")
+            if expected_revision is not None and int(expected_revision) != current_revision:
+                conn.rollback()
+                raise ConcurrentStateWriteError(
+                    "configuration changed concurrently; retry the operation against a fresh snapshot"
+                )
             for key, value in normalized.items():
                 conn.execute(
                     "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
                     (key, self._encode_value(value)),
                 )
+            self._increment_revision(conn, "config_revision", current_revision)
             conn.commit()
 
     def read_state(self) -> dict[str, Any]:
         self.ensure()
-        state = copy.deepcopy(DEFAULT_STATE)
+        state: dict[str, Any] = copy.deepcopy(DEFAULT_STATE)
         with self._connect() as conn:
             template_rows = conn.execute("SELECT name, payload FROM templates").fetchall()
             agent_rows = conn.execute("SELECT agent_id, payload FROM agents").fetchall()
             event_rows = conn.execute(
                 "SELECT timestamp, type, message, context FROM events ORDER BY id ASC"
             ).fetchall()
+            revision = self._read_revision(conn, "state_revision")
 
         state["templates"] = {}
         for row in template_rows:
@@ -202,7 +229,7 @@ class StateStore:
                     "context": context,
                 }
             )
-        return state
+        return _RevisionedDict(state, revision=revision)
 
     def write_state(self, payload: dict[str, Any]) -> None:
         self.ensure()
@@ -212,7 +239,15 @@ class StateStore:
         if not isinstance(templates, dict) or not isinstance(agents, dict) or not isinstance(events, list):
             raise ValueError("state payload must include templates/agents/events")
 
+        expected_revision = getattr(payload, "_clawie_revision", None)
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current_revision = self._read_revision(conn, "state_revision")
+            if expected_revision is not None and int(expected_revision) != current_revision:
+                conn.rollback()
+                raise ConcurrentStateWriteError(
+                    "state changed concurrently; retry the operation against a fresh snapshot"
+                )
             conn.execute("DELETE FROM templates")
             conn.execute("DELETE FROM agents")
             conn.execute("DELETE FROM events")
@@ -239,7 +274,20 @@ class StateStore:
                         json.dumps(event.get("context", {}), sort_keys=True),
                     ),
                 )
+            self._increment_revision(conn, "state_revision", current_revision)
             conn.commit()
+
+    @staticmethod
+    def _read_revision(conn: sqlite3.Connection, key: str) -> int:
+        row = conn.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    @staticmethod
+    def _increment_revision(conn: sqlite3.Connection, key: str, current: int) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)",
+            (key, int(current) + 1),
+        )
 
     def write_metric(
         self,
@@ -395,13 +443,27 @@ class StateStore:
         if status:
             clauses.append("status = ?")
             params.append(status)
-        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, limit))
+        if len(clauses) == 2:
+            query = (
+                "SELECT * FROM delegation_tasks "
+                "WHERE parent_agent_id = ? AND status = ? "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+        elif parent_agent_id:
+            query = (
+                "SELECT * FROM delegation_tasks WHERE parent_agent_id = ? "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+        elif status:
+            query = (
+                "SELECT * FROM delegation_tasks WHERE status = ? "
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+        else:
+            query = "SELECT * FROM delegation_tasks ORDER BY created_at DESC LIMIT ?"
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM delegation_tasks{where} ORDER BY created_at DESC LIMIT ?",
-                params,
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
             d: dict[str, Any] = {
@@ -512,15 +574,16 @@ class StateStore:
     ) -> list[dict[str, Any]]:
         self.ensure()
         params: list[Any] = []
-        where = ""
         if parent_agent_id:
-            where = " WHERE parent_agent_id = ?"
             params.append(parent_agent_id)
+            query = (
+                "SELECT * FROM session_agents WHERE parent_agent_id = ? "
+                "ORDER BY created_at ASC"
+            )
+        else:
+            query = "SELECT * FROM session_agents ORDER BY created_at ASC"
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM session_agents{where} ORDER BY created_at ASC",
-                params,
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [self._session_agent_row(row) for row in rows]
 
     def read_session_agent(
@@ -787,7 +850,7 @@ class StateStore:
                     "refusing to change permissions on non-clawie state directory: "
                     f"{self.root}. Use a dedicated empty directory, CLAWIE_HOME, or --config-dir."
                 )
-        owner = self._sudo_user_owner_for_path(self.root)
+        owner = self._owner_for_managed_path(self.root)
         if owner is not None:
             try:
                 os.chown(self.root, owner[0], owner[1])
@@ -802,10 +865,6 @@ class StateStore:
         except OSError:
             return False
         reserved = {Path("/").resolve(), Path(tempfile.gettempdir()).resolve()}
-        try:
-            reserved.add(Path("/tmp").resolve())
-        except OSError:
-            pass
         if resolved in reserved:
             return False
         markers = {
@@ -839,7 +898,7 @@ class StateStore:
         ):
             try:
                 if path.exists() and not path.is_symlink():
-                    owner = self._sudo_user_owner_for_path(path)
+                    owner = self._owner_for_managed_path(path)
                     if owner is not None:
                         try:
                             os.chown(path, owner[0], owner[1])
@@ -871,6 +930,23 @@ class StateStore:
         except ValueError:
             return None
         return int(row.pw_uid), int(row.pw_gid)
+
+    def _owner_for_managed_path(self, path: Path) -> tuple[int, int] | None:
+        sudo_owner = self._sudo_user_owner_for_path(path)
+        if sudo_owner is not None:
+            return sudo_owner
+        if os.geteuid() != 0:
+            return None
+        try:
+            root_st = self.root.stat()
+            resolved_root = self.root.resolve()
+            resolved_path = path.resolve()
+            resolved_path.relative_to(resolved_root)
+        except (OSError, ValueError):
+            return None
+        if int(root_st.st_uid) == 0:
+            return None
+        return int(root_st.st_uid), int(root_st.st_gid)
 
     @staticmethod
     def _fallback_root() -> Path:

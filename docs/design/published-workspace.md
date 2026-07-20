@@ -1,8 +1,10 @@
 # Published workspace design
 
-> Status: proposed. Nothing here is implemented yet. This captures the target
-> architecture after reviewing the current clawie runtime/delegation code and
-> the `@lattice/` A2A implementation.
+> Status: **immutable publication core implemented.** The catalog, hash
+> verification, publish/list/show/mount CLI, OpenClaw provisioning integration,
+> and private materialized per-agent projections are live. Versioned streams,
+> append logs, grant/revoke mutation, and delegation artifact references remain
+> future work. This document retains those later phases as design rationale.
 
 ## 1. Goal
 
@@ -141,8 +143,10 @@ published-workspace/
       _index.json
       _index.md
       alice/
-        research-notes -> ../../../streams/alice/research-notes/latest
-        pub_20260614T193012Z_alice_7f3a9c -> ../../../publications/pub_...
+        pub_20260614T193012Z_alice_7f3a9c/
+          manifest.json
+          files/
+            report.md
 
   events/
     global.jsonl
@@ -156,8 +160,9 @@ published-workspace/
   tmp/
 ```
 
-Only `views/<viewer>/` is meant to be mounted into an agent workspace. The rest
-is clawie-managed internals.
+Everything under this root is clawie-manager-only. `views/<viewer>/` is a
+derived source for rebuilding a private materialized projection in that agent's
+workspace; it is never exposed by relaxing or bypassing the root permissions.
 
 The friendly in-agent layout should look like this:
 
@@ -321,17 +326,13 @@ Preferred enforcement when clawie runs with enough privilege:
   authorized viewer Linux users, and the clawie manager user;
 - generated views contain links only to publications the viewer may read.
 
-Fallback if ACLs are unavailable:
+Current enforcement (portable fallback):
 
-- materialize per-viewer copies or hardlinks under `views/<viewer>/`;
-- make each view owned by the viewer and not readable by other agents;
+- keep the canonical store and manager-side derived views under a `0700`
+  manager-only root;
+- materialize only authorized content into each agent's own private
+  `workspace/published` projection;
 - keep the internal publication store readable only by the clawie manager.
-
-Development-only fallback:
-
-- metadata-enforced visibility with a world-readable published root. This is
-  useful for rapid iteration but should be explicitly labeled as not a security
-  boundary.
 
 Avoid one broad Unix group containing all agents. That would recreate the class
 of cross-agent access this feature is meant to avoid.
@@ -341,11 +342,11 @@ of cross-agent access this feature is meant to avoid.
 On agent provisioning or reconcile, clawie should ensure:
 
 ```text
-<agent-home>/.openclaw/workspace/published -> <published-root>/views/<agent-id>
+<agent-home>/.openclaw/workspace/published/
 ```
 
-or, when symlinks are not the right permission boundary, a real directory mount
-or materialized directory at that path.
+This is a regenerated, materialized projection. It deliberately does not use a
+symlink through the manager's private state tree.
 
 This belongs near the existing openclaw workspace preparation in
 `clawie/_service_agents.py`. The mount is a derived projection, so it can be
@@ -355,7 +356,8 @@ OpenClaw UX should be "magic" in the same way Lattice is:
 
 - The first prompt/context should mention that shared artifacts from visible
   peers appear in `published/`.
-- It should say that `published/` is read-only from the agent's perspective.
+- It should say that `published/` is disposable and non-authoritative: local
+  edits are discarded on refresh, while canonical publications are immutable.
 - It should point to the CLI command for publishing mutable private work.
 - It should include the visible peer list, generated from the same policy that
   powers the views.
@@ -485,4 +487,3 @@ Phase 6: A2A/delegation integration
    group visibility be part of the first implementation?
 5. Should append-only mode be JSONL-only initially, or should it support generic
    file chunks from the start?
-

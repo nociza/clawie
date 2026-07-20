@@ -1,14 +1,16 @@
 """Shared addon install, auth, and agent attachment (ClawieService mixin)."""
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
+import secrets
 import shlex
-import shutil
 import subprocess
 import tarfile
 import tempfile
 import urllib.request
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 from clawie.addon_auth import inspect_addon_auth, parse_gws_exported_credentials, parse_gws_status_output
@@ -32,7 +34,29 @@ from clawie.display import (
     vnc_port_for_display,
     write_systemd_units,
 )
-from clawie.service_common import SetupError, AgentNotFoundError, now_iso
+from clawie.safe_fs import ensure_directory_under, remove_under, write_bytes_under
+from clawie.service_common import AgentNotFoundError, SetupError, now_iso
+
+_GCLOUD_DOWNLOAD_MAX_BYTES = 128 * 1024 * 1024
+_GCLOUD_VERSION = "576.0.0"
+_GCLOUD_ARCHIVES = {
+    "x86_64": (
+        "google-cloud-cli-linux-x86_64.tar.gz",
+        "a9561d76ee0fcbceff4caa8dc84376a5b1586d1bd25cc7f89f29fdb2a4e92ed4",
+    ),
+    "amd64": (
+        "google-cloud-cli-linux-x86_64.tar.gz",
+        "a9561d76ee0fcbceff4caa8dc84376a5b1586d1bd25cc7f89f29fdb2a4e92ed4",
+    ),
+    "aarch64": (
+        "google-cloud-cli-linux-arm.tar.gz",
+        "8bf879c65b2ca542150943e17b74ea41a006e900cb23283831476eeb4ced4544",
+    ),
+    "arm64": (
+        "google-cloud-cli-linux-arm.tar.gz",
+        "8bf879c65b2ca542150943e17b74ea41a006e900cb23283831476eeb4ced4544",
+    ),
+}
 
 
 class AddonOpsMixin:
@@ -221,41 +245,101 @@ class AddonOpsMixin:
             }
 
         root = self._ensure_shared_toolchain_root()
-        archive_name = self._gcloud_archive_name()
+        archive_name, expected_sha256 = self._gcloud_archive_spec()
         url = f"https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/{archive_name}"
         install_dir = root / "google-cloud-sdk"
-        if install_dir.exists() or install_dir.is_symlink():
-            if install_dir.is_symlink() or install_dir.is_file():
-                install_dir.unlink(missing_ok=True)
-            else:
-                shutil.rmtree(install_dir)
+        if install_dir.is_symlink() or (install_dir.exists() and not install_dir.is_dir()):
+            raise SetupError(f"refusing to replace unsafe gcloud install path: {install_dir}")
+        staging_dir = Path(tempfile.mkdtemp(prefix=".clawie-gcloud-stage-", dir=str(root)))
 
-        archive_path = Path(
-            tempfile.mkstemp(prefix="clawie-gcloud-", suffix=".tar.gz", dir=str(root))[1]
+        archive_fd, archive_name_on_disk = tempfile.mkstemp(
+            prefix="clawie-gcloud-",
+            suffix=".tar.gz",
+            dir=str(root),
         )
+        archive_path = Path(archive_name_on_disk)
         try:
-            with urllib.request.urlopen(url, timeout=120) as response, archive_path.open("wb") as handle:
-                shutil.copyfileobj(response, handle)
-            self._extract_tarball_safe(archive_path, root)
+            digest = hashlib.sha256()
+            total = 0
+            # The URL is a fixed HTTPS Google host and the final URL is checked.
+            with urllib.request.urlopen(url, timeout=120) as response, os.fdopen(  # nosec B310
+                archive_fd, "wb"
+            ) as handle:
+                final_url = str(getattr(response, "geturl", lambda: url)())
+                parsed = urlsplit(final_url)
+                if parsed.scheme != "https" or parsed.hostname != "dl.google.com":
+                    raise SetupError(
+                        f"gcloud download redirected to an untrusted URL: {final_url}"
+                    )
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _GCLOUD_DOWNLOAD_MAX_BYTES:
+                        raise SetupError(
+                            "gcloud archive exceeds the 128 MiB download limit"
+                        )
+                    digest.update(chunk)
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if digest.hexdigest() != expected_sha256:
+                raise SetupError(
+                    "gcloud archive SHA256 mismatch; refusing to extract unverified content"
+                )
+            self._extract_tarball_safe(archive_path, staging_dir)
+            staged_install = staging_dir / "google-cloud-sdk"
+            if staged_install.is_symlink() or not staged_install.is_dir():
+                raise SetupError(
+                    "gcloud archive did not contain a real google-cloud-sdk directory"
+                )
+            staged_executable = staged_install / "bin" / "gcloud"
+            if staged_executable.is_symlink() or not staged_executable.is_file():
+                raise SetupError(
+                    "gcloud archive did not contain a regular gcloud executable"
+                )
+            verify = subprocess.run(
+                [str(staged_executable), "version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(""),
+            )
+            if verify.returncode != 0:
+                output = "\n".join(
+                    part for part in [verify.stdout, verify.stderr] if str(part).strip()
+                ).strip()
+                raise SetupError(
+                    "installed gcloud but version check failed: "
+                    f"{output or f'exit {verify.returncode}'}"
+                )
+
+            old_install: Path | None = None
+            if install_dir.exists():
+                old_install = root / (
+                    f".clawie-old-google-cloud-sdk-{secrets.token_hex(8)}"
+                )
+                os.replace(install_dir, old_install)
+            try:
+                os.replace(staged_install, install_dir)
+            except Exception:
+                if old_install is not None and old_install.exists():
+                    os.replace(old_install, install_dir)
+                raise
+            if old_install is not None:
+                remove_under(root, old_install.name, recursive=True)
         except Exception as exc:  # noqa: BLE001
+            try:
+                os.close(archive_fd)
+            except OSError:
+                pass
             archive_path.unlink(missing_ok=True)
+            remove_under(root, staging_dir.name, recursive=True)
             raise SetupError(f"failed to install gcloud from {url}: {exc}") from exc
         archive_path.unlink(missing_ok=True)
+        remove_under(root, staging_dir.name, recursive=True)
         executable = str(root / "google-cloud-sdk" / "bin" / "gcloud")
-        if not Path(executable).exists():
-            raise SetupError(f"gcloud install finished but executable was not found at {executable}")
-        verify = subprocess.run(
-            [executable, "version"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=self._service_env(""),
-        )
-        if verify.returncode != 0:
-            output = "\n".join(
-                part for part in [verify.stdout, verify.stderr] if str(part).strip()
-            ).strip()
-            raise SetupError(f"installed gcloud but version check failed: {output or f'exit {verify.returncode}'}")
 
         self._harden_shared_toolchain_permissions(root)
         state = self.store.read_state()
@@ -268,6 +352,8 @@ class AddonOpsMixin:
                 "method": "archive",
                 "scope": self._shared_toolchain_scope(),
                 "url": url,
+                "version": _GCLOUD_VERSION,
+                "sha256": expected_sha256,
                 "executable": executable,
             },
         )
@@ -279,6 +365,8 @@ class AddonOpsMixin:
             "method": "archive",
             "scope": self._shared_toolchain_scope(),
             "url": url,
+            "version": _GCLOUD_VERSION,
+            "sha256": expected_sha256,
             "executable": executable,
         }
 
@@ -541,26 +629,23 @@ class AddonOpsMixin:
         if spec.tools_snippet:
             rendered_snippet = spec.tools_snippet.format_map(context)
             tools_path = self._core_prompt_path(provider, home, "TOOLS.md")
-            current = ""
-            if tools_path.exists():
-                current = tools_path.read_text(encoding="utf-8")
+            try:
+                current = self._read_agent_text_file(home, tools_path.relative_to(home))
+            except FileNotFoundError:
+                current = ""
             updated = inject_addon_tools_snippet(current, addon_name, rendered_snippet)
-            self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
-            if linux_user and os.geteuid() == 0:
-                subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False, capture_output=True)
+            self._write_core_prompt_file(provider, home, "TOOLS.md", updated, linux_user)
         # ── Shell env exports ──
         if spec.env_exports:
             exports = {var: val.format_map(context) for var, val in spec.env_exports}
             block = render_addon_env_block(addon_name, exports)
             for rel in (".bashrc", ".profile"):
-                path = home / rel
-                current = ""
-                if path.exists():
-                    current = path.read_text(encoding="utf-8")
+                try:
+                    current = self._read_agent_text_file(home, rel)
+                except FileNotFoundError:
+                    current = ""
                 updated = inject_addon_env_block(current, addon_name, block)
-                path.write_text(updated, encoding="utf-8")
-                if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False, capture_output=True)
+                self._write_agent_text_file(home, rel, updated, linux_user, mode=0o600)
 
     def _remove_addon_agent_integration(
         self,
@@ -574,23 +659,22 @@ class AddonOpsMixin:
         # ── TOOLS.md snippet ──
         if spec.tools_snippet:
             tools_path = self._core_prompt_path(provider, home, "TOOLS.md")
-            if tools_path.exists():
-                current = tools_path.read_text(encoding="utf-8")
+            try:
+                current = self._read_agent_text_file(home, tools_path.relative_to(home))
+            except FileNotFoundError:
+                current = ""
+            if current:
                 updated = remove_addon_tools_snippet(current, addon_name)
-                self._write_core_prompt_file(provider, home, "TOOLS.md", updated)
-                if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(tools_path)], check=False, capture_output=True)
+                self._write_core_prompt_file(provider, home, "TOOLS.md", updated, linux_user)
         # ── Shell env exports ──
         if spec.env_exports:
             for rel in (".bashrc", ".profile"):
-                path = home / rel
-                if not path.exists():
+                try:
+                    current = self._read_agent_text_file(home, rel)
+                except FileNotFoundError:
                     continue
-                current = path.read_text(encoding="utf-8")
                 updated = remove_addon_env_block(current, addon_name)
-                path.write_text(updated, encoding="utf-8")
-                if linux_user and os.geteuid() == 0:
-                    subprocess.run(["chown", f"{linux_user}:{linux_user}", str(path)], check=False, capture_output=True)
+                self._write_agent_text_file(home, rel, updated, linux_user, mode=0o600)
 
     def agent_display_status(self, agent_id: str) -> dict[str, Any]:
         """Return display status for an agent."""
@@ -1443,17 +1527,13 @@ class AddonOpsMixin:
         src = self._shared_addon_config_dir(spec.name)
         if not src.exists():
             return []
-        target = target_home / spec.target_config_rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        self._chown_tree(target.parent, username)
-        if target.exists() or target.is_symlink():
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        shutil.copytree(src, target)
-        self._harden_private_tree_permissions(target)
-        self._chown_tree(target, username)
+        target = self._copy_tree_to_agent(
+            src.parent,
+            src.name,
+            target_home,
+            spec.target_config_rel,
+            username,
+        )
         return [str(target)]
 
     def _revoke_addon_from_home(self, addon: str, target_home: Path) -> list[str]:
@@ -1461,10 +1541,7 @@ class AddonOpsMixin:
         target = target_home / spec.target_config_rel
         if not target.exists() and not target.is_symlink():
             return []
-        if target.is_symlink() or target.is_file():
-            target.unlink(missing_ok=True)
-        else:
-            shutil.rmtree(target)
+        self._remove_agent_path(target_home, spec.target_config_rel, recursive=True)
         return [str(target)]
 
     def _agent_addon_link_status(self, addon: str, home: Path | None, *, linux_user: str = "") -> dict[str, Any]:
@@ -1542,26 +1619,61 @@ class AddonOpsMixin:
 
     @staticmethod
     def _extract_tarball_safe(archive_path: Path, target_dir: Path) -> None:
-        root = target_dir.resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        max_members = 100_000
+        max_file_bytes = 512 * 1024 * 1024
+        max_total_bytes = 4 * 1024 * 1024 * 1024
+        seen: set[str] = set()
+        total_bytes = 0
         with tarfile.open(archive_path, "r:gz") as archive:
-            for member in archive.getmembers():
-                candidate = (target_dir / member.name).resolve()
-                try:
-                    candidate.relative_to(root)
-                except ValueError as exc:
-                    raise SetupError(f"archive contained an unsafe path: {member.name}") from exc
-            archive.extractall(target_dir)
+            members = archive.getmembers()
+            if len(members) > max_members:
+                raise SetupError(f"archive contains too many members: {len(members)}")
+            validated: list[tuple[tarfile.TarInfo, Path]] = []
+            for member in members:
+                relative = Path(member.name)
+                if member.name in {"", ".", "./"} and member.isdir():
+                    continue
+                if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                    raise SetupError(f"archive contained an unsafe path: {member.name}")
+                normalized = relative.as_posix()
+                if normalized in seen:
+                    raise SetupError(f"archive contained a duplicate path: {member.name}")
+                seen.add(normalized)
+                if member.issym() or member.islnk():
+                    raise SetupError(f"archive contained a link: {member.name}")
+                if not member.isdir() and not member.isreg():
+                    raise SetupError(f"archive contained a special file: {member.name}")
+                if member.size < 0 or member.size > max_file_bytes:
+                    raise SetupError(f"archive member is too large: {member.name}")
+                total_bytes += int(member.size)
+                if total_bytes > max_total_bytes:
+                    raise SetupError("archive expands beyond the allowed size")
+                validated.append((member, relative))
+
+            for member, relative in validated:
+                if member.isdir():
+                    ensure_directory_under(target_dir, relative, mode=0o755)
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    raise SetupError(f"archive member could not be read: {member.name}")
+                data = source.read(max_file_bytes + 1)
+                if len(data) != member.size:
+                    raise SetupError(f"archive member size mismatch: {member.name}")
+                mode = 0o755 if int(member.mode) & 0o111 else 0o644
+                write_bytes_under(
+                    target_dir,
+                    relative,
+                    data,
+                    mode=mode,
+                    directory_mode=0o755,
+                )
 
     @staticmethod
-    def _gcloud_archive_name() -> str:
+    def _gcloud_archive_spec() -> tuple[str, str]:
         machine = platform.machine().strip().lower()
-        mapping = {
-            "x86_64": "google-cloud-cli-linux-x86_64.tar.gz",
-            "amd64": "google-cloud-cli-linux-x86_64.tar.gz",
-            "aarch64": "google-cloud-cli-linux-arm.tar.gz",
-            "arm64": "google-cloud-cli-linux-arm.tar.gz",
-        }
-        archive = mapping.get(machine)
-        if archive:
+        archive = _GCLOUD_ARCHIVES.get(machine)
+        if archive is not None:
             return archive
         raise SetupError(f"automatic gcloud install is not supported on architecture '{machine}'")

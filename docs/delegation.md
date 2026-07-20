@@ -16,7 +16,13 @@ Parent                           Child (REPL running)
   |                                |
 ```
 
-Agents communicate via Unix domain sockets at `/tmp/clawie-delegation/<agent-id>.sock` using a length-prefixed JSON protocol. A file-based mailbox fallback is available for cross-user scenarios.
+Agents communicate through a private, per-OS-user Unix socket directory:
+`$CLAWIE_DELEGATION_DIR`, then `$XDG_RUNTIME_DIR/clawie/delegation`, or finally a
+UID-scoped directory under the system temp root. Directories are `0700`, sockets
+are `0600`, peer UIDs are checked where supported, messages are capped at 16
+MiB, and each REPL admits at most 16 concurrent connections. A symlink-safe
+file mailbox is available only as a same-user fallback; managed cross-user work
+uses the runtime gateway.
 
 ## Model tiers
 
@@ -47,8 +53,11 @@ The child must be running a REPL. The command blocks until the result arrives or
 Make an agent available to receive delegations:
 
 ```bash
-clawie delegation repl --agent-id worker --tier balanced
+clawie delegation repl --agent-id worker --executor-agent planner --tier balanced
 ```
+
+`--executor-agent` is required and must name a managed agent with a live
+gateway. A REPL without a real execution backend fails closed.
 
 ### Spawn session sub-agents
 
@@ -188,10 +197,10 @@ mgr.stop_all()
 
 ## Safety limits
 
-- Max recursion depth: 10
+- Max recursion depth: 10 by default; manifests can lower it per agent
 - Max children per agent: 50
 - Cycle detection prevents A -> B -> A loops
-- Stale sockets auto-cleaned after 10 minutes
+- Socket cleanup only removes dead socket entries owned within the private runtime directory
 
 ## Error handling
 
@@ -201,6 +210,6 @@ mgr.stop_all()
 | Child crashes | Connection error; task marked failed |
 | Handler exception | `task_error` with exception message |
 | Timeout | Timeout error; task marked failed |
-| Depth > 10 | `ValueError` before delegation starts |
+| Depth at or beyond the configured limit | `ValueError` before delegation starts |
 | Cycle detected | `ValueError` before delegation starts |
 | Budget >= 90% | Compaction triggered automatically |

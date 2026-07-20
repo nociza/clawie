@@ -19,12 +19,13 @@ def test_package_metadata_matches_current_production_readiness() -> None:
 
     assert project["license"] == "Apache-2.0"
     assert not any(classifier.startswith("License ::") for classifier in classifiers)
-    assert "Development Status :: 5 - Production/Stable" in classifiers
+    assert "Development Status :: 5 - Production/Stable" not in classifiers
     assert "Development Status :: 3 - Alpha" not in classifiers
-    assert "Development Status :: 4 - Beta" not in classifiers
+    assert "Development Status :: 4 - Beta" in classifiers
     assert "Operating System :: POSIX :: Linux" in classifiers
     assert "Operating System :: OS Independent" not in classifiers
     assert not any("MacOS" in classifier or "Microsoft :: Windows" in classifier for classifier in classifiers)
+    assert "Programming Language :: Python :: 3.14" in classifiers
 
 
 def test_runtime_defaults_do_not_ship_placeholder_api_endpoints() -> None:

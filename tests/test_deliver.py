@@ -50,10 +50,34 @@ def test_deliver_to_agent_success(tmp_path: Path) -> None:
     assert cmd[cmd.index("--agent") + 1] == "alice"
     assert cmd[cmd.index("--message") + 1] == "do the thing"
     assert cmd[cmd.index("--timeout") + 1] == "60"
-    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.2"  # fast tier
+    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"  # fast tier
     # session key is task-scoped
     assert cmd[cmd.index("--session-key") + 1].startswith("agent:alice:clawie:")
     assert any(e["type"] == "delegation.delivered" for e in service.list_events(limit=5))
+
+
+def test_deliver_to_agent_enforces_manifest_gateway_timeout(tmp_path: Path) -> None:
+    service = _service_with_agent(tmp_path)
+    state = service.store.read_state()
+    state["agents"]["alice"]["agent"]["limits"] = {"gateway_timeout": 15}
+    service.store.write_state(state)
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd: list[str]) -> str:
+        captured["cmd"] = cmd
+        return '{"payloads":[{"text":"done"}]}'
+
+    result = service.deliver_to_agent("alice", "x", timeout=300, run=fake_run)
+
+    assert captured["cmd"][captured["cmd"].index("--timeout") + 1] == "15"
+    assert result["timeout_seconds"] == 15.0
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_deliver_to_agent_rejects_invalid_timeout(tmp_path: Path, timeout: float) -> None:
+    service = _service_with_agent(tmp_path)
+    with pytest.raises(ValueError, match="positive finite"):
+        service.deliver_to_agent("alice", "x", timeout=timeout, run=lambda cmd: "{}")
 
 
 def test_deliver_to_agent_error_reply(tmp_path: Path) -> None:
@@ -74,6 +98,39 @@ def test_deliver_to_agent_provider_without_adapter(tmp_path: Path) -> None:
     service = _service_with_agent(tmp_path, provider="picoclaw")
     with pytest.raises(AdapterError):
         service.deliver_to_agent("alice", "x", run=lambda cmd: "{}")
+
+
+def test_delegate_task_delivers_to_managed_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service_with_agent(tmp_path)
+    state = service.store.read_state()
+    state["agents"]["planner"] = {
+        "agent_id": "planner",
+        "agent": {"provider": "openclaw", "linux_user": "", "model_tier": "balanced"},
+    }
+    service.store.write_state(state)
+    seen: dict[str, object] = {}
+
+    def fake_deliver(agent_id: str, message: str, **kwargs: object) -> dict[str, object]:
+        seen.update(agent_id=agent_id, message=message, kwargs=kwargs)
+        return {"ok": True, "output": "gateway-computed", "delivery_status": "sent"}
+
+    monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
+    result = service.delegate_task(
+        "planner", "alice", {"task": "analyze this"}, timeout=45, model_tier="fast"
+    )
+
+    assert result["status"] == "completed"
+    assert result["result"]["output"] == "gateway-computed"
+    assert seen == {
+        "agent_id": "alice",
+        "message": "analyze this",
+        "kwargs": {"tier": "fast", "timeout": 45},
+    }
+    tasks = service.delegation_tasks(agent_id="planner", status="completed")
+    assert len(tasks) == 1
+    assert tasks[0]["result"]["output"] == "gateway-computed"
 
 
 def test_default_deliver_runner_resolves_agent_provider(

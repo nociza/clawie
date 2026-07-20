@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import shutil
-import subprocess
+import stat
 from pathlib import Path
 from typing import Any
 from clawie.providers import (
@@ -94,6 +94,17 @@ class CredentialOpsMixin:
             )
         except ValueError:
             bundles = self._normalize_credential_bundles([], include_defaults=default_when_missing)
+        raw_scopes = payload.get("credential_scopes", {})
+        if not isinstance(raw_scopes, dict):
+            raw_scopes = {}
+        credential_scopes: dict[str, str] = {}
+        for bundle in bundles:
+            scope = str(raw_scopes.get(bundle, "") or "").strip().lower()
+            if scope not in {"agent", "shared"}:
+                scope = "shared" if bundle == "provider-auth" and bool(
+                    payload.get("shared_provider_auth", False)
+                ) else "agent"
+            credential_scopes[bundle] = scope
         return {
             "bundles": self._ordered_credential_bundles(bundles),
             "last_synced_at": str(payload.get("last_synced_at", "")),
@@ -102,6 +113,7 @@ class CredentialOpsMixin:
             "last_revoked_at": str(payload.get("last_revoked_at", "")),
             "last_revoked_paths": self._normalized_string_list(payload.get("last_revoked_paths", [])),
             "shared_provider_auth": bool(payload.get("shared_provider_auth", False)),
+            "credential_scopes": credential_scopes,
         }
 
     def get_agent_credential_sync(self, agent_id: str) -> dict[str, Any]:
@@ -156,6 +168,16 @@ class CredentialOpsMixin:
         )
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
         sync["bundles"] = selected
+        prior_scopes = sync.get("credential_scopes", {})
+        sync["credential_scopes"] = {
+            bundle: str(prior_scopes.get(bundle, "agent"))
+            if str(prior_scopes.get(bundle, "agent")) in {"agent", "shared"}
+            else "agent"
+            for bundle in selected
+        }
+        sync["shared_provider_auth"] = (
+            sync["credential_scopes"].get("provider-auth") == "shared"
+        )
         sync["last_synced_paths"] = []
         sync["last_revoked_paths"] = []
         agent["credential_sync"] = sync
@@ -191,6 +213,16 @@ class CredentialOpsMixin:
         else:
             current.append(bundle_id)
         sync["bundles"] = self._ordered_credential_bundles(current)
+        prior_scopes = sync.get("credential_scopes", {})
+        sync["credential_scopes"] = {
+            bundle: str(prior_scopes.get(bundle, "agent"))
+            if str(prior_scopes.get(bundle, "agent")) in {"agent", "shared"}
+            else "agent"
+            for bundle in sync["bundles"]
+        }
+        sync["shared_provider_auth"] = (
+            sync["credential_scopes"].get("provider-auth") == "shared"
+        )
         sync["last_synced_paths"] = []
         sync["last_revoked_paths"] = []
         agent["credential_sync"] = sync
@@ -446,16 +478,27 @@ class CredentialOpsMixin:
                 continue
             seen.add(token)
             src = source_home / token
-            dst = target_home / token
-            if not src.exists():
+            try:
+                source_st = src.lstat()
+            except FileNotFoundError:
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if src.is_dir():
-                if dst.exists():
-                    shutil.rmtree(dst)
-                shutil.copytree(src, dst)
+            if stat.S_ISDIR(source_st.st_mode):
+                dst = self._copy_tree_to_agent(
+                    source_home,
+                    token,
+                    target_home,
+                    token,
+                    username,
+                )
+            elif stat.S_ISREG(source_st.st_mode):
+                dst = self._copy_file_to_agent(
+                    source_home,
+                    token,
+                    target_home,
+                    token,
+                    username,
+                )
             else:
-                shutil.copy2(src, dst)
-            subprocess.run(["chown", "-R", f"{username}:{username}", str(dst)], check=True)
+                raise SetupError(f"refusing to copy symlink or special credential path: {src}")
             copied.append(str(dst))
         return copied

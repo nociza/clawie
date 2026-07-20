@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
-import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,10 +16,12 @@ from clawie.providers import (
     provider_names,
 )
 from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
+from clawie.safe_fs import read_text_under
 
 # Agent IDs become file names, backup paths, channel prefixes, and
 # default Linux usernames; keep them path- and shell-safe.
 _AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_MANAGED_USER_MARKER = ".clawie-managed-user.json"
 
 
 class AgentOpsMixin:
@@ -658,14 +661,9 @@ class AgentOpsMixin:
         auth_mode: str,
         api_key: str,
     ) -> None:
-        root = home / ".picoclaw"
-        root.mkdir(parents=True, exist_ok=True)
-        self._chown_tree(root, linux_user)
-
-        workspace = root / "workspace"
-        workspace.mkdir(parents=True, exist_ok=True)
-        config_path = root / "config.json"
-        config = self._read_json_file(config_path)
+        self._ensure_agent_directory(home, ".picoclaw", linux_user)
+        workspace = self._ensure_agent_directory(home, ".picoclaw/workspace", linux_user)
+        config = self._read_agent_json_file(home, ".picoclaw/config.json")
 
         agents_cfg = config.get("agents", {})
         if not isinstance(agents_cfg, dict):
@@ -806,8 +804,7 @@ class AgentOpsMixin:
         if not has_enabled_channel:
             raise SetupError("picoclaw requires at least one enabled provider channel before the gateway can run")
 
-        self._write_json_file(config_path, config)
-        self._chown_tree(root, linux_user)
+        self._write_agent_json_file(home, ".picoclaw/config.json", config, linux_user)
 
     def _ensure_openclaw_home_prepared(
         self,
@@ -822,14 +819,9 @@ class AgentOpsMixin:
         gateway_token: str = "",
         agent_id: str = "",
     ) -> None:
-        root = home / ".openclaw"
-        root.mkdir(parents=True, exist_ok=True)
-        self._chown_tree(root, linux_user)
-
-        workspace = root / "workspace"
-        workspace.mkdir(parents=True, exist_ok=True)
-        config_path = root / "openclaw.json"
-        config = self._read_json_file(config_path)
+        self._ensure_agent_directory(home, ".openclaw", linux_user)
+        workspace = self._ensure_agent_directory(home, ".openclaw/workspace", linux_user)
+        config = self._read_agent_json_file(home, ".openclaw/openclaw.json")
 
         gateway_cfg = config.get("gateway", {})
         if not isinstance(gateway_cfg, dict):
@@ -863,14 +855,16 @@ class AgentOpsMixin:
         defaults["heartbeat"] = heartbeat
 
         desired_model = ""
-        if auth_mode == "linked":
-            # Canonical `openai/*` id — `openai-codex/*` is legacy that
+        if auth_mode in {"linked", "api_key"}:
+            # Keep home provisioning on the same source-pinned model contract
+            # as delegated delivery.  `openai-codex/*` is a legacy route that
             # `openclaw doctor --fix` rewrites (see clawie.adapters).
-            desired_model = "openai/gpt-5.4"
-        elif auth_mode == "api_key":
+            from clawie.adapters import OpenclawAdapter
+
+            desired_model = OpenclawAdapter.DEFAULT_MODEL
+        if auth_mode == "api_key":
             if not api_key:
                 raise SetupError("openclaw API-key mode requires an API key before the runtime can start")
-            desired_model = "openai/gpt-5.2"
 
         current_model = defaults.get("model")
         if desired_model:
@@ -1020,7 +1014,7 @@ class AgentOpsMixin:
             channels_cfg["telegram"] = telegram_cfg
 
         config["channels"] = channels_cfg
-        self._write_json_file(config_path, config)
+        self._write_agent_json_file(home, ".openclaw/openclaw.json", config, linux_user)
         if auth_mode == "linked":
             self._ensure_openclaw_agent_auth_link(home=home, linux_user=linux_user)
         if agent_id:
@@ -1029,7 +1023,6 @@ class AgentOpsMixin:
                 workspace=workspace,
                 linux_user=linux_user,
             )
-        self._chown_tree(root, linux_user)
 
     def _remove_picoclaw_channel_from_home(
         self,
@@ -1038,8 +1031,7 @@ class AgentOpsMixin:
         linux_user: str,
         kind: str,
     ) -> None:
-        config_path = home / ".picoclaw" / "config.json"
-        config = self._read_json_file(config_path)
+        config = self._read_agent_json_file(home, ".picoclaw/config.json")
         channels_cfg = config.get("channels", {})
         if not isinstance(channels_cfg, dict):
             return
@@ -1047,8 +1039,7 @@ class AgentOpsMixin:
         if token in channels_cfg:
             channels_cfg.pop(token, None)
             config["channels"] = channels_cfg
-            self._write_json_file(config_path, config)
-            self._chown_tree(home / ".picoclaw", linux_user)
+            self._write_agent_json_file(home, ".picoclaw/config.json", config, linux_user)
 
     def _remove_openclaw_channel_from_home(
         self,
@@ -1057,8 +1048,7 @@ class AgentOpsMixin:
         linux_user: str,
         kind: str,
     ) -> None:
-        config_path = home / ".openclaw" / "openclaw.json"
-        config = self._read_json_file(config_path)
+        config = self._read_agent_json_file(home, ".openclaw/openclaw.json")
         channels_cfg = config.get("channels", {})
         if not isinstance(channels_cfg, dict):
             return
@@ -1066,8 +1056,7 @@ class AgentOpsMixin:
         if token in channels_cfg:
             channels_cfg.pop(token, None)
             config["channels"] = channels_cfg
-            self._write_json_file(config_path, config)
-            self._chown_tree(home / ".openclaw", linux_user)
+            self._write_agent_json_file(home, ".openclaw/openclaw.json", config, linux_user)
 
     def ensure_agent_permissions(self, agent_id: str, manager_user: str = "") -> dict[str, Any]:
         """Set up group-based access so the manager user can manage the agent without sudo.
@@ -1175,22 +1164,43 @@ class AgentOpsMixin:
         if not agent:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
 
-        linux_user = str(agent.get("agent", {}).get("linux_user", "")).strip()
+        info = agent.get("agent", {}) if isinstance(agent.get("agent"), dict) else {}
+        linux_user = str(info.get("linux_user", "")).strip()
         user_removed = False
         home_removed = False
+        ssh_cleanup_error = ""
         if linux_user:
             if os.geteuid() != 0:
                 raise SetupError(
                     "purge requires root privileges for spawned Linux users. Re-run with sudo/root."
                 )
-            home_path = Path("/home") / linux_user
-            if self._linux_user_exists(linux_user):
+            user_exists = self._linux_user_exists(linux_user)
+            home_path = self._verified_managed_user_home_for_purge(
+                agent_id=agent_id,
+                linux_user=linux_user,
+                info=info,
+                require_marker=user_exists,
+            )
+            home_exists = home_path is not None and home_path.exists()
+            if home_exists and not user_exists:
+                self._verified_managed_user_home_for_purge(
+                    agent_id=agent_id,
+                    linux_user=linux_user,
+                    info=info,
+                    require_marker=True,
+                )
+                raise SetupError(
+                    f"linux user {linux_user} is missing; refusing recursive deletion of orphan home "
+                    f"{home_path}. Inspect it and remove it explicitly before purging the record."
+                )
+            if user_exists:
                 subprocess.run(["userdel", "-r", linux_user], check=True)
                 user_removed = True
-                home_removed = True
-            elif home_path.exists():
-                shutil.rmtree(home_path)
-                home_removed = True
+                home_removed = bool(home_path is not None and not home_path.exists())
+                try:
+                    self._remove_ssh_login_denial(linux_user)
+                except Exception as exc:  # noqa: BLE001 - user deletion already succeeded.
+                    ssh_cleanup_error = str(exc)
 
         del agents[agent_id]
         self._event(
@@ -1202,6 +1212,7 @@ class AgentOpsMixin:
                 "linux_user": linux_user,
                 "linux_user_removed": user_removed,
                 "home_removed": home_removed,
+                "ssh_cleanup_error": ssh_cleanup_error,
             },
         )
         self.store.write_state(state)
@@ -1210,7 +1221,55 @@ class AgentOpsMixin:
             "linux_user": linux_user,
             "linux_user_removed": user_removed,
             "home_removed": home_removed,
+            "ssh_cleanup_error": ssh_cleanup_error,
         }
+
+    def _verified_managed_user_home_for_purge(
+        self,
+        *,
+        agent_id: str,
+        linux_user: str,
+        info: dict[str, Any],
+        require_marker: bool,
+    ) -> Path | None:
+        stored_home_text = str(info.get("linux_home", "") or "").strip()
+        stored_home = Path(stored_home_text) if stored_home_text else None
+        passwd_home = self._linux_home_for_user(linux_user)
+        if stored_home is not None and passwd_home is not None:
+            try:
+                if stored_home.resolve() != passwd_home.resolve():
+                    raise SetupError(
+                        f"refusing purge: stored home {stored_home} does not match passwd home {passwd_home}"
+                    )
+            except OSError as exc:
+                raise SetupError(f"could not validate managed user home: {exc}") from exc
+        home = passwd_home or stored_home or (Path("/home") / linux_user)
+        if not require_marker and not home.exists():
+            return home
+        if not bool(info.get("linux_user_managed", False)):
+            raise SetupError(
+                f"refusing to purge Linux user {linux_user}: agent record has no managed-user ownership proof"
+            )
+        try:
+            home_st = home.lstat()
+        except FileNotFoundError as exc:
+            raise SetupError(f"refusing purge: managed user home is missing: {home}") from exc
+        if stat.S_ISLNK(home_st.st_mode) or not stat.S_ISDIR(home_st.st_mode):
+            raise SetupError(f"refusing purge: managed user home is not a real directory: {home}")
+        try:
+            marker = json.loads(read_text_under(home, _MANAGED_USER_MARKER, max_bytes=16 * 1024))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SetupError(f"refusing purge: managed-user marker is missing or invalid: {exc}") from exc
+        expected = {
+            "format_version": 1,
+            "agent_id": agent_id,
+            "linux_user": linux_user,
+            "operation_id": str(info.get("managed_user_operation_id", "") or ""),
+            "state_root": str(self.store.root.resolve()),
+        }
+        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected.items()):
+            raise SetupError("refusing purge: managed-user marker does not match the agent record")
+        return home
 
     def batch_create_agents(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
         results = {"created": [], "errors": []}
@@ -1601,10 +1660,22 @@ class AgentOpsMixin:
         self.store.write_state(state)
         return new_tier
 
-    def start_agent_repl(self, agent_id: str, handler: Any = None, model_tier: str = "") -> None:
+    def start_agent_repl(
+        self,
+        agent_id: str,
+        handler: Any = None,
+        model_tier: str = "",
+        executor_agent_id: str = "",
+    ) -> None:
         from clawie.delegation import AgentREPL, DEFAULT_TIER
 
+        agent_id = self._validate_agent_id(agent_id)
         tier = model_tier or DEFAULT_TIER
+        executor = str(executor_agent_id).strip()
+        if handler is None:
+            if not executor:
+                raise SetupError("delegation REPL requires a managed executor agent")
+            handler = self._gateway_task_handler(executor)
 
         repl = AgentREPL(agent_id, handler=handler, model_tier=tier)
         import signal

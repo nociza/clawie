@@ -81,7 +81,66 @@ def test_reconcile_agent_manifest_creates_and_converges_agent(tmp_path: Path) ->
     assert observed["model_tier"] == "power"
     assert observed["display_name"] == "Alice Ops"
     assert observed["credential_bundles"] == ["provider-auth"]
-    assert observed["channels"] == [{"kind": "telegram", "name": "ops"}]
+    assert observed["channels"] == [
+        {"kind": "telegram", "name": "ops", "allow_from": []}
+    ]
+
+
+def test_reconcile_manifest_applies_prompts_policies_scopes_and_limits(
+    tmp_path: Path,
+) -> None:
+    service = _setup_service(tmp_path / "state")
+    manifest = AgentManifest(
+        id="policy-agent",
+        provider="openclaw",
+        display_name="Policy Agent",
+        role="control",
+        prompts_dir="policy/prompts",
+        channels=[ChannelSpec("telegram", "ops", ("@owner", "12345"))],
+        credentials=[CredentialRef("provider-auth", "shared")],
+        limits={"delegation_depth": 3, "gateway_timeout": 45},
+    )
+    manifest_path = manifest.write(tmp_path / "declarations" / "policy-agent.json")
+    prompt_dir = manifest_path.parent / "policy" / "prompts"
+    prompt_dir.mkdir(parents=True)
+    (prompt_dir / "AGENTS.md").write_text("# Manifest-owned policy\n", encoding="utf-8")
+
+    first = service.reconcile_agent_manifest(manifest_path)
+    second = service.reconcile_agent_manifest(manifest_path)
+    observed = service.observed_agent_manifest_state("policy-agent")
+    stored = service.get_agent("policy-agent")
+
+    assert first["converged"] is True
+    assert second["converged"] is True
+    assert second["actions"] == []
+    assert observed is not None
+    assert observed["channels"] == [
+        {
+            "kind": "telegram",
+            "name": "ops",
+            "allow_from": ["@owner", "12345"],
+        }
+    ]
+    assert observed["credential_refs"] == [
+        {"name": "provider-auth", "scope": "shared"}
+    ]
+    assert observed["limits"] == {"delegation_depth": 3, "gateway_timeout": 45}
+    assert stored["agent"]["role"] == "control"
+    assert stored["core_prompts"]["AGENTS.md"].startswith("# Manifest-owned policy\n")
+    assert "clawie-control-boot-begin" in stored["core_prompts"]["AGENTS.md"]
+
+
+def test_reconcile_manifest_rejects_symlinked_prompt_tree(tmp_path: Path) -> None:
+    service = _setup_service(tmp_path / "state")
+    manifest = AgentManifest(id="unsafe", prompts_dir="prompts")
+    manifest_path = manifest.write(tmp_path / "declarations" / "unsafe.json")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "AGENTS.md").write_text("outside\n", encoding="utf-8")
+    (manifest_path.parent / "prompts").symlink_to(outside, target_is_directory=True)
+
+    with raises(PermissionError):
+        service.reconcile_agent_manifest(manifest_path)
 
 
 def test_reconcile_control_role_seeds_control_workspace_prompts(tmp_path: Path) -> None:
@@ -173,6 +232,7 @@ def test_clawied_ipc_status_and_stop(tmp_path: Path) -> None:
     )
     thread.start()
     _wait_for_socket(daemon.socket_path)
+    assert daemon.socket_path.stat().st_mode & 0o777 == 0o600
 
     status = daemon.request("status", {})
     stop = daemon.request("stop", {})
@@ -183,6 +243,46 @@ def test_clawied_ipc_status_and_stop(tmp_path: Path) -> None:
     assert stop["via"] == "ipc"
     assert stop["stopped"] is True
     assert result_holder["result"]["status"] == "stopped"  # type: ignore[index]
+
+
+def test_clawied_refuses_to_replace_non_socket_ipc_path(tmp_path: Path) -> None:
+    service = _setup_service(tmp_path)
+    daemon = Clawied(service)
+    outside = tmp_path / "outside"
+    outside.write_text("preserve", encoding="utf-8")
+    daemon.socket_path.parent.mkdir(mode=0o700, exist_ok=True)
+    daemon.socket_path.symlink_to(outside)
+
+    try:
+        with raises(SetupError, match="non-socket"):
+            daemon._start_ipc()
+    finally:
+        daemon.socket_path.unlink(missing_ok=True)
+        if daemon.socket_path.parent != tmp_path:
+            daemon.socket_path.parent.rmdir()
+
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
+
+def test_mutating_cli_fails_closed_on_daemon_permission_error(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _setup_service(tmp_path)
+    before = service.store.read_config()["provider"]
+    monkeypatch.setattr(
+        Clawied,
+        "request",
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    code = run_cli(tmp_path, "config", "set", "--provider", "picoclaw")
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "failed closed" in output
+    assert service.store.read_config()["provider"] == before
 
 
 def test_clawied_cli_status_uses_ipc_when_daemon_is_running(
@@ -931,6 +1031,33 @@ def test_control_github_token_file_must_be_private(tmp_path: Path) -> None:
 
     with raises(SetupError, match="must not be group/world accessible"):
         service.open_control_issue(title="unsafe token")
+
+
+def test_control_github_token_file_must_not_be_symlink(tmp_path: Path) -> None:
+    service = _setup_service(tmp_path / "state")
+    real_token = tmp_path / "real-token"
+    real_token.write_text("ghp_testtoken\n", encoding="utf-8")
+    real_token.chmod(0o600)
+    token_link = tmp_path / "token-link"
+    token_link.symlink_to(real_token)
+    service.configure_control_escalation(
+        github_repo="octo/example",
+        github_token_path=str(token_link),
+        rate_limit_seconds=0,
+    )
+
+    with raises(SetupError, match="not readable"):
+        service.open_control_issue(title="unsafe token")
+
+
+def test_control_github_request_rejects_noncanonical_destination() -> None:
+    with raises(SetupError, match="https://api.github.com"):
+        ClawieService._github_json_request(
+            "POST",
+            "https://api.github.com.evil.example/repos/octo/example/issues",
+            token="secret",
+            payload={},
+        )
 
 
 def _wait_for_socket(path: Path) -> None:

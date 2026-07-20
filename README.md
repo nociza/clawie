@@ -12,7 +12,11 @@ You have multiple agents across providers. Each needs its own config, credential
 
 **Agent orchestration** — Delegate tasks across agents in recursive trees with automatic tier-based routing. Fast agents handle lookups, power agents handle analysis, balanced agents handle everything else.
 
-**Provider-aware fleet** — Production delegated-task delivery is source-pinned for openclaw. picoclaw and zeroclaw lifecycle/auth support remains available for migration and experimentation, with delivery gated until their runtime contracts are pinned. Authorize once, copy private credential material into eligible agent homes, and port sessions between claws with `clawie auth port`.
+**Provider-aware fleet** — The delegated-task contract is source-pinned for
+OpenClaw 2026.7.1. A deployment is accepted only after the verifier completes a
+live challenge through that host's gateway; picoclaw and zeroclaw delivery
+remain gated. Authorize once, copy private credential material into eligible
+agent homes, and port sessions between claws with `clawie auth port`.
 
 **Linux isolation** — Each agent gets its own Linux user and home directory. Credential files are copied into agent homes with private modes; agents do not read or mutate shared auth/cache files.
 
@@ -105,10 +109,10 @@ clawie backup restore --agent alice
 clawie status
 
 # Production acceptance for the configured host
-sudo clawie production verify --exercise-watchdog-restart --json
+sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-delivery --json
 
 # Release acceptance for the verified delivery surface
-sudo clawie production verify --exercise-watchdog-restart --all-provider-contracts --json
+sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-delivery --all-provider-contracts --json
 ```
 
 ## Status
@@ -151,8 +155,9 @@ See [docs/backup.md](docs/backup.md).
 - **Linux only** — no macOS or Windows. Relies on Linux users, systemd, and Unix sockets.
 - **Single machine** — all agent communication is over localhost Unix sockets. No network/multi-host delegation.
 - **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
-- **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout.
-- **SQLite storage** — uses an agents-only state table, WAL, and a busy timeout; `clawied` hosts manifest reconcile cycles, mutating CLI service operations, and a capability-gated control-tool RPC. Linux/root host validation has container proof, and the built `0.1.7` wheel has a Colima Linux/systemd `production verify --exercise-watchdog-restart --all-provider-contracts` proof in `docs/proofs/`. Repeat that verifier on any different deployment host before accepting that host; picoclaw/zeroclaw delegated-task delivery remains gated until their runtime contracts are source-pinned.
+- **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout; manifests can lower depth and gateway timeout limits per agent.
+- **SQLite storage** — uses WAL, a busy timeout, and revision-based compare-and-swap for JSON state/config snapshots so stale writers fail instead of silently losing updates. `clawied` hosts manifest reconciliation, mutating service operations, and a capability-gated control RPC.
+- **Acceptance is host-specific** — earlier records under `docs/proofs/` are historical evidence, not evidence for the hardened tree or a new host. Run both destructive exercises in `production verify` on the exact built artifact and deployment host. The package remains Beta until that fresh Linux/systemd acceptance is recorded.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.

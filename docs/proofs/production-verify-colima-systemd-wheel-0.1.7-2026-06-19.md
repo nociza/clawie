@@ -1,5 +1,10 @@
 # Production Verify Proof (Colima systemd VM, wheel artifact)
 
+> Historical evidence only. This run predates the mandatory
+> `--exercise-runtime-delivery` gateway challenge, the OpenClaw 2026.7.1 pin,
+> and the current hardening changes. It does not accept the current source tree
+> or any deployment host.
+
 Date: 2026-06-19 PDT
 
 Environment:

@@ -3,13 +3,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from clawie.service_common import SetupError, now_iso
+
+
+class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Prevent bearer credentials from being forwarded through redirects."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 class ControlEscalationMixin:
@@ -330,13 +348,31 @@ class ControlEscalationMixin:
         path = Path(str(token_path or "")).expanduser()
         if not str(token_path or "").strip():
             raise SetupError("control GitHub token path is not configured")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd: int | None = None
         try:
-            stat = path.stat()
-        except OSError as exc:
+            fd = os.open(path, flags)
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise SetupError("control GitHub token path must be a regular file")
+            if file_stat.st_mode & 0o077:
+                raise SetupError("control GitHub token file must not be group/world accessible")
+            if file_stat.st_size > 64 * 1024:
+                raise SetupError("control GitHub token file exceeds 64 KiB")
+            chunks: list[bytes] = []
+            remaining = 64 * 1024 + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(remaining, 8192))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            token = b"".join(chunks).decode("utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
             raise SetupError(f"control GitHub token file is not readable: {path}") from exc
-        if stat.st_mode & 0o077:
-            raise SetupError("control GitHub token file must not be group/world accessible")
-        token = path.read_text(encoding="utf-8").strip()
+        finally:
+            if fd is not None:
+                os.close(fd)
         if not token:
             raise SetupError("control GitHub token file is empty")
         return token
@@ -349,6 +385,16 @@ class ControlEscalationMixin:
         token: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        parsed_url = urlsplit(str(url))
+        if (
+            parsed_url.scheme != "https"
+            or parsed_url.hostname != "api.github.com"
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise SetupError("control GitHub requests must target https://api.github.com")
         body = json.dumps(payload, sort_keys=True).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -362,8 +408,9 @@ class ControlEscalationMixin:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
+        opener = urllib.request.build_opener(_RejectRedirectHandler())
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 - user-configured GitHub URL.
+            with opener.open(request, timeout=20) as response:
                 raw = response.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")

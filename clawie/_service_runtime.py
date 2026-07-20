@@ -1226,16 +1226,16 @@ class RuntimeOpsMixin:
             return False
         executable = self._resolve_provider_executable(provider)
         unit_text = self._generated_user_service_unit_contents(provider, executable)
-        unit_dir = unit_path.parent
-        unit_dir.mkdir(parents=True, exist_ok=True)
-        current = ""
+        home = self._linux_home_for_user(linux_user)
+        if home is None:
+            return False
+        relative = unit_path.relative_to(home)
         try:
-            current = unit_path.read_text(encoding="utf-8")
-        except OSError:
+            current = self._read_agent_text_file(home, relative)
+        except FileNotFoundError:
             current = ""
         if current != unit_text:
-            unit_path.write_text(unit_text, encoding="utf-8")
-        self._chown_tree(unit_dir, linux_user)
+            self._write_agent_text_file(home, relative, unit_text, linux_user, mode=0o600)
         return True
 
     def _run_systemd_user_command(self, linux_user: str, args: list[str]) -> dict[str, Any]:

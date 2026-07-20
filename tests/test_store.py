@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pytest import MonkeyPatch, raises
 
-from clawie.store import StateStore
+from clawie.store import ConcurrentStateWriteError, StateStore
 
 
 def test_store_uses_wal_and_busy_timeout(tmp_path: Path) -> None:
@@ -203,3 +203,35 @@ def test_store_add_column_tolerates_concurrent_duplicate_column_race() -> None:
         "model_tier",
         "TEXT DEFAULT ''",
     )
+
+
+def test_store_rejects_stale_state_snapshot_instead_of_losing_update(tmp_path: Path) -> None:
+    first = StateStore(config_dir=tmp_path)
+    second = StateStore(config_dir=tmp_path)
+    stale = first.read_state()
+    fresh = second.read_state()
+
+    fresh["agents"]["new"] = {"agent_id": "new", "agent": {"provider": "openclaw"}}
+    second.write_state(fresh)
+    stale["events"].append(
+        {"timestamp": "now", "type": "stale", "message": "stale", "context": {}}
+    )
+
+    with raises(ConcurrentStateWriteError, match="changed concurrently"):
+        first.write_state(stale)
+    assert "new" in first.read_state()["agents"]
+
+
+def test_store_rejects_stale_config_snapshot_instead_of_losing_update(tmp_path: Path) -> None:
+    first = StateStore(config_dir=tmp_path)
+    second = StateStore(config_dir=tmp_path)
+    stale = first.read_config()
+    fresh = second.read_config()
+
+    fresh["workspace"] = "new-workspace"
+    second.write_config(fresh)
+    stale["subscription"] = "pro"
+
+    with raises(ConcurrentStateWriteError, match="changed concurrently"):
+        first.write_config(stale)
+    assert first.read_config()["workspace"] == "new-workspace"

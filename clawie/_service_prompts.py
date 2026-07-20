@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 from clawie.providers import (
     get_provider,
 )
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso, _default_core_prompt_content, _is_legacy_core_prompt_default
+from clawie.safe_fs import owner_for_username, read_text_under, write_text_under
 
 
 class PromptOpsMixin:
@@ -262,23 +262,33 @@ class PromptOpsMixin:
 
     def _read_core_prompts_from_home(self, provider: str, home: Path) -> dict[str, str]:
         rows: dict[str, str] = {}
+        if not home.exists():
+            return {name: "" for name in self._provider_core_prompt_names(provider)}
         for name in self._provider_core_prompt_names(provider):
             path = self._core_prompt_path(provider, home, name)
-            if path.exists():
-                rows[name] = path.read_text(encoding="utf-8")
-            else:
+            try:
+                rows[name] = read_text_under(home, path.relative_to(home), max_bytes=4 * 1024 * 1024)
+            except FileNotFoundError:
                 rows[name] = ""
         return rows
 
-    def _write_core_prompt_file(self, provider: str, home: Path, prompt_name: str, content: str) -> Path:
+    def _write_core_prompt_file(
+        self,
+        provider: str,
+        home: Path,
+        prompt_name: str,
+        content: str,
+        linux_user: str = "",
+    ) -> Path:
         path = self._core_prompt_path(provider, home, prompt_name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(content), encoding="utf-8")
-        try:
-            os.chmod(str(path), 0o664)
-        except OSError:
-            pass
-        return path
+        return write_text_under(
+            home,
+            path.relative_to(home),
+            content,
+            mode=0o600,
+            directory_mode=0o700,
+            owner=owner_for_username(linux_user) if os.geteuid() == 0 else None,
+        )
 
     def _write_prompt_files_for_home(
         self,
@@ -288,23 +298,16 @@ class PromptOpsMixin:
         linux_user: str = "",
     ) -> list[str]:
         written: list[str] = []
-        staged: list[str] = []
         for name, content in self._normalize_core_prompts(provider, prompts).items():
             try:
-                target = self._write_core_prompt_file(provider, home, name, content)
-                if linux_user and os.geteuid() == 0:
-                    subprocess.run(
-                        ["chown", f"{linux_user}:{linux_user}", str(target)],
-                        check=False,
-                        capture_output=True,
-                    )
+                target = self._write_core_prompt_file(provider, home, name, content, linux_user)
                 written.append(str(target))
             except PermissionError:
                 if linux_user:
                     raise SetupError(
                         "could not write core prompts directly to the agent workspace. "
                         "Run with sudo/root or run 'sudo clawie agent fix-permissions "
-                        f"<agent-id>' to grant manager access; insecure /tmp prompt "
+                        "<agent-id>' to grant manager access; insecure /tmp prompt "
                         "staging is disabled."
                     )
                 else:

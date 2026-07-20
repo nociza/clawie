@@ -101,8 +101,8 @@ def test_reconcile_channels_add_and_remove() -> None:
     plan = reconcile_plan(m, observed)
     ensures = [a.detail for a in plan if a.kind == "ensure_channel"]
     removes = [a.detail for a in plan if a.kind == "remove_channel"]
-    assert {"kind": "slack", "name": "new"} in ensures
-    assert {"kind": "telegram", "name": "keep"} not in ensures  # already present
+    assert {"kind": "slack", "name": "new", "allow_from": []} in ensures
+    assert not any(row["kind"] == "telegram" and row["name"] == "keep" for row in ensures)
     assert {"kind": "email", "name": "stale"} in removes
 
 
@@ -142,5 +142,64 @@ def test_reconcile_credentials_by_bundle_reference() -> None:
 
     assert ReconcileAction(
         "set_credentials",
-        {"from": ["git"], "to": ["git", "provider-auth"]},
+        {
+            "from": [{"name": "git", "scope": "agent"}],
+            "to": [
+                {"name": "git", "scope": "agent"},
+                {"name": "provider-auth", "scope": "shared"},
+            ],
+        },
     ) in plan
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"id": "alice", "prompts_dir": "../outside"},
+        {"id": "alice", "channels": ["telegram:ops"]},
+        {"id": "alice", "channels": [{"kind": "telegram", "name": "ops", "allow_from": "*"}]},
+        {"id": "alice", "credentials": ["provider-auth"]},
+        {"id": "alice", "credentials": [{"name": "provider-auth", "scope": "global"}]},
+        {"id": "alice", "addons": {"display": "yes"}},
+        {"id": "alice", "limits": {"gateway_timeout": 0}},
+        {"id": "alice", "limits": {"unknown": 1}},
+    ],
+)
+def test_manifest_rejects_malformed_or_unsafe_fields(payload: dict[str, object]) -> None:
+    with pytest.raises(ManifestError):
+        AgentManifest.from_dict(payload)
+
+
+def test_reconcile_channel_policy_identity_and_limits() -> None:
+    desired = AgentManifest(
+        id="alice",
+        display_name="Alice Ops",
+        role="control",
+        prompts_dir="policy/prompts",
+        channels=[ChannelSpec("telegram", "ops", ("@owner",))],
+        limits={"delegation_depth": 3, "gateway_timeout": 45},
+    )
+    observed = {
+        "provider": "openclaw",
+        "model_tier": "balanced",
+        "display_name": "alice",
+        "role": "worker",
+        "prompts_dir": "prompts",
+        "channels": [{"kind": "telegram", "name": "ops", "allow_from": []}],
+        "addons": {},
+        "limits": {},
+    }
+
+    plan = reconcile_plan(desired, observed)
+
+    assert ReconcileAction(
+        "set_channel_allow_from",
+        {
+            "kind": "telegram",
+            "name": "ops",
+            "from": [],
+            "to": ["@owner"],
+        },
+    ) in plan
+    assert any(action.kind == "sync_identity" for action in plan)
+    assert any(action.kind == "set_limits" for action in plan)

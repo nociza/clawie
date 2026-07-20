@@ -6,6 +6,7 @@ import os
 import pwd
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import warnings
@@ -25,6 +26,9 @@ from clawie.providers import (
     get_provider,
 )
 from clawie.service_common import SetupError, AgentExistsError, now_iso
+from clawie.safe_fs import read_text_under, write_text_under
+
+_MANAGED_USER_MARKER = ".clawie-managed-user.json"
 
 
 class SpawnOpsMixin:
@@ -46,6 +50,55 @@ class SpawnOpsMixin:
         include_default_credentials: bool = True,
         plugin_overrides: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
+        saga: dict[str, Any] = {"operation_id": secrets.token_hex(16)}
+        target_user = str(linux_user or agent_id).strip()
+        try:
+            return self._spawn_linux_user_impl(
+                agent_id=agent_id,
+                linux_user=linux_user,
+                copy_configs=copy_configs,
+                source_home=source_home,
+                template=template,
+                agent_version=agent_version,
+                provider=provider,
+                password=password,
+                password_hash=password_hash,
+                use_global_password=use_global_password,
+                clone_from_agent=clone_from_agent,
+                credential_bundles=credential_bundles,
+                include_default_credentials=include_default_credentials,
+                plugin_overrides=plugin_overrides,
+                _saga=saga,
+            )
+        except Exception as exc:
+            cleanup_errors = self._rollback_spawn_linux_user(
+                agent_id=str(agent_id).strip(),
+                linux_user=target_user,
+                saga=saga,
+            )
+            if cleanup_errors and hasattr(exc, "add_note"):
+                exc.add_note("spawn rollback warnings: " + "; ".join(cleanup_errors))
+            raise
+
+    def _spawn_linux_user_impl(
+        self,
+        agent_id: str,
+        linux_user: str | None = None,
+        copy_configs: bool = True,
+        source_home: str | Path | None = None,
+        template: str = "baseline",
+        agent_version: str = "1.0.0",
+        provider: str | None = None,
+        password: str | None = None,
+        password_hash: str | None = None,
+        use_global_password: bool = True,
+        clone_from_agent: str | None = None,
+        credential_bundles: list[str] | None = None,
+        include_default_credentials: bool = True,
+        plugin_overrides: dict[str, bool] | None = None,
+        _saga: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        saga = _saga if _saga is not None else {}
         self._require_setup()
         agent_id = agent_id.strip()
         if not agent_id:
@@ -69,25 +122,43 @@ class SpawnOpsMixin:
         resolved_provider = str(provider or config.get("provider", "openclaw")).strip().lower() or "openclaw"
         self.ensure_provider_runtime(resolved_provider)
 
-        target_home = self._linux_home_for_user(target_user) or (Path("/home") / target_user)
         if self._linux_user_exists(target_user):
             raise AgentExistsError(f"linux user already exists: {target_user}")
 
         spawn_shell = self._spawn_user_shell()
         subprocess.run(["useradd", "-m", "-s", spawn_shell, target_user], check=True)
+        saga["user_created"] = True
         # useradd can exit 0 yet skip the home (full disk, CREATE_HOME=no). Once
         # the user is registered in the password database, confirm its home
         # really exists so later credential/config copies fail with a clear
         # cause instead of a cryptic downstream error.
         try:
             created_home = Path(pwd.getpwnam(target_user).pw_dir)
-        except KeyError:
-            created_home = None
-        if created_home is not None and not created_home.is_dir():
+        except KeyError as exc:
+            raise SetupError(
+                f"useradd succeeded but {target_user} has no passwd database entry"
+            ) from exc
+        if not created_home.is_dir():
             raise SetupError(
                 f"useradd succeeded but home directory {created_home} was not created "
                 "(check disk space and CREATE_HOME in /etc/login.defs)."
             )
+        target_home = created_home
+        saga["home"] = str(created_home)
+        marker = {
+            "format_version": 1,
+            "agent_id": agent_id,
+            "linux_user": target_user,
+            "operation_id": str(saga.get("operation_id", "")),
+            "state_root": str(self.store.root.resolve()),
+        }
+        self._write_agent_json_file(
+            target_home,
+            _MANAGED_USER_MARKER,
+            marker,
+            target_user,
+        )
+        saga["marker_written"] = True
         password_source, password_value = self._apply_spawn_password(
             username=target_user,
             password=password,
@@ -95,6 +166,7 @@ class SpawnOpsMixin:
             use_global_password=use_global_password,
         )
         ssh_login_disabled = self._disable_ssh_login_for_user(target_user)
+        saga["ssh_login_disabled"] = bool(ssh_login_disabled)
 
         if source_home:
             src_home = Path(source_home).expanduser()
@@ -159,7 +231,12 @@ class SpawnOpsMixin:
             core_prompts=cloned_prompts,
             plugin_overrides=plugin_overrides,
         )
+        saga["agent_created"] = True
+        saga["agent_created_at"] = str(agent_state.get("created_at", ""))
         agent_state["agent"]["linux_user"] = target_user
+        agent_state["agent"]["linux_home"] = str(target_home)
+        agent_state["agent"]["linux_user_managed"] = True
+        agent_state["agent"]["managed_user_operation_id"] = str(saga.get("operation_id", ""))
         agent_state["agent"]["manager_user"] = self._current_linux_user()
         agent_state["agent"]["ssh_login_disabled"] = bool(ssh_login_disabled)
         agent_state["agent"]["login_shell"] = spawn_shell
@@ -217,6 +294,72 @@ class SpawnOpsMixin:
             "credential_bundles": selected_credential_bundles,
         }
 
+    def _rollback_spawn_linux_user(
+        self,
+        *,
+        agent_id: str,
+        linux_user: str,
+        saga: dict[str, Any],
+    ) -> list[str]:
+        errors: list[str] = []
+        if saga.get("agent_created"):
+            try:
+                state = self.store.read_state()
+                current = state.get("agents", {}).get(agent_id)
+                if isinstance(current, dict) and str(current.get("created_at", "")) == str(
+                    saga.get("agent_created_at", "")
+                ):
+                    del state["agents"][agent_id]
+                    self.store.write_state(state)
+            except Exception as cleanup_exc:  # noqa: BLE001 - preserve original spawn error.
+                errors.append(f"agent record cleanup failed: {cleanup_exc}")
+        if saga.get("ssh_login_disabled"):
+            try:
+                self._remove_ssh_login_denial(linux_user)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                errors.append(f"SSH deny cleanup failed: {cleanup_exc}")
+        if saga.get("user_created") and os.geteuid() == 0:
+            try:
+                outcome = subprocess.run(
+                    ["userdel", "-r", linux_user],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if outcome.returncode != 0:
+                    detail = (outcome.stderr or outcome.stdout or "").strip()
+                    errors.append(f"user rollback failed: {detail or f'exit {outcome.returncode}'}")
+            except Exception as cleanup_exc:  # noqa: BLE001
+                errors.append(f"user rollback failed: {cleanup_exc}")
+        return errors
+
+    def _remove_ssh_login_denial(self, username: str) -> bool:
+        path = self.SSHD_DENY_USERS_FILE
+        if not path.exists():
+            return False
+        users: set[str] = set()
+        for line in read_text_under(path.parent, path.name, max_bytes=1024 * 1024).splitlines():
+            token = line.strip()
+            if token.lower().startswith("denyusers"):
+                users.update(part for part in token.split()[1:] if part)
+        if username not in users:
+            return False
+        users.remove(username)
+        rendered = "# Managed by clawie. Spawned users are denied SSH login.\n"
+        if users:
+            rendered += f"DenyUsers {' '.join(sorted(users))}\n"
+        write_text_under(path.parent, path.name, rendered, mode=0o644)
+        for service_name in ("ssh", "sshd"):
+            result = subprocess.run(
+                ["systemctl", "reload", service_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True
+        raise SetupError("updated ssh deny-users config but failed to reload ssh daemon")
+
     @staticmethod
     def _validate_linux_username(username: str) -> None:
         if not username:
@@ -266,17 +409,17 @@ class SpawnOpsMixin:
         updated: list[str] = []
         for rel in [".profile", ".bashrc"]:
             path = target_home / rel
-            current = ""
-            if path.exists():
-                current = path.read_text(encoding="utf-8")
+            try:
+                current = self._read_agent_text_file(target_home, rel)
+            except FileNotFoundError:
+                current = ""
             if self.SHARED_TOOLCHAIN_BEGIN in current and self.SHARED_TOOLCHAIN_END in current:
                 continue
             rendered = current
             if rendered and not rendered.endswith("\n"):
                 rendered += "\n"
             rendered += self.SHARED_TOOLCHAIN_BLOCK
-            path.write_text(rendered, encoding="utf-8")
-            subprocess.run(["chown", f"{username}:{username}", str(path)], check=True)
+            self._write_agent_text_file(target_home, rel, rendered, username, mode=0o600)
             updated.append(str(path))
         return updated
 
@@ -293,22 +436,17 @@ class SpawnOpsMixin:
         ]
         updated: list[str] = []
         for dst, src in targets:
-            if not src.exists():
+            try:
+                source_st = src.lstat()
+            except FileNotFoundError:
                 continue
-            if dst.exists() or dst.is_symlink():
-                if dst.is_dir():
-                    shutil.rmtree(dst)
-                else:
-                    dst.unlink()
-            if src.is_dir():
-                shutil.copytree(src, dst)
-                self._harden_private_tree_permissions(dst)
-                self._chown_tree(dst, username)
+            relative = dst.relative_to(target_home)
+            if stat.S_ISDIR(source_st.st_mode):
+                self._copy_tree_to_agent(src.parent, src.name, target_home, relative, username)
+            elif stat.S_ISREG(source_st.st_mode):
+                self._copy_file_to_agent(src.parent, src.name, target_home, relative, username)
             else:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-                self._harden_private_path_permissions(dst)
-                self._chown_path(dst, username)
+                raise SetupError(f"refusing to copy symlink or special shared config: {src}")
             updated.append(str(dst))
         return updated
 
@@ -317,14 +455,14 @@ class SpawnOpsMixin:
         changed = not path.exists()
         if path.exists():
             try:
-                current = path.read_text(encoding="utf-8")
+                current = read_text_under(path.parent, path.name, max_bytes=4 * 1024 * 1024)
             except OSError:
                 current = ""
             if current != content:
                 changed = True
         if changed:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+            write_text_under(path.parent, path.name, content, mode=mode)
         current_mode = int(path.stat().st_mode) & 0o777
         if current_mode != mode:
             os.chmod(path, mode)
@@ -339,9 +477,7 @@ class SpawnOpsMixin:
             (source_home / ".claude.json", shared / ".claude.json"),
         ]
         for src, dst in mapping:
-            if src.exists() and not dst.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+            if src.exists() and not dst.exists() and self._copy_if_present(src, dst):
                 updated.append(str(dst))
             if dst.exists():
                 current_mode = int(dst.stat().st_mode) & 0o777
@@ -481,7 +617,7 @@ class SpawnOpsMixin:
         rendered += f"DenyUsers {' '.join(sorted(users))}\n"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(rendered, encoding="utf-8")
+            write_text_under(path.parent, path.name, rendered, mode=0o644)
         except OSError as exc:
             raise SetupError(f"failed writing ssh deny-users config: {exc}") from exc
 
@@ -666,6 +802,12 @@ class SpawnOpsMixin:
 
         parent_id = self._validate_agent_id(parent_id)
         child_id = self._validate_agent_id(child_id)
+        self.get_agent(parent_id)
+        depth_limit = self._delegation_depth_limit(parent_id)
+        if 1 >= depth_limit:
+            raise ValueError(
+                f"max recursion depth ({depth_limit}) exceeded at depth=1"
+            )
         tier = model_tier or DEFAULT_TIER
         if detached:
             existing = self.store.read_session_agent(parent_id, child_id)
@@ -692,6 +834,8 @@ class SpawnOpsMixin:
                 "repl",
                 "--agent-id",
                 child_id,
+                "--executor-agent",
+                parent_id,
                 "--tier",
                 tier,
             ]
@@ -758,7 +902,12 @@ class SpawnOpsMixin:
             }
 
         mgr = self._get_session_manager(parent_id)
-        info = mgr.spawn(child_id, timeout=timeout, model_tier=tier)
+        info = mgr.spawn(
+            child_id,
+            handler=self._gateway_task_handler(parent_id),
+            timeout=timeout,
+            model_tier=tier,
+        )
         state = self.store.read_state()
         self._event(
             state,

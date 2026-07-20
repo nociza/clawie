@@ -1,8 +1,6 @@
 """Provider auth stores, linked-auth inspection, and login flows (ClawieService mixin)."""
 from __future__ import annotations
 
-import os
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -323,18 +321,13 @@ class ProviderAuthMixin:
                 continue
             if rel == ".openclaw/auth-profiles.json":
                 self._repair_openclaw_auth_store(src)
-            dst = target_home / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            self._chown_tree(dst.parent, username)
-            if dst.exists() or dst.is_symlink():
-                if dst.is_dir():
-                    shutil.rmtree(dst)
-                else:
-                    dst.unlink()
-            shutil.copy2(src, dst)
-            self._harden_private_path_permissions(dst.parent)
-            self._harden_private_path_permissions(dst)
-            self._chown_tree(dst, username)
+            dst = self._copy_file_to_agent(
+                shared_home,
+                rel,
+                target_home,
+                rel,
+                username,
+            )
             updated.append(str(dst))
         return updated
 
@@ -375,9 +368,11 @@ class ProviderAuthMixin:
                 continue
             if native_target.is_symlink() and not self._path_exists(native_target):
                 native_target.unlink(missing_ok=True)
-            payload = merge_picoclaw_auth_store(self._read_json_file(native_target), imported)
-            self._write_json_file(native_target, payload)
-            self._chown_tree(home / ".picoclaw", linux_user)
+            payload = merge_picoclaw_auth_store(
+                self._read_agent_json_file(home, ".picoclaw/auth.json"),
+                imported,
+            )
+            self._write_agent_json_file(home, ".picoclaw/auth.json", payload, linux_user)
             return
 
     def _ensure_openclaw_agent_auth_link(self, *, home: Path, linux_user: str) -> None:
@@ -386,22 +381,14 @@ class ProviderAuthMixin:
         if not self._path_exists(source):
             return
         self._repair_openclaw_auth_store(source)
-        agent_dir = root / "agents" / "main" / "agent"
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        self._chown_tree(agent_dir, linux_user)
-        target = agent_dir / "auth-profiles.json"
-        if target.is_symlink():
-            target.unlink(missing_ok=True)
-        elif target.exists():
-            if os.geteuid() != 0 and not os.access(target, os.W_OK):
-                return
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-        shutil.copy2(source, target)
-        self._harden_private_path_permissions(target)
-        self._chown_tree(target, linux_user)
+        self._ensure_agent_directory(home, ".openclaw/agents/main/agent", linux_user)
+        self._copy_file_to_agent(
+            home,
+            ".openclaw/auth-profiles.json",
+            home,
+            ".openclaw/agents/main/agent/auth-profiles.json",
+            linux_user,
+        )
 
     def _repair_openclaw_auth_store(self, path: Path) -> bool:
         if not self._path_exists(path):

@@ -19,13 +19,34 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from clawie.manifest import AgentManifest, ChannelSpec, CredentialRef, ManifestError
 from clawie.providers import get_provider
-from clawie.service_common import SetupError, AgentNotFoundError, now_iso, redact
+from clawie.service_common import SetupError, AgentNotFoundError, now_iso
+from clawie.safe_fs import (
+    ensure_directory_under,
+    read_bytes_under,
+    read_text_under,
+    remove_under,
+    write_bytes_under,
+    write_text_under,
+)
+
+_BACKUP_SENTINEL = ".clawie-backup.json"
+_BACKUP_FORMAT_VERSION = 1
+_BACKUP_MANAGED_PATHS = (
+    _BACKUP_SENTINEL,
+    "README.md",
+    ".gitignore",
+    "state",
+    "agents",
+)
 
 _BACKUP_README = """# clawie knowledge backup
 
@@ -77,6 +98,18 @@ _SAFE_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # Workspace knowledge file names may contain spaces; still no leading dots,
 # path separators, or shell-hostile characters.
 _SAFE_WORKSPACE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+_SECRET_CONTENT_PATTERNS = (
+    re.compile(rb"-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----"),
+    re.compile(rb"\bsk-[A-Za-z0-9_-]{16,}\b"),
+    re.compile(rb"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+    re.compile(rb"\bxox[baprs]-[A-Za-z0-9-]{16,}\b"),
+    re.compile(rb"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
+    re.compile(rb"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"),
+    re.compile(
+        rb"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)\b"
+        rb"\s*[:=]\s*[\"']?(?!<redacted>)[A-Za-z0-9._~+/=-]{12,}"
+    ),
+)
 
 
 class BackupOpsMixin:
@@ -120,23 +153,35 @@ class BackupOpsMixin:
         else:
             configured = str(config.get("backup_repo_path", "")).strip()
             repo = Path(configured).expanduser() if configured else self._default_backup_repo_path()
+        remote_url = self._validate_backup_remote(str(remote or "").strip())
         # Anchor relative paths to the current directory now; the maintenance
         # cron runs from a different cwd and must find the same repo.
-        repo = repo.resolve()
-        repo.mkdir(parents=True, exist_ok=True)
+        repo = Path(os.path.abspath(str(repo)))
+        if repo.exists() or repo.is_symlink():
+            repo_st = repo.lstat()
+            if stat.S_ISLNK(repo_st.st_mode) or not stat.S_ISDIR(repo_st.st_mode):
+                raise SetupError(f"backup path must be a real directory: {repo}")
+        else:
+            repo.mkdir(parents=True, mode=0o700)
 
-        created = not (repo / ".git").exists()
+        sentinel = repo / _BACKUP_SENTINEL
+        git_dir = repo / ".git"
+        if sentinel.exists() or sentinel.is_symlink():
+            self._validate_backup_repo(repo, require_git=False)
+        elif any(repo.iterdir()):
+            raise SetupError(
+                f"refusing to adopt non-empty directory without {_BACKUP_SENTINEL}: {repo}"
+            )
+
+        created = not git_dir.exists()
         if created:
             self._run_backup_git(repo, "init", "--quiet")
+        self._write_backup_sentinel(repo)
+        self._validate_backup_repo(repo)
 
-        readme = repo / "README.md"
-        if not readme.exists():
-            readme.write_text(_BACKUP_README, encoding="utf-8")
-        gitignore = repo / ".gitignore"
-        if not gitignore.exists():
-            gitignore.write_text(_BACKUP_GITIGNORE, encoding="utf-8")
+        write_text_under(repo, "README.md", _BACKUP_README, mode=0o600)
+        write_text_under(repo, ".gitignore", _BACKUP_GITIGNORE, mode=0o600)
 
-        remote_url = str(remote or "").strip()
         if remote_url:
             has_origin = (
                 self._run_backup_git(repo, "remote", "get-url", "origin", check=False).returncode == 0
@@ -175,10 +220,15 @@ class BackupOpsMixin:
         if not (repo / ".git").exists():
             # First run bootstraps the repo so automatic backups Just Work.
             self.backup_init(repo, enable=bool(self.backup_settings()["enabled"]))
+        self._validate_backup_repo(repo)
 
         result = self._write_backup_tree(repo)
-        self._run_backup_git(repo, "add", "-A")
-        dirty = bool(self._run_backup_git(repo, "status", "--porcelain").stdout.strip())
+        self._run_backup_git(repo, "add", "-A", "--", *_BACKUP_MANAGED_PATHS)
+        dirty = bool(
+            self._run_backup_git(
+                repo, "status", "--porcelain", "--", *_BACKUP_MANAGED_PATHS
+            ).stdout.strip()
+        )
 
         commit = ""
         if dirty:
@@ -189,10 +239,11 @@ class BackupOpsMixin:
             commit = head.stdout.strip()
 
         settings = self.backup_settings()
+        remote_url = self._validate_backup_remote(str(settings["remote"] or ""))
         should_push = settings["auto_push"] if push is None else bool(push)
         pushed = False
         push_error = ""
-        if should_push and settings["remote"] and commit:
+        if should_push and remote_url and commit:
             outcome = self._run_backup_git(repo, "push", "-u", "origin", "HEAD", check=False)
             if outcome.returncode == 0:
                 pushed = True
@@ -248,13 +299,21 @@ class BackupOpsMixin:
             "last_run_at": settings["last_run_at"],
             "last_commit": settings["last_commit"],
             "git_available": bool(shutil.which("git")),
-            "initialized": (repo / ".git").exists(),
+            "initialized": False,
+            "validation_error": "",
             "dirty": False,
             "head": "",
             "commit_count": 0,
         }
-        if not payload["git_available"] or not payload["initialized"]:
+        if not payload["git_available"]:
             return payload
+        try:
+            self._validate_backup_repo(repo)
+        except SetupError as exc:
+            if repo.exists() or repo.is_symlink():
+                payload["validation_error"] = str(exc)
+            return payload
+        payload["initialized"] = True
         status = self._run_backup_git(repo, "status", "--porcelain", check=False)
         if status.returncode == 0:
             payload["dirty"] = bool(status.stdout.strip())
@@ -278,8 +337,15 @@ class BackupOpsMixin:
     ) -> dict[str, Any]:
         """Restore agent prompts (and optionally workspace knowledge) from the backup repo."""
         repo = self._backup_repo_path()
+        self._validate_backup_repo(repo)
         agents_root = repo / "agents"
-        if not agents_root.is_dir():
+        try:
+            agents_root_st = agents_root.lstat()
+        except FileNotFoundError:
+            agents_root_st = None
+        if agents_root_st is None or stat.S_ISLNK(agents_root_st.st_mode) or not stat.S_ISDIR(
+            agents_root_st.st_mode
+        ):
             raise SetupError(
                 f"backup repo has no agents to restore (looked at: {agents_root}). "
                 "Run 'clawie backup run' first."
@@ -289,11 +355,26 @@ class BackupOpsMixin:
         known_agents = state.get("agents", {})
         requested = str(agent_id or "").strip()
         if requested:
-            if not (agents_root / requested).is_dir():
+            if not _SAFE_PATH_SEGMENT.fullmatch(requested):
+                raise ValueError("agent id is unsafe for backup restore paths")
+            requested_root = agents_root / requested
+            try:
+                requested_st = requested_root.lstat()
+            except FileNotFoundError:
+                requested_st = None
+            if requested_st is None or stat.S_ISLNK(requested_st.st_mode) or not stat.S_ISDIR(
+                requested_st.st_mode
+            ):
                 raise AgentNotFoundError(f"agent not found in backup repo: {requested}")
             targets = [requested]
         else:
-            targets = sorted(entry.name for entry in agents_root.iterdir() if entry.is_dir())
+            targets = []
+            for entry in sorted(agents_root.iterdir(), key=lambda item: item.name):
+                if not _SAFE_PATH_SEGMENT.fullmatch(entry.name):
+                    continue
+                entry_st = entry.lstat()
+                if not stat.S_ISLNK(entry_st.st_mode) and stat.S_ISDIR(entry_st.st_mode):
+                    targets.append(entry.name)
 
         restored: dict[str, dict[str, int]] = {}
         skipped: list[dict[str, str]] = []
@@ -357,21 +438,20 @@ class BackupOpsMixin:
         files_written = 0
         skipped: list[dict[str, str]] = []
 
-        state_dir = repo / "state"
-        agents_dir = repo / "agents"
-        for stale in (state_dir, agents_dir):
-            if stale.exists():
-                shutil.rmtree(stale)
-        state_dir.mkdir(parents=True)
-        agents_dir.mkdir(parents=True)
+        self._validate_backup_repo(repo)
+        for stale in ("state", "agents"):
+            remove_under(repo, stale, recursive=True)
+        state_dir = ensure_directory_under(repo, "state", mode=0o700)
+        agents_dir = ensure_directory_under(repo, "agents", mode=0o700)
 
         snapshot = {
             "config": self._redacted_backup_config(),
             "state": self._redacted_backup_state(),
         }
-        (state_dir / "snapshot.json").write_text(
-            json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        snapshot_bytes = (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        if self._contains_secret_material(snapshot_bytes):
+            raise SetupError("refusing to write backup snapshot because secret-like content remains")
+        write_bytes_under(state_dir, "snapshot.json", snapshot_bytes, mode=0o600)
         files_written += 1
 
         state = self.store.read_state()
@@ -386,7 +466,9 @@ class BackupOpsMixin:
             agent_root = agents_dir / safe_id
             provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
             files_written += self._write_agent_manifest_backup(agent_root, safe_id, agent)
-            files_written += self._write_agent_prompt_backups(agent_root, provider, agent)
+            files_written += self._write_agent_prompt_backups(
+                agent_root, provider, agent, skipped, agent_id=safe_id
+            )
             files_written += self._write_agent_workspace_backups(
                 agent_root, provider, agent, skipped, agent_id=safe_id
             )
@@ -395,9 +477,8 @@ class BackupOpsMixin:
 
     def _write_agent_manifest_backup(self, agent_root: Path, agent_id: str, agent: dict[str, Any]) -> int:
         manifest = self._agent_manifest_from_state(agent_id, agent)
-        target = agent_root / "manifest.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(manifest.to_json(), encoding="utf-8")
+        ensure_directory_under(agent_root.parent, agent_root.name, mode=0o700)
+        write_text_under(agent_root, "manifest.json", manifest.to_json(), mode=0o600)
         return 1
 
     def _agent_manifest_from_state(self, agent_id: str, agent: dict[str, Any]) -> AgentManifest:
@@ -419,17 +500,24 @@ class BackupOpsMixin:
                 continue
             if self._is_sensitive_manifest_channel(kind, name):
                 continue
-            channels.append(ChannelSpec(kind=kind, name=name))
+            allow_from = tuple(
+                dict.fromkeys(
+                    str(item).strip()
+                    for item in row.get("allow_from", [])
+                    if str(item).strip()
+                )
+            )
+            channels.append(ChannelSpec(kind=kind, name=name, allow_from=allow_from))
 
         sync = self._normalize_credential_sync_state(
             agent.get("credential_sync"),
             default_when_missing=True,
         )
-        shared_provider_auth = bool(sync.get("shared_provider_auth", False))
+        credential_scopes = sync.get("credential_scopes", {})
         credentials = [
             CredentialRef(
                 name=str(bundle),
-                scope="shared" if str(bundle) == "provider-auth" and shared_provider_auth else "agent",
+                scope=str(credential_scopes.get(str(bundle), "agent")),
             )
             for bundle in sync.get("bundles", [])
             if str(bundle).strip()
@@ -441,27 +529,40 @@ class BackupOpsMixin:
             if bool(data.get("enabled", False))
         }
 
+        display_name = str(agent.get("display_name", agent_id)).strip() or agent_id
+        if self._contains_secret_material(display_name.encode("utf-8")):
+            display_name = agent_id
         return AgentManifest(
             id=agent_id,
             provider=str(info.get("provider", "openclaw")).strip().lower() or "openclaw",
             role=role,
             model_tier=model_tier,
-            display_name=str(agent.get("display_name", agent_id)).strip() or agent_id,
+            display_name=display_name,
             prompts_dir=str(agent.get("manifest_prompts_dir", "prompts")).strip() or "prompts",
             channels=channels,
             credentials=credentials,
             addons=addons,
-            limits={},
+            limits=dict(info.get("limits", {})) if isinstance(info.get("limits"), dict) else {},
         )
 
     def _is_sensitive_manifest_channel(self, kind: str, name: str) -> bool:
+        if self._contains_secret_material(name.encode("utf-8")):
+            return True
         if self._looks_like_unresolved_secret(name):
             return True
         if kind == "telegram" and self._looks_like_telegram_bot_token(name):
             return True
         return False
 
-    def _write_agent_prompt_backups(self, agent_root: Path, provider: str, agent: dict[str, Any]) -> int:
+    def _write_agent_prompt_backups(
+        self,
+        agent_root: Path,
+        provider: str,
+        agent: dict[str, Any],
+        skipped: list[dict[str, str]],
+        *,
+        agent_id: str,
+    ) -> int:
         prompts = agent.get("core_prompts", {})
         if not isinstance(prompts, dict):
             return 0
@@ -472,9 +573,13 @@ class BackupOpsMixin:
             body = str(content or "")
             if token not in names or not body.strip():
                 continue
-            target = agent_root / "prompts" / token
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(body, encoding="utf-8")
+            encoded = body.encode("utf-8")
+            if self._contains_secret_material(encoded):
+                skipped.append(
+                    {"agent_id": agent_id, "reason": f"prompt {token} contains secret-like content"}
+                )
+                continue
+            write_bytes_under(agent_root, Path("prompts") / token, encoded, mode=0o600)
             written += 1
         return written
 
@@ -518,12 +623,25 @@ class BackupOpsMixin:
             if not self._is_backupable_knowledge_file(entry, workspace):
                 continue
             rel = entry.relative_to(workspace)
-            target = agent_root / "workspace" / rel
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(entry, target)
+                data = read_bytes_under(
+                    home,
+                    Path(spec.state_dir) / spec.workspace_dir / rel,
+                    max_bytes=_MAX_KNOWLEDGE_FILE_BYTES,
+                )
+                if self._contains_secret_material(data):
+                    skipped.append(
+                        {"agent_id": agent_id, "reason": f"workspace file {rel} contains secret-like content"}
+                    )
+                    continue
+                write_bytes_under(
+                    agent_root,
+                    Path("workspace") / rel,
+                    data,
+                    mode=0o600,
+                )
                 written += 1
-            except (OSError, PermissionError) as exc:
+            except (OSError, PermissionError, ValueError) as exc:
                 skipped.append({"agent_id": agent_id, "reason": f"could not copy {rel}: {exc}"})
         return written
 
@@ -552,55 +670,220 @@ class BackupOpsMixin:
         return True
 
     def _redacted_backup_config(self) -> dict[str, Any]:
-        config = copy.deepcopy(self.store.read_config())
-        # Backup bookkeeping changes on every run; including it would make
-        # each run dirty the repo and defeat commit-on-change detection.
-        config.pop("backup_last_run_at", None)
-        config.pop("backup_last_commit", None)
-        if str(config.get("api_key", "")).strip():
-            config["api_key"] = redact(str(config["api_key"]))
-        if str(config.get("spawn_password_hash", "")).strip():
+        source = self.store.read_config()
+        safe_keys = (
+            "schema_version",
+            "provider",
+            "auth_mode",
+            "subscription",
+            "workspace",
+            "runtime_installed",
+            "maintenance_cron_enabled",
+            "maintenance_cron_interval_hours",
+            "backup_enabled",
+            "backup_auto_push",
+            "created_at",
+            "updated_at",
+        )
+        config = {key: copy.deepcopy(source.get(key)) for key in safe_keys}
+        if str(source.get("api_key", "") or "").strip():
+            config["api_key"] = "<redacted>"
+        if str(source.get("spawn_password_hash", "") or "").strip():
             config["spawn_password_hash"] = "<redacted>"
-        credentials = config.get("provider_credentials", {})
-        if isinstance(credentials, dict):
-            for payload in credentials.values():
-                if isinstance(payload, dict) and str(payload.get("api_key", "")).strip():
-                    payload["api_key"] = redact(str(payload["api_key"]))
+        api_url = self._sanitize_backup_url(str(source.get("api_url", "") or ""))
+        if api_url:
+            config["api_url"] = api_url
+        provider_credentials = source.get("provider_credentials", {})
+        if isinstance(provider_credentials, dict):
+            config["provider_credentials"] = {
+                str(provider): {
+                    "api_url": self._sanitize_backup_url(str(payload.get("api_url", "") or "")),
+                    "api_key": "<redacted>" if str(payload.get("api_key", "") or "").strip() else "",
+                }
+                for provider, payload in provider_credentials.items()
+                if isinstance(payload, dict)
+            }
         return config
 
     def _redacted_backup_state(self) -> dict[str, Any]:
-        state = copy.deepcopy(self.store.read_state())
-        # Events are an append-only audit log; excluding them keeps backup
-        # commits meaningful (knowledge changes only, not every cron tick).
-        state.pop("events", None)
-        state.pop("users", None)
-        agents = state.get("agents", {})
-        if isinstance(agents, dict):
-            for agent in agents.values():
-                if not isinstance(agent, dict):
-                    continue
-                info = agent.get("agent", {})
-                if isinstance(info, dict) and str(info.get("gateway_token", "")).strip():
-                    info["gateway_token"] = "<redacted>"
-                channels = agent.get("channels", [])
-                if not isinstance(channels, list):
-                    continue
-                for channel in channels:
-                    if not isinstance(channel, dict):
-                        continue
-                    name = str(channel.get("name", ""))
-                    if self._looks_like_telegram_bot_token(name):
-                        channel["name"] = redact(name)
-        return state
+        source = self.store.read_state()
+        safe: dict[str, Any] = {"agents": {}, "templates": {}}
+        agents = source.get("agents", {})
+        if not isinstance(agents, dict):
+            return safe
+        for agent_id, payload in agents.items():
+            if not isinstance(payload, dict):
+                continue
+            info = payload.get("agent", {}) if isinstance(payload.get("agent"), dict) else {}
+            safe_info = {
+                key: copy.deepcopy(info.get(key))
+                for key in (
+                    "provider",
+                    "role",
+                    "model_tier",
+                    "agent_version",
+                    "runtime",
+                    "autostart",
+                    "heartbeat_seconds",
+                    "gateway_port",
+                    "linux_user",
+                    "ssh_login_disabled",
+                )
+                if key in info
+            }
+            if str(info.get("gateway_token", "") or "").strip():
+                safe_info["gateway_token"] = "<redacted>"
+            safe["agents"][str(agent_id)] = {
+                "agent_id": str(payload.get("agent_id", agent_id)),
+                "display_name": str(payload.get("display_name", agent_id)),
+                "agent": safe_info,
+                "channels": [
+                    {"kind": str(row.get("kind", "")), "name": self._safe_backup_channel_name(row)}
+                    for row in payload.get("channels", [])
+                    if isinstance(row, dict)
+                ],
+                "addons": {
+                    str(name): {"enabled": bool(data.get("enabled", False))}
+                    for name, data in payload.get("addons", {}).items()
+                    if isinstance(data, dict)
+                }
+                if isinstance(payload.get("addons"), dict)
+                else {},
+            }
+        return safe
+
+    @staticmethod
+    def _contains_secret_material(data: bytes) -> bool:
+        return any(pattern.search(data) is not None for pattern in _SECRET_CONTENT_PATTERNS)
+
+    def _safe_backup_channel_name(self, row: dict[str, Any]) -> str:
+        name = str(row.get("name", "") or "")
+        kind = str(row.get("kind", "") or "").strip().lower()
+        if self._is_sensitive_manifest_channel(kind, name):
+            return "<redacted>"
+        return name
+
+    @staticmethod
+    def _sanitize_backup_url(value: str) -> str:
+        token = str(value or "").strip()
+        if not token:
+            return ""
+        try:
+            parsed = urlsplit(token)
+        except ValueError:
+            return ""
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        host = parsed.hostname or ""
+        if not host:
+            return ""
+        try:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+        except ValueError:
+            return ""
+        return urlunsplit((parsed.scheme, f"{host}{port}", parsed.path, "", ""))
+
+    @staticmethod
+    def _validate_backup_remote(value: str) -> str:
+        token = str(value or "").strip()
+        if not token:
+            return ""
+        try:
+            parsed = urlsplit(token)
+        except ValueError as exc:
+            raise SetupError(f"invalid backup remote URL: {exc}") from exc
+        if parsed.scheme in {"http", "https"} and (parsed.username or parsed.password):
+            raise SetupError("backup remote URL must not contain embedded credentials")
+        sensitive_query_keys = {
+            "access_token",
+            "api_key",
+            "apikey",
+            "auth",
+            "key",
+            "password",
+            "secret",
+            "sig",
+            "signature",
+            "token",
+        }
+        if any(key.strip().lower() in sensitive_query_keys for key, _ in parse_qsl(parsed.query)):
+            raise SetupError("backup remote URL must not contain credential query parameters")
+        if parsed.fragment:
+            raise SetupError("backup remote URL must not contain a fragment")
+        return token
+
+    def _write_backup_sentinel(self, repo: Path) -> None:
+        sentinel = repo / _BACKUP_SENTINEL
+        repository_id = ""
+        if sentinel.exists() and not sentinel.is_symlink():
+            try:
+                current = json.loads(read_text_under(repo, _BACKUP_SENTINEL, max_bytes=16 * 1024))
+            except (OSError, ValueError, json.JSONDecodeError):
+                current = {}
+            if isinstance(current, dict):
+                repository_id = str(current.get("repository_id", "") or "").strip()
+        payload = {
+            "format_version": _BACKUP_FORMAT_VERSION,
+            "managed_by": "clawie",
+            "repository_id": repository_id or uuid.uuid4().hex,
+        }
+        write_text_under(
+            repo,
+            _BACKUP_SENTINEL,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+
+    def _validate_backup_repo(self, repo: Path, *, require_git: bool = True) -> None:
+        try:
+            repo_st = repo.lstat()
+        except FileNotFoundError as exc:
+            raise SetupError(f"backup repository does not exist: {repo}") from exc
+        if stat.S_ISLNK(repo_st.st_mode) or not stat.S_ISDIR(repo_st.st_mode):
+            raise SetupError(f"backup repository must be a real directory: {repo}")
+        sentinel = repo / _BACKUP_SENTINEL
+        try:
+            sentinel_st = sentinel.lstat()
+        except FileNotFoundError as exc:
+            raise SetupError(
+                f"refusing unowned backup repository without {_BACKUP_SENTINEL}: {repo}"
+            ) from exc
+        if stat.S_ISLNK(sentinel_st.st_mode) or not stat.S_ISREG(sentinel_st.st_mode):
+            raise SetupError(f"backup repository sentinel is not a regular file: {sentinel}")
+        try:
+            payload = json.loads(read_text_under(repo, _BACKUP_SENTINEL, max_bytes=16 * 1024))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SetupError(f"invalid backup repository sentinel: {exc}") from exc
+        if not isinstance(payload, dict) or payload.get("managed_by") != "clawie":
+            raise SetupError("backup repository sentinel is not owned by clawie")
+        if payload.get("format_version") != _BACKUP_FORMAT_VERSION:
+            raise SetupError("unsupported backup repository format version")
+        if not re.fullmatch(r"[0-9a-f]{32}", str(payload.get("repository_id", "") or "")):
+            raise SetupError("backup repository sentinel has an invalid repository id")
+        if not require_git:
+            return
+        git_dir = repo / ".git"
+        try:
+            git_st = git_dir.lstat()
+        except FileNotFoundError as exc:
+            raise SetupError(f"backup repository has no .git directory: {repo}") from exc
+        if stat.S_ISLNK(git_st.st_mode) or not stat.S_ISDIR(git_st.st_mode):
+            raise SetupError(f"backup .git path must be a real directory: {git_dir}")
 
     # ── restore helpers ──────────────────────────────────────────────────
 
     def _restore_agent_from_backup_manifest(self, agent_id: str, agent_root: Path) -> tuple[bool, str]:
         manifest_path = agent_root / "manifest.json"
-        if not manifest_path.is_file():
-            return False, "not in local state and backup has no manifest"
         try:
-            manifest = AgentManifest.read(manifest_path)
+            manifest_st = manifest_path.lstat()
+        except FileNotFoundError:
+            return False, "not in local state and backup has no manifest"
+        if stat.S_ISLNK(manifest_st.st_mode) or not stat.S_ISREG(manifest_st.st_mode):
+            return False, "backup manifest is not a regular file"
+        try:
+            manifest = AgentManifest.from_json(
+                read_text_under(agent_root, "manifest.json", max_bytes=_MAX_KNOWLEDGE_FILE_BYTES)
+            )
         except (OSError, ManifestError, ValueError) as exc:
             return False, f"invalid manifest: {exc}"
         if manifest.id != agent_id:
@@ -622,16 +905,23 @@ class BackupOpsMixin:
         return True, f"manifest reconcile incomplete: {detail or errors!r}"
 
     def _restore_agent_prompts(self, agent_id: str, prompts_dir: Path) -> int:
-        if not prompts_dir.is_dir():
+        try:
+            root_st = prompts_dir.lstat()
+        except FileNotFoundError:
             return 0
+        if stat.S_ISLNK(root_st.st_mode) or not stat.S_ISDIR(root_st.st_mode):
+            raise SetupError(f"backup prompts path is not a real directory: {prompts_dir}")
         payload = self.get_dashboard_agent(agent_id)
         provider = str(payload.get("agent", {}).get("provider", "")).strip().lower()
         valid_names = set(self._provider_core_prompt_names(provider))
         restored = 0
         for entry in sorted(prompts_dir.iterdir()):
-            if not entry.is_file() or entry.name not in valid_names:
+            entry_st = entry.lstat()
+            if stat.S_ISLNK(entry_st.st_mode):
+                raise SetupError(f"backup prompt is a symlink: {entry}")
+            if not stat.S_ISREG(entry_st.st_mode) or entry.name not in valid_names:
                 continue
-            content = entry.read_text(encoding="utf-8")
+            content = read_text_under(prompts_dir, entry.name, max_bytes=_MAX_KNOWLEDGE_FILE_BYTES)
             self.set_agent_core_prompt(agent_id, entry.name, content, sync_to_disk=False)
             restored += 1
         return restored
@@ -642,8 +932,12 @@ class BackupOpsMixin:
         workspace_backup: Path,
         skipped: list[dict[str, str]],
     ) -> int:
-        if not workspace_backup.is_dir():
+        try:
+            backup_st = workspace_backup.lstat()
+        except FileNotFoundError:
             return 0
+        if stat.S_ISLNK(backup_st.st_mode) or not stat.S_ISDIR(backup_st.st_mode):
+            raise SetupError(f"backup workspace is not a real directory: {workspace_backup}")
         state = self.store.read_state()
         agent = state.get("agents", {}).get(agent_id, {})
         provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
@@ -659,20 +953,34 @@ class BackupOpsMixin:
             skipped.append({"agent_id": agent_id, "reason": "no linux home; workspace files not restored"})
             return 0
 
-        workspace = home / spec.state_dir / spec.workspace_dir
         restored = 0
         for entry in sorted(workspace_backup.rglob("*"), key=str):
-            if not entry.is_file():
+            entry_st = entry.lstat()
+            if stat.S_ISLNK(entry_st.st_mode):
+                skipped.append({"agent_id": agent_id, "reason": f"refused backup symlink: {entry}"})
+                continue
+            if stat.S_ISDIR(entry_st.st_mode):
+                continue
+            if not stat.S_ISREG(entry_st.st_mode):
+                skipped.append({"agent_id": agent_id, "reason": f"refused special backup file: {entry}"})
                 continue
             rel = entry.relative_to(workspace_backup)
-            target = workspace / rel
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(entry, target)
-                if linux_user:
-                    self._chown_path(target, linux_user)
+                data = read_bytes_under(
+                    workspace_backup,
+                    rel,
+                    max_bytes=_MAX_KNOWLEDGE_FILE_BYTES,
+                )
+                write_bytes_under(
+                    home,
+                    Path(spec.state_dir) / spec.workspace_dir / rel,
+                    data,
+                    mode=0o600,
+                    directory_mode=0o700,
+                    owner=self._agent_owner(linux_user),
+                )
                 restored += 1
-            except (OSError, PermissionError) as exc:
+            except (OSError, ValueError) as exc:
                 skipped.append({"agent_id": agent_id, "reason": f"could not restore {rel}: {exc}"})
         return restored
 

@@ -56,18 +56,18 @@ def test_version_ordering_and_str() -> None:
 
 def test_supported_range_bounds(adapter: OpenclawAdapter) -> None:
     low, high = adapter.supported_range()
-    assert low == Version(2026, 6, 0)
-    assert high == Version(2026, 7, 0)
+    assert low == Version(2026, 7, 1)
+    assert high == Version(2026, 7, 2)
 
 
 @pytest.mark.parametrize(
     "version,supported",
     [
-        (Version(2026, 6, 0), True),
-        (Version(2026, 6, 2), True),
-        (Version(2026, 6, 999), True),
+        (Version(2026, 7, 1), True),
+        (Version(2026, 6, 2), False),
+        (Version(2026, 7, 2), False),
         (Version(2026, 5, 9), False),  # below
-        (Version(2026, 7, 0), False),  # exclusive upper bound
+        (Version(2026, 7, 0), False),  # below pinned release
         (Version(2027, 0, 0), False),  # above
         (None, False),
     ],
@@ -77,10 +77,10 @@ def test_is_supported(adapter: OpenclawAdapter, version, supported) -> None:
 
 
 def test_version_gate_supported(adapter: OpenclawAdapter) -> None:
-    gate = adapter.version_gate("openclaw 2026.6.2")
+    gate = adapter.version_gate("openclaw 2026.7.1")
     assert gate.supported is True
     assert gate.degraded is False
-    assert gate.version == Version(2026, 6, 2)
+    assert gate.version == Version(2026, 7, 1)
 
 
 def test_version_gate_unknown_degrades(adapter: OpenclawAdapter) -> None:
@@ -137,12 +137,12 @@ def test_deep_merge_is_recursive_and_nondestructive() -> None:
 # --- models ----------------------------------------------------------------
 
 def test_tier_to_model_uses_canonical_openai_ids(adapter: OpenclawAdapter) -> None:
-    assert adapter.tier_to_model("fast") == "openai/gpt-5.2"
-    assert adapter.tier_to_model("balanced") == "openai/gpt-5.4"
-    assert adapter.tier_to_model("power") == "openai/gpt-5.4"
+    assert adapter.tier_to_model("fast") == "openai/gpt-5.5"
+    assert adapter.tier_to_model("balanced") == "openai/gpt-5.6"
+    assert adapter.tier_to_model("power") == "openai/gpt-5.6"
     # unknown tier falls back to a real default, never the legacy openai-codex id
     model = adapter.tier_to_model("nonsense")
-    assert model == "openai/gpt-5.4"
+    assert model == "openai/gpt-5.6"
     for value in adapter.TIER_MODELS.values():
         assert not value.startswith("openai-codex/")
 
@@ -164,7 +164,7 @@ def test_deliver_command_structure(adapter: OpenclawAdapter) -> None:
     # timeout coerced to int string
     assert cmd[cmd.index("--timeout") + 1] == "90"
     # fast tier maps to a real model
-    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.2"
+    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"
 
 
 def test_deliver_command_respects_custom_bin(adapter: OpenclawAdapter) -> None:
@@ -334,12 +334,12 @@ def test_detect_version_success(adapter: OpenclawAdapter) -> None:
 
     def run(argv: list[str]) -> str:
         calls.append(argv)
-        return "openclaw 2026.6.2"
+        return "openclaw 2026.7.1"
 
     gate = detect_version(adapter, run)
     assert calls == [["openclaw", "--version"]]
     assert gate.supported is True
-    assert gate.version == Version(2026, 6, 2)
+    assert gate.version == Version(2026, 7, 1)
 
 
 def test_detect_version_probe_failure_degrades(adapter: OpenclawAdapter) -> None:

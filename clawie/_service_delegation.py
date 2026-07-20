@@ -1,6 +1,8 @@
 """Recursive delegation, session agents, and maintenance automation (ClawieService mixin)."""
 from __future__ import annotations
 
+import json
+import math
 import os
 import signal
 import shutil
@@ -10,10 +12,24 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
-from clawie.service_common import SetupError, now_iso
+from clawie.service_common import AgentNotFoundError, SetupError, now_iso
 
 
 class DelegationOpsMixin:
+
+    def _delegation_depth_limit(self, agent_id: str) -> int:
+        from clawie.delegation import MAX_RECURSION_DEPTH
+
+        try:
+            agent = self.get_agent(agent_id)
+        except AgentNotFoundError:
+            return MAX_RECURSION_DEPTH
+        info = agent.get("agent", {}) if isinstance(agent.get("agent"), dict) else {}
+        limits = info.get("limits", {}) if isinstance(info.get("limits"), dict) else {}
+        value = limits.get("delegation_depth", MAX_RECURSION_DEPTH)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return MAX_RECURSION_DEPTH
+        return min(max(value, 1), MAX_RECURSION_DEPTH)
 
     @classmethod
     def _seed_delegation_skill(
@@ -51,6 +67,31 @@ class DelegationOpsMixin:
 
     # ── Delegation methods ────────────────────────────────────────────────
 
+    @staticmethod
+    def _delegation_payload_message(payload: dict[str, Any]) -> str:
+        for key in ("task", "message", "prompt"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return json.dumps(payload, indent=2, sort_keys=True)
+
+    def _gateway_task_handler(self, executor_agent_id: str) -> Any:
+        executor = self._validate_agent_id(executor_agent_id)
+        self.get_agent(executor)
+
+        def _handle(msg: Any, repl: Any) -> dict[str, Any]:
+            result = self.deliver_to_agent(
+                executor,
+                self._delegation_payload_message(dict(msg.payload)),
+                tier=str(repl.model_tier or "balanced"),
+                timeout=float(repl.timeout),
+            )
+            if not bool(result.get("ok", False)):
+                raise SetupError(str(result.get("error", "gateway delivery failed")))
+            return result
+
+        return _handle
+
     def delegate_task(
         self,
         parent_id: str,
@@ -66,6 +107,15 @@ class DelegationOpsMixin:
             DelegationTree,
         )
 
+        parent_id = self._validate_agent_id(parent_id)
+        child_id = self._validate_agent_id(child_id)
+        if parent_id == child_id:
+            raise ValueError("parent and child agent ids must differ")
+        depth_limit = self._delegation_depth_limit(parent_id)
+        if 1 >= depth_limit:
+            raise ValueError(
+                f"max recursion depth ({depth_limit}) exceeded at depth=1"
+            )
         tier = model_tier or DEFAULT_TIER
         task_id = uuid.uuid4().hex
         created_at = now_iso()
@@ -79,8 +129,23 @@ class DelegationOpsMixin:
             timeout_seconds=timeout,
             model_tier=tier,
         )
+        if not self._socket_alive(self._delegation_socket_path(child_id)):
+            try:
+                self.get_agent(child_id)
+            except AgentNotFoundError:
+                pass
+            else:
+                return self._deliver_managed_delegation(
+                    task_id=task_id,
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    payload=payload or {},
+                    timeout=timeout,
+                    tier=tier,
+                    created_at=created_at,
+                )
         bus = DelegationBus(parent_id)
-        tree = DelegationTree()
+        tree = DelegationTree(max_depth=depth_limit)
         coordinator = DelegationCoordinator(parent_id, bus, tree, model_tier=tier)
         try:
             result = coordinator.delegate(child_id, payload or {}, timeout=timeout)
@@ -165,6 +230,74 @@ class DelegationOpsMixin:
         )
         self.store.write_state(state)
         return {"task_id": task_id, "status": "completed", "result": clean_result}
+
+    def _deliver_managed_delegation(
+        self,
+        *,
+        task_id: str,
+        parent_id: str,
+        child_id: str,
+        payload: dict[str, Any],
+        timeout: float,
+        tier: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        from clawie.delegation import DelegationTree
+
+        error = ""
+        try:
+            result = self.deliver_to_agent(
+                child_id,
+                self._delegation_payload_message(payload),
+                tier=tier,
+                timeout=timeout,
+            )
+            if not bool(result.get("ok", False)):
+                error = str(result.get("error", "gateway delivery failed"))
+        except Exception as exc:  # noqa: BLE001 - persist delivery failures.
+            result = {"ok": False, "error": str(exc)}
+            error = str(exc)
+
+        status = "failed" if error else "completed"
+        completed_at = now_iso()
+        self.store.write_delegation_task(
+            task_id=task_id,
+            parent_agent_id=parent_id,
+            child_agent_id=child_id,
+            payload=payload,
+            depth=1,
+            timeout_seconds=timeout,
+            status=status,
+            result=result,
+            error=error,
+            created_at=created_at,
+            completed_at=completed_at,
+            model_tier=tier,
+        )
+        tree = DelegationTree(max_depth=self._delegation_depth_limit(parent_id))
+        tree.register(parent_id, "", f"{task_id}:root", depth=0, model_tier=tier)
+        tree.update_status(parent_id, "running")
+        tree.register(child_id, parent_id, task_id, depth=1, model_tier=tier)
+        tree.update_status(child_id, status)
+        self.store.write_delegation_tree(parent_id, tree.to_dict())
+        state = self.store.read_state()
+        event_type = "delegation.failed" if error else "delegation.completed"
+        message = (
+            f"Delegation {parent_id}->{child_id} failed: {error}"
+            if error
+            else f"Delegation {parent_id}->{child_id} completed through the live gateway"
+        )
+        self._event(
+            state,
+            event_type,
+            message,
+            {"task_id": task_id, "parent": parent_id, "child": child_id, "gateway": True},
+        )
+        self.store.write_state(state)
+        response = {"task_id": task_id, "status": status, "result": result}
+        if error:
+            response["error"] = error
+        return response
 
     def delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
         return self.store.read_delegation_tree(root_agent_id) or {}
@@ -348,7 +481,10 @@ class DelegationOpsMixin:
         if parent_id not in self._session_managers:
             from clawie.delegation import SessionAgentManager
 
-            self._session_managers[parent_id] = SessionAgentManager(parent_id)
+            self._session_managers[parent_id] = SessionAgentManager(
+                parent_id,
+                max_depth=self._delegation_depth_limit(parent_id),
+            )
         return self._session_managers[parent_id]
 
     def session_tree_lines(self, parent_id: str) -> list[str]:
@@ -556,9 +692,23 @@ class DelegationOpsMixin:
         linux_user = str(info.get("linux_user", "")).strip()
         adapter = get_adapter(provider)
 
+        requested_timeout = float(timeout)
+        if not math.isfinite(requested_timeout) or requested_timeout <= 0:
+            raise ValueError("delivery timeout must be a positive finite number")
+        limits = info.get("limits", {}) if isinstance(info.get("limits"), dict) else {}
+        configured_timeout = limits.get("gateway_timeout")
+        if isinstance(configured_timeout, int) and not isinstance(configured_timeout, bool):
+            effective_timeout = min(requested_timeout, float(configured_timeout))
+        else:
+            effective_timeout = requested_timeout
+
         task = Task(task_id=uuid.uuid4().hex, message=str(message), tier=str(tier or "balanced"))
-        cmd = adapter.deliver_command(agent_id, task, timeout=timeout)
-        runner = run or self._default_deliver_runner(provider, linux_user)
+        cmd = adapter.deliver_command(agent_id, task, timeout=effective_timeout)
+        runner = run or self._default_deliver_runner(
+            provider,
+            linux_user,
+            timeout=effective_timeout,
+        )
         stdout = runner(cmd)
         reply = adapter.parse_reply(stdout)
 
@@ -570,18 +720,37 @@ class DelegationOpsMixin:
             "error": reply.error,
             "usage": reply.usage,
             "delivery_status": reply.delivery_status,
+            "transport": str(reply.raw.get("meta", {}).get("transport", ""))
+            if isinstance(reply.raw.get("meta"), dict)
+            else "",
+            "fallback_from": str(reply.raw.get("meta", {}).get("fallbackFrom", ""))
+            if isinstance(reply.raw.get("meta"), dict)
+            else "",
+            "timeout_seconds": effective_timeout,
         }
         state = self.store.read_state()
         self._event(
             state,
             "delegation.delivered" if reply.ok else "delegation.delivery_failed",
             f"Delivered task to {agent_id}" if reply.ok else f"Delivery to {agent_id} failed",
-            {"agent_id": agent_id, "task_id": task.task_id, "ok": reply.ok, "tier": task.tier},
+            {
+                "agent_id": agent_id,
+                "task_id": task.task_id,
+                "ok": reply.ok,
+                "tier": task.tier,
+                "timeout_seconds": effective_timeout,
+            },
         )
         self.store.write_state(state)
         return result
 
-    def _default_deliver_runner(self, provider: str, linux_user: str) -> Callable[[list[str]], str]:
+    def _default_deliver_runner(
+        self,
+        provider: str,
+        linux_user: str,
+        *,
+        timeout: float,
+    ) -> Callable[[list[str]], str]:
         """Run an adapter delivery command in the agent user's service env."""
         provider_name = str(provider).strip().lower()
 
@@ -589,13 +758,19 @@ class DelegationOpsMixin:
             executable = self._resolve_provider_executable(provider_name)
             argv = [executable, *list(cmd)[1:]]
             wrapped = self._wrap_user_command(argv, linux_user, purpose="agent delegation")
-            result = subprocess.run(
-                wrapped,
-                capture_output=True,
-                text=True,
-                check=False,
-                env=self._service_env(linux_user),
-            )
+            try:
+                result = subprocess.run(
+                    wrapped,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._service_env(linux_user),
+                    timeout=timeout + 10.0,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise SetupError(
+                    f"{provider_name} agent delivery exceeded {timeout:g}s timeout"
+                ) from exc
             if result.returncode != 0 and not str(result.stdout).strip():
                 detail = (result.stderr or "").strip() or f"exit {result.returncode}"
                 raise SetupError(f"{provider_name} agent delivery failed: {detail}")

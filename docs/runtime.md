@@ -94,24 +94,26 @@ That command requires Linux with `/proc`, root, and at least two managed
 Linux-user agents. It checks that the users exist, homes are private, credential
 files are private and not symlinks, and one agent user cannot read another
 agent's sensitive paths. A skipped or failed report is not production evidence.
-The repository includes a Linux/root container proof in
+The repository includes historical Linux/root proof records in
 [`docs/proofs/host-validation-linux-container-2026-06-14.md`](proofs/host-validation-linux-container-2026-06-14.md);
-the built wheel also has a Colima Linux/systemd aggregate proof in
+and a Colima Linux/systemd aggregate proof in
 [`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md).
-Repeat the verifier on any different deployment host before accepting that host.
+Those records predate mandatory live runtime delivery and do not accept the
+current tree or any deployment host.
 
 For full target-host acceptance, run the aggregate verifier:
 
 ```bash
-sudo clawie production verify --exercise-watchdog-restart --json
+sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-delivery --json
 ```
 
 It combines standard health, host isolation validation, watchdog restart
-verification, and configured runtime adapter contract checks into one report.
+verification, source-pinned runtime checks, and a nonce-bearing live gateway
+delivery into one report. Static adapter metadata is not production evidence.
 For package release acceptance, add `--all-provider-contracts` so every verified
 production delivery provider is checked for a source-pinned adapter.
-The aggregate verifier exits nonzero unless `--exercise-watchdog-restart`
-actually proves restart behavior.
+The aggregate verifier exits nonzero unless both `--exercise-watchdog-restart`
+and `--exercise-runtime-delivery` prove their runtime behavior.
 
 ## Detect installed runtimes
 
@@ -141,7 +143,8 @@ Runtime isolation is **user-level, not container-level**. Each agent gets a sepa
 
 What is **not** isolated:
 - Agents share the same kernel, network stack, and hardware
-- `/tmp/clawie-delegation/` is world-accessible for IPC sockets
+- Delegation IPC is private to one OS user (`$XDG_RUNTIME_DIR/clawie/delegation`
+  when available, otherwise a UID-scoped directory under the system temp root)
 - Any root process can access all agent files
 - No network namespace, cgroup, seccomp, or container boundary
 

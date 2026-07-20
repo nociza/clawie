@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -77,13 +78,45 @@ def test_workspace_publish_creates_publication_and_view(
     bob_publications = service.workspace_list(agent_id="bob")
     assert [row["publication_id"] for row in bob_publications] == [result["publication_id"]]
     bob_mount = homes["bob-user"] / ".openclaw" / "workspace" / "published"
-    assert bob_mount.is_symlink()
+    assert bob_mount.is_dir()
+    assert not bob_mount.is_symlink()
     assert (bob_mount / "_index.json").is_file()
     assert (bob_mount / "alice" / result["view_name"] / "files" / "report.md").read_text(
         encoding="utf-8"
     ) == "published notes\n"
     assert service.workspace_verify(result["publication_id"])["status"] == "ok"
     assert service.workspace_verify()["status"] == "ok"
+    assert service._published_workspace_root().stat().st_mode & 0o777 == 0o700
+    assert publication.stat().st_mode & 0o777 == 0o500
+    assert (publication / "files" / "report.md").stat().st_mode & 0o777 == 0o400
+    assert bob_mount.stat().st_mode & 0o777 == 0o700
+    assert (bob_mount / "alice" / result["view_name"] / "files" / "report.md").stat().st_mode & 0o777 == 0o600
+
+
+def test_workspace_mount_replaces_symlink_without_touching_its_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, homes = _service_with_agents(tmp_path, monkeypatch)
+    source = homes["alice-user"] / ".openclaw" / "workspace" / "report.md"
+    source.write_text("published notes\n", encoding="utf-8")
+    result = service.workspace_publish(source, agent_id="alice", visible_to=["bob"])
+
+    mount = homes["bob-user"] / ".openclaw" / "workspace" / "published"
+    shutil.rmtree(mount)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("untouched\n", encoding="utf-8")
+    os.symlink(outside, mount, target_is_directory=True)
+
+    mounted = service.workspace_mount(agent_id="bob")
+
+    assert mounted["mounted"][0]["status"] == "materialized"
+    assert mount.is_dir()
+    assert not mount.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "untouched\n"
+    assert (mount / "alice" / result["view_name"] / "files" / "report.md").is_file()
 
 
 def test_workspace_publish_rejects_source_outside_agent_workspace(
@@ -163,7 +196,9 @@ def test_workspace_publish_infers_default_named_runtime_agent(
 
     assert result["publisher_agent_id"] == "Abulafia"
     assert "bob" in result["visible_to"]
-    assert (homes["bob-user"] / ".openclaw" / "workspace" / "published").is_symlink()
+    published = homes["bob-user"] / ".openclaw" / "workspace" / "published"
+    assert published.is_dir()
+    assert not published.is_symlink()
 
 
 def test_cli_workspace_publish_and_list(
@@ -218,6 +253,7 @@ def test_openclaw_home_prep_mounts_empty_published_view(
     service = ClawieService(StateStore(config_dir=tmp_path / "state"))
     monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
     home = tmp_path / "alice-home"
+    home.mkdir()
 
     service._ensure_openclaw_home_prepared(
         home=home,
@@ -230,5 +266,6 @@ def test_openclaw_home_prep_mounts_empty_published_view(
     )
 
     target = home / ".openclaw" / "workspace" / "published"
-    assert target.is_symlink()
+    assert target.is_dir()
+    assert not target.is_symlink()
     assert (target / "_index.json").is_file()

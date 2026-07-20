@@ -4,17 +4,78 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import socket
+import stat
 import struct
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from clawie.safe_fs import read_text_under, write_text_under
 
-DELEGATION_DIR = Path(os.environ.get("CLAWIE_DELEGATION_DIR", "/tmp/clawie-delegation"))
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+MAX_ACTIVE_CONNECTIONS = 16
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_agent_id(agent_id: str) -> str:
+    token = str(agent_id).strip()
+    if not _AGENT_ID_RE.fullmatch(token) or ".." in token:
+        raise ValueError(
+            "agent id must start with a letter/digit and contain only letters, "
+            "digits, '.', '_' or '-' (max 64 chars)"
+        )
+    return token
+
+
+def _default_delegation_dir() -> Path:
+    configured = str(os.environ.get("CLAWIE_DELEGATION_DIR", "")).strip()
+    if configured:
+        return Path(configured).expanduser()
+    runtime_dir = str(os.environ.get("XDG_RUNTIME_DIR", "")).strip()
+    if runtime_dir:
+        return Path(runtime_dir).expanduser() / "clawie" / "delegation"
+    uid_fn = getattr(os, "geteuid", None)
+    uid = int(uid_fn()) if callable(uid_fn) else os.getpid()
+    return Path(tempfile.gettempdir()) / f"clawie-delegation-{uid}"
+
+
+DELEGATION_DIR = _default_delegation_dir()
+
+
+def _ensure_private_delegation_dir() -> None:
+    DELEGATION_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    st = DELEGATION_DIR.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(f"delegation path is not a real directory: {DELEGATION_DIR}")
+    uid_fn = getattr(os, "geteuid", None)
+    if callable(uid_fn) and int(st.st_uid) != int(uid_fn()):
+        raise PermissionError(f"delegation directory has an unexpected owner: {DELEGATION_DIR}")
+    os.chmod(DELEGATION_DIR, 0o700)
+
+
+def _peer_is_current_user(conn: socket.socket) -> bool:
+    uid_fn = getattr(os, "geteuid", None)
+    expected_uid = int(uid_fn()) if callable(uid_fn) else None
+    if expected_uid is None:
+        return True
+    peercred = getattr(socket, "SO_PEERCRED", None)
+    if peercred is not None:
+        raw = conn.getsockopt(socket.SOL_SOCKET, peercred, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", raw)
+        return int(uid) == expected_uid
+    getpeereid = getattr(conn, "getpeereid", None)
+    if callable(getpeereid):
+        uid, _gid = getpeereid()
+        return int(uid) == expected_uid
+    # The containing directory is 0700 and the socket is 0600, which is the
+    # portable same-user boundary on POSIX systems without peer credentials.
+    return True
 
 # ---------------------------------------------------------------------------
 # Default DELEGATION.md skill content -- auto-loaded for agents with the
@@ -59,10 +120,12 @@ Parent                           Child (REPL running)
   |                                |
 ```
 
-Communication uses **Unix domain sockets** at `/tmp/clawie-delegation/<agent-id>.sock`
-with a 4-byte length-prefixed JSON wire protocol.  If sockets are unavailable
-(cross-user permissions), a **file-based mailbox** fallback at
-`/tmp/clawie-delegation/<agent-id>/inbox/` is used.
+Communication uses **Unix domain sockets** in a private, per-OS-user runtime
+directory (`$CLAWIE_DELEGATION_DIR`, `$XDG_RUNTIME_DIR/clawie/delegation`, or a
+UID-scoped system-temp fallback) with a 4-byte length-prefixed JSON protocol.
+Directories are `0700`, sockets are `0600`, peer UIDs are checked where the OS
+supports it, and a symlink-safe file mailbox is available for same-user
+fallback. Managed cross-user tasks use the runtime gateway.
 
 ---
 
@@ -94,7 +157,7 @@ the capability level and context budget.
 clawie delegation submit --parent p --child c --tier fast --payload '{}'
 
 # Start a REPL with a tier
-clawie delegation repl --agent-id worker --tier power
+clawie delegation repl --agent-id worker --executor-agent planner --tier power
 
 # Spawn a session agent with a tier
 clawie delegation spawn-session --parent p --child c --tier fast
@@ -155,7 +218,7 @@ All delegation commands live under the `clawie delegation` subcommand group.
 ### Start a REPL (make yourself available for tasks)
 
 ```bash
-clawie delegation repl --agent-id <your-agent-id> [--tier balanced]
+clawie delegation repl --agent-id <your-agent-id> --executor-agent <managed-id> [--tier balanced]
 ```
 
 This blocks and listens for incoming tasks.  Press **Ctrl+C** to stop.
@@ -246,10 +309,10 @@ tier = recommend_tier("refactor authentication module", {})       # -> "power"
 
 ## 6. Using the REPL Loop
 
-When you run `clawie delegation repl --agent-id <id> [--tier balanced]`, an
+When you run `clawie delegation repl --agent-id <id> --executor-agent <managed-id> [--tier balanced]`, an
 **AgentREPL** starts that:
 
-1. Binds a Unix domain socket at `/tmp/clawie-delegation/<id>.sock`.
+1. Binds an owner-only Unix domain socket in the private runtime directory.
 2. Loops: accepts a connection → reads a `task_submit` message → dispatches to
    the handler → sends back `task_accepted` then `task_result` or `task_error`.
 3. Tracks token usage in its context budget.
@@ -339,7 +402,7 @@ mgr.stop_all()
 ```
 
 For a persistent worker across separate shell commands, run
-`clawie delegation repl --agent-id <child-id>` in a live terminal and delegate to
+`clawie delegation repl --agent-id <child-id> --executor-agent <managed-id>` in a live terminal and delegate to
 that REPL with `clawie delegation submit`.
 
 ---
@@ -583,6 +646,8 @@ class Message:
     def encode(self) -> bytes:
         """Serialize to length-prefixed UTF-8 JSON."""
         body = json.dumps(asdict(self), sort_keys=True).encode("utf-8")
+        if not body or len(body) > MAX_MESSAGE_BYTES:
+            raise ValueError(f"delegation message exceeds {MAX_MESSAGE_BYTES} bytes")
         return struct.pack("!I", len(body)) + body
 
     @classmethod
@@ -598,6 +663,8 @@ def recv_message(sock: socket.socket, timeout: float | None = None) -> Message:
         sock.settimeout(timeout)
     header = _recv_exact(sock, MSG_HEADER_SIZE)
     (length,) = struct.unpack("!I", header)
+    if length <= 0 or length > MAX_MESSAGE_BYTES:
+        raise ValueError(f"invalid delegation message length: {length}")
     body = _recv_exact(sock, length)
     return Message.decode(body)
 
@@ -625,7 +692,7 @@ class DelegationBus:
     """Manages Unix domain sockets for agent IPC."""
 
     def __init__(self, agent_id: str) -> None:
-        self.agent_id = agent_id
+        self.agent_id = validate_agent_id(agent_id)
         self._server: socket.socket | None = None
         self._connections: dict[str, socket.socket] = {}
         self._lock = threading.Lock()
@@ -636,14 +703,16 @@ class DelegationBus:
 
     def listen(self) -> None:
         """Bind a server socket for this agent."""
-        DELEGATION_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(str(DELEGATION_DIR), 0o1777)
-        except OSError:
-            pass
+        _ensure_private_delegation_dir()
 
         path = self.socket_path
-        if path.exists():
+        if path.exists() or path.is_symlink():
+            st = path.lstat()
+            uid_fn = getattr(os, "geteuid", None)
+            if not stat.S_ISSOCK(st.st_mode):
+                raise PermissionError(f"refusing to replace non-socket delegation path: {path}")
+            if callable(uid_fn) and int(st.st_uid) != int(uid_fn()):
+                raise PermissionError(f"refusing to replace socket owned by another user: {path}")
             path.unlink()
 
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -651,10 +720,7 @@ class DelegationBus:
         self._server.bind(str(path))
         self._server.listen(16)
         self._server.setblocking(False)
-        try:
-            os.chmod(str(path), 0o777)
-        except OSError:
-            pass
+        os.chmod(path, 0o600)
 
     def accept(self, timeout: float = POLL_INTERVAL) -> socket.socket | None:
         """Non-blocking accept via select() with *timeout* seconds poll."""
@@ -665,6 +731,9 @@ class DelegationBus:
             ready, _, _ = select.select([srv], [], [], timeout)
             if ready:
                 conn, _ = srv.accept()
+                if not _peer_is_current_user(conn):
+                    conn.close()
+                    return None
                 return conn
         except (OSError, ValueError):
             return None
@@ -672,7 +741,15 @@ class DelegationBus:
 
     def connect(self, child_id: str) -> socket.socket:
         """Connect to a child agent's socket."""
-        path = DELEGATION_DIR / f"{child_id}.sock"
+        child = validate_agent_id(child_id)
+        _ensure_private_delegation_dir()
+        path = DELEGATION_DIR / f"{child}.sock"
+        st = path.lstat()
+        uid_fn = getattr(os, "geteuid", None)
+        if not stat.S_ISSOCK(st.st_mode):
+            raise ConnectionError(f"delegation endpoint is not a socket: {path}")
+        if callable(uid_fn) and int(st.st_uid) != int(uid_fn()):
+            raise PermissionError(f"delegation endpoint belongs to another user: {path}")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(str(path))
         with self._lock:
@@ -682,7 +759,7 @@ class DelegationBus:
                     old.close()
                 except OSError:
                     pass
-            self._connections[child_id] = sock
+            self._connections[child] = sock
         return sock
 
     def send_and_recv(
@@ -732,30 +809,30 @@ class FileMailbox:
     """File-based message queue for cases where Unix sockets fail."""
 
     def __init__(self, agent_id: str) -> None:
-        self.agent_id = agent_id
-        self._inbox = DELEGATION_DIR / agent_id / "inbox"
+        self.agent_id = validate_agent_id(agent_id)
+        self._inbox = DELEGATION_DIR / self.agent_id / "inbox"
 
     def ensure(self) -> None:
-        self._inbox.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(str(self._inbox.parent), 0o1777)
-            os.chmod(str(self._inbox), 0o1777)
-        except OSError:
-            pass
+        _ensure_private_delegation_dir()
+        self._inbox.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(self._inbox.parent, 0o700)
+        os.chmod(self._inbox, 0o700)
 
     def send(self, target_agent_id: str, msg: Message) -> Path:
         """Write a message file into *target_agent_id*'s inbox."""
-        inbox = DELEGATION_DIR / target_agent_id / "inbox"
-        inbox.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(str(inbox.parent), 0o1777)
-            os.chmod(str(inbox), 0o1777)
-        except OSError:
-            pass
+        target = validate_agent_id(target_agent_id)
+        _ensure_private_delegation_dir()
+        inbox = DELEGATION_DIR / target / "inbox"
+        inbox.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(inbox.parent, 0o700)
+        os.chmod(inbox, 0o700)
         filename = f"{msg.timestamp:.6f}-{msg.msg_id}.json"
-        path = inbox / filename
-        path.write_text(json.dumps(asdict(msg), sort_keys=True), encoding="utf-8")
-        return path
+        return write_text_under(
+            inbox,
+            filename,
+            json.dumps(asdict(msg), sort_keys=True),
+            mode=0o600,
+        )
 
     def poll(self) -> list[Message]:
         """Read and consume all pending messages (oldest first)."""
@@ -764,7 +841,9 @@ class FileMailbox:
         files = sorted(self._inbox.glob("*.json"))
         for path in files:
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(
+                    read_text_under(self._inbox, path.name, max_bytes=MAX_MESSAGE_BYTES)
+                )
                 messages.append(
                     Message(**{k: v for k, v in data.items() if k in Message.__dataclass_fields__})
                 )
@@ -795,7 +874,12 @@ class TreeNode:
 class DelegationTree:
     """Tracks the recursive delegation hierarchy."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_depth: int = MAX_RECURSION_DEPTH) -> None:
+        if isinstance(max_depth, bool) or not 1 <= int(max_depth) <= MAX_RECURSION_DEPTH:
+            raise ValueError(
+                f"max_depth must be between 1 and {MAX_RECURSION_DEPTH}"
+            )
+        self.max_depth = int(max_depth)
         self._nodes: dict[str, TreeNode] = {}
         self._lock = threading.Lock()
 
@@ -808,9 +892,9 @@ class DelegationTree:
         model_tier: str = "",
     ) -> TreeNode:
         """Add a delegation node. Raises on depth overflow or cycle."""
-        if depth >= MAX_RECURSION_DEPTH:
+        if depth >= self.max_depth:
             raise ValueError(
-                f"max recursion depth ({MAX_RECURSION_DEPTH}) exceeded at depth={depth}"
+                f"max recursion depth ({self.max_depth}) exceeded at depth={depth}"
             )
         # Cycle detection: walk ancestry from parent_id upward
         with self._lock:
@@ -909,8 +993,13 @@ class DelegationTree:
             }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "DelegationTree":
-        tree = cls()
+    def from_dict(
+        cls,
+        data: dict[str, Any],
+        *,
+        max_depth: int = MAX_RECURSION_DEPTH,
+    ) -> "DelegationTree":
+        tree = cls(max_depth=max_depth)
         for aid, raw in data.items():
             node = TreeNode(
                 agent_id=raw.get("agent_id", aid),
@@ -933,8 +1022,11 @@ TaskHandler = Callable[[Message, "AgentREPL"], dict[str, Any]]
 
 
 def _default_handler(msg: Message, repl: "AgentREPL") -> dict[str, Any]:
-    """Echo handler for testing -- returns the payload as-is."""
-    return dict(msg.payload)
+    """Fail closed when a listener has no real execution backend."""
+    raise RuntimeError(
+        f"session agent {repl.agent_id!r} has no execution handler; "
+        "start it through clawie with an executor agent"
+    )
 
 
 class AgentREPL:
@@ -951,16 +1043,18 @@ class AgentREPL:
         handler: TaskHandler | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         model_tier: str = DEFAULT_TIER,
+        max_depth: int = MAX_RECURSION_DEPTH,
     ) -> None:
         self.agent_id = agent_id
         self.handler = handler or _default_handler
         self.timeout = timeout
         self.model_tier = model_tier
         self.bus = DelegationBus(agent_id)
-        self.tree = DelegationTree()
+        self.tree = DelegationTree(max_depth=max_depth)
         self.context_budget = ContextBudget.for_tier(model_tier)
         self._running = False
         self._thread: threading.Thread | None = None
+        self._connection_slots = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
 
     def start(self) -> None:
         """Listen on socket, loop: accept -> dispatch -> respond."""
@@ -975,18 +1069,29 @@ class AgentREPL:
                 conn = self.bus.accept(timeout=POLL_INTERVAL)
                 if conn is None:
                     continue
-                try:
-                    self._handle_connection(conn)
-                except (ConnectionError, OSError):
-                    pass
-                finally:
-                    try:
-                        conn.close()
-                    except OSError:
-                        pass
+                if not self._connection_slots.acquire(blocking=False):
+                    conn.close()
+                    continue
+                threading.Thread(
+                    target=self._serve_connection,
+                    args=(conn,),
+                    daemon=True,
+                ).start()
         finally:
             self._running = False
             self.bus.close()
+
+    def _serve_connection(self, conn: socket.socket) -> None:
+        try:
+            self._handle_connection(conn)
+        except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            self._connection_slots.release()
 
     def start_background(self) -> threading.Thread:
         """Start the REPL loop in a daemon thread."""
@@ -1485,9 +1590,18 @@ class SessionAgentManager:
     own AgentREPL with a unique Unix socket.
     """
 
-    def __init__(self, parent_agent_id: str) -> None:
+    def __init__(
+        self,
+        parent_agent_id: str,
+        *,
+        max_depth: int = MAX_RECURSION_DEPTH,
+    ) -> None:
         self.parent_agent_id = parent_agent_id
-        self.coordinator = DelegationCoordinator(parent_agent_id)
+        self.max_depth = max_depth
+        self.coordinator = DelegationCoordinator(
+            parent_agent_id,
+            tree=DelegationTree(max_depth=max_depth),
+        )
         self._agents: dict[str, AgentREPL] = {}
         self._lock = threading.Lock()
         # Register parent as root so the tree renders properly
@@ -1512,7 +1626,13 @@ class SessionAgentManager:
             if child_id in self._agents:
                 raise ValueError(f"session agent already exists: {child_id}")
 
-        repl = AgentREPL(child_id, handler=handler, timeout=timeout, model_tier=model_tier)
+        repl = AgentREPL(
+            child_id,
+            handler=handler,
+            timeout=timeout,
+            model_tier=model_tier,
+            max_depth=self.max_depth,
+        )
         thread = repl.start_background()
         deadline = time.monotonic() + min(max(timeout, 0.1), 5.0)
         while time.monotonic() < deadline:

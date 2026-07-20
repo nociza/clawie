@@ -11,7 +11,7 @@ return config patches. All subprocess execution, port allocation, token
 persistence, and filesystem work stay in the service layer, which keeps the whole
 seam unit-testable without a runtime installed.
 
-Verified against openclaw ``2026.6.2`` (github.com/openclaw/openclaw @ ``e9bd90d2``);
+Verified against openclaw ``2026.7.1`` (github.com/openclaw/openclaw @ ``2d2ddc43``);
 see ``docs/design/control-plane.md`` Appendix A for the primary-source facts this
 encodes (loopback gateway port, token auth, ``agent`` run JSON, protocol v4,
 ``openclaw models auth`` as the auth surface, canonical ``openai/*`` model ids).
@@ -328,11 +328,13 @@ class GatewayCliAdapter:
                         parts.append(chunk)
         output = "\n".join(parts)
 
-        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        raw_result = data.get("result")
+        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
         delivery = data.get("deliveryStatus") or result.get("deliveryStatus") or {}
         delivery_status = str(delivery.get("status", "")) if isinstance(delivery, dict) else ""
 
-        meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+        raw_meta = data.get("meta")
+        meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
         usage = {}
         for src in (meta.get("usage"), result.get("usage"), data.get("usage")):
             if isinstance(src, dict) and src:
@@ -401,24 +403,24 @@ class GatewayCliAdapter:
 
 
 class OpenclawAdapter(GatewayCliAdapter):
-    """Reference adapter — the openclaw gateway runtime (verified 2026.6.2)."""
+    """Reference adapter — the openclaw gateway runtime (verified 2026.7.1)."""
 
     name = "openclaw"
     binary = "openclaw"
-    # Tested band: the 2026.6.x line. Outside this range clawie degrades writes
-    # for that agent to read-only and notifies (Principle 7 — notify on drift).
-    MIN_SUPPORTED = Version(2026, 6, 0)
-    MAX_SUPPORTED_EXCLUSIVE = Version(2026, 7, 0)
+    # Source-pinned production band. A future patch is deliberately rejected
+    # until its CLI and JSON delivery contract has been exercised and pinned.
+    MIN_SUPPORTED = Version(2026, 7, 1)
+    MAX_SUPPORTED_EXCLUSIVE = Version(2026, 7, 2)
     PROTOCOL_MIN = OPENCLAW_PROTOCOL_MIN
     PROTOCOL_MAX = OPENCLAW_PROTOCOL_MAX
     # Canonical ``openai/*`` ids — NOT the legacy ``openai-codex/*`` ids that
     # `openclaw doctor --fix` rewrites (Appendix A).
     TIER_MODELS = {
-        "fast": "openai/gpt-5.2",
-        "balanced": "openai/gpt-5.4",
-        "power": "openai/gpt-5.4",
+        "fast": "openai/gpt-5.5",
+        "balanced": "openai/gpt-5.6",
+        "power": "openai/gpt-5.6",
     }
-    DEFAULT_MODEL = "openai/gpt-5.4"
+    DEFAULT_MODEL = "openai/gpt-5.6"
 
 
 class HermesAdapter(GatewayCliAdapter):

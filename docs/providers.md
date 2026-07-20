@@ -1,16 +1,16 @@
 # Providers & Auth
 
 clawie tracks three provider integrations. Each agent has exactly one provider
-assigned at a time, but production delegated-task delivery is currently
-source-pinned only for openclaw. picoclaw and zeroclaw lifecycle/auth support is
-kept for migration and experimentation until their delivery contracts are
-verified.
+assigned at a time. OpenClaw 2026.7.1 is the only source-pinned delivery
+contract, and each deployment must still pass a live gateway challenge.
+picoclaw and zeroclaw lifecycle/auth support is kept for migration and
+experimentation until their delivery contracts are verified.
 
 ## Supported providers
 
 | Provider | Runtime | Default Auth | Install | Delegated-task delivery |
 |----------|---------|-------------|---------|-------------------------|
-| **openclaw** | openclaw-agent | none | pnpm | production verified |
+| **openclaw** | openclaw-agent | none | pnpm | source-pinned; live host proof required |
 | **picoclaw** | picoclaw-agent | linked | brew | gated until source-pinned |
 | **zeroclaw** | zeroclaw-agent | linked | brew | gated until source-pinned |
 

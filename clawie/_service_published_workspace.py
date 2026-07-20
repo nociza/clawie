@@ -7,6 +7,7 @@ from typing import Any
 
 from clawie.providers import get_provider
 from clawie.published_workspace import PublishedWorkspace, PublishedWorkspaceError
+from clawie.safe_fs import UnsafePathError
 from clawie.service_common import AgentNotFoundError, SetupError
 
 
@@ -196,37 +197,33 @@ class PublishedWorkspaceOpsMixin:
             return {}
         published = self._published_workspace()
         view = Path(published.rebuild_view(token)["view_path"]).resolve(strict=True)
-        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            workspace.lstat()
+        except FileNotFoundError as exc:
+            raise PublishedWorkspaceError(
+                f"provider workspace does not exist: {workspace}"
+            ) from exc
+        if workspace.is_symlink() or not workspace.is_dir():
+            raise PublishedWorkspaceError(
+                f"provider workspace must be a real directory: {workspace}"
+            )
         target = workspace / "published"
-        if target.is_symlink():
-            try:
-                if target.resolve(strict=True) == view:
-                    self._chown_path(target, linux_user)
-                    return {
-                        "agent_id": token,
-                        "workspace": str(workspace),
-                        "target": str(target),
-                        "view": str(view),
-                        "status": "mounted",
-                    }
-            except OSError:
-                pass
-            target.unlink()
-        elif target.exists():
-            if target.is_dir() and not any(target.iterdir()):
-                target.rmdir()
-            else:
-                raise PublishedWorkspaceError(
-                    f"cannot mount published workspace because path already exists: {target}"
-                )
-        os.symlink(view, target, target_is_directory=True)
-        self._chown_path(target, linux_user)
+        try:
+            self._copy_tree_to_agent(
+                published.root,
+                Path("views") / token,
+                workspace,
+                "published",
+                linux_user,
+            )
+        except UnsafePathError as exc:
+            raise PublishedWorkspaceError(str(exc)) from exc
         return {
             "agent_id": token,
             "workspace": str(workspace),
             "target": str(target),
             "view": str(view),
-            "status": "mounted",
+            "status": "materialized",
         }
 
     def _agent_provider_workspace_path(self, agent: dict[str, Any]) -> Path | None:
@@ -293,4 +290,3 @@ class PublishedWorkspaceOpsMixin:
         state = self.store.read_state()
         if str(agent_id or "").strip() not in state.setdefault("agents", {}):
             raise AgentNotFoundError(f"agent not found: {agent_id}")
-

@@ -306,7 +306,8 @@ class ClawieService(
         provider_spec = get_provider(provider)
         credentials = self._provider_auth(provider)
         auth_mode = credentials.get("auth_mode", provider_spec.default_auth_mode)
-        configured = self._is_provider_configured(provider, credentials)
+        initialized = bool(str(config.get("updated_at", "")).strip())
+        configured = initialized and self._is_provider_configured(provider, credentials)
         return {
             "configured": configured,
             "provider": provider,
@@ -328,7 +329,15 @@ class ClawieService(
         provider = str(config.get("provider", "openclaw"))
         provider_auth = self._provider_auth(provider)
         mode = provider_auth.get("auth_mode", get_provider(provider).default_auth_mode)
-        if self._is_provider_configured(provider, provider_auth):
+        initialized = bool(str(config.get("updated_at", "")).strip())
+        if not initialized:
+            checks.append(
+                {
+                    "status": "fail",
+                    "message": "Setup has not been initialized. Run 'clawie config set'.",
+                }
+            )
+        elif self._is_provider_configured(provider, provider_auth):
             checks.append(
                 {
                     "status": "pass",
@@ -364,9 +373,9 @@ class ClawieService(
 
         agents = state.setdefault("agents", {})
         if agents:
-            checks.append({"status": "pass", "message": f"{len(agents)} agent(s) provisioned"})
+            checks.append({"status": "pass", "message": f"{len(agents)} agent definition(s)"})
         else:
-            checks.append({"status": "warn", "message": "No agents provisioned yet"})
+            checks.append({"status": "warn", "message": "No agent definitions yet"})
 
         no_channels = [aid for aid, row in agents.items() if not row.get("channels")]
         if no_channels:
@@ -1104,6 +1113,8 @@ class ClawieService(
 
     def _require_setup(self) -> None:
         config = self.store.read_config()
+        if not str(config.get("updated_at", "")).strip():
+            raise SetupError("setup is incomplete. Run 'clawie config set'.")
         provider = str(config.get("provider", "openclaw")).strip().lower() or "openclaw"
         credentials = self._provider_auth(provider)
         if not self._is_provider_configured(provider, credentials):

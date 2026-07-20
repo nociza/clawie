@@ -164,7 +164,10 @@ class AgentOpsMixin:
 
         display = display_name.strip() if display_name else agent_id
         agent = {
-            "status": "ready",
+            # This record is a desired control-plane definition.  Runtime
+            # readiness is established separately by ``runtime create`` and
+            # live service probes, so do not claim it is ready here.
+            "status": "configured",
             "version": agent_version,
             "last_sync": now_iso(),
             "runtime": runtime,
@@ -217,7 +220,7 @@ class AgentOpsMixin:
         self._event(
             state,
             "agents.created",
-            f"Provisioned agent {agent_id}",
+            f"Created agent definition {agent_id}",
             {
                 "agent_id": agent_id,
                 "channel_strategy": channel_strategy,
@@ -606,6 +609,14 @@ class AgentOpsMixin:
         name = str(provider).strip().lower()
         if name not in {"picoclaw", "openclaw"}:
             return
+        spec = get_provider(name)
+        if spec.verified_delivery:
+            # This method is the shared config-write choke point used by
+            # spawning, provider switching, channel changes, and manifest
+            # reconciliation.  Probe immediately before touching a runtime's
+            # schema so an untested upgrade degrades to read-only.
+            executable = self._resolve_provider_executable(name)
+            self._verify_installed_runtime_version(name, executable)
 
         sync = self._normalize_credential_sync_state(agent.get("credential_sync"), default_when_missing=True)
         use_shared_auth = "provider-auth" in set(sync.get("bundles", []))
@@ -622,7 +633,7 @@ class AgentOpsMixin:
             current_auth_mode=str(agent.get("agent", {}).get("auth_mode", "")),
             allow_defaults=True,
         )
-        auth_mode = str(auth.get("auth_mode", get_provider(name).default_auth_mode)).strip().lower()
+        auth_mode = str(auth.get("auth_mode", spec.default_auth_mode)).strip().lower()
         api_key = str(auth.get("api_key", "")).strip()
         if name == "picoclaw":
             self._ensure_picoclaw_home_prepared(

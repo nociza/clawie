@@ -6,6 +6,8 @@ import os
 import pwd
 import sqlite3
 import tempfile
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -823,17 +825,29 @@ class StateStore:
             )
             conn.commit()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a transactional connection and always release its resources.
+
+        ``sqlite3.Connection`` commits or rolls back when used as a context
+        manager, but it does not close itself.  Keeping the close here makes
+        every existing ``with self._connect()`` call safe on Python versions
+        that report unclosed database handles as ``ResourceWarning``.
+        """
         self._ensure_root_dir()
         if self.db_path.is_symlink():
             raise PermissionError(f"clawie database must not be a symlink: {self.db_path}")
         conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        self._harden_db_files()
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            self._harden_db_files()
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _set_root(self, root: Path) -> None:
         self.root = root.expanduser()

@@ -38,14 +38,20 @@ agent homes, and port sessions between claws with `clawie auth port`.
 
 ```bash
 uv tool install clawie        # from PyPI
-uv tool install -e .          # from source
+uv tool install .             # immutable install from source
+sudo ./install.sh             # system install for sudo/runtime automation
 ```
+
+Use the root-owned system install for operational agents, cron, and the
+systemd watchdog. A user-owned tool environment is appropriate for unprivileged
+definition and inspection commands, but must not be executed as root.
 
 ## Quick start
 
 ```bash
 clawie config set --provider openclaw --subscription pro
-clawie agent create alice --template baseline
+sudo clawie runtime install openclaw
+sudo clawie runtime create alice --user alice --template baseline
 clawie status
 ```
 
@@ -77,11 +83,14 @@ Tiers include context budgets that track token usage and trigger compaction warn
 ## Key commands
 
 ```bash
-# Agents
+# Definition-only agents (no Linux user or service)
 clawie agent create alice --model-tier balanced
 clawie agent clone alice bob --channel-strategy migrate
 clawie agent list
 clawie agent show alice
+
+# Operational isolated agent
+sudo clawie runtime create worker --user worker --provider openclaw
 
 # Delegation
 clawie delegation submit --parent p --child c --tier fast --payload '{}'

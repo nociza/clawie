@@ -776,6 +776,17 @@ class DelegationBus:
         send_message(sock, msg)
         return recv_message(sock, timeout=timeout)
 
+    def disconnect(self, child_id: str) -> None:
+        """Close one cached outbound connection without touching any server."""
+        child = validate_agent_id(child_id)
+        with self._lock:
+            sock = self._connections.pop(child, None)
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def close(self) -> None:
         """Tear down server and all connections."""
         with self._lock:
@@ -786,6 +797,7 @@ class DelegationBus:
                     pass
             self._connections.clear()
 
+        owned_server = self._server is not None
         if self._server is not None:
             try:
                 self._server.close()
@@ -793,8 +805,11 @@ class DelegationBus:
                 pass
             self._server = None
 
+        # Outbound-only buses use the parent's agent id for message metadata,
+        # but they do not own the parent's listening socket.  Only unlink a
+        # socket path when this bus actually created the server.
         path = self.socket_path
-        if path.exists():
+        if owned_server and (path.exists() or path.is_symlink()):
             try:
                 path.unlink()
             except OSError:
@@ -1757,6 +1772,7 @@ class SessionAgentManager:
             repl = self._agents.pop(child_id, None)
         if repl:
             repl.stop()
+            self.coordinator.bus.disconnect(child_id)
             self.coordinator.tree.update_status(child_id, "completed")
 
     def stop_all(self) -> None:
@@ -1767,6 +1783,7 @@ class SessionAgentManager:
         for child_id, repl in agents.items():
             repl.stop()
             self.coordinator.tree.update_status(child_id, "completed")
+        self.coordinator.bus.close()
 
     def list_agents(self) -> list[dict[str, Any]]:
         """List all session sub-agents."""

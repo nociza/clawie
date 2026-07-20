@@ -401,7 +401,9 @@ class ChannelOpsMixin:
         if moved_from_source:
             source.setdefault("agent", {})["last_sync"] = now_iso()
         target["channel_strategy"] = "migrate"
-        target["agent"]["status"] = "syncing"
+        # The migration is complete before this state is persisted; runtime
+        # liveness is reported separately by service probes.
+        target["agent"]["status"] = "configured"
         target["agent"]["last_sync"] = now_iso()
 
         self._event(
@@ -467,7 +469,7 @@ class ChannelOpsMixin:
         )
 
         target["channels"] = target_channels
-        target["agent"]["status"] = "ready"
+        target["agent"]["status"] = "configured"
         target["agent"]["last_sync"] = now_iso()
 
         self._event(

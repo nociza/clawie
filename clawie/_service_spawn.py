@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import pwd
 import secrets
+import signal
 import shutil
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -26,7 +29,7 @@ from clawie.providers import (
     get_provider,
 )
 from clawie.service_common import SetupError, AgentExistsError, now_iso
-from clawie.safe_fs import read_text_under, write_text_under
+from clawie.safe_fs import UnsafePathError, ensure_directory_under, read_text_under, write_text_under
 
 _MANAGED_USER_MARKER = ".clawie-managed-user.json"
 
@@ -798,17 +801,23 @@ class SpawnOpsMixin:
         model_tier: str = "",
         detached: bool = False,
     ) -> dict[str, Any]:
-        from clawie.delegation import DEFAULT_TIER
+        from clawie.delegation import DEFAULT_TIER, get_model_tier
 
         parent_id = self._validate_agent_id(parent_id)
         child_id = self._validate_agent_id(child_id)
+        if parent_id == child_id:
+            raise ValueError("parent and child agent ids must differ")
         self.get_agent(parent_id)
+        effective_timeout = float(timeout)
+        if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            raise ValueError("session timeout must be a positive finite number")
         depth_limit = self._delegation_depth_limit(parent_id)
         if 1 >= depth_limit:
             raise ValueError(
                 f"max recursion depth ({depth_limit}) exceeded at depth=1"
             )
         tier = model_tier or DEFAULT_TIER
+        get_model_tier(tier)
         if detached:
             existing = self.store.read_session_agent(parent_id, child_id)
             if existing:
@@ -817,8 +826,7 @@ class SpawnOpsMixin:
                     raise ValueError(f"session agent already exists: {child_id}")
                 self.store.delete_session_agent(parent_id, child_id)
 
-            session_dir = self.store.root / "session-agents"
-            session_dir.mkdir(parents=True, exist_ok=True)
+            session_dir = ensure_directory_under(self.store.root, "session-agents", mode=0o700)
             log_path = session_dir / f"{parent_id}-{child_id}.log"
             socket_path = self._delegation_socket_path(child_id)
             if self._socket_alive(socket_path):
@@ -839,25 +847,57 @@ class SpawnOpsMixin:
                 "--tier",
                 tier,
             ]
-            with log_path.open("ab") as log:
-                proc = subprocess.Popen(
+            log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            log_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            log_fd: int | None = None
+            null_fd: int | None = None
+            try:
+                log_fd = os.open(log_path, log_flags, 0o600)
+                log_stat = os.fstat(log_fd)
+                if not stat.S_ISREG(log_stat.st_mode):
+                    raise UnsafePathError(f"refusing non-regular session log: {log_path}")
+                os.fchmod(log_fd, 0o600)
+                null_fd = os.open(os.devnull, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+                pid = os.posix_spawn(
+                    sys.executable,
                     cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    close_fds=True,
-                    start_new_session=True,
+                    os.environ.copy(),
+                    file_actions=[
+                        (os.POSIX_SPAWN_DUP2, null_fd, 0),
+                        (os.POSIX_SPAWN_DUP2, log_fd, 1),
+                        (os.POSIX_SPAWN_DUP2, log_fd, 2),
+                    ],
+                    setsid=True,
                 )
-            ready_timeout = min(max(float(timeout), 0.5), 5.0)
+            except (OSError, NotImplementedError) as exc:
+                raise SetupError(f"could not start detached session agent: {exc}") from exc
+            finally:
+                if null_fd is not None:
+                    os.close(null_fd)
+                if log_fd is not None:
+                    os.close(log_fd)
+            ready_timeout = min(max(effective_timeout, 0.5), 5.0)
             if not self._wait_for_session_socket(
                 child_id,
                 timeout=ready_timeout,
-                pid=int(proc.pid),
+                pid=int(pid),
             ):
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.kill(pid, sig)
+                    except OSError:
+                        break
+                    deadline = time.monotonic() + 1.0
+                    while time.monotonic() < deadline:
+                        try:
+                            waited, _status = os.waitpid(pid, os.WNOHANG)
+                        except (ChildProcessError, OSError):
+                            waited = pid
+                        if waited == pid or not self._pid_alive(pid):
+                            break
+                        time.sleep(0.05)
+                    if waited == pid or not self._pid_alive(pid):
+                        break
                 raise RuntimeError(
                     f"session agent failed to start: {child_id}; see {log_path}"
                 )
@@ -866,7 +906,7 @@ class SpawnOpsMixin:
             self.store.write_session_agent(
                 parent_agent_id=parent_id,
                 child_agent_id=child_id,
-                pid=int(proc.pid),
+                pid=int(pid),
                 depth=1,
                 status="running",
                 model_tier=tier,
@@ -885,7 +925,7 @@ class SpawnOpsMixin:
                     "parent": parent_id,
                     "child": child_id,
                     "model_tier": tier,
-                    "pid": int(proc.pid),
+                    "pid": int(pid),
                 },
             )
             self.store.write_state(state)
@@ -896,7 +936,7 @@ class SpawnOpsMixin:
                 "status": "running",
                 "session": True,
                 "model_tier": tier,
-                "pid": int(proc.pid),
+                "pid": int(pid),
                 "socket": str(socket_path),
                 "log": str(log_path),
             }
@@ -905,7 +945,7 @@ class SpawnOpsMixin:
         info = mgr.spawn(
             child_id,
             handler=self._gateway_task_handler(parent_id),
-            timeout=timeout,
+            timeout=effective_timeout,
             model_tier=tier,
         )
         state = self.store.read_state()

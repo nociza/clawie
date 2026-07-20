@@ -39,6 +39,7 @@ class ProviderAuthMixin:
         imported: dict[str, str],
     ) -> list[str]:
         if str(provider).strip().lower() == "openclaw":
+            self._verify_detected_runtime_before_write("openclaw")
             return self._write_openclaw_native_auth_profile(imported)
         shared_home = self._ensure_shared_provider_auth_root()
         target = shared_home / get_provider(provider).state_dir / "auth-profiles.json"

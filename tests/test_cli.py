@@ -87,6 +87,67 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
     assert not (tmp_path / "clawie.db").exists()
 
 
+def test_fresh_store_is_not_reported_as_configured(
+    tmp_path: Path, capsys: CaptureFixture[str]
+) -> None:
+    code = run_cli(tmp_path, "config", "show")
+    output = capsys.readouterr().out
+
+    assert code == 1
+    assert "configured: False" in output
+    assert "clawie config set" in output
+
+
+def test_maintenance_cron_preserves_state_root_and_exact_schedule(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state % with spaces"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="",
+    )
+    cron_dir = tmp_path / "cron.d"
+    cron_dir.mkdir()
+    cron_file = cron_dir / "clawie-maintenance"
+    monkeypatch.setattr(service, "MAINTENANCE_CRON_FILE", cron_file)
+    monkeypatch.setattr(service, "MAINTENANCE_LOG_FILE", tmp_path / "maintenance.log")
+    monkeypatch.setattr("clawie._service_delegation.os.geteuid", lambda: 0)
+    monkeypatch.setattr(
+        "clawie._service_delegation.shutil.which",
+        lambda _name: "/opt/clawie % bin/clawie",
+    )
+    monkeypatch.setattr(
+        service,
+        "_validated_root_automation_executable",
+        lambda path: str(Path(path)),
+    )
+
+    result = service.maintenance_enable(interval_hours=6)
+    cron = cron_file.read_text(encoding="utf-8")
+
+    assert result["interval_hours"] == 6
+    assert "0 */6 * * * root" in cron
+    assert "'/opt/clawie \\% bin/clawie'" in cron
+    expected_root = str(service.store.root.resolve()).replace("%", r"\%")
+    assert f"--config-dir '{expected_root}' maintenance run" in cron
+    assert (cron_file.stat().st_mode & 0o777) == 0o644
+
+    with raises(ValueError, match="must be one of"):
+        service.maintenance_enable(interval_hours=5)
+
+
+def test_maintenance_rejects_user_writable_executable(tmp_path: Path) -> None:
+    executable = tmp_path / "clawie"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    with raises(SetupError, match="root-owned, non-group/world-writable"):
+        ClawieService._validated_root_automation_executable(executable)
+
+
 def _fake_jwt(payload: dict[str, object]) -> str:
     import base64
 
@@ -220,6 +281,11 @@ def test_control_watchdog_install_writes_systemd_units(
         unit_dir / "clawie-control-alert.service",
     )
     monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        service,
+        "_validated_root_automation_executable",
+        lambda path: str(path),
+    )
 
     def fake_which(name: str) -> str | None:
         if name == "clawie":
@@ -286,6 +352,11 @@ def test_control_watchdog_install_fails_when_systemd_start_fails(
         unit_dir / "clawie-control-alert.service",
     )
     monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        service,
+        "_validated_root_automation_executable",
+        lambda path: str(path),
+    )
     monkeypatch.setattr(watchdog_module.shutil, "which", lambda name: "/bin/systemctl" if name == "systemctl" else None)
 
     def fake_run(
@@ -332,6 +403,11 @@ def test_control_watchdog_install_no_start_does_not_mark_enabled(
         unit_dir / "clawie-control-alert.service",
     )
     monkeypatch.setattr(watchdog_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        service,
+        "_validated_root_automation_executable",
+        lambda path: str(path),
+    )
     monkeypatch.setattr(watchdog_module.shutil, "which", lambda name: "/bin/systemctl" if name == "systemctl" else None)
     calls: list[list[str]] = []
 
@@ -1071,6 +1147,9 @@ def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
 ) -> None:
     service = ClawieService(StateStore(config_dir=tmp_path))
     monkeypatch.setattr(ClawieService, "_shared_toolchain_home", lambda self: tmp_path / "shared-toolchain")
+    # Hosted runners may already have gcloud on PATH; this test exercises the
+    # archive installer and must not depend on the host image.
+    monkeypatch.setattr(service, "_resolve_executable_in_service_env", lambda _name: "")
     downloads: list[str] = []
 
     class FakeResponse(io.BytesIO):
@@ -1258,7 +1337,8 @@ def test_create_agent_uses_random_default_name_when_omitted(
     output = capsys.readouterr().out
 
     assert code == 0
-    assert "Provisioned agent Abulafia" in output
+    assert "Created agent definition Abulafia" in output
+    assert "no Linux user or provider service" in output
     state = StateStore(config_dir=tmp_path).read_state()
     assert "Abulafia" in state["agents"]
 
@@ -1285,7 +1365,7 @@ def test_random_default_name_skips_existing_names_case_insensitively(
 
     assert code == 0
     assert "Abulafia" not in seen_candidates[0]
-    assert "Provisioned agent Diotallevi" in output
+    assert "Created agent definition Diotallevi" in output
 
 
 def test_agent_provider_set_changes_provider(
@@ -4773,6 +4853,12 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     )
 
     monkeypatch.setattr(service, "_shared_linked_auth_available", lambda provider: provider == "openclaw")
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "/opt/openclaw")
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda _provider, _executable: "2026.7.1",
+    )
     monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
 
     service._prepare_agent_provider_home(
@@ -4793,6 +4879,52 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     assert agent_auth.is_file()
     assert not agent_auth.is_symlink()
     assert json.loads(agent_auth.read_text(encoding="utf-8"))["profiles"]["openai-codex:default"]["access"] == "tok"
+
+
+def test_prepare_openclaw_home_fails_closed_before_schema_writes(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="",
+    )
+    agent = service.create_agent(
+        agent_id="blocked",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    home = tmp_path / "blocked-home"
+    home.mkdir()
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "/opt/openclaw")
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda _provider, _executable: (_ for _ in ()).throw(
+            SetupError("outside the verified delivery range")
+        ),
+    )
+
+    with raises(SetupError, match="verified delivery range"):
+        service._prepare_agent_provider_home(
+            provider="openclaw",
+            agent=agent,
+            linux_user="blocked",
+            home=home,
+            channels=[],
+            live_payloads={},
+        )
+
+    assert list(home.iterdir()) == []
 
 
 def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
@@ -4844,6 +4976,12 @@ def test_prepare_openclaw_home_repairs_legacy_shared_auth_store_format(
         encoding="utf-8",
     )
 
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "/opt/openclaw")
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda _provider, _executable: "2026.7.1",
+    )
     monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})())
 
     service._prepare_agent_provider_home(

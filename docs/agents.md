@@ -1,6 +1,9 @@
 # Agent Management
 
-Agents are the core unit in clawie. Each agent has a provider, channels, credentials, core prompts, plugins, and an optional Linux runtime.
+Agents are the core unit in clawie. Each agent has a provider, channels,
+credentials, core prompts, plugins, and an optional Linux runtime. `agent
+create` creates only the control-plane definition; for a runnable isolated
+agent, use `sudo clawie runtime create ID --user USER` instead.
 
 ## Create
 
@@ -9,6 +12,7 @@ clawie agent create alice --template baseline
 ```
 
 If `AGENT_ID` is omitted, clawie picks an unused default name at random.
+This command does not create a Linux user or start a provider service.
 
 Options:
 
@@ -95,7 +99,9 @@ Each agent has a default model tier that controls delegation budgets:
 clawie agent create alice --model-tier fast
 ```
 
-Set the tier programmatically via the service API.
+This creates a control-plane definition, not a Linux runtime. Use `sudo clawie
+runtime create` for an operational isolated agent. Set the tier programmatically
+via the service API.
 
 ## Delete
 

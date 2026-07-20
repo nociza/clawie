@@ -28,6 +28,9 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
     fcntl = None  # type: ignore[assignment]
 
 
+IPC_CLIENT_TIMEOUT_SECONDS = 2.0
+
+
 class Clawied:
     """Small foreground daemon host for manifest reconciliation.
 
@@ -327,6 +330,9 @@ class Clawied:
         except OSError:
             return
         with conn:
+            # A local peer must not be able to freeze the single-writer
+            # reconcile loop by opening a socket and withholding EOF.
+            conn.settimeout(IPC_CLIENT_TIMEOUT_SECONDS)
             peer_uid = self._peer_uid(conn)
             control_entry = next(
                 (item for item in self._control_servers if item[0] is selected),
@@ -499,16 +505,30 @@ class Clawied:
         if verb == "apply_prompts":
             return self.service.apply_staged_prompts(str(args.get("agent_id", "") or ""))
         if verb == "sync_auth":
+            forbidden = sorted(
+                key
+                for key in ("source_home", "bundles", "include_defaults")
+                if key in args
+            )
+            if forbidden:
+                raise PermissionError(
+                    "autonomous sync_auth uses the agent's stored credential policy; "
+                    "policy/source overrides require an operator command"
+                )
             return self.service.sync_agent_credentials(
                 str(args.get("agent_id", "") or ""),
-                source_home=args.get("source_home"),
-                bundles=args.get("bundles"),
-                include_defaults=bool(args.get("include_defaults", False)),
             )
         if verb == "backup":
+            if "push" in args and args.get("push") is not False and args.get("push") is not None:
+                raise PermissionError(
+                    "autonomous control backups are local-only; use the operator backup command to push"
+                )
             return self.service.backup_run(
                 message=str(args.get("message", "") or ""),
-                push=args.get("push"),
+                # Override even an operator-configured automatic push policy:
+                # a prompt-injected control agent must never create outward
+                # network writes through a SAFE_HEAL verb.
+                push=False,
             )
         if verb == "reconcile":
             dry_run = bool(args.get("dry_run", False))
@@ -517,7 +537,9 @@ class Clawied:
             if manifest and agent:
                 raise ValueError("use either manifest or agent, not both")
             if manifest:
-                return self.service.reconcile_agent_manifest(Path(manifest), dry_run=dry_run)
+                raise PermissionError(
+                    "autonomous reconcile only accepts manager-owned stored manifests"
+                )
             if agent:
                 return self.service.reconcile_agent_manifest(self.service.agent_manifest_path(agent), dry_run=dry_run)
             return {"results": self.service.reconcile_all_manifests(dry_run=dry_run)}

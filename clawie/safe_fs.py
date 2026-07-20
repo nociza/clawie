@@ -216,6 +216,80 @@ def write_text_under(
     )
 
 
+def append_bytes_under(
+    root: str | Path,
+    relative: str | Path,
+    data: bytes,
+    *,
+    mode: int = 0o600,
+    directory_mode: int = 0o700,
+    owner: Owner = None,
+) -> Path:
+    """Append bytes below *root* without following symlinks."""
+    root_path = Path(root)
+    parts = _relative_parts(relative)
+    root_fd = _open_root(root_path)
+    parent_fd: int | None = None
+    file_fd: int | None = None
+    try:
+        parent_fd = _walk_directory(
+            root_fd,
+            parts[:-1],
+            create=True,
+            mode=directory_mode,
+            owner=owner,
+        )
+        try:
+            file_fd = os.open(
+                parts[-1],
+                _file_flags(os.O_WRONLY | os.O_CREAT | os.O_APPEND),
+                mode,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise UnsafePathError(
+                f"could not safely open append target: {root_path / Path(*parts)}"
+            ) from exc
+        st = os.fstat(file_fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise UnsafePathError(
+                f"refusing to append to non-regular file: {root_path / Path(*parts)}"
+            )
+        os.fchmod(file_fd, mode)
+        _apply_owner(file_fd, owner)
+        view = memoryview(data)
+        while view:
+            written = os.write(file_fd, view)
+            view = view[written:]
+        os.fsync(file_fd)
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(root_fd)
+    return root_path.joinpath(*parts)
+
+
+def append_text_under(
+    root: str | Path,
+    relative: str | Path,
+    text: str,
+    *,
+    mode: int = 0o600,
+    directory_mode: int = 0o700,
+    owner: Owner = None,
+) -> Path:
+    return append_bytes_under(
+        root,
+        relative,
+        str(text).encode("utf-8"),
+        mode=mode,
+        directory_mode=directory_mode,
+        owner=owner,
+    )
+
+
 def read_bytes_under(
     root: str | Path,
     relative: str | Path,

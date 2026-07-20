@@ -77,6 +77,28 @@ class RuntimeOpsMixin:
             )
         return str(gate.version or "")
 
+    def _verify_detected_runtime_before_write(self, provider: str) -> str:
+        """Gate schema writes when a verified runtime is present on the host.
+
+        Auth may be staged before the runtime is installed.  That is safe: the
+        later install path is pinned and gated.  Once an executable is present
+        (or the store says it should be), unknown versions fail closed.
+        """
+        spec = get_provider(provider)
+        if not spec.verified_delivery:
+            return ""
+        try:
+            executable = self._resolve_provider_executable(spec.name)
+        except SetupError:
+            config = self.store.read_config()
+            if self._is_runtime_marked_installed(config, spec.name):
+                raise SetupError(
+                    f"{spec.name} is recorded as installed but its executable is unavailable; "
+                    "runtime schema writes are disabled"
+                )
+            return ""
+        return self._verify_installed_runtime_version(spec.name, executable)
+
     def install_provider_runtime(self, provider: str) -> dict[str, Any]:
         name = str(provider).strip().lower()
         if not name:
@@ -1876,7 +1898,7 @@ class RuntimeOpsMixin:
             return "running"
         if token in {"stopped", "inactive", "dead", "offline"}:
             return "stopped"
-        if token in {"ready", "syncing"}:
+        if token in {"configured", "ready", "syncing"}:
             return token
         return "unknown"
 

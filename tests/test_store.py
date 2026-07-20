@@ -20,6 +20,8 @@ def test_store_uses_wal_and_busy_timeout(tmp_path: Path) -> None:
 
     assert journal_mode == "wal"
     assert busy_timeout_ms == 30000
+    with raises(sqlite3.ProgrammingError, match="closed database"):
+        conn.execute("SELECT 1")
 
 
 def test_store_hardens_state_root_and_database_permissions(tmp_path: Path) -> None:
@@ -168,6 +170,7 @@ def test_store_migrates_legacy_users_table_to_agents(tmp_path: Path) -> None:
             ("alice", json.dumps(legacy_agent, sort_keys=True)),
         )
         conn.commit()
+    conn.close()
 
     store = StateStore(config_dir=tmp_path)
     state = store.read_state()

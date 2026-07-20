@@ -411,7 +411,7 @@ def test_clawied_cli_agent_create_and_delete_route_through_daemon(
         thread.join(timeout=5)
 
     assert create_code == 0
-    assert "Provisioned agent iris" in create_output
+    assert "Created agent definition iris" in create_output
     assert created["agent"]["model_tier"] == "fast"
     assert delete_code == 0
     assert "Deleted agent iris" in delete_output
@@ -804,6 +804,31 @@ def test_clawied_control_request_runs_safe_heal_reconcile(tmp_path: Path) -> Non
     assert result["tier"] == "safe_heal"
     assert result["result"]["agent_id"] == "pax"
     assert service.observed_agent_manifest_state("pax") is not None
+
+
+def test_control_safe_heal_operations_cannot_expand_their_authority(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _setup_service(tmp_path)
+    daemon = Clawied(service)
+    backup_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        service,
+        "backup_run",
+        lambda **kwargs: backup_calls.append(dict(kwargs)) or {"pushed": False},
+    )
+
+    result = daemon._execute_control_verb("backup", {"message": "local snapshot"})
+
+    assert result == {"pushed": False}
+    assert backup_calls == [{"message": "local snapshot", "push": False}]
+    with raises(PermissionError, match="local-only"):
+        daemon._execute_control_verb("backup", {"push": True})
+    with raises(PermissionError, match="stored credential policy"):
+        daemon._execute_control_verb("sync_auth", {"agent_id": "x", "source_home": "/root"})
+    with raises(PermissionError, match="manager-owned stored manifests"):
+        daemon._execute_control_verb("reconcile", {"manifest": "/tmp/untrusted.json"})
 
 
 def test_clawied_control_destructive_requires_matching_confirmation(tmp_path: Path) -> None:

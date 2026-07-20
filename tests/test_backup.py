@@ -141,6 +141,44 @@ def test_backup_init_requires_git(tmp_path: Path, monkeypatch: MonkeyPatch) -> N
         service.backup_init(tmp_path / "repo")
 
 
+def test_backup_git_drops_root_privileges_and_disables_hooks(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    captured: list[str] = []
+
+    class OwnedRepo:
+        def __str__(self) -> str:
+            return str(tmp_path / "repo")
+
+        @staticmethod
+        def stat() -> object:
+            return type("Stat", (), {"st_uid": 12345})()
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(command: list[str], **_kwargs: object) -> Result:
+        captured.extend(command)
+        return Result()
+
+    monkeypatch.setattr("clawie._service_backup.os.geteuid", lambda: 0)
+    monkeypatch.setattr(
+        "clawie._service_backup.pwd.getpwuid",
+        lambda _uid: type("User", (), {"pw_name": "manager"})(),
+    )
+    monkeypatch.setattr("clawie._service_backup.subprocess.run", fake_run)
+
+    service._run_backup_git(OwnedRepo(), "status")  # type: ignore[arg-type]
+
+    assert captured[:6] == ["sudo", "-u", "manager", "-H", "--", "git"]
+    assert "core.hooksPath=/dev/null" in captured
+    assert "protocol.ext.allow=never" in captured
+
+
 def test_backup_init_refuses_unowned_nonempty_directory(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     repo = tmp_path / "existing"
@@ -309,6 +347,7 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
 def test_backup_secret_scanner_catches_common_cloud_and_registry_tokens() -> None:
     samples = (
         b"AWS key: AKIAIOSFODNN7EXAMPLE",
+        b"AWS_SECRET_ACCESS_KEY=" + (b"a" * 40),
         b"Google key: AIzaSyD-ExampleKeyMaterial123456789",
         b"npm token: npm_abcdefghijklmnopqrstuvwxyz1234567890",
         b"GitLab token: glpat-abcdefghijklmnopqrstuvwxyz1234",

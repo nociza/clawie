@@ -22,6 +22,7 @@ Most read-only operations work without root. These require `sudo`:
 | `agent auth login` | Writes auth files to agent home |
 | `auth apply` | Copies private provider-auth files into agent homes |
 | `agent addon enable/apply` | Writes config into agent home |
+| `maintenance enable/disable` | Writes `/etc/cron.d`; enable requires a root-owned immutable clawie executable because cron runs it as root |
 | SSH login disable | Modifies `/etc/ssh/sshd_config.d/` and reloads sshd |
 | `control watchdog install/remove/verify` | Writes root-owned systemd unit files and runs `systemctl`; `verify --exercise-restart` intentionally kills the watchdog service process to prove restart behavior |
 

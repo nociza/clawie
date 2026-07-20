@@ -448,7 +448,10 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         metavar="{create,clone,prompt,credentials,addon,auth,provider,service,list,show,delete,purge,create-batch}",
     )
 
-    create = agent_sub.add_parser("create", help="Create a new agent")
+    create = agent_sub.add_parser(
+        "create",
+        help="Create an agent definition only (no Linux runtime)",
+    )
     _add_positional_argument(
         create,
         "agent_id",
@@ -1835,7 +1838,8 @@ def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
         if model_tier is _CLAWIED_UNAVAILABLE:
             model_tier = service.set_agent_model_tier(agent_id, tier)
         agent.setdefault("agent", {})["model_tier"] = model_tier
-    print_success(f"Provisioned agent {agent['agent_id']}")
+    print_success(f"Created agent definition {agent['agent_id']}")
+    print_info("Definition only: no Linux user or provider service was created or started.")
     _print_agent(agent)
     return 0
 
@@ -2358,7 +2362,7 @@ def cmd_agents_provider_set(args: argparse.Namespace, service: ClawieService) ->
 def cmd_agents_list(args: argparse.Namespace, service: ClawieService) -> int:
     agents = service.list_agents()
     if not agents:
-        print_info("No agents provisioned yet.")
+        print_info("No agent definitions yet.")
         return 0
 
     rows: list[list[str]] = []
@@ -2726,7 +2730,7 @@ def _print_status_agents(payload: Any) -> None:
     )
     rows = payload.get("rows", [])
     if not rows:
-        print_info("No agents provisioned yet.")
+        print_info("No agent definitions yet.")
         return
     table = [
         [

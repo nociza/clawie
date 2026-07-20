@@ -175,6 +175,13 @@ clawie maintenance disable                 # remove the cron (root)
 clawie maintenance run                     # sync credentials, write prompts, run backup
 ```
 
+`--interval` accepts exact cron-representable hour intervals: `1`, `2`, `3`,
+`4`, `6`, `8`, `12`, or `24`. The installed cron command pins the active clawie
+state root with `--config-dir`, including when `sudo` was used to install it.
+Because cron executes as root, `enable` also requires the resolved clawie binary
+and every parent directory to be root-owned and non-group/world-writable; use an
+immutable system installation rather than a user-editable checkout or tool env.
+
 Each pass refreshes shared auth, syncs private credential copies into agent
 homes, writes configured prompts directly when it has permission, and — when
 backup is enabled — commits knowledge changes to the backup repo.
@@ -222,6 +229,10 @@ is derived from the Unix peer's OS username or `uid:<number>`. Empty operator
 allowlists fail closed. Read and safe-heal verbs execute immediately;
 destructive and outward verbs return a nonce and only execute after `confirm`
 echoes the same verb and args from an allowlisted local principal.
+Autonomous `backup` is forced local-only even when automatic pushes are enabled;
+autonomous `sync_auth` can only apply the agent's stored credential policy; and
+autonomous `reconcile` accepts only manifests already stored under the manager's
+private state root.
 
 The watchdog commands manage a root-owned systemd unit that runs
 `clawie clawied run` with `Restart=always`. `--notify-command` writes a separate

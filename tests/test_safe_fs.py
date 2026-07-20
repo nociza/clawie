@@ -6,6 +6,7 @@ import pytest
 
 from clawie.safe_fs import (
     UnsafePathError,
+    append_text_under,
     copy_tree_under,
     read_text_under,
     remove_under,
@@ -24,6 +25,30 @@ def test_write_text_under_rejects_destination_symlink(tmp_path: Path) -> None:
         write_text_under(root, "target", "overwritten")
 
     assert outside.read_text(encoding="utf-8") == "original"
+
+
+def test_append_text_under_rejects_destination_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text("original", encoding="utf-8")
+    (root / "event.jsonl").symlink_to(outside)
+
+    with pytest.raises(UnsafePathError, match="append target"):
+        append_text_under(root, "event.jsonl", "new\n")
+
+    assert outside.read_text(encoding="utf-8") == "original"
+
+
+def test_append_text_under_appends_and_hardens_mode(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+
+    target = append_text_under(root, "events/log.jsonl", "first\n", mode=0o600)
+    append_text_under(root, "events/log.jsonl", "second\n", mode=0o600)
+
+    assert target.read_text(encoding="utf-8") == "first\nsecond\n"
+    assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_write_text_under_rejects_parent_symlink(tmp_path: Path) -> None:

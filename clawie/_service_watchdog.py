@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from clawie.safe_fs import write_text_under
 from clawie.service_common import SetupError
 
 
@@ -30,17 +31,26 @@ class ControlWatchdogMixin:
         unit_path = self.CONTROL_WATCHDOG_UNIT_FILE
         alert_path = self.CONTROL_WATCHDOG_ALERT_UNIT_FILE
         unit_path.parent.mkdir(parents=True, exist_ok=True)
-        unit_path.write_text(
-            self._control_watchdog_unit_contents(interval_seconds=interval, notify_command=notify),
-            encoding="utf-8",
+        clawie_bin = self._validated_root_automation_executable(
+            shutil.which("clawie") or "/usr/local/bin/clawie"
         )
-        os.chmod(unit_path, 0o644)
+        write_text_under(
+            unit_path.parent,
+            unit_path.name,
+            self._control_watchdog_unit_contents(
+                interval_seconds=interval,
+                notify_command=notify,
+                clawie_bin=clawie_bin,
+            ),
+            mode=0o644,
+        )
         if notify:
-            alert_path.write_text(
+            write_text_under(
+                alert_path.parent,
+                alert_path.name,
                 self._control_watchdog_alert_unit_contents(notify_command=notify),
-                encoding="utf-8",
+                mode=0o644,
             )
-            os.chmod(alert_path, 0o644)
         else:
             alert_path.unlink(missing_ok=True)
 
@@ -282,10 +292,14 @@ class ControlWatchdogMixin:
         *,
         interval_seconds: int,
         notify_command: str,
+        clawie_bin: str = "",
     ) -> str:
-        clawie_bin = shutil.which("clawie") or "/usr/local/bin/clawie"
+        executable = str(clawie_bin or shutil.which("clawie") or "/usr/local/bin/clawie")
+        state_root = str(self.store.root)
+        if any("\n" in value or "\r" in value for value in (executable, state_root, notify_command)):
+            raise SetupError("watchdog paths and notification commands must be single-line values")
         command = (
-            f"{shlex.quote(clawie_bin)} --config-dir {shlex.quote(str(self.store.root))} "
+            f"{shlex.quote(executable)} --config-dir {shlex.quote(state_root)} "
             f"clawied run --interval {int(interval_seconds)}"
         )
         lines = [
@@ -301,7 +315,7 @@ class ControlWatchdogMixin:
                 "",
                 "[Service]",
                 "Type=simple",
-                f"ExecStart=/bin/bash -lc {shlex.quote(command)}",
+                f"ExecStart=/bin/bash -lc {shlex.quote(command).replace('%', '%%')}",
                 "Restart=always",
                 "RestartSec=5",
                 "KillSignal=SIGTERM",
@@ -316,6 +330,8 @@ class ControlWatchdogMixin:
 
     def _control_watchdog_alert_unit_contents(self, *, notify_command: str) -> str:
         command = str(notify_command or "").strip()
+        if "\n" in command or "\r" in command:
+            raise SetupError("watchdog notification command must be a single-line value")
         return "\n".join(
             [
                 "[Unit]",
@@ -323,7 +339,7 @@ class ControlWatchdogMixin:
                 "",
                 "[Service]",
                 "Type=oneshot",
-                f"ExecStart=/bin/bash -lc {shlex.quote(command)}",
+                f"ExecStart=/bin/bash -lc {shlex.quote(command).replace('%', '%%')}",
                 "",
             ]
         )
@@ -338,7 +354,8 @@ class ControlWatchdogMixin:
             line = raw_line.strip()
             if not line.startswith("ExecStart="):
                 continue
-            value = line.split("=", 1)[1].strip()
+            # systemd resolves %% to a literal percent before exec.
+            value = line.split("=", 1)[1].strip().replace("%%", "%")
             try:
                 outer = shlex.split(value)
             except ValueError:

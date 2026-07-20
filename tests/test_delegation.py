@@ -65,6 +65,16 @@ def run_cli(config_dir: Path, *args: str) -> int:
     return main(["--config-dir", str(config_dir), *args])
 
 
+def _register_managed_agent(config_dir: Path, agent_id: str) -> None:
+    store = StateStore(config_dir=config_dir)
+    state = store.read_state()
+    state["agents"][agent_id] = {
+        "agent_id": agent_id,
+        "agent": {"provider": "openclaw", "linux_user": ""},
+    }
+    store.write_state(state)
+
+
 def _echo_handler(message: Message, _repl: AgentREPL) -> dict:
     """Explicit transport-only handler used by low-level delegation tests."""
     return dict(message.payload)
@@ -268,6 +278,19 @@ class TestDelegationBus:
         finally:
             server_bus.close()
             client_bus.close()
+
+    def test_closing_outbound_bus_does_not_unlink_live_parent_socket(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _use_short_delegation_dir(monkeypatch)
+        server = DelegationBus("parent")
+        server.listen()
+        try:
+            outbound = DelegationBus("parent")
+            outbound.close()
+            assert server.socket_path.exists()
+        finally:
+            server.close()
 
 
 # ---------------------------------------------------------------------------
@@ -686,13 +709,14 @@ class TestDelegationCLI:
         assert code == 0
         assert "cli-test" in output
 
-    def test_submit_unreachable_child_marks_failed(
+    def test_submit_unknown_child_fails_before_persisting(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _use_short_delegation_dir(monkeypatch)
+        _register_managed_agent(tmp_path, "planner")
 
         code = run_cli(
             tmp_path,
@@ -710,18 +734,11 @@ class TestDelegationCLI:
         output = capsys.readouterr().out
 
         assert code == 1
-        assert "status: failed" in output
-        assert "connection failed" in output
+        assert "agent not found: missing-worker" in output
 
         store = StateStore(config_dir=tmp_path)
         tasks = store.read_delegation_tasks(parent_agent_id="planner")
-        assert len(tasks) == 1
-        assert tasks[0]["status"] == "failed"
-        assert "connection failed" in tasks[0]["error"]
-        assert tasks[0]["result"]["error"] == tasks[0]["error"]
-
-        events = store.read_state()["events"]
-        assert events[-1]["type"] == "delegation.failed"
+        assert tasks == []
 
     def test_submit_success_result_can_contain_error_key(
         self,
@@ -730,6 +747,7 @@ class TestDelegationCLI:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _use_short_delegation_dir(monkeypatch)
+        _register_managed_agent(tmp_path, "planner")
 
         def handler(_msg: Message, _repl: AgentREPL) -> dict[str, str]:
             return {"error": "domain-level result"}
@@ -1138,6 +1156,10 @@ class TestSessionCLI:
         fake_gateway = bin_dir / "openclaw"
         fake_gateway.write_text(
             "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  printf '%s\\n' 'openclaw 2026.7.1'\n"
+            "  exit 0\n"
+            "fi\n"
             "printf '%s\\n' '{\"payloads\":[{\"text\":\"managed gateway result\"}]}'\n",
             encoding="utf-8",
         )
@@ -1223,6 +1245,41 @@ class TestSessionCLI:
         while socket_path.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not socket_path.exists()
+
+    def test_detached_session_rejects_symlink_log(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from clawie.service import ClawieService, SetupError
+
+        _use_short_delegation_dir(monkeypatch)
+        config_dir = tmp_path / "state"
+        _register_managed_agent(config_dir, "parent")
+        session_dir = config_dir / "session-agents"
+        session_dir.mkdir()
+        victim = tmp_path / "victim.log"
+        victim.write_text("keep", encoding="utf-8")
+        (session_dir / "parent-child.log").symlink_to(victim)
+
+        service = ClawieService(StateStore(config_dir=config_dir))
+        with pytest.raises(SetupError, match="could not start detached session agent"):
+            service.spawn_session_agent("parent", "child", detached=True)
+
+        assert victim.read_text(encoding="utf-8") == "keep"
+        assert service.store.read_session_agents("parent") == []
+
+    def test_session_spawn_rejects_invalid_timeout_before_persisting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from clawie.service import ClawieService
+
+        _use_short_delegation_dir(monkeypatch)
+        _register_managed_agent(tmp_path, "parent")
+        service = ClawieService(StateStore(config_dir=tmp_path))
+
+        with pytest.raises(ValueError, match="positive finite"):
+            service.spawn_session_agent("parent", "child", timeout=float("nan"), detached=True)
+
+        assert service.store.read_session_agents("parent") == []
 
     def test_tree_uses_ascii_art(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

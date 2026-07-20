@@ -4,15 +4,21 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 from clawie.service_common import AgentNotFoundError, SetupError, now_iso
+from clawie.safe_fs import write_text_under
+
+
+_MAINTENANCE_INTERVALS = frozenset({1, 2, 3, 4, 6, 8, 12, 24})
 
 
 class DelegationOpsMixin:
@@ -105,18 +111,30 @@ class DelegationOpsMixin:
             DelegationBus,
             DelegationCoordinator,
             DelegationTree,
+            get_model_tier,
         )
 
         parent_id = self._validate_agent_id(parent_id)
         child_id = self._validate_agent_id(child_id)
         if parent_id == child_id:
             raise ValueError("parent and child agent ids must differ")
+        # Reject invalid endpoints before persisting a task.  A child may be a
+        # live ephemeral session agent, but the delegating parent must always
+        # be a managed fleet agent.
+        self.get_agent(parent_id)
+        child_socket_alive = self._socket_alive(self._delegation_socket_path(child_id))
+        if not child_socket_alive:
+            self.get_agent(child_id)
+        effective_timeout = float(timeout)
+        if not math.isfinite(effective_timeout) or effective_timeout <= 0:
+            raise ValueError("delegation timeout must be a positive finite number")
         depth_limit = self._delegation_depth_limit(parent_id)
         if 1 >= depth_limit:
             raise ValueError(
                 f"max recursion depth ({depth_limit}) exceeded at depth=1"
             )
         tier = model_tier or DEFAULT_TIER
+        get_model_tier(tier)
         task_id = uuid.uuid4().hex
         created_at = now_iso()
         self.store.write_delegation_task(
@@ -126,29 +144,24 @@ class DelegationOpsMixin:
             payload=payload or {},
             depth=0,
             created_at=created_at,
-            timeout_seconds=timeout,
+            timeout_seconds=effective_timeout,
             model_tier=tier,
         )
-        if not self._socket_alive(self._delegation_socket_path(child_id)):
-            try:
-                self.get_agent(child_id)
-            except AgentNotFoundError:
-                pass
-            else:
-                return self._deliver_managed_delegation(
-                    task_id=task_id,
-                    parent_id=parent_id,
-                    child_id=child_id,
-                    payload=payload or {},
-                    timeout=timeout,
-                    tier=tier,
-                    created_at=created_at,
-                )
+        if not child_socket_alive:
+            return self._deliver_managed_delegation(
+                task_id=task_id,
+                parent_id=parent_id,
+                child_id=child_id,
+                payload=payload or {},
+                timeout=effective_timeout,
+                tier=tier,
+                created_at=created_at,
+            )
         bus = DelegationBus(parent_id)
         tree = DelegationTree(max_depth=depth_limit)
         coordinator = DelegationCoordinator(parent_id, bus, tree, model_tier=tier)
         try:
-            result = coordinator.delegate(child_id, payload or {}, timeout=timeout)
+            result = coordinator.delegate(child_id, payload or {}, timeout=effective_timeout)
         except Exception as exc:
             self.store.write_delegation_task(
                 task_id=task_id,
@@ -156,7 +169,7 @@ class DelegationOpsMixin:
                 child_agent_id=child_id,
                 payload=payload or {},
                 depth=0,
-                timeout_seconds=timeout,
+                timeout_seconds=effective_timeout,
                 status="failed",
                 error=str(exc),
                 created_at=created_at,
@@ -172,6 +185,8 @@ class DelegationOpsMixin:
             )
             self.store.write_state(state)
             return {"task_id": task_id, "status": "failed", "error": str(exc)}
+        finally:
+            bus.close()
         tree_data = tree.to_dict()
         self.store.write_delegation_tree(parent_id, tree_data)
         clean_result = dict(result)
@@ -341,23 +356,63 @@ class DelegationOpsMixin:
 
     # ── Maintenance cron ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _validated_root_automation_executable(path: str | Path) -> str:
+        """Require an immutable root-owned executable for a root cron job."""
+        candidate = Path(path).expanduser()
+        try:
+            resolved = candidate.resolve(strict=True)
+            executable_st = resolved.stat()
+        except OSError as exc:
+            raise SetupError(f"maintenance executable is unavailable: {candidate}: {exc}") from exc
+        if not stat.S_ISREG(executable_st.st_mode) or not os.access(resolved, os.X_OK):
+            raise SetupError(f"maintenance executable is not an executable regular file: {resolved}")
+        for current in (resolved, *resolved.parents):
+            current_st = current.stat()
+            if int(current_st.st_uid) != 0 or stat.S_IMODE(current_st.st_mode) & 0o022:
+                raise SetupError(
+                    "root maintenance requires a root-owned, non-group/world-writable "
+                    f"clawie installation; unsafe path component: {current}"
+                )
+        return str(resolved)
+
     def maintenance_enable(self, *, interval_hours: int = 4) -> dict[str, Any]:
         """Install a system cron job that periodically syncs agent credentials."""
         self._require_setup()
         if os.geteuid() != 0:
             raise SetupError("maintenance enable requires root. Re-run with sudo.")
-        clawie_bin = shutil.which("clawie") or "/usr/local/bin/clawie"
+        if isinstance(interval_hours, bool) or interval_hours not in _MAINTENANCE_INTERVALS:
+            allowed = ", ".join(str(item) for item in sorted(_MAINTENANCE_INTERVALS))
+            raise ValueError(f"maintenance interval must be one of: {allowed} hours")
+        clawie_bin = self._validated_root_automation_executable(
+            shutil.which("clawie") or "/usr/local/bin/clawie"
+        )
+        config_root = str(self.store.root.resolve())
+        log_path = str(self.MAINTENANCE_LOG_FILE)
+        if any("\n" in value or "\r" in value for value in (clawie_bin, config_root, log_path)):
+            raise SetupError("maintenance paths must not contain newline characters")
+        # cron treats an unescaped percent as a command/newline separator even
+        # inside shell quotes. Escape after shell quoting so path contents can
+        # never alter the installed root command.
+        quoted_bin = shlex.quote(clawie_bin).replace("%", r"\%")
+        quoted_root = shlex.quote(config_root).replace("%", r"\%")
+        quoted_log = shlex.quote(log_path).replace("%", r"\%")
         hour_spec = f"*/{interval_hours}" if interval_hours < 24 else "0"
         cron_content = (
             "# Managed by clawie -- do not edit manually\n"
             "SHELL=/bin/bash\n"
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             ":/home/linuxbrew/.linuxbrew/bin\n"
-            f"0 {hour_spec} * * * root {clawie_bin} maintenance run"
-            f" >> {self.MAINTENANCE_LOG_FILE} 2>&1\n"
+            f"0 {hour_spec} * * * root {quoted_bin} "
+            f"--config-dir {quoted_root} maintenance run"
+            f" >> {quoted_log} 2>&1\n"
         )
-        self.MAINTENANCE_CRON_FILE.write_text(cron_content, encoding="utf-8")
-        os.chmod(str(self.MAINTENANCE_CRON_FILE), 0o644)
+        write_text_under(
+            self.MAINTENANCE_CRON_FILE.parent,
+            self.MAINTENANCE_CRON_FILE.name,
+            cron_content,
+            mode=0o644,
+        )
         config = self.store.read_config()
         config["maintenance_cron_enabled"] = True
         config["maintenance_cron_interval_hours"] = interval_hours
@@ -643,10 +698,16 @@ class DelegationOpsMixin:
 
         if self._socket_alive(self._delegation_socket_path(child_id)):
             coordinator = DelegationCoordinator(parent_id)
-            coordinator.shutdown_child(child_id)
+            try:
+                coordinator.shutdown_child(child_id)
+            finally:
+                coordinator.bus.close()
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
-                if not self._socket_alive(self._delegation_socket_path(child_id)):
+                if self._reap_session_child(pid) or (
+                    not self._socket_alive(self._delegation_socket_path(child_id))
+                    and not self._pid_alive(pid)
+                ):
                     return
                 time.sleep(0.05)
 
@@ -658,9 +719,21 @@ class DelegationOpsMixin:
                     return
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
-                    if not self._pid_alive(pid):
+                    if self._reap_session_child(pid) or not self._pid_alive(pid):
                         return
                     time.sleep(0.05)
+        self._reap_session_child(pid)
+
+    @staticmethod
+    def _reap_session_child(pid: int) -> bool:
+        """Reap a detached session when this invocation is still its parent."""
+        if pid <= 0:
+            return False
+        try:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return False
+        return waited == pid
 
     # ── Gateway delivery bridge ───────────────────────────────────────────
     #
@@ -704,11 +777,20 @@ class DelegationOpsMixin:
 
         task = Task(task_id=uuid.uuid4().hex, message=str(message), tier=str(tier or "balanced"))
         cmd = adapter.deliver_command(agent_id, task, timeout=effective_timeout)
-        runner = run or self._default_deliver_runner(
-            provider,
-            linux_user,
-            timeout=effective_timeout,
-        )
+        runtime_version = ""
+        if run is None:
+            executable = self._resolve_provider_executable(provider)
+            runtime_version = self._verify_installed_runtime_version(provider, executable)
+            runner = self._default_deliver_runner(
+                provider,
+                linux_user,
+                timeout=effective_timeout,
+                executable=executable,
+            )
+        else:
+            # Injected runners are an explicit test/embedding seam; callers own
+            # the contract represented by that runner.
+            runner = run
         stdout = runner(cmd)
         reply = adapter.parse_reply(stdout)
 
@@ -727,6 +809,7 @@ class DelegationOpsMixin:
             if isinstance(reply.raw.get("meta"), dict)
             else "",
             "timeout_seconds": effective_timeout,
+            "runtime_version": runtime_version,
         }
         state = self.store.read_state()
         self._event(
@@ -750,13 +833,14 @@ class DelegationOpsMixin:
         linux_user: str,
         *,
         timeout: float,
+        executable: str = "",
     ) -> Callable[[list[str]], str]:
         """Run an adapter delivery command in the agent user's service env."""
         provider_name = str(provider).strip().lower()
 
         def _run(cmd: list[str]) -> str:
-            executable = self._resolve_provider_executable(provider_name)
-            argv = [executable, *list(cmd)[1:]]
+            resolved = executable or self._resolve_provider_executable(provider_name)
+            argv = [resolved, *list(cmd)[1:]]
             wrapped = self._wrap_user_command(argv, linux_user, purpose="agent delegation")
             try:
                 result = subprocess.run(

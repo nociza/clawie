@@ -9,10 +9,19 @@ import sqlite3
 import stat
 import tempfile
 import uuid
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from clawie.safe_fs import (
+    UnsafePathError,
+    append_text_under,
+    ensure_directory_under,
+    read_bytes_under,
+    write_bytes_under,
+)
 
 
 SCHEMA = "clawie.published-workspace.v1"
@@ -137,35 +146,45 @@ class PublishedWorkspace:
                 f"published workspace root must be a real directory: {self.root}"
             )
         os.chmod(self.root, 0o700)
-        for rel in (
-            "blobs/sha256",
-            "publications",
-            "streams",
-            "append",
-            "views",
-            "events/agents",
-            "snapshots",
-            "tmp",
-        ):
-            directory = self.root / rel
-            directory.mkdir(parents=True, exist_ok=True)
-            os.chmod(directory, 0o700)
-        workspace_info = self.root / "WORKSPACE.json"
-        if not workspace_info.exists():
-            workspace_info.write_text(
-                json.dumps(
-                    {
-                        "schema": SCHEMA,
-                        "created_at": _now_iso(),
-                        "layout": "local-fs-v1",
-                    },
-                    indent=2,
-                    sort_keys=True,
+        try:
+            for rel in (
+                "blobs/sha256",
+                "publications",
+                "streams",
+                "append",
+                "views",
+                "events/agents",
+                "snapshots",
+                "tmp",
+            ):
+                ensure_directory_under(self.root, rel, mode=0o700)
+            try:
+                workspace_info = read_bytes_under(
+                    self.root,
+                    "WORKSPACE.json",
+                    max_bytes=1024 * 1024,
                 )
-                + "\n",
-                encoding="utf-8",
+            except FileNotFoundError:
+                workspace_info = (
+                    json.dumps(
+                        {
+                            "schema": SCHEMA,
+                            "created_at": _now_iso(),
+                            "layout": "local-fs-v1",
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            write_bytes_under(
+                self.root,
+                "WORKSPACE.json",
+                workspace_info,
+                mode=0o600,
             )
-        os.chmod(workspace_info, 0o600)
+        except UnsafePathError as exc:
+            raise PublishedWorkspaceError(str(exc)) from exc
         with self._connect() as conn:
             conn.executescript(
                 """
@@ -493,19 +512,29 @@ class PublishedWorkspace:
         viewer = _safe_token(viewer_agent_id, field_name="viewer_agent_id")
         return self.root / "views" / viewer
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open the catalog transactionally and close it on every path."""
         self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
         if self.root.is_symlink():
             raise PublishedWorkspaceError(
                 f"published workspace root must be a real directory: {self.root}"
             )
         os.chmod(self.root, 0o700)
+        if self.catalog_path.is_symlink():
+            raise PublishedWorkspaceError(
+                f"published workspace catalog must not be a symlink: {self.catalog_path}"
+            )
         conn = sqlite3.connect(self.catalog_path)
-        os.chmod(self.catalog_path, 0o600)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            os.chmod(self.catalog_path, 0o600)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _collect_source_files(self, source: Path, capture_root: Path) -> list[SourceFile]:
         """Capture source content once through no-follow descriptors.
@@ -781,13 +810,21 @@ class PublishedWorkspace:
         lines.append("")
         return "\n".join(lines)
 
-    @staticmethod
-    def _append_event(path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+    def _append_event(self, path: Path, payload: dict[str, Any]) -> None:
+        try:
+            relative = path.relative_to(self.root)
+        except ValueError as exc:
+            raise PublishedWorkspaceError(f"event path escapes workspace root: {path}") from exc
+        try:
+            append_text_under(
+                self.root,
+                relative,
+                json.dumps(payload, sort_keys=True) + "\n",
+                mode=0o600,
+                directory_mode=0o700,
+            )
+        except UnsafePathError as exc:
+            raise PublishedWorkspaceError(str(exc)) from exc
 
     @staticmethod
     def _make_readonly_file(path: Path) -> None:

@@ -94,6 +94,23 @@ def test_deliver_to_agent_unknown_agent(tmp_path: Path) -> None:
         service.deliver_to_agent("ghost", "x", run=lambda cmd: "{}")
 
 
+def test_delegate_task_rejects_missing_endpoints_before_persisting(tmp_path: Path) -> None:
+    service = _service_with_agent(tmp_path)
+    state = service.store.read_state()
+    state["agents"]["planner"] = {
+        "agent_id": "planner",
+        "agent": {"provider": "openclaw", "linux_user": "", "model_tier": "balanced"},
+    }
+    service.store.write_state(state)
+
+    with pytest.raises(AgentNotFoundError, match="ghost-parent"):
+        service.delegate_task("ghost-parent", "alice", {"task": "x"})
+    with pytest.raises(AgentNotFoundError, match="ghost-child"):
+        service.delegate_task("planner", "ghost-child", {"task": "x"})
+
+    assert service.delegation_tasks() == []
+
+
 def test_deliver_to_agent_provider_without_adapter(tmp_path: Path) -> None:
     service = _service_with_agent(tmp_path, provider="picoclaw")
     with pytest.raises(AdapterError):
@@ -150,6 +167,11 @@ def test_default_deliver_runner_resolves_agent_provider(
         return list(argv)
 
     monkeypatch.setattr(service, "_resolve_provider_executable", fake_resolve)
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda provider, executable: "2026.7.1",
+    )
     monkeypatch.setattr(service, "_wrap_user_command", fake_wrap)
     monkeypatch.setattr(service, "_service_env", lambda lu: {})
 
@@ -169,6 +191,7 @@ def test_default_deliver_runner_resolves_agent_provider(
     assert seen["argv"][0] == "/opt/openclaw"
     assert seen["linux_user"] == "alice"
     assert seen["purpose"] == "agent delegation"
+    assert result["runtime_version"] == "2026.7.1"
 
 
 def test_default_deliver_runner_reports_agent_provider(
@@ -176,6 +199,11 @@ def test_default_deliver_runner_reports_agent_provider(
 ) -> None:
     service = _service_with_agent(tmp_path)
     monkeypatch.setattr(service, "_resolve_provider_executable", lambda provider: f"/opt/{provider}")
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda provider, executable: "2026.7.1",
+    )
     monkeypatch.setattr(service, "_wrap_user_command", lambda argv, lu, purpose="": list(argv))
     monkeypatch.setattr(service, "_service_env", lambda lu: {})
 
@@ -187,6 +215,23 @@ def test_default_deliver_runner_reports_agent_provider(
     monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
 
     with pytest.raises(SetupError, match="openclaw agent delivery failed: gateway unavailable"):
+        service.deliver_to_agent("alice", "x")
+
+
+def test_delivery_fails_closed_on_unsupported_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service_with_agent(tmp_path)
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "/opt/openclaw")
+    monkeypatch.setattr(
+        service,
+        "_verify_installed_runtime_version",
+        lambda _provider, _executable: (_ for _ in ()).throw(
+            SetupError("outside the verified delivery range")
+        ),
+    )
+
+    with pytest.raises(SetupError, match="verified delivery range"):
         service.deliver_to_agent("alice", "x")
 
 

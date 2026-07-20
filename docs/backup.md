@@ -40,6 +40,10 @@ clawie backup run
 sudo clawie maintenance enable --interval 4
 ```
 
+Root cron installation requires clawie itself to resolve to a root-owned,
+non-group/world-writable system installation. User-editable tool environments
+and source checkouts are rejected.
+
 Every maintenance pass now syncs credentials, writes configured prompts, and
 **commits knowledge changes locally**. Remote pushes are opt-in. `clawie status`
 shows the backup section alongside everything else.

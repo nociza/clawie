@@ -3,14 +3,54 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from clawie.cli import main
-from clawie.published_workspace import PublishedWorkspace
+from clawie.published_workspace import PublishedWorkspace, PublishedWorkspaceError
 from clawie.service import ClawieService
 from clawie.store import StateStore
+
+
+def test_catalog_connections_close_after_context_exit(tmp_path: Path) -> None:
+    workspace = PublishedWorkspace(tmp_path / "published")
+    workspace.ensure()
+
+    with workspace._connect() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        conn.execute("SELECT 1")
+
+
+def test_catalog_rejects_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "published"
+    root.mkdir()
+    victim = tmp_path / "victim.db"
+    victim.write_text("keep", encoding="utf-8")
+    (root / "catalog.sqlite").symlink_to(victim)
+    workspace = PublishedWorkspace(root)
+
+    with pytest.raises(PublishedWorkspaceError, match="catalog must not be a symlink"):
+        workspace.ensure()
+
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_workspace_initialization_rejects_child_directory_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "published"
+    root.mkdir()
+    victim = tmp_path / "victim-dir"
+    victim.mkdir()
+    victim.chmod(0o755)
+    (root / "views").symlink_to(victim)
+
+    with pytest.raises(PublishedWorkspaceError, match="unsafe or non-directory"):
+        PublishedWorkspace(root).ensure()
+
+    assert victim.stat().st_mode & 0o777 == 0o755
 
 
 def _service_with_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ClawieService, dict[str, Path]]:

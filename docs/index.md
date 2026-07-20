@@ -20,9 +20,10 @@ clawie manages multiple AI agents across providers from one CLI. It handles agen
 ## Quick start
 
 ```bash
-uv tool install clawie
+sudo ./install.sh  # from a release checkout; installs a root-owned system copy
 clawie config set --provider openclaw --subscription pro
-clawie agent create alice --template baseline
+sudo clawie runtime install openclaw
+sudo clawie runtime create alice --user alice --template baseline
 clawie status
 ```
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -114,7 +115,16 @@ _SECRET_CONTENT_PATTERNS = (
     re.compile(rb"\bdckr_pat_[A-Za-z0-9_-]{20,}\b"),
     re.compile(rb"\bsk_live_[A-Za-z0-9]{16,}\b"),
     re.compile(
-        rb"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|client[_-]?secret)\b"
+        rb"(?i)\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|"
+        rb"client[_-]?secret|secret[_-]?access[_-]?key|private[_-]?key)\b"
+        rb"\s*[:=]\s*[\"']?(?!<redacted>)[A-Za-z0-9._~+/=-]{12,}"
+    ),
+    # Common environment-variable prefixes otherwise prevent a word-boundary
+    # match (for example AWS_SECRET_ACCESS_KEY).
+    re.compile(
+        rb"(?i)\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_"
+        rb"(?:API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PASSWORD|CLIENT_SECRET|"
+        rb"SECRET_ACCESS_KEY|PRIVATE_KEY)\b"
         rb"\s*[:=]\s*[\"']?(?!<redacted>)[A-Za-z0-9._~+/=-]{12,}"
     ),
 )
@@ -241,6 +251,10 @@ class BackupOpsMixin:
         self._validate_backup_repo(repo)
 
         result = self._write_backup_tree(repo)
+        # Root maintenance writes the snapshot, but Git must run as the
+        # manager/repository owner so user-controlled attributes or config can
+        # never become a root code-execution path.
+        self._restore_backup_repo_ownership(repo)
         self._run_backup_git(repo, "add", "-A", "--", *_BACKUP_MANAGED_PATHS)
         dirty = bool(
             self._run_backup_git(
@@ -1009,12 +1023,20 @@ class BackupOpsMixin:
         if not shutil.which("git"):
             raise SetupError("git is required for clawie backup. Install git and re-run.")
 
-    @staticmethod
-    def _run_backup_git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        cmd = [
+    def _run_backup_git(
+        self,
+        repo: Path,
+        *args: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        git_cmd = [
             "git",
             "-C",
             str(repo),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "protocol.ext.allow=never",
             "-c",
             "user.name=clawie",
             "-c",
@@ -1023,6 +1045,20 @@ class BackupOpsMixin:
             "commit.gpgsign=false",
             *args,
         ]
+        cmd = git_cmd
+        if os.geteuid() == 0:
+            try:
+                owner_uid = int(repo.stat().st_uid)
+            except OSError as exc:
+                raise SetupError(f"cannot determine backup repository owner: {repo}: {exc}") from exc
+            if owner_uid != 0:
+                try:
+                    owner_name = str(pwd.getpwuid(owner_uid).pw_name)
+                except KeyError as exc:
+                    raise SetupError(
+                        f"backup repository owner uid {owner_uid} has no local account"
+                    ) from exc
+                cmd = ["sudo", "-u", owner_name, "-H", "--", *git_cmd]
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()

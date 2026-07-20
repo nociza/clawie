@@ -21,11 +21,15 @@ experimentation until their delivery contracts are verified.
 clawie config set --provider openclaw --subscription pro --workspace production
 
 # Install a runtime
-clawie runtime install openclaw
+sudo clawie runtime install openclaw  # for isolated Linux-user agents
 
 # Override provider per agent
 clawie agent create alice --provider openclaw
 ```
+
+`agent create` is definition-only. Use `sudo clawie runtime create alice
+--provider openclaw` when the command should also create and start an isolated
+Linux runtime.
 
 ## Auth modes
 

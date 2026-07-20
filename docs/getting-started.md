@@ -16,8 +16,16 @@ See [Requirements & Limitations](requirements.md) for full details.
 uv tool install clawie
 
 # From source
-uv tool install -e .
+uv tool install .
+
+# Production host (root-owned copy plus /usr/local/bin/clawie)
+sudo ./install.sh
 ```
+
+Use `uv tool install -e .` only for local development; editable installs keep
+executing code from the checkout and are not production artifacts.
+Use the system install for any command run through `sudo`, cron, or systemd;
+do not execute a user-owned tool environment as root.
 
 Python 3.10 installs `tomli`; Python 3.11+ uses only the standard library.
 
@@ -44,31 +52,36 @@ clawie config show
 ## Install a provider runtime
 
 ```bash
-clawie runtime install openclaw
+sudo clawie runtime install openclaw
 ```
 
 OpenClaw 2026.7.1 is the only source-pinned delegated-task contract. Before
 accepting a host, run `production verify` with both live exercises; picoclaw and
 zeroclaw lifecycle/auth support is available, but their delivery remains gated.
 
-## Create your first agent
+## Create your first operational agent
 
 ```bash
-clawie agent create alice --template baseline
+sudo clawie runtime create alice --user alice --template baseline
 ```
 
-This creates an agent named `alice` with the default baseline template, delegation enabled, and balanced model tier.
+This creates the `alice` agent record, a dedicated Linux user and home, and its
+provider service configuration. The default baseline enables delegation and
+uses the balanced model tier.
 
 Options:
 
 ```bash
-clawie agent create alice \
-  --display-name "Alice" \
+sudo clawie runtime create alice \
+  --user alice \
   --template baseline \
-  --channel-strategy new \
-  --model-tier power \
   --provider openclaw
 ```
+
+`clawie agent create draft` is a definition-only planning command: it does not
+create a Linux user or start a provider. To launch a new runtime using one of
+those definitions as a source, use `sudo clawie runtime create NEW_ID
+--from-agent draft`.
 
 ## Check fleet status
 
@@ -77,16 +90,6 @@ clawie status
 ```
 
 This prints a read-only overview of all your agents — status, runtimes, auth, delegation, and health. Add `--json` for scripting, or `--watch` for a live view.
-
-## Create an isolated runtime
-
-For full Linux-level isolation (requires root):
-
-```bash
-sudo clawie runtime create alice --user alice
-```
-
-This creates a dedicated Linux user, copies credentials, and installs the provider runtime. See [Runtime Isolation](runtime.md) for details.
 
 ## Set up continuous backup
 
@@ -98,6 +101,10 @@ clawie backup init --remote git@github.com:you/agent-backup.git
 clawie backup run                 # first snapshot
 sudo clawie maintenance enable    # keep it current on every maintenance pass
 ```
+
+The root cron requires an immutable root-owned clawie executable. A user-owned
+`uv tool` install or editable checkout is intentionally rejected; use the
+repository's `sudo ./install.sh` system installation before enabling cron.
 
 Credential-looking content is filtered on a best-effort basis. Automatic remote
 pushes are opt-in; review the repository before enabling them with

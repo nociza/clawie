@@ -451,18 +451,19 @@ class ProviderAuthMixin:
             self._harden_private_path_permissions(path)
         return changed
 
-    def shared_auth_status(self, provider: str) -> dict[str, Any]:
+    def shared_auth_status(self, provider: str, *, probe_cli: bool = True) -> dict[str, Any]:
         name = str(provider).strip().lower()
         if not name:
             raise ValueError("provider is required")
         spec = get_provider(name)
-        shared_home = self._ensure_shared_provider_auth_root()
+        shared_home = self._shared_provider_auth_home()
         auth_mode = str(self._preferred_shared_provider_auth(spec.name, allow_defaults=True).get("auth_mode", spec.default_auth_mode))
         payload = self._inspect_provider_auth_state(
             provider=spec.name,
             auth_mode=auth_mode,
             linux_user="",
             home=shared_home,
+            probe_cli=probe_cli,
         )
         payload.update(
             {
@@ -475,12 +476,12 @@ class ProviderAuthMixin:
         )
         return payload
 
-    def list_shared_auth_statuses(self) -> list[dict[str, Any]]:
+    def list_shared_auth_statuses(self, *, probe_cli: bool = True) -> list[dict[str, Any]]:
         providers = self.configured_provider_names()
         if not providers:
             config = self.store.read_config()
             providers = [str(config.get("provider", "openclaw")).strip().lower() or "openclaw"]
-        return [self.shared_auth_status(provider) for provider in providers]
+        return [self.shared_auth_status(provider, probe_cli=probe_cli) for provider in providers]
 
     def shared_auth_login(self, provider: str) -> dict[str, Any]:
         self._require_setup()
@@ -748,7 +749,7 @@ class ProviderAuthMixin:
                 rows.append(str(aid))
         return rows
 
-    def local_claw_auth_status(self, provider: str) -> dict[str, Any]:
+    def local_claw_auth_status(self, provider: str, *, probe_cli: bool = True) -> dict[str, Any]:
         name = str(provider).strip().lower()
         if not name:
             raise ValueError("provider is required")
@@ -760,6 +761,7 @@ class ProviderAuthMixin:
             auth_mode=auth_mode,
             linux_user=str(target.get("linux_user", "")),
             home=self._path_or_none(target.get("home")),
+            probe_cli=probe_cli,
         )
         payload.update(
             {
@@ -796,13 +798,23 @@ class ProviderAuthMixin:
         )
         return payload
 
-    def agent_auth_status(self, agent_id: str) -> dict[str, Any]:
+    def agent_auth_status(
+        self,
+        agent_id: str,
+        *,
+        persist_alignment: bool = True,
+        probe_cli: bool = True,
+    ) -> dict[str, Any]:
         token = str(agent_id).strip()
         if token.startswith("@local:"):
-            payload = self.local_claw_auth_status(token.split(":", 1)[1])
+            payload = self.local_claw_auth_status(
+                token.split(":", 1)[1],
+                probe_cli=probe_cli,
+            )
             payload["agent_id"] = token
             return payload
-        self._refresh_managed_agent_provider_alignment(token)
+        if persist_alignment:
+            self._refresh_managed_agent_provider_alignment(token)
 
         state = self.store.read_state()
         agents = state.setdefault("agents", {})
@@ -832,6 +844,7 @@ class ProviderAuthMixin:
             auth_mode=auth_mode,
             linux_user=inspect_linux_user,
             home=inspect_home,
+            probe_cli=probe_cli,
         )
         payload.update(
             {
@@ -943,7 +956,8 @@ class ProviderAuthMixin:
             provider=provider,
             auth_mode="linked",
             linux_user="",
-            home=self._ensure_shared_provider_auth_root(),
+            home=self._shared_provider_auth_home(),
+            probe_cli=False,
         )
 
     def _shared_linked_auth_available(self, provider: str) -> bool:
@@ -1215,6 +1229,7 @@ class ProviderAuthMixin:
         auth_mode: str,
         linux_user: str,
         home: Path | None,
+        probe_cli: bool = True,
     ) -> dict[str, Any]:
         spec = get_provider(provider)
         mode = str(auth_mode or spec.default_auth_mode).strip().lower() or spec.default_auth_mode
@@ -1253,7 +1268,11 @@ class ProviderAuthMixin:
             )
             return payload
 
-        cli_status = self._run_provider_auth_status(provider=spec.name, linux_user=linux_user, home=home)
+        cli_status = (
+            self._run_provider_auth_status(provider=spec.name, linux_user=linux_user, home=home)
+            if probe_cli
+            else {}
+        )
         if cli_status:
             payload.update(cli_status)
             payload["source"] = str(cli_status.get("source", "cli"))

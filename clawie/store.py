@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import pwd
 import sqlite3
+import stat
 import tempfile
+import time
 from contextlib import contextmanager
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,8 +35,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "backup_repo_path": "",
     "backup_remote": "",
     "backup_auto_push": False,
+    "backup_last_attempt_at": "",
     "backup_last_run_at": "",
     "backup_last_commit": "",
+    "backup_last_status": "never",
+    "backup_last_error": "",
     "published_workspace_root": "",
     "control_operator_allowlist": [],
     "control_github_repo": "",
@@ -79,6 +85,7 @@ class StateStore:
     )
 
     def __init__(self, config_dir: str | Path | None = None) -> None:
+        self._read_only_depth = 0
         self._explicit_config_dir = config_dir is not None
         self._allow_tmp_fallback = config_dir is None and "CLAWIE_HOME" not in os.environ
         if config_dir is None:
@@ -88,6 +95,27 @@ class StateStore:
         self._set_root(root)
 
     def ensure(self) -> None:
+        if self._read_only_depth:
+            # Observational commands must never initialize, migrate, chmod, or
+            # otherwise mutate the live store.  Existing schemas are queried as
+            # they are; a missing database is represented by the in-memory
+            # defaults returned by the read methods below.
+            if self.root.exists() or self.root.is_symlink():
+                root_st = self.root.lstat()
+                if self.root.is_symlink() or not self.root.is_dir():
+                    raise PermissionError(f"clawie state root must be a real directory: {self.root}")
+                if self.db_path.exists() or self.db_path.is_symlink():
+                    db_st = self.db_path.lstat()
+                    if self.db_path.is_symlink() or not stat.S_ISREG(db_st.st_mode):
+                        raise PermissionError(
+                            f"clawie database must be a regular non-symlink file: {self.db_path}"
+                        )
+                    if stat.S_IMODE(root_st.st_mode) & 0o077 or stat.S_IMODE(db_st.st_mode) & 0o077:
+                        raise PermissionError(
+                            "clawie state permissions are not private; run a non-status clawie "
+                            "command as the state owner to repair them"
+                        )
+            return
         self._ensure_root_dir()
         with self._connect() as conn:
             conn.executescript(
@@ -169,6 +197,8 @@ class StateStore:
     def read_config(self) -> dict[str, Any]:
         self.ensure()
         config: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+        if self._read_only_depth and not self.db_path.exists():
+            return _RevisionedDict(config, revision=0)
         with self._connect() as conn:
             rows = conn.execute("SELECT key, value FROM config").fetchall()
             revision = self._read_revision(conn, "config_revision")
@@ -202,6 +232,8 @@ class StateStore:
     def read_state(self) -> dict[str, Any]:
         self.ensure()
         state: dict[str, Any] = copy.deepcopy(DEFAULT_STATE)
+        if self._read_only_depth and not self.db_path.exists():
+            return _RevisionedDict(state, revision=0)
         with self._connect() as conn:
             template_rows = conn.execute("SELECT name, payload FROM templates").fetchall()
             agent_rows = conn.execute("SELECT agent_id, payload FROM agents").fetchall()
@@ -279,6 +311,77 @@ class StateStore:
             self._increment_revision(conn, "state_revision", current_revision)
             conn.commit()
 
+    def write_snapshot(self, config: dict[str, Any], state: dict[str, Any]) -> None:
+        """Replace configuration and state in one all-or-nothing transaction.
+
+        All serialization and structural validation happens before the write
+        transaction begins, so a malformed imported snapshot cannot leave the
+        configuration and fleet state out of sync.
+        """
+        if not isinstance(config, dict) or not isinstance(state, dict):
+            raise ValueError("snapshot config and state must be JSON objects")
+        templates = state.get("templates", {})
+        agents = state.get("agents", {})
+        events = state.get("events", [])
+        if not isinstance(templates, dict) or not isinstance(agents, dict) or not isinstance(events, list):
+            raise ValueError("state payload must include templates/agents/events")
+        if any(not isinstance(value, dict) for value in templates.values()):
+            raise ValueError("every imported template must be a JSON object")
+        if any(not isinstance(value, dict) for value in agents.values()):
+            raise ValueError("every imported agent must be a JSON object")
+        if any(not isinstance(value, dict) for value in events):
+            raise ValueError("every imported event must be a JSON object")
+
+        normalized_config = copy.deepcopy(DEFAULT_CONFIG)
+        normalized_config.update({key: value for key, value in config.items() if key in DEFAULT_CONFIG})
+        encoded_config = {
+            key: self._encode_value(value) for key, value in normalized_config.items()
+        }
+        encoded_templates = {
+            str(name): json.dumps(value, sort_keys=True) for name, value in templates.items()
+        }
+        encoded_agents = {
+            str(agent_id): json.dumps(value, sort_keys=True) for agent_id, value in agents.items()
+        }
+        encoded_events = [
+            (
+                str(event.get("timestamp", "")),
+                str(event.get("type", "")),
+                str(event.get("message", "")),
+                json.dumps(event.get("context", {}), sort_keys=True),
+            )
+            for event in events
+        ]
+
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            config_revision = self._read_revision(conn, "config_revision")
+            state_revision = self._read_revision(conn, "state_revision")
+            conn.execute("DELETE FROM config")
+            conn.execute("DELETE FROM templates")
+            conn.execute("DELETE FROM agents")
+            conn.execute("DELETE FROM events")
+            conn.executemany(
+                "INSERT INTO config(key, value) VALUES (?, ?)",
+                encoded_config.items(),
+            )
+            conn.executemany(
+                "INSERT INTO templates(name, payload) VALUES (?, ?)",
+                encoded_templates.items(),
+            )
+            conn.executemany(
+                "INSERT INTO agents(agent_id, payload) VALUES (?, ?)",
+                encoded_agents.items(),
+            )
+            conn.executemany(
+                "INSERT INTO events(timestamp, type, message, context) VALUES (?, ?, ?, ?)",
+                encoded_events,
+            )
+            self._increment_revision(conn, "config_revision", config_revision)
+            self._increment_revision(conn, "state_revision", state_revision)
+            conn.commit()
+
     @staticmethod
     def _read_revision(conn: sqlite3.Connection, key: str) -> int:
         row = conn.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
@@ -313,6 +416,8 @@ class StateStore:
 
     def latest_metrics(self, limit_per_user: int = 1) -> dict[str, list[dict[str, Any]]]:
         self.ensure()
+        if self._read_only_depth and not self.db_path.exists():
+            return {}
         limit = max(1, int(limit_per_user))
         with self._connect() as conn:
             rows = conn.execute(
@@ -437,6 +542,8 @@ class StateStore:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         self.ensure()
+        if self._read_only_depth and not self.db_path.exists():
+            return []
         clauses: list[str] = []
         params: list[Any] = []
         if parent_agent_id:
@@ -511,6 +618,8 @@ class StateStore:
 
     def read_delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
         self.ensure()
+        if self._read_only_depth and not self.db_path.exists():
+            return {}
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT tree_data FROM delegation_trees WHERE root_agent_id = ?",
@@ -575,6 +684,8 @@ class StateStore:
         self, parent_agent_id: str | None = None
     ) -> list[dict[str, Any]]:
         self.ensure()
+        if self._read_only_depth and not self.db_path.exists():
+            return []
         params: list[Any] = []
         if parent_agent_id:
             params.append(parent_agent_id)
@@ -592,6 +703,8 @@ class StateStore:
         self, parent_agent_id: str, child_agent_id: str
     ) -> dict[str, Any] | None:
         self.ensure()
+        if self._read_only_depth and not self.db_path.exists():
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -826,6 +939,15 @@ class StateStore:
             conn.commit()
 
     @contextmanager
+    def read_only(self) -> Iterator[None]:
+        """Prevent persistent store mutations for an observational operation."""
+        self._read_only_depth += 1
+        try:
+            yield
+        finally:
+            self._read_only_depth -= 1
+
+    @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Open a transactional connection and always release its resources.
 
@@ -834,20 +956,85 @@ class StateStore:
         every existing ``with self._connect()`` call safe on Python versions
         that report unclosed database handles as ``ResourceWarning``.
         """
+        if self._read_only_depth:
+            if self.db_path.is_symlink():
+                raise PermissionError(f"clawie database must not be a symlink: {self.db_path}")
+            if not self.db_path.exists():
+                raise FileNotFoundError(self.db_path)
+            with self._database_lock(exclusive=False):
+                self._assert_safe_database_sidecars(require_checkpointed=True)
+                database_uri = self.db_path.resolve().as_uri() + "?mode=ro&immutable=1"
+                conn = sqlite3.connect(database_uri, uri=True, timeout=30.0)
+                try:
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA query_only = ON")
+                    conn.execute("PRAGMA busy_timeout = 30000")
+                    yield conn
+                finally:
+                    conn.close()
+            return
+
         self._ensure_root_dir()
         if self.db_path.is_symlink():
             raise PermissionError(f"clawie database must not be a symlink: {self.db_path}")
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        with self._database_lock(exclusive=True):
+            self._assert_safe_database_sidecars(require_checkpointed=False)
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                self._harden_db_files()
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
+
+    @contextmanager
+    def _database_lock(self, *, exclusive: bool) -> Iterator[None]:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = NORMAL")
-            self._harden_db_files()
-            with conn:
-                yield conn
+            fd = os.open(self.root, flags)
+        except OSError as exc:
+            raise PermissionError(f"cannot safely lock clawie state root {self.root}: {exc}") from exc
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        deadline = time.monotonic() + 30.0
+        try:
+            lock_st = os.fstat(fd)
+            if not stat.S_ISDIR(lock_st.st_mode):
+                raise PermissionError(f"clawie state lock is not a directory: {self.root}")
+            while True:
+                try:
+                    fcntl.flock(fd, operation | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for the clawie database lock") from None
+                    time.sleep(0.05)
+            yield
         finally:
-            conn.close()
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def _assert_safe_database_sidecars(self, *, require_checkpointed: bool) -> None:
+        for suffix in ("-wal", "-shm"):
+            path = self.db_path.with_name(self.db_path.name + suffix)
+            try:
+                path_st = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(path_st.st_mode) or not stat.S_ISREG(path_st.st_mode):
+                raise PermissionError(f"clawie database sidecar must be a regular file: {path}")
+            if stat.S_IMODE(path_st.st_mode) & 0o077:
+                raise PermissionError(f"clawie database sidecar permissions are not private: {path}")
+            if require_checkpointed and suffix == "-wal" and int(path_st.st_size) > 0:
+                raise PermissionError(
+                    "read-only status cannot inspect an uncheckpointed clawie WAL; "
+                    "retry after the active writer finishes or run a normal clawie command"
+                )
 
     def _set_root(self, root: Path) -> None:
         self.root = root.expanduser()

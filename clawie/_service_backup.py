@@ -16,6 +16,7 @@ excludes auth file patterns. Automatic remote pushes are opt-in.
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import pwd
@@ -23,7 +24,11 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -35,12 +40,12 @@ from clawie.safe_fs import (
     ensure_directory_under,
     read_bytes_under,
     read_text_under,
-    remove_under,
     write_bytes_under,
     write_text_under,
 )
 
 _BACKUP_SENTINEL = ".clawie-backup.json"
+_BACKUP_TRANSACTION = ".clawie-backup-transaction.json"
 _BACKUP_FORMAT_VERSION = 1
 _BACKUP_MANAGED_PATHS = (
     _BACKUP_SENTINEL,
@@ -143,8 +148,11 @@ class BackupOpsMixin:
             "repo_configured": bool(repo),
             "remote": str(config.get("backup_remote", "")).strip(),
             "auto_push": bool(config.get("backup_auto_push", False)),
+            "last_attempt_at": str(config.get("backup_last_attempt_at", "")),
             "last_run_at": str(config.get("backup_last_run_at", "")),
             "last_commit": str(config.get("backup_last_commit", "")),
+            "last_status": str(config.get("backup_last_status", "never")),
+            "last_error": str(config.get("backup_last_error", "")),
         }
 
     def _default_backup_repo_path(self) -> Path:
@@ -183,6 +191,24 @@ class BackupOpsMixin:
         else:
             repo.mkdir(parents=True, mode=0o700)
 
+        with self._backup_repository_lock(repo, exclusive=True):
+            return self._backup_init_locked(
+                repo,
+                config=config,
+                remote_url=remote_url,
+                enable=enable,
+                auto_push=auto_push,
+            )
+
+    def _backup_init_locked(
+        self,
+        repo: Path,
+        *,
+        config: dict[str, Any],
+        remote_url: str,
+        enable: bool,
+        auto_push: bool | None,
+    ) -> dict[str, Any]:
         sentinel = repo / _BACKUP_SENTINEL
         git_dir = repo / ".git"
         if sentinel.exists() or sentinel.is_symlink():
@@ -248,9 +274,87 @@ class BackupOpsMixin:
         if not (repo / ".git").exists():
             # First run bootstraps the repo so automatic backups Just Work.
             self.backup_init(repo, enable=bool(self.backup_settings()["enabled"]))
+        with self._backup_repository_lock(repo, exclusive=True):
+            return self._backup_run_locked(repo, message=message, push=push)
+
+    def _backup_run_locked(
+        self,
+        repo: Path,
+        *,
+        message: str,
+        push: bool | None,
+    ) -> dict[str, Any]:
         self._validate_backup_repo(repo)
 
-        result = self._write_backup_tree(repo)
+        attempt_at = now_iso()
+        try:
+            result = self._write_backup_tree(repo)
+        except Exception as exc:
+            bookkeeping_errors: list[str] = []
+            try:
+                config = self.store.read_config()
+                config["backup_last_attempt_at"] = attempt_at
+                config["backup_last_status"] = "failed"
+                config["backup_last_error"] = str(exc)
+                self.store.write_config(config)
+            except Exception as bookkeeping_exc:  # noqa: BLE001 - preserve collection failure.
+                bookkeeping_errors.append(f"config bookkeeping failed: {bookkeeping_exc}")
+            try:
+                state = self.store.read_state()
+                self._event(
+                    state,
+                    "backup.failed",
+                    "Backup failed before a complete snapshot could be installed",
+                    {"repo": str(repo), "error": str(exc)},
+                )
+                self.store.write_state(state)
+            except Exception as bookkeeping_exc:  # noqa: BLE001 - preserve collection failure.
+                bookkeeping_errors.append(f"event bookkeeping failed: {bookkeeping_exc}")
+            if bookkeeping_errors and hasattr(exc, "add_note"):
+                exc.add_note("; ".join(bookkeeping_errors))
+            raise
+        if not bool(result.get("installed", False)):
+            reasons = "; ".join(
+                str(row.get("reason", ""))
+                for row in result.get("incomplete", [])
+                if isinstance(row, dict)
+            ) or "backup collection was incomplete"
+            head = self._run_backup_git(repo, "rev-parse", "HEAD", check=False)
+            commit = head.stdout.strip() if head.returncode == 0 else ""
+            config = self.store.read_config()
+            config["backup_last_attempt_at"] = attempt_at
+            config["backup_last_status"] = "degraded"
+            config["backup_last_error"] = reasons
+            self.store.write_config(config)
+            state = self.store.read_state()
+            self._event(
+                state,
+                "backup.degraded",
+                "Backup collection incomplete; previous complete snapshot preserved",
+                {
+                    "repo": str(repo),
+                    "commit": commit,
+                    "agents": result["agents"],
+                    "files": result["files"],
+                    "skipped": result["skipped"],
+                    "incomplete": result["incomplete"],
+                },
+            )
+            self.store.write_state(state)
+            return {
+                "status": "degraded",
+                "repo": str(repo),
+                "changed": False,
+                "commit": commit,
+                "pushed": False,
+                "push_error": "",
+                "agents": result["agents"],
+                "files": result["files"],
+                "skipped": result["skipped"],
+                "incomplete": result["incomplete"],
+                "error": reasons,
+            }
+
         # Root maintenance writes the snapshot, but Git must run as the
         # manager/repository owner so user-controlled attributes or config can
         # never become a root code-execution path.
@@ -275,27 +379,39 @@ class BackupOpsMixin:
         should_push = settings["auto_push"] if push is None else bool(push)
         pushed = False
         push_error = ""
-        if should_push and remote_url and commit:
-            outcome = self._run_backup_git(repo, "push", "-u", "origin", "HEAD", check=False)
-            if outcome.returncode == 0:
-                pushed = True
+        if should_push:
+            if not remote_url:
+                push_error = "remote push requested but no backup remote is configured"
+            elif not commit:
+                push_error = "remote push requested but the backup repository has no commit"
             else:
-                push_error = (outcome.stderr or outcome.stdout or "").strip() or (
-                    f"git push exited {outcome.returncode}"
-                )
+                outcome = self._run_backup_git(repo, "push", "-u", "origin", "HEAD", check=False)
+                if outcome.returncode == 0:
+                    pushed = True
+                else:
+                    push_error = (outcome.stderr or outcome.stdout or "").strip() or (
+                        f"git push exited {outcome.returncode}"
+                    )
 
         config = self.store.read_config()
-        config["backup_last_run_at"] = now_iso()
+        config["backup_last_attempt_at"] = attempt_at
+        config["backup_last_run_at"] = attempt_at
         if commit:
             config["backup_last_commit"] = commit
+        config["backup_last_status"] = "degraded" if push_error else "completed"
+        config["backup_last_error"] = push_error
         self.store.write_config(config)
         self._restore_backup_repo_ownership(repo)
 
         state = self.store.read_state()
         self._event(
             state,
-            "backup.completed",
-            f"Backup run: {'committed ' + commit[:10] if dirty else 'no changes'}",
+            "backup.degraded" if push_error else "backup.completed",
+            (
+                f"Backup committed locally but remote push failed: {push_error}"
+                if push_error
+                else f"Backup run: {'committed ' + commit[:10] if dirty else 'no changes'}"
+            ),
             {
                 "repo": str(repo),
                 "changed": dirty,
@@ -309,6 +425,7 @@ class BackupOpsMixin:
         )
         self.store.write_state(state)
         return {
+            "status": "degraded" if push_error else "completed",
             "repo": str(repo),
             "changed": dirty,
             "commit": commit,
@@ -317,6 +434,8 @@ class BackupOpsMixin:
             "agents": result["agents"],
             "files": result["files"],
             "skipped": result["skipped"],
+            "incomplete": [],
+            "error": push_error,
         }
 
     def backup_status(self) -> dict[str, Any]:
@@ -328,24 +447,42 @@ class BackupOpsMixin:
             "repo": str(repo),
             "remote": settings["remote"],
             "auto_push": settings["auto_push"],
+            "last_attempt_at": settings["last_attempt_at"],
             "last_run_at": settings["last_run_at"],
             "last_commit": settings["last_commit"],
+            "last_status": settings["last_status"],
+            "last_error": settings["last_error"],
             "git_available": bool(shutil.which("git")),
             "initialized": False,
             "validation_error": "",
             "dirty": False,
             "head": "",
             "commit_count": 0,
+            "interrupted_transaction": False,
         }
         if not payload["git_available"]:
             return payload
         try:
-            self._validate_backup_repo(repo)
+            with self._backup_repository_lock(repo, exclusive=False):
+                return self._backup_status_locked(repo, payload)
         except SetupError as exc:
             if repo.exists() or repo.is_symlink():
                 payload["validation_error"] = str(exc)
             return payload
+
+    def _backup_status_locked(self, repo: Path, payload: dict[str, Any]) -> dict[str, Any]:
+        self._validate_backup_repo(repo)
         payload["initialized"] = True
+        payload["interrupted_transaction"] = (
+            (repo / _BACKUP_TRANSACTION).exists()
+            or (repo / _BACKUP_TRANSACTION).is_symlink()
+        )
+        if payload["interrupted_transaction"]:
+            payload["validation_error"] = (
+                "backup repository contains an interrupted snapshot transaction; "
+                "the next backup run will recover it"
+            )
+            return payload
         status = self._run_backup_git(repo, "status", "--porcelain", check=False)
         if status.returncode == 0:
             payload["dirty"] = bool(status.stdout.strip())
@@ -370,6 +507,24 @@ class BackupOpsMixin:
         """Restore agent prompts (and optionally workspace knowledge) from the backup repo."""
         repo = self._backup_repo_path()
         self._validate_backup_repo(repo)
+        with self._backup_repository_lock(repo, exclusive=True):
+            return self._backup_restore_locked(
+                repo,
+                agent_id=agent_id,
+                apply_to_disk=apply_to_disk,
+                include_workspace=include_workspace,
+            )
+
+    def _backup_restore_locked(
+        self,
+        repo: Path,
+        *,
+        agent_id: str | None,
+        apply_to_disk: bool,
+        include_workspace: bool,
+    ) -> dict[str, Any]:
+        self._validate_backup_repo(repo)
+        self._assert_no_interrupted_backup_transaction(repo)
         agents_root = repo / "agents"
         try:
             agents_root_st = agents_root.lstat()
@@ -471,41 +626,342 @@ class BackupOpsMixin:
         skipped: list[dict[str, str]] = []
 
         self._validate_backup_repo(repo)
-        for stale in ("state", "agents"):
-            remove_under(repo, stale, recursive=True)
-        state_dir = ensure_directory_under(repo, "state", mode=0o700)
-        agents_dir = ensure_directory_under(repo, "agents", mode=0o700)
+        self._recover_interrupted_backup_swap(repo)
+        stage = Path(tempfile.mkdtemp(prefix=".clawie-backup-stage-", dir=repo))
+        os.chmod(stage, 0o700)
+        try:
+            state_dir = ensure_directory_under(stage, "state", mode=0o700)
+            agents_dir = ensure_directory_under(stage, "agents", mode=0o700)
 
-        snapshot = {
-            "config": self._redacted_backup_config(),
-            "state": self._redacted_backup_state(),
+            snapshot = {
+                "config": self._redacted_backup_config(),
+                "state": self._redacted_backup_state(),
+            }
+            snapshot_bytes = (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            if self._contains_secret_material(snapshot_bytes):
+                raise SetupError("refusing to write backup snapshot because secret-like content remains")
+            write_bytes_under(state_dir, "snapshot.json", snapshot_bytes, mode=0o600)
+            files_written += 1
+
+            state = self.store.read_state()
+            agents = state.get("agents", {})
+            for token, agent in sorted(agents.items()):
+                if not isinstance(agent, dict):
+                    skipped.append(
+                        {
+                            "agent_id": str(token),
+                            "reason": "agent payload is not an object",
+                            "severity": "incomplete",
+                        }
+                    )
+                    continue
+                safe_id = str(token).strip()
+                if not _SAFE_PATH_SEGMENT.fullmatch(safe_id):
+                    skipped.append(
+                        {
+                            "agent_id": safe_id,
+                            "reason": "unsafe agent id for backup paths",
+                            "severity": "incomplete",
+                        }
+                    )
+                    continue
+                agent_root = agents_dir / safe_id
+                provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
+                files_written += self._write_agent_manifest_backup(agent_root, safe_id, agent)
+                files_written += self._write_agent_prompt_backups(
+                    agent_root, provider, agent, skipped, agent_id=safe_id
+                )
+                files_written += self._write_agent_workspace_backups(
+                    agent_root, provider, agent, skipped, agent_id=safe_id
+                )
+                agents_backed_up.append(safe_id)
+
+            incomplete = [row for row in skipped if row.get("severity") == "incomplete"]
+            if incomplete:
+                return {
+                    "agents": agents_backed_up,
+                    "files": files_written,
+                    "skipped": skipped,
+                    "incomplete": incomplete,
+                    "installed": False,
+                }
+            self._fsync_backup_tree(stage)
+            self._install_staged_backup_tree(repo, stage)
+            return {
+                "agents": agents_backed_up,
+                "files": files_written,
+                "skipped": skipped,
+                "incomplete": [],
+                "installed": True,
+            }
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    @staticmethod
+    def _install_staged_backup_tree(repo: Path, stage: Path) -> None:
+        """Swap a complete staged tree into place with crash recovery metadata."""
+        transaction = uuid.uuid4().hex
+        journal = repo / _BACKUP_TRANSACTION
+        if journal.exists() or journal.is_symlink():
+            raise SetupError(
+                "an interrupted backup transaction must be recovered before installing a snapshot"
+            )
+        previous: dict[str, Path] = {}
+        installed: list[str] = []
+        existed: dict[str, bool] = {}
+        for name in ("state", "agents"):
+            target = repo / name
+            existed[name] = target.exists() or target.is_symlink()
+        BackupOpsMixin._write_backup_transaction_journal(
+            repo,
+            transaction=transaction,
+            phase="installing",
+            existed=existed,
+        )
+        try:
+            for name in ("state", "agents"):
+                source = stage / name
+                source_st = source.lstat()
+                if not stat.S_ISDIR(source_st.st_mode) or stat.S_ISLNK(source_st.st_mode):
+                    raise SetupError(f"staged backup path is not a real directory: {source}")
+                target = repo / name
+                prior = repo / f".clawie-backup-previous-{transaction}-{name}"
+                if target.exists() or target.is_symlink():
+                    target_st = target.lstat()
+                    if stat.S_ISLNK(target_st.st_mode) or not stat.S_ISDIR(target_st.st_mode):
+                        raise SetupError(f"backup managed path is not a real directory: {target}")
+                    os.replace(target, prior)
+                    previous[name] = prior
+                os.replace(source, target)
+                installed.append(name)
+            BackupOpsMixin._fsync_directory(repo)
+            BackupOpsMixin._write_backup_transaction_journal(
+                repo,
+                transaction=transaction,
+                phase="installed",
+                existed=existed,
+            )
+        except Exception:
+            for name in reversed(installed):
+                target = repo / name
+                if target.exists() and target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+            for name, prior in previous.items():
+                if prior.exists() and not (repo / name).exists():
+                    os.replace(prior, repo / name)
+            if journal.exists() and journal.is_file() and not journal.is_symlink():
+                journal.unlink()
+            BackupOpsMixin._fsync_directory(repo)
+            raise
+        else:
+            for prior in previous.values():
+                if prior.exists() or prior.is_symlink():
+                    prior_st = prior.lstat()
+                    if stat.S_ISLNK(prior_st.st_mode) or not stat.S_ISDIR(prior_st.st_mode):
+                        raise SetupError(f"backup recovery path is unsafe: {prior}")
+                    shutil.rmtree(prior)
+            journal.unlink()
+            BackupOpsMixin._fsync_directory(repo)
+
+    @staticmethod
+    def _write_backup_transaction_journal(
+        repo: Path,
+        *,
+        transaction: str,
+        phase: str,
+        existed: dict[str, bool],
+    ) -> None:
+        payload = {
+            "transaction": transaction,
+            "phase": phase,
+            "existed": {name: bool(existed.get(name, False)) for name in ("state", "agents")},
         }
-        snapshot_bytes = (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode("utf-8")
-        if self._contains_secret_material(snapshot_bytes):
-            raise SetupError("refusing to write backup snapshot because secret-like content remains")
-        write_bytes_under(state_dir, "snapshot.json", snapshot_bytes, mode=0o600)
-        files_written += 1
+        write_text_under(
+            repo,
+            _BACKUP_TRANSACTION,
+            json.dumps(payload, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+        BackupOpsMixin._fsync_directory(repo)
 
-        state = self.store.read_state()
-        agents = state.get("agents", {})
-        for token, agent in sorted(agents.items()):
-            if not isinstance(agent, dict):
-                continue
-            safe_id = str(token).strip()
-            if not _SAFE_PATH_SEGMENT.fullmatch(safe_id):
-                skipped.append({"agent_id": safe_id, "reason": "unsafe agent id for backup paths"})
-                continue
-            agent_root = agents_dir / safe_id
-            provider = str(agent.get("agent", {}).get("provider", "")).strip().lower()
-            files_written += self._write_agent_manifest_backup(agent_root, safe_id, agent)
-            files_written += self._write_agent_prompt_backups(
-                agent_root, provider, agent, skipped, agent_id=safe_id
+    @staticmethod
+    def _read_backup_transaction_journal(repo: Path) -> dict[str, Any] | None:
+        journal = repo / _BACKUP_TRANSACTION
+        if not journal.exists() and not journal.is_symlink():
+            return None
+        try:
+            journal_st = journal.lstat()
+            if stat.S_ISLNK(journal_st.st_mode) or not stat.S_ISREG(journal_st.st_mode):
+                raise SetupError(f"backup transaction journal is not a regular file: {journal}")
+            payload = json.loads(read_text_under(repo, _BACKUP_TRANSACTION, max_bytes=16 * 1024))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SetupError(f"invalid backup transaction journal: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise SetupError("invalid backup transaction journal payload")
+        transaction = str(payload.get("transaction", "") or "")
+        phase = str(payload.get("phase", "") or "")
+        existed = payload.get("existed")
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", transaction)
+            or phase not in {"installing", "installed"}
+            or not isinstance(existed, dict)
+            or any(not isinstance(existed.get(name), bool) for name in ("state", "agents"))
+        ):
+            raise SetupError("invalid backup transaction journal fields")
+        return payload
+
+    @staticmethod
+    def _assert_no_interrupted_backup_transaction(repo: Path) -> None:
+        if BackupOpsMixin._read_backup_transaction_journal(repo) is not None:
+            raise SetupError(
+                "backup repository contains an interrupted snapshot transaction; "
+                "run 'clawie backup run' to recover it before restoring"
             )
-            files_written += self._write_agent_workspace_backups(
-                agent_root, provider, agent, skipped, agent_id=safe_id
-            )
-            agents_backed_up.append(safe_id)
-        return {"agents": agents_backed_up, "files": files_written, "skipped": skipped}
+
+    @staticmethod
+    def _recover_interrupted_backup_swap(repo: Path) -> None:
+        payload = BackupOpsMixin._read_backup_transaction_journal(repo)
+        if payload is None:
+            return
+        transaction = str(payload["transaction"])
+        phase = str(payload["phase"])
+        existed = dict(payload["existed"])
+        journal = repo / _BACKUP_TRANSACTION
+
+        if phase == "installed":
+            complete = True
+            for name in ("state", "agents"):
+                target = repo / name
+                try:
+                    target_st = target.lstat()
+                except FileNotFoundError:
+                    complete = False
+                    break
+                if stat.S_ISLNK(target_st.st_mode) or not stat.S_ISDIR(target_st.st_mode):
+                    raise SetupError(f"backup managed path is unsafe during recovery: {target}")
+            if complete:
+                for name in ("state", "agents"):
+                    prior = repo / f".clawie-backup-previous-{transaction}-{name}"
+                    if prior.exists() or prior.is_symlink():
+                        prior_st = prior.lstat()
+                        if stat.S_ISLNK(prior_st.st_mode) or not stat.S_ISDIR(
+                            prior_st.st_mode
+                        ):
+                            raise SetupError(f"backup recovery path is unsafe: {prior}")
+                        shutil.rmtree(prior)
+                journal.unlink()
+                BackupOpsMixin._remove_abandoned_backup_stages(repo)
+                BackupOpsMixin._fsync_directory(repo)
+                return
+
+        for name in reversed(("state", "agents")):
+            target = repo / name
+            prior = repo / f".clawie-backup-previous-{transaction}-{name}"
+            if prior.exists() or prior.is_symlink():
+                prior_st = prior.lstat()
+                if stat.S_ISLNK(prior_st.st_mode) or not stat.S_ISDIR(prior_st.st_mode):
+                    raise SetupError(f"backup recovery path is unsafe: {prior}")
+                if target.exists() or target.is_symlink():
+                    target_st = target.lstat()
+                    if stat.S_ISLNK(target_st.st_mode) or not stat.S_ISDIR(target_st.st_mode):
+                        raise SetupError(f"backup managed path is unsafe during recovery: {target}")
+                    shutil.rmtree(target)
+                os.replace(prior, target)
+            elif not bool(existed.get(name, False)) and (target.exists() or target.is_symlink()):
+                target_st = target.lstat()
+                if stat.S_ISLNK(target_st.st_mode) or not stat.S_ISDIR(target_st.st_mode):
+                    raise SetupError(f"backup managed path is unsafe during recovery: {target}")
+                shutil.rmtree(target)
+
+        journal.unlink()
+        BackupOpsMixin._remove_abandoned_backup_stages(repo)
+        BackupOpsMixin._fsync_directory(repo)
+
+    @staticmethod
+    def _remove_abandoned_backup_stages(repo: Path) -> None:
+        for candidate in repo.glob(".clawie-backup-stage-*"):
+            try:
+                candidate_st = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(candidate_st.st_mode) and not stat.S_ISLNK(candidate_st.st_mode):
+                shutil.rmtree(candidate)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _fsync_backup_tree(root: Path) -> None:
+        """Persist staged contents before the journal makes their rename durable."""
+        directories: list[Path] = []
+        def fail_walk(exc: OSError) -> None:
+            raise SetupError(f"could not traverse staged backup tree: {exc}") from exc
+
+        for current, dirnames, filenames in os.walk(
+            root,
+            topdown=True,
+            onerror=fail_walk,
+            followlinks=False,
+        ):
+            current_path = Path(current)
+            directories.append(current_path)
+            for name in [*dirnames, *filenames]:
+                candidate = current_path / name
+                candidate_st = candidate.lstat()
+                if stat.S_ISLNK(candidate_st.st_mode):
+                    raise SetupError(f"staged backup path must not be a symlink: {candidate}")
+                if name in dirnames:
+                    if not stat.S_ISDIR(candidate_st.st_mode):
+                        raise SetupError(
+                            f"staged backup directory entry is not a directory: {candidate}"
+                        )
+                else:
+                    if not stat.S_ISREG(candidate_st.st_mode):
+                        raise SetupError(f"staged backup path is not a regular file: {candidate}")
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(candidate, flags)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+        for directory in reversed(directories):
+            BackupOpsMixin._fsync_directory(directory)
+
+    @staticmethod
+    @contextmanager
+    def _backup_repository_lock(repo: Path, *, exclusive: bool) -> Iterator[None]:
+        """Serialize backup transactions without creating observable lock files."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(repo, flags)
+        except OSError as exc:
+            raise SetupError(f"cannot safely lock backup repository {repo}: {exc}") from exc
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        deadline = time.monotonic() + 30.0
+        try:
+            repo_st = os.fstat(fd)
+            if not stat.S_ISDIR(repo_st.st_mode):
+                raise SetupError(f"backup repository lock target is not a directory: {repo}")
+            while True:
+                try:
+                    fcntl.flock(fd, operation | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SetupError("timed out waiting for the backup repository lock") from None
+                    time.sleep(0.05)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def _write_agent_manifest_backup(self, agent_root: Path, agent_id: str, agent: dict[str, Any]) -> int:
         manifest = self._agent_manifest_from_state(agent_id, agent)
@@ -608,7 +1064,11 @@ class BackupOpsMixin:
             encoded = body.encode("utf-8")
             if self._contains_secret_material(encoded):
                 skipped.append(
-                    {"agent_id": agent_id, "reason": f"prompt {token} contains secret-like content"}
+                    {
+                        "agent_id": agent_id,
+                        "reason": f"prompt {token} contains secret-like content",
+                        "severity": "policy",
+                    }
                 )
                 continue
             write_bytes_under(agent_root, Path("prompts") / token, encoded, mode=0o600)
@@ -628,7 +1088,14 @@ class BackupOpsMixin:
             return 0
         try:
             spec = get_provider(provider)
-        except ValueError:
+        except ValueError as exc:
+            skipped.append(
+                {
+                    "agent_id": agent_id,
+                    "reason": f"unknown provider prevents workspace backup: {exc}",
+                    "severity": "incomplete",
+                }
+            )
             return 0
         home = self._agent_linux_home(agent)
         if home is None:
@@ -637,22 +1104,47 @@ class BackupOpsMixin:
         try:
             if not workspace.is_dir():
                 return 0
-        except OSError:
+        except OSError as exc:
+            skipped.append(
+                {
+                    "agent_id": agent_id,
+                    "reason": f"could not inspect workspace: {exc}",
+                    "severity": "incomplete",
+                }
+            )
             return 0
 
         written = 0
         try:
             entries = sorted(workspace.rglob("*"), key=str)
         except (OSError, PermissionError) as exc:
-            skipped.append({"agent_id": agent_id, "reason": f"workspace unreadable: {exc}"})
+            skipped.append(
+                {
+                    "agent_id": agent_id,
+                    "reason": f"workspace unreadable: {exc}",
+                    "severity": "incomplete",
+                }
+            )
             return 0
         for entry in entries:
             if written >= _MAX_KNOWLEDGE_FILES_PER_AGENT:
                 skipped.append(
-                    {"agent_id": agent_id, "reason": "workspace file cap reached; remaining files skipped"}
+                    {
+                        "agent_id": agent_id,
+                        "reason": "workspace file cap reached; remaining files skipped",
+                        "severity": "incomplete",
+                    }
                 )
                 break
             if not self._is_backupable_knowledge_file(entry, workspace):
+                if self._oversized_knowledge_file(entry, workspace):
+                    skipped.append(
+                        {
+                            "agent_id": agent_id,
+                            "reason": f"workspace file {entry.relative_to(workspace)} exceeds the size limit",
+                            "severity": "incomplete",
+                        }
+                    )
                 continue
             rel = entry.relative_to(workspace)
             try:
@@ -664,6 +1156,7 @@ class BackupOpsMixin:
                 if self._contains_secret_material(data):
                     skipped.append(
                         {"agent_id": agent_id, "reason": f"workspace file {rel} contains secret-like content"}
+                        | {"severity": "policy"}
                     )
                     continue
                 write_bytes_under(
@@ -674,8 +1167,35 @@ class BackupOpsMixin:
                 )
                 written += 1
             except (OSError, PermissionError, ValueError) as exc:
-                skipped.append({"agent_id": agent_id, "reason": f"could not copy {rel}: {exc}"})
+                skipped.append(
+                    {
+                        "agent_id": agent_id,
+                        "reason": f"could not copy {rel}: {exc}",
+                        "severity": "incomplete",
+                    }
+                )
         return written
+
+    @staticmethod
+    def _oversized_knowledge_file(entry: Path, workspace: Path) -> bool:
+        try:
+            if entry.is_symlink() or not entry.is_file():
+                return False
+            rel = entry.relative_to(workspace)
+            if any(
+                segment.startswith(".") or not _SAFE_WORKSPACE_SEGMENT.fullmatch(segment)
+                for segment in rel.parts
+            ):
+                return False
+            name = entry.name.lower()
+            in_memory_dir = rel.parts[0] == "memory" and len(rel.parts) > 1
+            is_knowledge = in_memory_dir or any(name.endswith(suffix) for suffix in _KNOWLEDGE_SUFFIXES)
+            stem = name.rsplit(".", 1)[0]
+            if not is_knowledge or any(token in stem for token in _SENSITIVE_NAME_TOKENS):
+                return False
+            return entry.stat().st_size > _MAX_KNOWLEDGE_FILE_BYTES
+        except OSError:
+            return False
 
     @staticmethod
     def _is_backupable_knowledge_file(entry: Path, workspace: Path) -> bool:
@@ -1059,7 +1579,11 @@ class BackupOpsMixin:
                         f"backup repository owner uid {owner_uid} has no local account"
                     ) from exc
                 cmd = ["sudo", "-u", owner_name, "-H", "--", *git_cmd]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        git_env = os.environ.copy()
+        # Read-only status calls must not refresh the Git index or create lock
+        # files. Required locks for mutating commands are unaffected.
+        git_env["GIT_OPTIONAL_LOCKS"] = "0"
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=git_env)
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise SetupError(f"git {' '.join(args)} failed: {detail or f'exit {result.returncode}'}")

@@ -32,7 +32,8 @@ agent homes, and port sessions between claws with `clawie auth port`.
 - **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and `clawie status` work without root.
 - **State root under sudo** — normal `sudo clawie ...` uses the invoking user's `~/.clawie` via `SUDO_USER`. For service accounts or custom layouts, set `CLAWIE_HOME` or pass `--config-dir` consistently.
 - **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
-- **Terminal**: UTF-8 with color support for `status` output.
+- **Terminal**: UTF-8. Colors are automatic on TTYs and can be disabled with
+  `--no-color` or `NO_COLOR`.
 
 ## Install
 
@@ -54,6 +55,9 @@ sudo clawie runtime install openclaw
 sudo clawie runtime create alice --user alice --template baseline
 clawie status
 ```
+
+Later `config set` calls update only the options supplied; omitted provider,
+auth, workspace, subscription, and API settings are preserved.
 
 ## Agent orchestration
 
@@ -123,6 +127,10 @@ sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-del
 # Release acceptance for the verified delivery surface
 sudo clawie production verify --exercise-watchdog-restart --exercise-runtime-delivery --all-provider-contracts --json
 ```
+
+Backup collection is staged before replacement. Incomplete reads preserve the
+last complete snapshot and return nonzero; failed remote pushes also return
+nonzero so cron and monitoring cannot report false durability.
 
 ## Status
 

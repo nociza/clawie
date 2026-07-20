@@ -78,7 +78,7 @@ class SharedInfraMixin:
         return self.store.root / "shared-provider-auth"
 
     def _shared_provider_auth_scope(self) -> str:
-        return "system" if self._ensure_shared_provider_auth_root() == self.SHARED_PROVIDER_AUTH_DIR else "local"
+        return "system" if self._shared_provider_auth_home() == self.SHARED_PROVIDER_AUTH_DIR else "local"
 
     def _ensure_shared_provider_auth_root(self) -> Path:
         root = self._shared_provider_auth_home()

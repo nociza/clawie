@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 from collections.abc import Iterable
+from typing import TextIO
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -12,6 +15,8 @@ CYAN = "\033[36m"
 BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 WHITE = "\033[37m"
+
+_COLOR_OVERRIDE: bool | None = None
 
 # Box-drawing characters
 _H = "\u2500"  # ─
@@ -25,7 +30,23 @@ _RT = "\u2524"  # ┤
 _XX = "\u253c"  # ┼
 
 
-def color(text: str, ansi: str, bold: bool = False) -> str:
+def set_color_enabled(enabled: bool | None) -> None:
+    global _COLOR_OVERRIDE
+    _COLOR_OVERRIDE = enabled
+
+
+def _color_enabled(stream: TextIO) -> bool:
+    if _COLOR_OVERRIDE is not None:
+        return _COLOR_OVERRIDE
+    if "NO_COLOR" in os.environ or os.environ.get("TERM", "") == "dumb":
+        return False
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def color(text: str, ansi: str, bold: bool = False, *, stream: TextIO | None = None) -> str:
+    output = stream or sys.stdout
+    if not _color_enabled(output):
+        return text
     prefix = ansi
     if bold:
         prefix = BOLD + ansi
@@ -41,7 +62,7 @@ def print_warning(message: str) -> None:
 
 
 def print_error(message: str) -> None:
-    print(color(f"  \u2717 {message}", RED, bold=True))
+    print(color(f"  \u2717 {message}", RED, bold=True, stream=sys.stderr), file=sys.stderr)
 
 
 def print_info(message: str) -> None:

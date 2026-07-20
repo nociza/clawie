@@ -12,6 +12,7 @@ import subprocess
 # also patches the executable lookups performed in the runtime mixins.
 import shutil  # noqa: F401
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from clawie.providers import (
@@ -19,7 +20,7 @@ from clawie.providers import (
     get_provider,
 )
 from clawie.store import StateStore
-from clawie.safe_fs import write_text_under
+from clawie.safe_fs import read_text_under, write_text_under
 
 # Re-exported for backwards compatibility: callers (clawie.cli, tests) import
 # these names from clawie.service.
@@ -53,6 +54,8 @@ STATUS_SECTIONS: tuple[str, ...] = (
     "backup",
     "events",
 )
+
+_MAX_STATE_SNAPSHOT_BYTES = 64 * 1024 * 1024
 
 
 class ClawieService(
@@ -240,33 +243,68 @@ class ClawieService(
 
     def setup(
         self,
-        provider: str,
-        api_key: str,
-        subscription: str,
-        workspace: str,
-        api_url: str,
+        provider: str | None = None,
+        api_key: str | None = None,
+        subscription: str | None = None,
+        workspace: str | None = None,
+        api_url: str | None = None,
         auth_mode: str | None = None,
         spawn_password: str | None = None,
         clear_spawn_password: bool = False,
         install_runtime: bool = False,
     ) -> dict[str, Any]:
-        provider = provider.strip().lower() or "openclaw"
-        provider_spec = get_provider(provider)
-        api_key_value = api_key.strip()
-        mode = self._resolve_auth_mode(provider_spec.name, api_key_value, auth_mode)
+        config = self.store.read_config()
+        current_provider = str(config.get("provider", "openclaw") or "openclaw").strip().lower()
+        requested_provider = str(provider or "").strip().lower()
+        provider_spec = get_provider(requested_provider or current_provider or "openclaw")
+        provider_changed = provider_spec.name != current_provider
+        credentials = self._normalized_provider_credentials(config)
+        provider_creds = dict(credentials.get(provider_spec.name, {}))
+
+        if api_key is None:
+            api_key_value = str(provider_creds.get("api_key", "") or "").strip()
+            if not api_key_value and not provider_changed and current_provider == provider_spec.name:
+                api_key_value = str(config.get("api_key", "") or "").strip()
+        else:
+            api_key_value = str(api_key).strip()
+
+        requested_mode = str(auth_mode or "").strip().lower()
+        if requested_mode:
+            mode = self._resolve_auth_mode(provider_spec.name, api_key_value, requested_mode)
+        elif api_key is not None:
+            mode = self._resolve_auth_mode(provider_spec.name, api_key_value, None)
+        else:
+            stored_mode = str(provider_creds.get("auth_mode", "") or "").strip().lower()
+            if not stored_mode and not provider_changed:
+                stored_mode = str(config.get("auth_mode", "") or "").strip().lower()
+            mode = self._resolve_auth_mode(
+                provider_spec.name,
+                api_key_value,
+                stored_mode or None,
+            )
         install_result: dict[str, Any] | None = None
         if install_runtime:
             install_result = self.install_provider_runtime(provider_spec.name)
-        config = self.store.read_config()
         config["provider"] = provider_spec.name
         config["auth_mode"] = mode
-        config["subscription"] = subscription.strip()
-        config["workspace"] = workspace.strip()
-        config["api_url"] = api_url.strip()
-        credentials = self._normalized_provider_credentials(config)
-        provider_creds = {"auth_mode": mode}
+        if subscription is not None:
+            config["subscription"] = str(subscription).strip() or "starter"
+        elif not str(config.get("subscription", "") or "").strip():
+            config["subscription"] = "starter"
+        if workspace is not None:
+            config["workspace"] = str(workspace).strip() or "default"
+        elif not str(config.get("workspace", "") or "").strip():
+            config["workspace"] = "default"
+        if api_url is not None:
+            config["api_url"] = str(api_url).strip()
+        elif provider_changed:
+            config["api_url"] = str(provider_creds.get("api_url", provider_spec.default_api_url) or "")
+        provider_creds["auth_mode"] = mode
         if mode == "api_key":
             provider_creds["api_key"] = api_key_value
+        else:
+            provider_creds.pop("api_key", None)
+        provider_creds["api_url"] = str(config.get("api_url", "") or "")
         credentials[provider_spec.name] = provider_creds
         config["provider_credentials"] = credentials
         config["api_key"] = provider_creds.get("api_key", "")
@@ -998,7 +1036,7 @@ class ClawieService(
             "health": self.doctor,
             "agents": lambda: self.performance_snapshot(agent_id=agent, refresh=refresh),
             "runtimes": lambda: self.list_local_runtime_statuses(refresh=refresh),
-            "auth": self.list_shared_auth_statuses,
+            "auth": lambda: self.list_shared_auth_statuses(probe_cli=refresh),
             "delegation": lambda: {
                 "tasks": self.delegation_tasks(agent_id=agent, limit=10),
                 "active_agents": self.active_delegation_agents(),
@@ -1011,14 +1049,16 @@ class ClawieService(
         result: dict[str, Any] = {"generated_at": now_iso()}
         if agent:
             result["agent_id"] = agent
-        for name in wanted:
-            collect = collectors.get(name)
-            if collect is None:
-                continue
-            try:
-                result[name] = collect()
-            except Exception as exc:  # noqa: BLE001 - status must survive partial failures
-                result[name] = {"error": str(exc)}
+        observation = nullcontext() if refresh else self.store.read_only()
+        with observation:
+            for name in wanted:
+                collect = collectors.get(name)
+                if collect is None:
+                    continue
+                try:
+                    result[name] = collect()
+                except Exception as exc:  # noqa: BLE001 - status must survive partial failures
+                    result[name] = {"error": str(exc)}
         return result
 
     def _resolve_status_sections(self, sections: list[str] | None) -> list[str]:
@@ -1068,8 +1108,13 @@ class ClawieService(
             "state": self.store.read_state(),
         }
         target = Path(output_path).expanduser()
-        target.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
+        if len(payload.encode("utf-8")) > _MAX_STATE_SNAPSHOT_BYTES:
+            raise ValueError(
+                f"snapshot exceeds the {_MAX_STATE_SNAPSHOT_BYTES // (1024 * 1024)} MiB "
+                "round-trip import limit"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
         # The snapshot carries unredacted credentials. Create it atomically at
         # its final private mode and refuse symlink/special-file targets.
         write_text_under(target.parent, target.name, payload, mode=0o600)
@@ -1077,8 +1122,15 @@ class ClawieService(
 
     def import_state(self, input_path: str | Path, merge: bool = False) -> None:
         source = Path(input_path).expanduser()
-        with source.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        try:
+            raw = read_text_under(
+                source.parent,
+                source.name,
+                max_bytes=_MAX_STATE_SNAPSHOT_BYTES,
+            )
+            payload = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid snapshot file: {exc}") from exc
 
         if not isinstance(payload, dict):
             raise ValueError("snapshot must be a JSON object")
@@ -1086,10 +1138,11 @@ class ClawieService(
         state = payload.get("state")
         if not isinstance(config, dict) or not isinstance(state, dict):
             raise ValueError("snapshot must include object fields: config, state")
+        self._validate_import_snapshot(config, state)
+        current_state = self.store.read_state()
 
         if merge:
             current_config = self.store.read_config()
-            current_state = self.store.read_state()
 
             merged_config = copy.deepcopy(current_config)
             merged_config.update(config)
@@ -1103,13 +1156,124 @@ class ClawieService(
             merged_state["events"] = (
                 merged_state["events"] + state.get("events", [])
             )[-self.EVENT_LIMIT :]
-
-            self.store.write_config(merged_config)
-            self.store.write_state(merged_state)
+            self._validate_import_snapshot(merged_config, merged_state)
+            self._validate_import_runtime_preservation(current_state, merged_state)
+            self.store.write_snapshot(merged_config, merged_state)
             return
 
-        self.store.write_config(config)
-        self.store.write_state(state)
+        self._validate_import_runtime_preservation(current_state, state)
+        self.store.write_snapshot(config, state)
+
+    def _validate_import_snapshot(
+        self,
+        config: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        provider = str(config.get("provider", "openclaw") or "openclaw").strip().lower()
+        get_provider(provider)
+        templates = state.get("templates")
+        agents = state.get("agents")
+        events = state.get("events")
+        if not isinstance(templates, dict) or not isinstance(agents, dict) or not isinstance(events, list):
+            raise ValueError("snapshot state must include object templates/agents and an events array")
+        if len(events) > self.EVENT_LIMIT:
+            raise ValueError(
+                f"snapshot contains {len(events)} events; the maximum is {self.EVENT_LIMIT}"
+            )
+        for name, template in templates.items():
+            if not str(name).strip() or not isinstance(template, dict):
+                raise ValueError("snapshot templates must have non-empty names and object values")
+        for agent_id, agent in agents.items():
+            token = self._validate_agent_id(str(agent_id))
+            if not isinstance(agent, dict):
+                raise ValueError(f"snapshot agent {token!r} must be an object")
+            embedded_id = str(agent.get("agent_id", token) or token).strip()
+            if embedded_id != token:
+                raise ValueError(
+                    f"snapshot agent key {token!r} does not match embedded agent_id {embedded_id!r}"
+                )
+            info = agent.get("agent", {})
+            if not isinstance(info, dict):
+                raise ValueError(f"snapshot agent {token!r} has a non-object agent payload")
+            agent_provider = str(info.get("provider", provider) or provider).strip().lower()
+            get_provider(agent_provider)
+        for event in events:
+            if not isinstance(event, dict) or not isinstance(event.get("context", {}), dict):
+                raise ValueError("snapshot events must be objects with object context values")
+        runtime_owners: dict[str, str] = {}
+        for agent_id, agent in agents.items():
+            info = agent.get("agent", {})
+            linux_user = str(info.get("linux_user", "") or "").strip()
+            if not linux_user:
+                continue
+            previous = runtime_owners.get(linux_user)
+            if previous is not None:
+                raise ValueError(
+                    f"snapshot maps Linux user {linux_user!r} to both {previous!r} and "
+                    f"{str(agent_id)!r}"
+                )
+            runtime_owners[linux_user] = str(agent_id)
+
+    @staticmethod
+    def _validate_import_runtime_preservation(
+        current_state: dict[str, Any],
+        next_state: dict[str, Any],
+    ) -> None:
+        current_agents = current_state.get("agents", {})
+        next_agents = next_state.get("agents", {})
+        if not isinstance(current_agents, dict) or not isinstance(next_agents, dict):
+            return
+        protected_fields = (
+            "linux_user",
+            "linux_uid",
+            "linux_home",
+            "linux_user_managed",
+            "managed_user_operation_id",
+            "provider",
+        )
+        for agent_id, current in current_agents.items():
+            if not isinstance(current, dict):
+                continue
+            current_info = current.get("agent", {})
+            if not isinstance(current_info, dict):
+                continue
+            linux_user = str(current_info.get("linux_user", "") or "").strip()
+            if not linux_user:
+                continue
+            incoming = next_agents.get(agent_id)
+            incoming_info = incoming.get("agent", {}) if isinstance(incoming, dict) else {}
+            changed = [
+                field
+                for field in protected_fields
+                if current_info.get(field) != incoming_info.get(field)
+            ]
+            if changed:
+                raise SetupError(
+                    f"snapshot would orphan or remap managed runtime '{agent_id}' ({linux_user}); "
+                    f"protected fields changed: {', '.join(changed)}. "
+                    f"Run 'clawie agent purge {agent_id}' first, then retry the import."
+                )
+        for agent_id, incoming in next_agents.items():
+            if not isinstance(incoming, dict):
+                continue
+            incoming_info = incoming.get("agent", {})
+            if not isinstance(incoming_info, dict):
+                continue
+            incoming_user = str(incoming_info.get("linux_user", "") or "").strip()
+            current = current_agents.get(agent_id)
+            current_info = current.get("agent", {}) if isinstance(current, dict) else {}
+            current_user = (
+                str(current_info.get("linux_user", "") or "").strip()
+                if isinstance(current_info, dict)
+                else ""
+            )
+            if incoming_user and not current_user:
+                raise SetupError(
+                    f"snapshot introduces Linux runtime mapping '{agent_id}' -> "
+                    f"'{incoming_user}' without local provisioning proof. Remove the runtime "
+                    "fields from the snapshot, import the definition, then use 'clawie runtime "
+                    "create' to provision it on this host."
+                )
 
     def _require_setup(self) -> None:
         config = self.store.read_config()

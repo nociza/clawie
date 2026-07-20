@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -47,3 +48,32 @@ def test_control_socket_paths_are_manager_scoped() -> None:
     assert first.name.startswith("1001-")
     assert first.suffix == ".sock"
     assert first != second
+
+
+def test_release_workflow_is_pinned_and_uses_trusted_publishing() -> None:
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+    action_refs = re.findall(r"^\s*uses:\s*[^@\s]+@([^\s#]+)", workflow, flags=re.MULTILINE)
+
+    assert action_refs
+    assert all(re.fullmatch(r"[0-9a-f]{40}", ref) for ref in action_refs)
+    assert "types: [published]" in workflow
+    assert "name: pypi" in workflow
+    assert "id-token: write" in workflow
+    assert "PYPI_TOKEN" not in workflow
+    assert "github.event.release.tag_name" in workflow
+    assert "uv audit --frozen" in workflow
+
+
+def test_production_fixture_exercises_the_real_public_user_journey() -> None:
+    fixture = Path("scripts/production_verify_fixture.py").read_text(encoding="utf-8")
+
+    assert '"runtime",\n                    "create"' in fixture
+    assert '"agent",\n                    "service",\n                    "start"' in fixture
+    assert '"--exercise-runtime-delivery"' in fixture
+    assert '"agent",\n                        "purge"' in fixture
+    assert 'proof_payload["cleanup"] = cleanup' in fixture
+    assert '"user_absent": absent' in fixture
+    assert '"preserved_state_root"' in fixture
+    assert "_seed_state" not in fixture
+    assert "_create_user_with_private_auth" not in fixture
+    assert 'required=True,\n        help="Home containing real provider or linked auth' in fixture

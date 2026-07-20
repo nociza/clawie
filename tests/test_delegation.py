@@ -731,7 +731,7 @@ class TestDelegationCLI:
             "--timeout",
             "0.1",
         )
-        output = capsys.readouterr().out
+        output = capsys.readouterr().err
 
         assert code == 1
         assert "agent not found: missing-worker" in output

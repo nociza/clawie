@@ -54,13 +54,13 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --dev
       - name: Lint
-        run: uv run ruff check clawie tests
+        run: uv run ruff check clawie tests scripts/production_verify_fixture.py
       - name: Type-check package
-        run: uv run mypy clawie
+        run: uv run mypy clawie scripts/production_verify_fixture.py
       - name: Scan source for medium and high severity findings
-        run: uv run bandit -q -r clawie -ll
-      - name: Audit locked production dependencies
-        run: uv audit --frozen --no-dev
+        run: uv run bandit -q -r clawie scripts -ll
+      - name: Audit locked dependencies and release tools
+        run: uv audit --frozen
 
   package:
     name: Build distributions

@@ -35,8 +35,13 @@ class TelemetryOpsMixin:
         if refresh:
             self.collect_metrics(agent_id=agent_id)
         daemon_map = self._running_provider_daemons_by_user()
-        self._refresh_managed_agent_provider_alignments(agent_id=agent_id, daemon_map=daemon_map)
         state = self.store.read_state()
+        state = self._refresh_managed_agent_provider_alignments(
+            agent_id=agent_id,
+            daemon_map=daemon_map,
+            state=state,
+            persist=False,
+        )
         agents = list(state.setdefault("agents", {}).values())
         if agent_id:
             agents = [

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 from pytest import MonkeyPatch, raises
@@ -110,6 +112,52 @@ def test_store_rejects_symlink_database(tmp_path: Path) -> None:
 
     with raises(PermissionError, match="database must not be a symlink"):
         StateStore(config_dir=tmp_path).ensure()
+
+
+def test_store_rejects_symlink_database_sidecar_without_touching_target(tmp_path: Path) -> None:
+    store = StateStore(config_dir=tmp_path / "state")
+    store.ensure()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("preserve\n", encoding="utf-8")
+    store.db_path.with_name(store.db_path.name + "-wal").symlink_to(victim)
+
+    with raises(PermissionError, match="sidecar must be a regular file"):
+        store.read_config()
+
+    assert victim.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_read_only_snapshot_waits_for_writer_and_observes_committed_state(tmp_path: Path) -> None:
+    writer = StateStore(config_dir=tmp_path / "state")
+    writer.ensure()
+    observed: list[str] = []
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def read_after_writer() -> None:
+        started.set()
+        try:
+            reader = StateStore(config_dir=tmp_path / "state")
+            with reader.read_only():
+                observed.append(str(reader.read_config()["workspace"]))
+        except BaseException as exc:  # pragma: no cover - assertion reports thread failures.
+            errors.append(exc)
+
+    with writer._connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO config(key, value) VALUES (?, ?)",
+            ("workspace", json.dumps("after-commit")),
+        )
+        thread = threading.Thread(target=read_after_writer)
+        thread.start()
+        assert started.wait(timeout=1)
+        time.sleep(0.1)
+        assert observed == []
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert observed == ["after-commit"]
 
 
 def test_store_preserves_sudo_user_ownership_for_state_files(

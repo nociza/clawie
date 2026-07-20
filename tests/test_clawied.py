@@ -284,7 +284,7 @@ def test_mutating_cli_fails_closed_on_daemon_permission_error(
     )
 
     code = run_cli(tmp_path, "config", "set", "--provider", "picoclaw")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
 
     assert code == 1
     assert "failed closed" in output

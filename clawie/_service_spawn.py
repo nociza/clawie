@@ -136,7 +136,8 @@ class SpawnOpsMixin:
         # really exists so later credential/config copies fail with a clear
         # cause instead of a cryptic downstream error.
         try:
-            created_home = Path(pwd.getpwnam(target_user).pw_dir)
+            created_account = pwd.getpwnam(target_user)
+            created_home = Path(created_account.pw_dir)
         except KeyError as exc:
             raise SetupError(
                 f"useradd succeeded but {target_user} has no passwd database entry"
@@ -146,12 +147,18 @@ class SpawnOpsMixin:
                 f"useradd succeeded but home directory {created_home} was not created "
                 "(check disk space and CREATE_HOME in /etc/login.defs)."
             )
+        created_uid = int(created_account.pw_uid)
+        if created_uid <= 0:
+            raise SetupError(
+                f"refusing managed user {target_user} with unsafe uid {created_uid}"
+            )
         target_home = created_home
         saga["home"] = str(created_home)
         marker = {
             "format_version": 1,
             "agent_id": agent_id,
             "linux_user": target_user,
+            "linux_uid": created_uid,
             "operation_id": str(saga.get("operation_id", "")),
             "state_root": str(self.store.root.resolve()),
         }
@@ -237,6 +244,7 @@ class SpawnOpsMixin:
         saga["agent_created"] = True
         saga["agent_created_at"] = str(agent_state.get("created_at", ""))
         agent_state["agent"]["linux_user"] = target_user
+        agent_state["agent"]["linux_uid"] = created_uid
         agent_state["agent"]["linux_home"] = str(target_home)
         agent_state["agent"]["linux_user_managed"] = True
         agent_state["agent"]["managed_user_operation_id"] = str(saga.get("operation_id", ""))
@@ -264,6 +272,11 @@ class SpawnOpsMixin:
         permission_warnings = self._ensure_workspace_accessible(
             resolved_provider, target_home, target_user
         )
+        if permission_warnings:
+            raise SetupError(
+                "failed to enforce private agent-home permissions: "
+                + "; ".join(permission_warnings)
+            )
         state = self.store.read_state()
         self._event(
             state,
@@ -721,76 +734,96 @@ class SpawnOpsMixin:
     def _ensure_workspace_accessible(
         self, provider: str, home: Path, linux_user: str,
     ) -> list[str]:
-        """Make agent home group-accessible so the manager user can operate without sudo.
+        """Enforce the private-home boundary required by host validation.
 
-        Sets the provider state dir and workspace to setgid-group-writable (2775)
-        so that files created there inherit the agent's group. Adds the current
-        (manager) user to the agent's group for traversal and write access.
-        The agent user's own access is unaffected (owner bits stay rwx).
-
-        This is best-effort: a failure here does not abort spawning (the agent
-        still works for its own user). But failures are collected and returned
-        so the caller can record them — silent permission drift is otherwise
-        very hard to diagnose later.
+        Cross-user management is deliberately handled by root or ``clawied``;
+        group traversal/write access would defeat the isolation contract.  The
+        historical method name is retained for compatibility with callers.
         """
         warnings: list[str] = []
         if os.geteuid() != 0:
             return warnings
 
-        def _chmod(label: str, cmd: list[str]) -> None:
+        try:
+            account = pwd.getpwnam(linux_user)
+            owner = (int(account.pw_uid), int(account.pw_gid))
+        except KeyError:
+            return [f"linux user does not exist: {linux_user}"]
+
+        def _harden(path: Path, mode: int) -> None:
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                current = path.lstat()
             except OSError as exc:
-                warnings.append(f"{label}: {exc}")
+                warnings.append(f"inspect {path}: {exc}")
                 return
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
-                warnings.append(f"{label}: {detail}")
+            if stat.S_ISLNK(current.st_mode):
+                warnings.append(f"refusing symlink in private agent state: {path}")
+                return
+            if not (stat.S_ISDIR(current.st_mode) or stat.S_ISREG(current.st_mode)):
+                warnings.append(f"refusing special file in private agent state: {path}")
+                return
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            if stat.S_ISDIR(current.st_mode):
+                flags |= getattr(os, "O_DIRECTORY", 0)
+            try:
+                fd = os.open(path, flags)
+            except OSError as exc:
+                warnings.append(f"harden {path}: {exc}")
+                return
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+                    warnings.append(f"path changed while hardening private agent state: {path}")
+                    return
+                os.fchown(fd, owner[0], owner[1])
+                os.fchmod(fd, mode)
+                verified = os.fstat(fd)
+            except OSError as exc:
+                warnings.append(f"harden {path}: {exc}")
+                return
+            finally:
+                os.close(fd)
+            if int(verified.st_uid) != owner[0] or int(verified.st_gid) != owner[1]:
+                warnings.append(f"unexpected owner after hardening {path}")
+            if stat.S_IMODE(verified.st_mode) != mode:
+                warnings.append(
+                    f"unexpected mode after hardening {path}: {stat.S_IMODE(verified.st_mode):o}"
+                )
 
         try:
             spec = get_provider(provider)
             state = home / spec.state_dir
-            ws = state / spec.workspace_dir
+            try:
+                home_st = home.lstat()
+            except OSError as exc:
+                return [f"inspect managed home {home}: {exc}"]
+            if stat.S_ISLNK(home_st.st_mode) or not stat.S_ISDIR(home_st.st_mode):
+                return [f"managed home is not a real directory: {home}"]
+            _harden(home, 0o700)
+            try:
+                state_st = state.lstat()
+            except FileNotFoundError:
+                state_st = None
+            if state_st is not None:
+                if stat.S_ISLNK(state_st.st_mode) or not stat.S_ISDIR(state_st.st_mode):
+                    warnings.append(f"provider state is not a real directory: {state}")
+                    return warnings
+                def walk_error(exc: OSError) -> None:
+                    warnings.append(f"traverse private provider state: {exc}")
 
-            # Home dir: ensure group can at least traverse (g+rx).
-            if home.is_dir():
-                _chmod("chmod home g+rx", ["chmod", "g+rx", str(home)])
-
-            # State dir (.openclaw/): setgid + group-writable so manager
-            # can write config and new files inherit the agent group.
-            if state.is_dir():
-                _chmod("chmod state 2775", ["chmod", "2775", str(state)])
-
-            # Workspace dir: same treatment.
-            if ws.is_dir():
-                _chmod("chmod workspace 2775", ["chmod", "2775", str(ws)])
-
-            # Make existing files in workspace group-writable.
-            if ws.is_dir():
-                for child in ws.iterdir():
-                    if child.is_file():
-                        _chmod(f"chmod {child.name} g+rw", ["chmod", "g+rw", str(child)])
-
-            # Make existing files in state dir group-writable (config, logs).
-            if state.is_dir():
-                for child in state.iterdir():
-                    if child.is_file():
-                        _chmod(f"chmod {child.name} g+rw", ["chmod", "g+rw", str(child)])
-
-            # Add the manager (spawner) user to the agent's group so it can
-            # traverse home and write to state/workspace via group bits.
-            # Prefer SUDO_USER over current user (root) when running under sudo.
-            spawner = (
-                os.environ.get("SUDO_USER", "").strip()
-                or self._current_linux_user()
-            )
-            if spawner and spawner != linux_user:
-                _chmod(
-                    f"usermod add {spawner} to group {linux_user}",
-                    ["usermod", "-a", "-G", linux_user, spawner],
-                )
+                for root, directory_names, file_names in os.walk(
+                    state,
+                    onerror=walk_error,
+                    followlinks=False,
+                ):
+                    root_path = Path(root)
+                    _harden(root_path, 0o700)
+                    for name in directory_names:
+                        _harden(root_path / name, 0o700)
+                    for name in file_names:
+                        _harden(root_path / name, 0o600)
         except OSError as exc:
-            warnings.append(f"workspace accessibility: {exc}")
+            warnings.append(f"private workspace hardening: {exc}")
         return warnings
 
     def spawn_session_agent(

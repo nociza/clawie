@@ -313,7 +313,7 @@ This is the load-bearing section; Phase 4 must not ship before it.
 | **Stop world-relaxing stores** | previous world-relaxed provider-auth/addon-auth/toolchain stores → manager-private caches plus per-agent **0o600** copies; shared toolchain directories `0755`, files non-world-writable | C2 |
 | **Per-agent auth by default** | one shared upstream identity for all → each agent references its own profile (`scope="agent"`); shared is explicit opt-in | C5 |
 | **Remove the binary patch** | rewriting `claude-code/cli.js` modes → per-agent `CLAUDE_CONFIG_DIR` with 0o600 credentials | `_service_spawn.py:323` (C3) |
-| **Close the `/tmp` inject vector** | previous `/tmp` prompt handoff → direct workspace writes only; sudo or manager group access is required when normal permissions block writes | C4 |
+| **Close the `/tmp` inject vector** | previous `/tmp` prompt handoff → direct workspace writes only; sudo/root or authenticated `clawied` IPC is required when owner-only permissions block writes | C4 |
 | **Scope the git bundle** | copying the manager's `.ssh`/`.git-credentials` into agent homes → per-agent deploy keys / no implicit identity copy | C5 |
 | **Reconcile the claims** | README "no agent sees another's secrets" → make it true, or state the real model plainly | `README.md:17` |
 | **Control-plane token** | (new) the control agent's GitHub token is a dedicated **0o600** secret **outside** every shared/relaxed store; never a credential bundle or addon | §9, C2 |

@@ -7,6 +7,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -321,7 +322,6 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     (workspace / "innocent-name.md").write_text(
         "API_KEY=sk-this-value-must-never-be-committed", encoding="utf-8"
     )
-    (workspace / "huge.md").write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
     (home / ".openclaw" / "auth-profiles.json").write_text("{}", encoding="utf-8")
     (workspace / "auth-link.md").symlink_to(home / ".openclaw" / "auth-profiles.json")
     monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: home)
@@ -337,11 +337,203 @@ def test_backup_run_collects_workspace_knowledge_and_skips_secrets(
     assert not (backed / "data.json").exists()
     assert not (backed / "my-token.md").exists()
     assert not (backed / "innocent-name.md").exists()
-    assert not (backed / "huge.md").exists()
     assert not (backed / "auth-link.md").exists()
     # The provider auth store sits outside the workspace and must never appear.
     committed = git_output(repo, "ls-files")
     assert "auth-profiles.json" not in committed
+
+
+def test_backup_run_preserves_last_complete_snapshot_when_collection_is_incomplete(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    state = service.store.read_state()
+    state["agents"]["alice"]["agent"]["linux_user"] = "alice"
+    service.store.write_state(state)
+    home = tmp_path / "alice-home"
+    workspace = home / ".openclaw" / "workspace"
+    workspace.mkdir(parents=True)
+    notes = workspace / "NOTES.md"
+    notes.write_text("last complete notes", encoding="utf-8")
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: home)
+
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    complete = service.backup_run()
+    head = complete["commit"]
+    notes.write_text("new notes from an incomplete pass", encoding="utf-8")
+    (workspace / "huge.md").write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
+
+    degraded = service.backup_run()
+
+    assert degraded["status"] == "degraded"
+    assert degraded["changed"] is False
+    assert degraded["commit"] == head
+    assert degraded["incomplete"]
+    assert git_output(repo, "rev-parse", "HEAD") == head
+    assert (repo / "agents" / "alice" / "workspace" / "NOTES.md").read_text(
+        encoding="utf-8"
+    ) == "last complete notes"
+    assert service.backup_settings()["last_status"] == "degraded"
+
+
+def test_backup_run_recovers_an_interrupted_tree_swap_before_collecting(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    first = service.backup_run()
+    transaction = "c" * 32
+    previous_state = repo / f".clawie-backup-previous-{transaction}-state"
+    (repo / "state").rename(previous_state)
+    (repo / "state").mkdir()
+    (repo / "state" / "partial.txt").write_text("incomplete", encoding="utf-8")
+    abandoned_stage = repo / ".clawie-backup-stage-abandoned"
+    abandoned_stage.mkdir()
+    (repo / ".clawie-backup-transaction.json").write_text(
+        json.dumps(
+            {
+                "transaction": transaction,
+                "phase": "installing",
+                "existed": {"state": True, "agents": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    status = service.backup_status()
+    assert status["interrupted_transaction"] is True
+    assert "interrupted" in status["validation_error"]
+    with raises(SetupError, match="interrupted snapshot transaction"):
+        service.backup_restore(apply_to_disk=False)
+
+    recovered = service.backup_run()
+
+    assert recovered["status"] == "completed"
+    assert recovered["commit"] == first["commit"]
+    assert (repo / "state" / "snapshot.json").is_file()
+    assert not (repo / "state" / "partial.txt").exists()
+    assert not (repo / ".clawie-backup-transaction.json").exists()
+    assert not previous_state.exists()
+    assert not abandoned_stage.exists()
+
+
+def test_backup_recovery_rejects_a_tampered_previous_tree(
+    tmp_path: Path,
+) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    service.backup_run()
+    transaction = "d" * 32
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    (repo / f".clawie-backup-previous-{transaction}-state").symlink_to(
+        victim,
+        target_is_directory=True,
+    )
+    (repo / ".clawie-backup-transaction.json").write_text(
+        json.dumps(
+            {
+                "transaction": transaction,
+                "phase": "installed",
+                "existed": {"state": True, "agents": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with raises(SetupError, match="backup recovery path is unsafe"):
+        service.backup_run()
+
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert (repo / ".clawie-backup-transaction.json").is_file()
+
+
+def test_backup_run_records_unexpected_collection_failure_without_replacing_snapshot(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    repo = tmp_path / "repo"
+    service.backup_init(repo)
+    complete = service.backup_run()
+    snapshot = (repo / "state" / "snapshot.json").read_bytes()
+    monkeypatch.setattr(
+        service,
+        "_write_backup_tree",
+        lambda _repo: (_ for _ in ()).throw(OSError("disk read failed")),
+    )
+
+    with raises(OSError, match="disk read failed"):
+        service.backup_run()
+
+    assert git_output(repo, "rev-parse", "HEAD") == complete["commit"]
+    assert (repo / "state" / "snapshot.json").read_bytes() == snapshot
+    settings = service.backup_settings()
+    assert settings["last_status"] == "failed"
+    assert "disk read failed" in settings["last_error"]
+    assert service.list_events(limit=1)[0]["type"] == "backup.failed"
+
+
+def test_concurrent_backup_runs_are_serialized(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    first = make_service(tmp_path)
+    make_agent(first)
+    repo = tmp_path / "repo"
+    first.backup_init(repo)
+    second = ClawieService(StateStore(config_dir=first.store.root))
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    results: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+    first_write = first._write_backup_tree
+    second_write = second._write_backup_tree
+
+    def delayed_first(repo_path: Path) -> dict[str, Any]:
+        first_entered.set()
+        if not release_first.wait(timeout=5):
+            raise TimeoutError("test did not release the first backup")
+        return first_write(repo_path)
+
+    def observed_second(repo_path: Path) -> dict[str, Any]:
+        second_entered.set()
+        return second_write(repo_path)
+
+    monkeypatch.setattr(first, "_write_backup_tree", delayed_first)
+    monkeypatch.setattr(second, "_write_backup_tree", observed_second)
+
+    def run(service: ClawieService) -> None:
+        try:
+            results.append(service.backup_run())
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below.
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=run, args=(first,))
+    second_thread = threading.Thread(target=run, args=(second,))
+    first_thread.start()
+    assert first_entered.wait(timeout=2)
+    second_thread.start()
+    assert not second_entered.wait(timeout=0.2)
+    release_first.set()
+    first_thread.join(timeout=10)
+    second_thread.join(timeout=10)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not errors
+    assert second_entered.is_set()
+    assert [row["status"] for row in results] == ["completed", "completed"]
 
 
 def test_backup_secret_scanner_catches_common_cloud_and_registry_tokens() -> None:
@@ -367,7 +559,7 @@ def test_backup_remote_push_is_opt_in(tmp_path: Path) -> None:
     assert service.backup_settings()["auto_push"] is False
 
 
-def test_backup_run_push_failure_is_nonfatal(tmp_path: Path) -> None:
+def test_backup_run_push_failure_is_reported_as_degraded(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     repo = tmp_path / "repo"
     service.backup_init(repo, remote=str(tmp_path / "missing-remote.git"))
@@ -375,6 +567,22 @@ def test_backup_run_push_failure_is_nonfatal(tmp_path: Path) -> None:
     assert result["changed"] is True
     assert result["pushed"] is False
     assert result["push_error"]
+    assert result["status"] == "degraded"
+    assert service.backup_settings()["last_status"] == "degraded"
+
+
+def test_backup_cli_returns_nonzero_when_explicit_push_fails(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    service = make_service(tmp_path)
+    service.backup_init(tmp_path / "repo", remote=str(tmp_path / "missing-remote.git"))
+
+    code = run_cli(tmp_path / "clawie", "backup", "run", "--push")
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "remote durability was not achieved" in captured.out
 
 
 def test_backup_run_pushes_to_local_remote(tmp_path: Path) -> None:
@@ -635,6 +843,20 @@ def test_export_state_refuses_symlink_target(tmp_path: Path) -> None:
     assert victim.read_text(encoding="utf-8") == "leave me alone\n"
 
 
+def test_export_refuses_snapshot_that_cannot_be_imported_under_size_limit(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = make_service(tmp_path / "source")
+    target = tmp_path / "missing-parent" / "snapshot.json"
+    monkeypatch.setattr("clawie.service._MAX_STATE_SNAPSHOT_BYTES", 128)
+
+    with raises(ValueError, match="round-trip import limit"):
+        service.export_state(target)
+
+    assert not target.parent.exists()
+
+
 def test_export_import_merge_keeps_existing_agents(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     make_agent(service)
@@ -645,6 +867,134 @@ def test_export_import_merge_keeps_existing_agents(tmp_path: Path) -> None:
     other.import_state(target, merge=True)
     agents = other.store.read_state()["agents"]
     assert {"alice", "bob"} <= set(agents)
+
+
+def test_import_rejects_malformed_snapshot_before_changing_live_state(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    make_agent(service)
+    before_config = dict(service.store.read_config())
+    before_state = dict(service.store.read_state())
+    snapshot = tmp_path / "malformed.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "config": {**before_config, "workspace": "must-not-apply"},
+                "state": {
+                    "templates": before_state["templates"],
+                    "agents": before_state["agents"],
+                    "events": [{"type": "bad", "context": ["not", "an", "object"]}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with raises(ValueError, match="events"):
+        service.import_state(snapshot)
+
+    assert service.store.read_config()["workspace"] == before_config["workspace"]
+    assert service.store.read_state()["agents"] == before_state["agents"]
+
+
+def test_import_rejects_an_unbounded_event_history(tmp_path: Path) -> None:
+    service = make_service(tmp_path)
+    before = service.store.read_state()
+    snapshot = tmp_path / "too-many-events.json"
+    events = [
+        {"timestamp": "", "type": "audit", "message": "", "context": {}}
+        for _ in range(service.EVENT_LIMIT + 1)
+    ]
+    snapshot.write_text(
+        json.dumps(
+            {
+                "config": dict(service.store.read_config()),
+                "state": {
+                    "templates": before["templates"],
+                    "agents": before["agents"],
+                    "events": events,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with raises(ValueError, match="maximum"):
+        service.import_state(snapshot)
+
+    assert service.store.read_state()["events"] == before["events"]
+
+
+def test_import_refuses_to_orphan_an_existing_managed_runtime(tmp_path: Path) -> None:
+    service = make_service(tmp_path / "live")
+    agent = make_agent(service, "worker")
+    agent["agent"].update(
+        {
+            "linux_user": "clawie-worker",
+            "linux_home": "/home/clawie-worker",
+            "linux_user_managed": True,
+            "managed_user_operation_id": "d" * 32,
+        }
+    )
+    state = service.store.read_state()
+    state["agents"]["worker"] = agent
+    service.store.write_state(state)
+    source = make_service(tmp_path / "source")
+    snapshot = source.export_state(tmp_path / "replacement.json")
+
+    with raises(SetupError, match="would orphan or remap managed runtime"):
+        service.import_state(snapshot)
+
+    preserved = service.store.read_state()["agents"]["worker"]["agent"]
+    assert preserved["linux_user"] == "clawie-worker"
+    assert preserved["managed_user_operation_id"] == "d" * 32
+
+
+def test_import_refuses_to_introduce_an_unprovisioned_linux_runtime(tmp_path: Path) -> None:
+    source = make_service(tmp_path / "source")
+    agent = make_agent(source, "worker")
+    agent["agent"].update(
+        {
+            "linux_user": "root",
+            "linux_uid": 0,
+            "linux_home": "/root",
+            "linux_user_managed": True,
+            "managed_user_operation_id": "e" * 32,
+        }
+    )
+    state = source.store.read_state()
+    state["agents"]["worker"] = agent
+    source.store.write_state(state)
+    snapshot = source.export_state(tmp_path / "unprovisioned-runtime.json")
+    destination = make_service(tmp_path / "destination")
+
+    with raises(SetupError, match="without local provisioning proof"):
+        destination.import_state(snapshot)
+
+    assert "worker" not in destination.store.read_state()["agents"]
+
+
+def test_cli_import_requires_confirmation_before_replacement(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    source = make_service(tmp_path / "source")
+    make_agent(source, "alice")
+    snapshot = source.export_state(tmp_path / "snapshot.json")
+    destination = make_service(tmp_path / "destination")
+    make_agent(destination, "bob")
+
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        lambda _prompt="": (_ for _ in ()).throw(EOFError()),
+    )
+    code = run_cli(tmp_path / "destination" / "clawie", "backup", "import", str(snapshot))
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "use --yes" in captured.err
+    assert "bob" in destination.store.read_state()["agents"]
 
 
 # ── auth porting between claws ──────────────────────────────────────────────
@@ -809,7 +1159,7 @@ def test_agent_id_rejects_path_unsafe_values(tmp_path: Path, capsys: CaptureFixt
 
     capsys.readouterr()
     code = run_cli(tmp_path / "clawie", "agent", "create", "../evil")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert code == 1
     assert "agent_id must start with" in output
 
@@ -827,7 +1177,8 @@ def test_agent_purge_without_stdin_cancels_cleanly(
 
     monkeypatch.setattr(builtins, "input", no_stdin)
     code = run_cli(tmp_path, "agent", "purge", "ghost")
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
     assert code == 1
     assert "purge cancelled" in output
     assert "--yes" in output

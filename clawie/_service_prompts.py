@@ -306,9 +306,8 @@ class PromptOpsMixin:
                 if linux_user:
                     raise SetupError(
                         "could not write core prompts directly to the agent workspace. "
-                        "Run with sudo/root or run 'sudo clawie agent fix-permissions "
-                        "<agent-id>' to grant manager access; insecure /tmp prompt "
-                        "staging is disabled."
+                        "Run with sudo/root or through clawied; private agent homes "
+                        "must not be opened to manager-group access and insecure staging is disabled."
                     )
                 else:
                     raise

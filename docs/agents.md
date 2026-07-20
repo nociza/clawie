@@ -106,9 +106,13 @@ via the service API.
 ## Delete
 
 ```bash
-clawie agent delete alice          # Remove metadata only
+clawie agent delete alice          # Remove a definition-only record
 sudo clawie agent purge alice      # Remove metadata + Linux user + credentials
 ```
+
+`delete` refuses records with a `linux_user`, preventing an active runtime and
+credential copies from becoming invisible or unmanaged. Use confirmed `purge`
+for every provisioned runtime.
 
 ## Batch provisioning
 

@@ -23,9 +23,9 @@ clawie status --refresh       # sample live CPU/memory once
 
 `status` is read-only and never requires root. A section that can't be read
 (e.g. an unconfigured maintenance cron) degrades to an error note instead of
-blanking the whole report. Fatal state-store safety refusals, such as a
-non-clawie `--config-dir` that would need permission changes, render the JSON
-error details and exit nonzero.
+blanking the whole report. It does not initialize, migrate, chmod, or rewrite
+the state store; `--refresh` is the explicit exception that records fresh
+metrics. Existing unsafe database paths still render error details.
 
 ## config
 
@@ -34,6 +34,10 @@ clawie config show
 clawie config set [--provider P] [--auth-mode M] [--api-key K] [--workspace W] [--subscription S] [--interactive]
 clawie config set --control-github-repo OWNER/REPO --control-github-token-path PATH [--control-operator HANDLE] [--control-issue-label LABEL] [--control-github-rate-limit-seconds N]
 ```
+
+`config set` is a patch operation: omitted options keep their current values.
+Changing providers reuses that provider's stored auth when available and uses
+its safe defaults otherwise.
 
 ## agent
 
@@ -46,6 +50,9 @@ clawie agent delete AGENT_ID
 clawie agent purge AGENT_ID
 clawie agent create-batch FILE
 ```
+
+`delete` is only for definition-only agents. It refuses any record attached to
+a Linux runtime; use confirmed `purge` to stop and remove that runtime safely.
 
 ### agent prompt
 
@@ -293,12 +300,20 @@ Full-fidelity local snapshots (credentials included; file is chmod `0600`):
 
 ```bash
 clawie backup export PATH
-clawie backup import PATH [--merge]
+clawie backup import PATH [--merge] [--yes]
 ```
+
+Replacement imports require confirmation (or `--yes`), validate the entire
+snapshot first, and update configuration and state in one transaction. Replace
+and merge both fail closed if an existing managed Linux runtime would be
+removed or remapped; purge that runtime explicitly first. Imports also reject
+new Linux-user mappings without local provisioning proof. Import the definition
+without those fields, then use `runtime create` on the destination host.
 
 ## Global flags
 
 | Flag | Description |
 |------|-------------|
 | `--config-dir` | Override state directory (default: `~/.clawie`) |
+| `--no-color` | Disable ANSI colors (`NO_COLOR` is also honored) |
 | `--version` | Show the installed clawie version and exit |

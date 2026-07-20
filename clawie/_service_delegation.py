@@ -508,8 +508,10 @@ class DelegationOpsMixin:
                     backup_summary = f"ok (commit {str(outcome.get('commit', ''))[:10]})"
                 else:
                     backup_summary = "ok (no changes)"
-                if outcome.get("push_error"):
-                    backup_summary += f"; push failed: {outcome['push_error']}"
+                if outcome.get("status") != "completed":
+                    detail = str(outcome.get("error", "") or "backup degraded")
+                    backup_summary = f"error: {detail}"
+                    errors += 1
             except Exception as exc:
                 backup_summary = f"error: {exc}"
                 errors += 1

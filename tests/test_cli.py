@@ -87,6 +87,37 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
     assert not (tmp_path / "clawie.db").exists()
 
 
+def test_json_command_errors_are_structured_on_stderr(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ClawieService,
+        "status_snapshot",
+        lambda self, **_kwargs: (_ for _ in ()).throw(ValueError("broken status")),
+    )
+
+    code = run_cli(tmp_path, "status", "--json")
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.out == ""
+    payload = json.loads(captured.err)
+    assert payload == {"ok": False, "error": "broken status", "error_type": "ValueError"}
+    assert "\x1b[" not in captured.err
+
+
+def test_non_tty_output_does_not_contain_ansi_sequences(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set") == 0
+    captured = capsys.readouterr()
+    assert "\x1b[" not in captured.out
+    assert "\x1b[" not in captured.err
+
+
 def test_fresh_store_is_not_reported_as_configured(
     tmp_path: Path, capsys: CaptureFixture[str]
 ) -> None:
@@ -1290,9 +1321,37 @@ def test_parse_gws_status_output_marks_invalid_client_config_missing(tmp_path: P
 
 def test_setup_api_key_mode_requires_api_key(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
     code = run_cli(tmp_path, "config", "set", "--provider", "picoclaw", "--auth-mode", "api_key")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert code == 1
     assert "API key is required when --auth-mode api_key is selected" in output
+
+
+def test_config_set_preserves_every_omitted_value(tmp_path: Path) -> None:
+    assert run_cli(
+        tmp_path,
+        "config",
+        "set",
+        "--provider",
+        "picoclaw",
+        "--auth-mode",
+        "linked",
+        "--subscription",
+        "pro",
+        "--workspace",
+        "production",
+        "--api-url",
+        "https://api.picoclaw.example/v1",
+    ) == 0
+
+    assert run_cli(tmp_path, "config", "set", "--subscription", "enterprise") == 0
+
+    config = StateStore(config_dir=tmp_path).read_config()
+    assert config["provider"] == "picoclaw"
+    assert config["auth_mode"] == "linked"
+    assert config["subscription"] == "enterprise"
+    assert config["workspace"] == "production"
+    assert config["api_url"] == "https://api.picoclaw.example/v1"
+    assert config["provider_credentials"]["picoclaw"]["auth_mode"] == "linked"
 
 
 def test_create_agent_with_provider_override(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -1626,7 +1685,7 @@ def test_spawn_requires_root(
     assert run_cli(tmp_path, "config", "set", "--api-key", "zc_live_1234") == 0
     capsys.readouterr()
     code = run_cli(tmp_path, "runtime", "create", "sam")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert code == 1
     assert "requires root privileges" in output
 
@@ -2063,6 +2122,7 @@ def test_purge_removes_agent_and_linux_user_with_root(
     operation_id = "a" * 32
     info = state["agents"]["teleclaw"]["agent"]
     info["linux_user"] = "teleclaw"
+    info["linux_uid"] = 12345
     info["linux_home"] = str(managed_home)
     info["linux_user_managed"] = True
     info["managed_user_operation_id"] = operation_id
@@ -2072,6 +2132,7 @@ def test_purge_removes_agent_and_linux_user_with_root(
                 "format_version": 1,
                 "agent_id": "teleclaw",
                 "linux_user": "teleclaw",
+                "linux_uid": 12345,
                 "operation_id": operation_id,
                 "state_root": str(store.root.resolve()),
             }
@@ -2082,28 +2143,173 @@ def test_purge_removes_agent_and_linux_user_with_root(
 
     calls: list[list[str]] = []
 
+    removed = False
+
     def fake_run(cmd: list[str], **_: object) -> object:
+        nonlocal removed
         calls.append(cmd)
 
         class Result:
-            returncode = 0
-            stdout = ""
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+                self.stdout = ""
+                self.stderr = ""
 
         if cmd[:2] == ["id", "-u"]:
-            return Result()
+            return Result(1 if removed else 0)
+        if cmd[:2] == ["userdel", "-r"]:
+            removed = True
+            (managed_home / ".clawie-managed-user.json").unlink()
+            managed_home.rmdir()
         return Result()
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr("subprocess.run", fake_run)
     monkeypatch.setattr(ClawieService, "_linux_home_for_user", lambda self, user: managed_home)
+    monkeypatch.setattr(
+        ClawieService,
+        "_run_managed_provider_service_action",
+        lambda self, **kwargs: {"service_status": "stopped"},
+    )
+    monkeypatch.setattr(ClawieService, "_provider_process_live_ps_only", lambda self, *args: False)
     monkeypatch.setattr(ClawieService, "_disable_ssh_login_for_user", lambda self, _username: True)
 
     code = run_cli(tmp_path, "agent", "purge", "teleclaw", "--yes")
     output = capsys.readouterr().out
     assert code == 0
     assert "Purged agent teleclaw" in output
+    assert "runtime_stopped=True" in output
     assert any(cmd[:2] == ["userdel", "-r"] for cmd in calls)
     assert "teleclaw" not in StateStore(config_dir=tmp_path).read_state()["agents"]
+
+
+def test_purge_preserves_agent_and_user_when_runtime_cannot_be_stopped(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(provider="openclaw")
+    agent = service.create_agent(
+        agent_id="worker",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    managed_home = tmp_path / "worker-home"
+    managed_home.mkdir()
+    operation_id = "b" * 32
+    info = agent["agent"]
+    info.update(
+        {
+            "linux_user": "worker",
+            "linux_uid": 12346,
+            "linux_home": str(managed_home),
+            "linux_user_managed": True,
+            "managed_user_operation_id": operation_id,
+        }
+    )
+    (managed_home / ".clawie-managed-user.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "agent_id": "worker",
+                "linux_user": "worker",
+                "linux_uid": 12346,
+                "operation_id": operation_id,
+                "state_root": str(service.store.root.resolve()),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = service.store.read_state()
+    state["agents"]["worker"] = agent
+    service.store.write_state(state)
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(service, "_linux_user_exists", lambda _user: True)
+    monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: managed_home)
+    monkeypatch.setattr(
+        service,
+        "_run_managed_provider_service_action",
+        lambda **kwargs: (_ for _ in ()).throw(SetupError("stop failed")),
+    )
+    monkeypatch.setattr(service, "_run_systemd_user_command", lambda *args: {"ok": False})
+    monkeypatch.setattr(service, "_force_stop_provider_processes", lambda *args: None)
+    monkeypatch.setattr(service, "_managed_provider_process_live_for_purge", lambda *args: True)
+    monkeypatch.setattr("subprocess.run", lambda cmd, **kwargs: calls.append(cmd))
+
+    with raises(SetupError, match="runtime is still running"):
+        service.purge_agent("worker")
+
+    assert not any(command[:2] == ["userdel", "-r"] for command in calls)
+    assert "worker" in service.store.read_state()["agents"]
+
+
+def test_purge_preserves_record_when_userdel_leaves_the_managed_home(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(provider="openclaw")
+    agent = service.create_agent(
+        agent_id="worker",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    managed_home = tmp_path / "worker-home"
+    managed_home.mkdir()
+    operation_id = "f" * 32
+    agent["agent"].update(
+        {
+            "linux_user": "worker",
+            "linux_uid": 12347,
+            "linux_home": str(managed_home),
+            "linux_user_managed": True,
+            "managed_user_operation_id": operation_id,
+        }
+    )
+    (managed_home / ".clawie-managed-user.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "agent_id": "worker",
+                "linux_user": "worker",
+                "linux_uid": 12347,
+                "operation_id": operation_id,
+                "state_root": str(service.store.root.resolve()),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = service.store.read_state()
+    state["agents"]["worker"] = agent
+    service.store.write_state(state)
+    existence_checks = iter((True, False))
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(service, "_linux_user_exists", lambda _user: next(existence_checks))
+    monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: managed_home)
+    monkeypatch.setattr(service, "_stop_managed_runtime_for_purge", lambda **_kwargs: True)
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: Result())
+
+    with raises(SetupError, match="managed home .* still exists"):
+        service.purge_agent("worker")
+
+    assert managed_home.is_dir()
+    assert "worker" in service.store.read_state()["agents"]
 
 
 def test_purge_refuses_unmarked_linux_user(
@@ -2133,7 +2339,7 @@ def test_purge_refuses_unmarked_linux_user(
     monkeypatch.setattr(ClawieService, "_linux_home_for_user", lambda self, user: home)
 
     code = run_cli(tmp_path, "agent", "purge", "legacy", "--yes")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
 
     assert code == 1
     assert "no managed-user ownership proof" in output
@@ -2157,9 +2363,32 @@ def test_purge_requires_root_for_spawned_linux_user(
 
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     code = run_cli(tmp_path, "agent", "purge", "teleclaw", "--yes")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert code == 1
     assert "purge requires root privileges" in output
+
+
+def test_delete_refuses_to_orphan_a_managed_linux_runtime(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(provider="openclaw")
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "clawie-alice"
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+
+    with raises(SetupError, match="use 'clawie agent purge alice'"):
+        service.delete_agent("alice")
+
+    assert "alice" in service.store.read_state()["agents"]
 
 
 def test_purge_accepts_positional_agent_id(
@@ -5634,8 +5863,15 @@ def _mock_openclaw_generated_user_unit(
     runtime_state: dict[str, bool],
 ) -> list[tuple[str, str, str]]:
     actions: list[tuple[str, str, str]] = []
+    unit_path = service.store.root / "openclaw.service"
+    unit_path.write_text("[Service]\nExecStart=/usr/bin/openclaw\n", encoding="utf-8")
 
     monkeypatch.setattr(service, "_ensure_generated_user_service_unit", lambda provider, linux_user: True)
+    monkeypatch.setattr(
+        service,
+        "_generated_user_service_unit_path",
+        lambda _provider, _linux_user: unit_path,
+    )
     monkeypatch.setattr(
         service,
         "_run_systemd_user_command",
@@ -6905,6 +7141,8 @@ def test_performance_snapshot_uses_live_runtime_as_provider_source_of_truth(
     assert row["cpu_percent"] == 1.5
     assert row["mem_percent"] == 2.5
     assert row["rss_kb"] == 4096
+    # Observational status may show live drift but must not rewrite desired state.
+    assert service.store.read_state()["agents"]["teleclaw"]["agent"]["provider"] == "openclaw"
 
 
 def test_probe_process_falls_back_when_ps_is_denied(
@@ -7973,21 +8211,97 @@ def test_status_command_partial_section_error_still_exits_zero(
     assert "checks" in payload["health"]
 
 
-def test_status_command_fatal_state_root_error_exits_nonzero(
+def test_status_command_unsafe_database_sidecar_exits_nonzero(
     tmp_path: Path,
     capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    (tmp_path / "clawie.db-wal").symlink_to(victim)
+
+    assert run_cli(tmp_path, "status", "--json") == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert any(
+        "database sidecar must be a regular file" in str(section.get("error", ""))
+        for section in payload.values()
+        if isinstance(section, dict)
+    )
+    assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_status_command_does_not_initialize_or_chmod_an_unconfigured_state_root(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
 ) -> None:
     shared = tmp_path / "shared"
     shared.mkdir()
     (shared / "unrelated.txt").write_text("keep", encoding="utf-8")
     shared.chmod(0o755)
+    shared_auth = tmp_path / "system-shared-auth"
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", shared_auth)
+    before = sorted(path.relative_to(shared) for path in shared.rglob("*"))
 
     code = run_cli(shared, "status", "--json")
 
-    assert code == 1
+    assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert "refusing to change permissions on non-clawie state directory" in payload["setup"]["error"]
+    assert payload["setup"]["configured"] is False
+    assert not (shared / "clawie.db").exists()
+    assert (shared / "unrelated.txt").read_text(encoding="utf-8") == "keep"
     assert shared.stat().st_mode & 0o777 == 0o755
+    assert sorted(path.relative_to(shared) for path in shared.rglob("*")) == before
+    assert not shared_auth.exists()
+
+
+def test_runtime_status_does_not_generate_or_start_a_user_service(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    home = tmp_path / "agent-home"
+    home.mkdir()
+    monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: home)
+
+    result = service._run_generated_user_service_action(
+        provider="openclaw",
+        action="status",
+        linux_user="worker",
+        agent_info={},
+    )
+
+    assert result is None
+    assert not (home / ".config").exists()
+
+
+def test_status_does_not_mutate_a_configured_state_tree(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    service = ClawieService(StateStore(config_dir=state_root))
+    service.setup(provider="openclaw")
+    monkeypatch.setattr(ClawieService, "SHARED_PROVIDER_AUTH_DIR", tmp_path / "shared-auth")
+
+    def fingerprint() -> list[tuple[str, int, int, int]]:
+        return sorted(
+            (
+                str(path.relative_to(state_root)),
+                path.lstat().st_mode,
+                path.lstat().st_size,
+                path.lstat().st_mtime_ns,
+            )
+            for path in state_root.rglob("*")
+        )
+
+    before = fingerprint()
+    service.status_snapshot()
+
+    assert fingerprint() == before
+    assert not (tmp_path / "shared-auth").exists()
 
 
 def test_agent_create_and_show_print_requested_model_tier(
@@ -8106,7 +8420,7 @@ def test_spawn_fails_when_useradd_leaves_no_home(
     )
 
     code = run_cli(tmp_path, "runtime", "create", "sam", "--user", "sam", "--skip-config-copy")
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert code == 1
     assert "was not created" in output
 
@@ -8155,18 +8469,83 @@ def test_ensure_workspace_accessible_collects_warnings_without_raising(
     home.mkdir()
     monkeypatch.setattr(os, "geteuid", lambda: 0)
 
-    def fake_run(cmd: list[str], **_: object) -> object:
-        class Result:
-            returncode = 1
-            stdout = ""
-            stderr = "chmod: operation not permitted"
+    class UserInfo:
+        pw_uid = os.getuid()
+        pw_gid = os.getgid()
 
-        return Result()
-
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("clawie._service_spawn.pwd.getpwnam", lambda _user: UserInfo())
+    monkeypatch.setattr(
+        "clawie._service_spawn.os.fchown",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("operation not permitted")),
+    )
     warnings = service._ensure_workspace_accessible("openclaw", home, "sam")
     assert warnings  # failures are collected, not silently swallowed
     assert any("not permitted" in w for w in warnings)
+
+
+def test_ensure_workspace_accessible_enforces_private_modes_without_group_membership(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
+    home = tmp_path / "home"
+    workspace = home / ".openclaw" / "workspace"
+    workspace.mkdir(parents=True)
+    config = home / ".openclaw" / "openclaw.json"
+    note = workspace / "MEMORY.md"
+    config.write_text("{}", encoding="utf-8")
+    note.write_text("memory", encoding="utf-8")
+    for path in (home, home / ".openclaw", workspace):
+        path.chmod(0o775)
+    for path in (config, note):
+        path.chmod(0o664)
+
+    class UserInfo:
+        pw_uid = os.getuid()
+        pw_gid = os.getgid()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("clawie._service_spawn.pwd.getpwnam", lambda _user: UserInfo())
+    monkeypatch.setattr("clawie._service_spawn.os.fchown", lambda *_args, **_kwargs: None)
+
+    warnings = service._ensure_workspace_accessible("openclaw", home, "alice")
+
+    assert warnings == []
+    assert home.stat().st_mode & 0o777 == 0o700
+    assert (home / ".openclaw").stat().st_mode & 0o777 == 0o700
+    assert workspace.stat().st_mode & 0o777 == 0o700
+    assert config.stat().st_mode & 0o777 == 0o600
+    assert note.stat().st_mode & 0o777 == 0o600
+
+
+def test_ensure_workspace_accessible_rejects_a_symlinked_provider_tree(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "clawie"))
+    home = tmp_path / "home"
+    home.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    secret = victim / "secret.txt"
+    secret.write_text("keep", encoding="utf-8")
+    victim.chmod(0o755)
+    secret.chmod(0o644)
+    (home / ".openclaw").symlink_to(victim, target_is_directory=True)
+
+    class UserInfo:
+        pw_uid = os.getuid()
+        pw_gid = os.getgid()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr("clawie._service_spawn.pwd.getpwnam", lambda _user: UserInfo())
+    monkeypatch.setattr("clawie._service_spawn.os.fchown", lambda *_args, **_kwargs: None)
+
+    warnings = service._ensure_workspace_accessible("openclaw", home, "alice")
+
+    assert any("provider state is not a real directory" in warning for warning in warnings)
+    assert victim.stat().st_mode & 0o777 == 0o755
+    assert secret.stat().st_mode & 0o777 == 0o644
+    assert secret.read_text(encoding="utf-8") == "keep"
 
 
 def test_hash_password_falls_back_to_openssl_when_crypt_not_sha512(

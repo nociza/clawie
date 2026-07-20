@@ -7,7 +7,7 @@
 | **Operating system** | Linux (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, `/tmp`, and `apt-get`. Not compatible with macOS or Windows. |
 | **Python** | 3.10 or later |
 | **Dependencies** | Stdlib on Python 3.11+. Python 3.10 installs `tomli` for TOML parsing. |
-| **Terminal** | UTF-8 encoding and color support for `clawie status` output. Minimum 80x24 recommended. |
+| **Terminal** | UTF-8 encoding. Color is TTY-aware and optional (`--no-color` or `NO_COLOR`). Minimum 80x24 recommended for text status. |
 
 ## Root / sudo
 
@@ -28,6 +28,10 @@ Most read-only operations work without root. These require `sudo`:
 
 When run with `sudo`, clawie reads `SUDO_USER` and uses the invoking user's
 `~/.clawie` state directory instead of `/root/.clawie`.
+
+Managed homes remain `0700`, provider directories `0700`, and provider files
+`0600`. Clawie never adds the manager to an agent group; cross-user changes go
+through sudo/root or the authenticated `clawied` IPC service.
 
 ## Provider runtimes
 

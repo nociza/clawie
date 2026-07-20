@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pwd
 import re
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -16,7 +18,7 @@ from clawie.providers import (
     provider_names,
 )
 from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
-from clawie.safe_fs import read_text_under
+from clawie.safe_fs import read_text_under, remove_under
 
 # Agent IDs become file names, backup paths, channel prefixes, and
 # default Linux usernames; keep them path- and shell-safe.
@@ -1072,15 +1074,11 @@ class AgentOpsMixin:
             self._write_agent_json_file(home, ".openclaw/openclaw.json", config, linux_user)
 
     def ensure_agent_permissions(self, agent_id: str, manager_user: str = "") -> dict[str, Any]:
-        """Set up group-based access so the manager user can manage the agent without sudo.
+        """Repair an agent home to the private production permission profile.
 
-        Requires root.  Adds *manager_user* (default: current user) to the
-        agent's Linux group and sets the provider state/workspace directories
-        to setgid-group-writable (2775).  The agent user's permissions are
-        unaffected—only group bits are widened.
-
-        After running this once (with sudo), the manager can write prompt
-        files and update configs without root.
+        The manager-user argument remains for API compatibility but never
+        grants group access. Cross-user writes run as root or through the
+        authenticated ``clawied`` service.
         """
         self._require_setup()
         if os.geteuid() != 0:
@@ -1102,64 +1100,36 @@ class AgentOpsMixin:
         if not home:
             raise SetupError(f"cannot resolve home directory for {linux_user}")
 
-        manager = (
-            str(manager_user).strip()
-            or str(agent_info.get("manager_user", "")).strip()
-            or os.environ.get("SUDO_USER", "").strip()
-            or self._current_linux_user()
-        )
-        changes: list[str] = []
-
-        spec = get_provider(provider)
-        state_dir = home / spec.state_dir
-        ws = state_dir / spec.workspace_dir
-
-        # Home dir: ensure group r-x for traversal.
-        if home.is_dir():
-            subprocess.run(["chmod", "g+rx", str(home)], check=False)
-            changes.append(f"{home}: g+rx")
-
-        # State dir: setgid + group-writable.
-        if state_dir.is_dir():
-            subprocess.run(["chmod", "2775", str(state_dir)], check=False)
-            changes.append(f"{state_dir}: 2775")
-            for child in state_dir.iterdir():
-                if child.is_file():
-                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
-
-        # Workspace: setgid + group-writable.
-        if ws.is_dir():
-            subprocess.run(["chmod", "2775", str(ws)], check=False)
-            changes.append(f"{ws}: 2775")
-            for child in ws.iterdir():
-                if child.is_file():
-                    subprocess.run(["chmod", "g+rw", str(child)], check=False)
-                    changes.append(f"{child.name}: g+rw")
-
-        # Add manager to agent group.
-        if manager and manager != linux_user:
-            result = subprocess.run(
-                ["usermod", "-a", "-G", linux_user, manager],
-                check=False, capture_output=True, text=True,
-            )
-            if result.returncode == 0:
-                changes.append(f"added {manager} to group {linux_user}")
-            else:
-                changes.append(f"usermod failed: {(result.stderr or '').strip()}")
+        _ = manager_user
+        warnings = self._ensure_workspace_accessible(provider, home, linux_user)
+        if warnings:
+            raise SetupError("could not repair private permissions: " + "; ".join(warnings))
 
         return {
             "agent_id": agent_id,
             "linux_user": linux_user,
-            "manager": manager,
-            "changes": changes,
+            "manager": "root-or-clawied",
+            "changes": [
+                f"{home}: 0700 and owned by {linux_user}",
+                "provider directories: 0700",
+                "provider files: 0600",
+            ],
         }
 
     def delete_agent(self, agent_id: str) -> None:
         self._require_setup()
         state = self.store.read_state()
         agents = state.setdefault("agents", {})
-        if agent_id not in agents:
+        agent = agents.get(agent_id)
+        if agent is None:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
+        info = agent.get("agent", {}) if isinstance(agent, dict) else {}
+        linux_user = str(info.get("linux_user", "") or "").strip()
+        if linux_user:
+            raise SetupError(
+                f"agent '{agent_id}' still has Linux runtime user '{linux_user}'; "
+                f"use 'clawie agent purge {agent_id}' to remove it safely"
+            )
         del agents[agent_id]
         self._event(
             state,
@@ -1181,6 +1151,7 @@ class AgentOpsMixin:
         linux_user = str(info.get("linux_user", "")).strip()
         user_removed = False
         home_removed = False
+        runtime_stopped = False
         ssh_cleanup_error = ""
         if linux_user:
             if os.geteuid() != 0:
@@ -1207,13 +1178,47 @@ class AgentOpsMixin:
                     f"{home_path}. Inspect it and remove it explicitly before purging the record."
                 )
             if user_exists:
+                runtime_stopped = self._stop_managed_runtime_for_purge(
+                    agent_id=agent_id,
+                    linux_user=linux_user,
+                    info=info,
+                )
                 subprocess.run(["userdel", "-r", linux_user], check=True)
                 user_removed = True
+                if self._linux_user_exists(linux_user):
+                    raise SetupError(
+                        f"userdel reported success but Linux user {linux_user} still exists; "
+                        "the agent record was preserved"
+                    )
                 home_removed = bool(home_path is not None and not home_path.exists())
+                if home_path is not None and not home_removed:
+                    raise SetupError(
+                        f"userdel removed Linux user {linux_user} but managed home {home_path} "
+                        "still exists; the agent record was preserved for manual recovery"
+                    )
                 try:
                     self._remove_ssh_login_denial(linux_user)
                 except Exception as exc:  # noqa: BLE001 - user deletion already succeeded.
                     ssh_cleanup_error = str(exc)
+            else:
+                recorded_uid = int(info.get("linux_uid", 0) or 0)
+                if recorded_uid <= 0:
+                    raise SetupError(
+                        f"linux user {linux_user} is missing and the legacy agent record has no "
+                        "recorded uid; refusing to forget it because a process may still own the "
+                        "deleted account uid"
+                    )
+                provider = str(info.get("provider", "") or "").strip().lower()
+                if self._managed_provider_process_live_for_purge(
+                    provider,
+                    linux_user,
+                    recorded_uid,
+                ):
+                    raise SetupError(
+                        f"refusing to purge agent '{agent_id}': its {provider} runtime is still "
+                        f"running under uid {recorded_uid}"
+                    )
+                runtime_stopped = True
 
         del agents[agent_id]
         self._event(
@@ -1225,6 +1230,7 @@ class AgentOpsMixin:
                 "linux_user": linux_user,
                 "linux_user_removed": user_removed,
                 "home_removed": home_removed,
+                "runtime_stopped": runtime_stopped,
                 "ssh_cleanup_error": ssh_cleanup_error,
             },
         )
@@ -1234,8 +1240,130 @@ class AgentOpsMixin:
             "linux_user": linux_user,
             "linux_user_removed": user_removed,
             "home_removed": home_removed,
+            "runtime_stopped": runtime_stopped,
             "ssh_cleanup_error": ssh_cleanup_error,
         }
+
+    def _stop_managed_runtime_for_purge(
+        self,
+        *,
+        agent_id: str,
+        linux_user: str,
+        info: dict[str, Any],
+    ) -> bool:
+        """Stop and disable an agent runtime before deleting its OS account.
+
+        Purge is deliberately fail-closed: losing the state record while a
+        service can still restart under the managed UID would orphan a live
+        runtime.  The fallback path handles a removed provider executable by
+        disabling an existing user unit and terminating matching processes.
+        """
+        provider = str(info.get("provider", "") or "").strip().lower()
+        if not provider:
+            raise SetupError(
+                f"agent '{agent_id}' has no provider metadata; refusing to purge its Linux runtime"
+            )
+
+        stop_error = ""
+        try:
+            result = self._run_managed_provider_service_action(
+                provider=provider,
+                action="stop",
+                linux_user=linux_user,
+                agent_info=info,
+            )
+            if str(result.get("service_status", "")).strip().lower() == "running":
+                raise SetupError("provider service still reports running after stop")
+        except Exception as exc:  # noqa: BLE001 - the safe fallback is intentional.
+            stop_error = str(exc)
+            self._force_stop_provider_processes(provider, linux_user)
+
+        unit = f"{provider}.service"
+        self._run_systemd_user_command(linux_user, ["disable", "--now", unit])
+        managed_home = self._linux_home_for_user(linux_user)
+        if managed_home is not None:
+            try:
+                remove_under(
+                    managed_home,
+                    Path(".config") / "systemd" / "user" / unit,
+                )
+            except (OSError, ValueError) as exc:
+                raise SetupError(
+                    f"refusing to purge agent '{agent_id}': could not remove generated service "
+                    f"unit beneath {managed_home}: {exc}"
+                ) from exc
+        recorded_uid = int(info.get("linux_uid", 0) or 0)
+        if recorded_uid <= 0:
+            try:
+                recorded_uid = int(pwd.getpwnam(linux_user).pw_uid)
+            except KeyError as exc:
+                raise SetupError(
+                    f"cannot verify runtime processes for missing user {linux_user}"
+                ) from exc
+        if self._managed_provider_process_live_for_purge(
+            provider,
+            linux_user,
+            recorded_uid,
+        ):
+            detail = f": {stop_error}" if stop_error else ""
+            raise SetupError(
+                f"refusing to purge agent '{agent_id}': its {provider} runtime is still running{detail}"
+            )
+        loginctl = shutil.which("loginctl")
+        if loginctl:
+            linger = subprocess.run(
+                [loginctl, "disable-linger", linux_user],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if linger.returncode != 0:
+                detail = (linger.stderr or linger.stdout or "").strip()
+                raise SetupError(
+                    f"refusing to purge agent '{agent_id}': failed to disable systemd lingering "
+                    f"for {linux_user}: {detail or f'exit {linger.returncode}'}"
+                )
+        return True
+
+    def _managed_provider_process_live_for_purge(
+        self,
+        provider: str,
+        linux_user: str,
+        linux_uid: int,
+    ) -> bool:
+        """Reliably inspect provider processes for a possibly deleted account."""
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "uid=,user=,args="],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise SetupError(f"could not verify managed runtime processes: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise SetupError(
+                "could not verify managed runtime processes: "
+                + (detail or f"ps exited {result.returncode}")
+            )
+        wanted_provider = str(provider).strip().lower()
+        wanted_user = str(linux_user).strip()
+        wanted_uid = int(linux_uid)
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3:
+                continue
+            uid_text, user_text, args = parts
+            try:
+                process_uid = int(uid_text)
+            except ValueError:
+                continue
+            if process_uid != wanted_uid and user_text != wanted_user:
+                continue
+            if self._provider_from_process_args(args) == wanted_provider:
+                return True
+        return False
 
     def _verified_managed_user_home_for_purge(
         self,
@@ -1256,6 +1384,17 @@ class AgentOpsMixin:
                     )
             except OSError as exc:
                 raise SetupError(f"could not validate managed user home: {exc}") from exc
+        recorded_uid = int(info.get("linux_uid", 0) or 0)
+        if recorded_uid > 0:
+            try:
+                current_uid = int(pwd.getpwnam(linux_user).pw_uid)
+            except KeyError:
+                current_uid = 0
+            if current_uid and current_uid != recorded_uid:
+                raise SetupError(
+                    f"refusing purge: Linux user {linux_user} now has uid {current_uid}, "
+                    f"but the managed agent record owns uid {recorded_uid}"
+                )
         home = passwd_home or stored_home or (Path("/home") / linux_user)
         if not require_marker and not home.exists():
             return home
@@ -1280,6 +1419,8 @@ class AgentOpsMixin:
             "operation_id": str(info.get("managed_user_operation_id", "") or ""),
             "state_root": str(self.store.root.resolve()),
         }
+        if recorded_uid > 0:
+            expected["linux_uid"] = recorded_uid
         if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected.items()):
             raise SetupError("refusing purge: managed-user marker does not match the agent record")
         return home
@@ -1327,10 +1468,13 @@ class AgentOpsMixin:
         *,
         agent_id: str | None = None,
         daemon_map: dict[str, list[dict[str, Any]]] | None = None,
-    ) -> None:
+        state: dict[str, Any] | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
         if daemon_map is None:
             daemon_map = self._running_provider_daemons_by_user()
-        state = self.store.read_state()
+        if state is None:
+            state = self.store.read_state()
         agents = state.setdefault("agents", {})
         dirty = False
         for token, agent in agents.items():
@@ -1344,8 +1488,9 @@ class AgentOpsMixin:
                 daemon_map=daemon_map,
             ):
                 dirty = True
-        if dirty:
+        if dirty and persist:
             self.store.write_state(state)
+        return state
 
     def _apply_live_provider_alignment(
         self,

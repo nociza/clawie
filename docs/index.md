@@ -45,3 +45,4 @@ Linux with Python 3.10+. Python 3.10 installs `tomli`; Python 3.11+ uses only th
 | [Status](status.md) | Fleet overview, `--json`, live `--watch` |
 | [CLI Reference](cli-reference.md) | Every command and flag |
 | [Python API](python-api.md) | Programmatic usage from Python |
+| [Releasing](releasing.md) | Exact artifact proof and trusted PyPI publishing |

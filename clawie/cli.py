@@ -29,6 +29,7 @@ from clawie.ui import (
     print_success,
     print_table,
     print_warning,
+    set_color_enabled,
 )
 
 
@@ -40,6 +41,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config-dir",
         help="Override state directory (default: ~/.clawie)",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output (also honored through NO_COLOR)",
     )
     parser.add_argument(
         "--version",
@@ -246,6 +252,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--merge",
         action="store_true",
         help="Merge into current state instead of replacing it",
+    )
+    backup_import.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm replacement without an interactive prompt (not required with --merge)",
     )
     backup_import.set_defaults(func=cmd_state_import)
 
@@ -834,7 +845,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
 
     fix_perms = agent_sub.add_parser(
         "fix-permissions",
-        help="Set up group access so the manager user can manage this agent without sudo",
+        help="Restore private ownership and permission modes for an agent home",
     )
     _add_positional_argument(
         fix_perms,
@@ -845,7 +856,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     fix_perms.add_argument(
         "--manager",
         default="",
-        help="Manager username (default: current user)",
+        help=argparse.SUPPRESS,
     )
     fix_perms.set_defaults(func=cmd_agents_fix_permissions)
 
@@ -1287,8 +1298,8 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=provider_names(),
-        default="openclaw",
-        help="Agent provider",
+        default=None,
+        help="Agent provider (omit to keep the current provider)",
     )
     parser.add_argument("--api-key", help="Provider API key (if using api_key auth)")
     parser.add_argument(
@@ -1296,8 +1307,8 @@ def _add_setup_arguments(parser: argparse.ArgumentParser) -> None:
         choices=["linked", "api_key", "none"],
         help="Provider auth mode (default is provider-specific)",
     )
-    parser.add_argument("--subscription", default="starter", help="Plan name")
-    parser.add_argument("--workspace", default="default", help="Workspace slug")
+    parser.add_argument("--subscription", default=None, help="Plan name")
+    parser.add_argument("--workspace", default=None, help="Workspace slug")
     parser.add_argument(
         "--spawn-password",
         help="Set a global default Linux password for future spawned users",
@@ -1361,6 +1372,7 @@ def _add_positional_argument(
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    set_color_enabled(False if bool(args.no_color) else None)
     service = ClawieService(StateStore(config_dir=args.config_dir))
 
     try:
@@ -1379,44 +1391,77 @@ def main(argv: list[str] | None = None) -> int:
         PermissionError,
         subprocess.CalledProcessError,
     ) as exc:
-        print_error(str(exc))
+        if bool(getattr(args, "json", False)):
+            print(
+                json.dumps({"ok": False, "error": str(exc), "error_type": type(exc).__name__}),
+                file=sys.stderr,
+            )
+        else:
+            print_error(str(exc))
         return 1
     except (KeyboardInterrupt, EOFError):
         # EOFError covers interactive prompts running without stdin
         # (piped/cron); treat it like a user abort instead of a traceback.
-        print_warning("Interrupted")
+        if bool(getattr(args, "json", False)):
+            print(json.dumps({"ok": False, "error": "interrupted"}), file=sys.stderr)
+        else:
+            print_warning("Interrupted")
         return 130
 
 
 def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
-    provider = str(args.provider).strip().lower() or "openclaw"
-    provider_spec = get_provider(provider)
-    api_key = str(args.api_key or "").strip()
+    provider = str(args.provider or "").strip().lower() or None
+    current = service.setup_status()
+    effective_provider = provider or str(current.get("provider", "openclaw") or "openclaw")
+    provider_spec = get_provider(effective_provider)
+    api_key = str(args.api_key).strip() if args.api_key is not None else None
     auth_mode = str(args.auth_mode or "").strip().lower() or None
     spawn_password = args.spawn_password
-    subscription = str(args.subscription).strip()
-    workspace = str(args.workspace).strip()
-    api_url = str(args.api_url or "").strip()
+    subscription = str(args.subscription).strip() if args.subscription is not None else None
+    workspace = str(args.workspace).strip() if args.workspace is not None else None
+    api_url = str(args.api_url).strip() if args.api_url is not None else None
 
     if args.interactive:
         print_info("Interactive setup mode")
         provider = _prompt_with_default(
             f"Provider ({'/'.join(provider_names())})",
-            provider,
+            effective_provider,
         ).lower()
         if provider not in set(provider_names()):
             raise ValueError("provider must be one of: " + ", ".join(provider_names()))
         provider_spec = get_provider(provider)
-        auth_mode = auth_mode or provider_spec.default_auth_mode
+        current_auth_mode = str(current.get("auth_mode", "") or "").strip().lower()
+        auth_mode = auth_mode or (
+            current_auth_mode if provider == effective_provider else provider_spec.default_auth_mode
+        )
         auth_mode = _prompt_with_default(
             f"Auth mode ({'/'.join(provider_spec.auth_modes)})",
             auth_mode,
         ).lower()
-        if auth_mode == "api_key":
-            api_key = api_key or _prompt_required(f"{provider} API key")
-        subscription = _prompt_with_default("Subscription", subscription)
-        workspace = _prompt_with_default("Workspace", workspace)
-        api_url = _prompt_with_default("API URL", api_url or provider_spec.default_api_url)
+        stored_config = service.store.read_config()
+        stored_credentials = stored_config.get("provider_credentials", {})
+        target_credentials = (
+            stored_credentials.get(provider, {}) if isinstance(stored_credentials, dict) else {}
+        )
+        target_has_api_key = bool(
+            isinstance(target_credentials, dict)
+            and str(target_credentials.get("api_key", "") or "").strip()
+        ) or bool(
+            provider == effective_provider
+            and str(stored_config.get("api_key", "") or "").strip()
+        )
+        if auth_mode == "api_key" and api_key is None and not target_has_api_key:
+            api_key = _prompt_required(f"{provider} API key")
+        subscription = _prompt_with_default(
+            "Subscription", subscription or str(current.get("subscription", "starter") or "starter")
+        )
+        workspace = _prompt_with_default(
+            "Workspace", workspace or str(current.get("workspace", "default") or "default")
+        )
+        api_url = _prompt_with_default(
+            "API URL",
+            api_url if api_url is not None else str(current.get("api_url", provider_spec.default_api_url) or ""),
+        )
 
     config = _clawied_service_call_or_unavailable(
         service,
@@ -1427,9 +1472,9 @@ def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
             "auth_mode": auth_mode,
             "spawn_password": spawn_password,
             "clear_spawn_password": bool(args.clear_spawn_password),
-            "subscription": subscription or "starter",
-            "workspace": workspace or "default",
-            "api_url": api_url or provider_spec.default_api_url,
+            "subscription": subscription,
+            "workspace": workspace,
+            "api_url": api_url,
             "install_runtime": bool(args.install_runtime),
         },
     )
@@ -1440,9 +1485,9 @@ def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
             auth_mode=auth_mode,
             spawn_password=spawn_password,
             clear_spawn_password=bool(args.clear_spawn_password),
-            subscription=subscription or "starter",
-            workspace=workspace or "default",
-            api_url=api_url or provider_spec.default_api_url,
+            subscription=subscription,
+            workspace=workspace,
+            api_url=api_url,
             install_runtime=bool(args.install_runtime),
         )
     control_kwargs = {
@@ -2293,16 +2338,14 @@ def cmd_agents_fix_permissions(args: argparse.Namespace, service: ClawieService)
     changes = result.get("changes", [])
     if changes:
         print_success(
-            f"Permissions updated for {agent_id} "
-            f"(manager={result.get('manager', '?')}, agent_user={result.get('linux_user', '?')})"
+            f"Private permissions restored for {agent_id} "
+            f"(agent_user={result.get('linux_user', '?')})"
         )
         for change in changes:
             print_info(f"  {change}")
     else:
         print_info(f"No permission changes needed for {agent_id}")
-    print_info("")
-    print_info("Note: group membership changes take effect on next login.")
-    print_info("Run `newgrp " + str(result.get("linux_user", "<group>")) + "` or re-login to activate.")
+    print_info("Cross-user changes must run with sudo/root or through clawied.")
     return 0
 
 
@@ -2581,7 +2624,8 @@ def cmd_agent_purge(args: argparse.Namespace, service: ClawieService) -> int:
     if linux_user:
         print_info(
             f"linux_user={linux_user} removed={bool(result.get('linux_user_removed', False))} "
-            f"home_removed={bool(result.get('home_removed', False))}"
+            f"home_removed={bool(result.get('home_removed', False))} "
+            f"runtime_stopped={bool(result.get('runtime_stopped', False))}"
         )
     return 0
 
@@ -2659,7 +2703,16 @@ def _fatal_status_error(error: str) -> bool:
     fatal_prefixes = (
         "refusing to change permissions on non-clawie state directory:",
         "clawie state root must not be a symlink:",
+        "clawie state root must be a real directory:",
+        "clawie state permissions are not private;",
+        "cannot safely lock clawie state root",
+        "clawie state lock is not a directory:",
         "clawie database must not be a symlink:",
+        "clawie database must be a regular non-symlink file:",
+        "clawie database sidecar must be a regular file:",
+        "clawie database sidecar permissions are not private:",
+        "read-only status cannot inspect an uncheckpointed clawie WAL;",
+        "timed out waiting for the clawie database lock",
     )
     return error.startswith(fatal_prefixes)
 
@@ -2871,7 +2924,12 @@ def _print_backup_status_panel(payload: dict[str, Any]) -> None:
             f"head: {payload.get('head', '') or '<no commits>'}",
             f"commits: {payload.get('commit_count', 0)}",
             f"dirty: {payload.get('dirty', False)}",
+            f"interrupted_transaction: {payload.get('interrupted_transaction', False)}",
+            f"last_status: {payload.get('last_status', 'never')}",
+            f"last_attempt_at: {payload.get('last_attempt_at', '')}",
             f"last_run_at: {payload.get('last_run_at', '')}",
+            f"last_error: {payload.get('last_error', '') or '<none>'}",
+            f"validation_error: {payload.get('validation_error', '') or '<none>'}",
         ],
     )
 
@@ -3291,7 +3349,15 @@ def cmd_backup_run(args: argparse.Namespace, service: ClawieService) -> int:
     )
     if result is _CLAWIED_UNAVAILABLE:
         result = service.backup_run(message=str(args.message or ""), push=args.push)
-    if result.get("changed"):
+    status = str(result.get("status", "completed") or "completed")
+    if status != "completed":
+        if result.get("incomplete"):
+            print_warning(
+                "Backup collection was incomplete; the previous complete snapshot was preserved."
+            )
+        else:
+            print_warning("Backup committed locally, but remote durability was not achieved.")
+    elif result.get("changed"):
         print_success(f"Backup committed {str(result.get('commit', ''))[:10]} in {result.get('repo', '')}")
     else:
         print_info(f"Backup up to date (no changes) in {result.get('repo', '')}")
@@ -3305,7 +3371,10 @@ def cmd_backup_run(args: argparse.Namespace, service: ClawieService) -> int:
     skipped = result.get("skipped", [])
     for row in skipped:
         print_warning(f"{row.get('agent_id', '')}: {row.get('reason', '')}")
-    return 0
+    error = str(result.get("error", "") or "").strip()
+    if error and not push_error:
+        print_warning(error)
+    return 0 if status == "completed" else 1
 
 
 def cmd_backup_status(args: argparse.Namespace, service: ClawieService) -> int:
@@ -3317,6 +3386,9 @@ def cmd_backup_status(args: argparse.Namespace, service: ClawieService) -> int:
         return 1
     if not payload.get("initialized"):
         print_info("Backup repo not initialized. Run 'clawie backup init'.")
+        return 1
+    if payload.get("validation_error"):
+        print_warning(str(payload["validation_error"]))
         return 1
     return 0
 
@@ -3359,6 +3431,16 @@ def cmd_state_export(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_state_import(args: argparse.Namespace, service: ClawieService) -> int:
     source = _resolve_required_value(args.input, field_name="input")
+    if not args.merge and not args.yes:
+        print_warning("This will replace the current Clawie configuration and fleet state.")
+        try:
+            confirmation = input("Proceed? [y/N]: ").strip().lower()
+        except EOFError:
+            raise ValueError(
+                "import cancelled: no confirmation input available (use --yes for non-interactive runs)"
+            ) from None
+        if confirmation not in {"y", "yes"}:
+            raise ValueError("import cancelled by user")
     result = _clawied_service_call_or_unavailable(
         service,
         "import_state",

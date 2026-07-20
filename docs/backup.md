@@ -21,7 +21,9 @@ What is deliberately **excluded**:
   this up at the git layer. Secret-like channel names are omitted from the
   manifest and must be re-linked after restore.
 - The event log, so commits only happen when knowledge actually changes.
-- Files over 1 MiB and non-knowledge formats (binaries, JSON state).
+- Non-knowledge formats (binaries, JSON state). A knowledge file over 1 MiB is
+  reported as an incomplete collection rather than silently replacing its last
+  good backup.
 
 Need a full-fidelity snapshot including credentials? Use
 `clawie backup export FILE` — it writes a `0600`-permission local file and is
@@ -56,7 +58,7 @@ clawie backup run [--message M] [--push|--no-push]
 clawie backup status
 clawie backup restore [--agent ID] [--no-workspace] [--no-apply-to-disk]
 clawie backup export PATH          # full-fidelity local snapshot (secrets included)
-clawie backup import PATH [--merge]
+clawie backup import PATH [--merge] [--yes]
 ```
 
 - `init` creates or adopts the git repo, optionally sets `origin`, and enables
@@ -67,9 +69,16 @@ clawie backup import PATH [--merge]
   something changed**. With a remote configured it pushes only when explicitly
   requested (`--push`) or after opting in with `backup init --auto-push`. Secret
   filtering is best-effort, so review the repository before enabling pushes.
-  A failed push is reported but never fails the backup.
+  Collection happens in a private staging tree. If a knowledge file is
+  unreadable, oversized, or the file cap is reached, the command exits nonzero
+  and preserves the previous complete snapshot. An explicit or automatic push
+  failure also exits nonzero and is counted as a maintenance error. A small
+  transaction journal makes a process or host crash during the tree swap
+  recoverable: restore fails closed while the journal exists, and the next
+  `backup run` completes or rolls back the interrupted swap before collecting.
 - `status` is read-only: repo path, remote, HEAD, commit count, dirty flag,
-  last run.
+  interrupted-transaction state, last attempt, last complete run, and last
+  error. It exits nonzero while repository validation requires attention.
 - `restore` reconciles backed-up manifests for agents missing from local state,
   writes prompts back into agent state (and agent homes), then restores
   workspace knowledge files. Live workspace files win over control-plane prompt
@@ -88,6 +97,14 @@ clawie backup restore --agent alice   # one agent
 - Older backup entries without `manifest.json` are skipped with a warning.
 - `--no-apply-to-disk` updates control-plane state only.
 - `--no-workspace` restores core prompts only.
+- Replacement `import` validates the complete credential-bearing snapshot and
+  applies configuration plus fleet state atomically. It prompts unless `--yes`
+  is supplied; `--merge` is non-destructive and does not require confirmation.
+  Neither mode may remove or remap an existing managed Linux runtime. Purge
+  that agent explicitly before importing a snapshot that changes its runtime
+  identity. Imports also reject new Linux-user mappings: remove runtime fields
+  before importing on a new host, then provision operational agents through
+  `clawie runtime create` so host ownership proof is created locally.
 - Restoring to another machine: clone the backup repo to the configured path
   (`clawie backup init PATH`), make credentials available separately, then
   `clawie backup restore`.

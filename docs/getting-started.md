@@ -49,6 +49,10 @@ View current config:
 clawie config show
 ```
 
+`config set` changes only the options you provide. A later subscription or
+workspace update will not reset the provider, auth mode, API URL, or other
+existing settings.
+
 ## Install a provider runtime
 
 ```bash
@@ -67,7 +71,8 @@ sudo clawie runtime create alice --user alice --template baseline
 
 This creates the `alice` agent record, a dedicated Linux user and home, and its
 provider service configuration. The default baseline enables delegation and
-uses the balanced model tier.
+uses the balanced model tier. The home and provider tree stay owner-only;
+cross-user management requires sudo/root or the authenticated `clawied` service.
 
 Options:
 

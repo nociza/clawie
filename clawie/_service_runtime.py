@@ -348,17 +348,13 @@ class RuntimeOpsMixin:
         token = str(linux_user).strip()
         if not token:
             return None
-        try:
-            self._ensure_generated_user_service_unit(provider, token)
-        except Exception:
-            return None
-        if os.geteuid() == 0:
-            self._bootstrap_user_bus(token)
-        reloaded = self._run_systemd_user_command(token, ["daemon-reload"])
-        if not reloaded.get("ok", False):
-            return None
-
         if action == "status":
+            unit_path = self._generated_user_service_unit_path(provider, token)
+            try:
+                if unit_path is None or unit_path.is_symlink() or not unit_path.is_file():
+                    return None
+            except OSError:
+                return None
             service_status = self._systemd_user_service_status(provider, token)
             if service_status == "unknown":
                 return None
@@ -372,6 +368,15 @@ class RuntimeOpsMixin:
                 "output": service_status,
                 "command": ["systemctl", "--user", "is-active", f"{provider}.service"],
             }
+        try:
+            self._ensure_generated_user_service_unit(provider, token)
+        except Exception:
+            return None
+        if os.geteuid() == 0:
+            self._bootstrap_user_bus(token)
+        reloaded = self._run_systemd_user_command(token, ["daemon-reload"])
+        if not reloaded.get("ok", False):
+            return None
 
         if action in {"start", "restart"}:
             self._run_systemd_user_command(token, ["reset-failed", f"{provider}.service"])
@@ -968,7 +973,7 @@ class RuntimeOpsMixin:
             if not provider:
                 continue
             info = dict(local_state.get(provider, {}))
-            auth = self.local_claw_auth_status(provider)
+            auth = self.local_claw_auth_status(provider, probe_cli=refresh)
             rows.append(
                 {
                     "provider": provider,

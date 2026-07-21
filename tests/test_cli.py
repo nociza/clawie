@@ -103,6 +103,35 @@ def test_cli_without_arguments_prints_help_without_creating_state(
     assert not (tmp_path / ".clawie").exists()
 
 
+def test_corrupt_state_db_reports_clean_error_not_traceback(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    """A corrupt/unreadable state DB must surface as a clean CLI error (exit 1),
+    never an uncaught sqlite3.DatabaseError traceback."""
+    (tmp_path / "clawie.db").write_bytes(b"this is not a sqlite database" * 64)
+
+    for command in (["health"], ["agent", "list"], ["config", "show"], ["backup", "status"]):
+        code = main(["--config-dir", str(tmp_path), "--no-color", *command])
+        assert code == 1, command
+        assert "database" in capsys.readouterr().err.lower(), command
+
+
+def test_corrupt_state_db_status_json_degrades_and_exits_nonzero(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    """status --json is a monitoring gate: even on a corrupt DB it must emit
+    valid JSON on stdout and exit nonzero, rather than crash."""
+    (tmp_path / "clawie.db").write_bytes(b"this is not a sqlite database" * 64)
+
+    code = main(["--config-dir", str(tmp_path), "--no-color", "status", "--json"])
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "health" in payload
+
+
 def test_json_command_errors_are_structured_on_stderr(
     tmp_path: Path,
     capsys: CaptureFixture[str],
@@ -369,6 +398,10 @@ def test_control_watchdog_install_writes_systemd_units(
     assert "/usr/bin/clawie --config-dir" in unit_text
     assert "clawied run --interval 9" in unit_text
     assert "Restart=always" in unit_text
+    # A bounded start limit must be present so a sustained crash-loop trips the
+    # unit into `failed` state (halting the hot-loop and firing OnFailure=).
+    assert "StartLimitBurst=8" in unit_text
+    assert "StartLimitIntervalSec=120" in unit_text
     assert "printf alert" in alert_text
     assert ["systemctl", "daemon-reload"] in calls
     assert ["systemctl", "enable", "--now", "clawie-control-watchdog.service"] in calls
@@ -3072,6 +3105,62 @@ def test_service_syncs_and_revokes_selected_credential_bundles(
     assert "provider-auth" in updated["credential_sync"]["bundles"]
     assert "git" not in updated["credential_sync"]["bundles"]
     assert updated["credential_sync"]["shared_provider_auth"] is True
+
+
+def test_revoke_refuses_to_delete_through_agent_planted_symlink(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """An agent-controlled intermediate symlink must not redirect a root-run
+    revoke into deleting files outside the sandbox (regression for the
+    ``shutil.rmtree(target_home / token)`` symlink-traversal escape)."""
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="",
+    )
+    agent = service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    agent["agent"]["linux_user"] = "alice"
+    state = service.store.read_state()
+    state["agents"]["alice"] = agent
+    service.store.write_state(state)
+
+    target_home = tmp_path / "target-home"
+    target_home.mkdir(parents=True)
+
+    # A victim tree outside the agent home, containing entries whose basenames
+    # match credential-bundle leaves (``gh`` dir for the git bundle,
+    # ``auth.json`` file for provider-auth).
+    victim = tmp_path / "victim"
+    (victim / "gh").mkdir(parents=True)
+    (victim / "gh" / "important.txt").write_text("keep me", encoding="utf-8")
+    (victim / "auth.json").write_text("secret", encoding="utf-8")
+
+    # The agent plants intermediate symlinks in its own home.
+    (target_home / ".config").symlink_to(victim, target_is_directory=True)
+    (target_home / ".codex").symlink_to(victim, target_is_directory=True)
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(ClawieService, "_agent_linux_home", lambda self, _agent: target_home)
+
+    service.set_agent_credential_bundles("alice", ["provider-auth", "git"])
+    service.revoke_agent_credentials("alice", bundles=["provider-auth", "git"])
+
+    # Nothing outside the home was deleted through the planted symlinks.
+    assert (victim / "gh" / "important.txt").exists()
+    assert (victim / "gh").is_dir()
+    assert (victim / "auth.json").exists()
 
 
 def test_import_shared_auth_from_codex_links_agents_and_exposes_status(

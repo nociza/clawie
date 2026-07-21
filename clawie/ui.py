@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import unicodedata
 from collections.abc import Iterable
 from typing import TextIO
 
@@ -28,6 +29,27 @@ _BR = "\u2518"  # ┘
 _LT = "\u251c"  # ├
 _RT = "\u2524"  # ┤
 _XX = "\u253c"  # ┼
+
+
+def display_width(text: str) -> int:
+    """Terminal column width of *text*.
+
+    ``len()`` counts code points, but box/table alignment needs display
+    columns: wide/fullwidth glyphs (e.g. the tier symbols ⚡/⭐) occupy two
+    columns and combining marks occupy zero. This is an approximation of
+    ``wcwidth`` sufficient for the symbols this CLI renders.
+    """
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
+
+
+def _pad(text: str, width: int) -> str:
+    """Left-justify *text* to *width* display columns (not code points)."""
+    return text + " " * max(0, width - display_width(text))
 
 
 def set_color_enabled(enabled: bool | None) -> None:
@@ -71,15 +93,15 @@ def print_info(message: str) -> None:
 
 def print_panel(title: str, lines: Iterable[str]) -> None:
     body = list(lines)
-    inner_w = max([len(title)] + [len(line) for line in body]) + 2
+    inner_w = max([display_width(title)] + [display_width(line) for line in body]) + 2
     border = color(_V, BLUE)
     hbar = _H * inner_w
     print(color(f"  {_TL}{hbar}{_TR}", BLUE))
-    padding = inner_w - len(title) - 1
+    padding = inner_w - display_width(title) - 1
     print(f"  {border} {color(title, CYAN, bold=True)}{' ' * padding}{border}")
     print(color(f"  {_LT}{hbar}{_RT}", BLUE))
     for line in body:
-        padding = inner_w - len(line) - 1
+        padding = inner_w - display_width(line) - 1
         print(f"  {border} {line}{' ' * padding}{border}")
     print(color(f"  {_BL}{hbar}{_BR}", BLUE))
 
@@ -87,15 +109,15 @@ def print_panel(title: str, lines: Iterable[str]) -> None:
 def print_table(headers: list[str], rows: list[list[str]]) -> None:
     if not headers:
         return
-    widths = [len(header) for header in headers]
+    widths = [display_width(header) for header in headers]
     for row in rows:
         for idx, col in enumerate(row):
             if idx < len(widths):
-                widths[idx] = max(widths[idx], len(col))
+                widths[idx] = max(widths[idx], display_width(col))
 
     def _fmt(values: list[str]) -> str:
         padded = [
-            values[idx].ljust(widths[idx]) if idx < len(values) else " " * widths[idx]
+            _pad(values[idx], widths[idx]) if idx < len(values) else " " * widths[idx]
             for idx in range(len(widths))
         ]
         sep = f" {_V} "

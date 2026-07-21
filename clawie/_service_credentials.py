@@ -1,7 +1,6 @@
 """Credential bundle policy and sync/revoke (ClawieService mixin)."""
 from __future__ import annotations
 
-import shutil
 import stat
 from pathlib import Path
 from typing import Any
@@ -9,6 +8,7 @@ from clawie.providers import (
     provider_names,
     shared_auth_paths_for_providers,
 )
+from clawie.safe_fs import UnsafePathError, remove_under
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
@@ -436,13 +436,16 @@ class CredentialOpsMixin:
                     continue
                 seen_rel.add(token)
                 dst = target_home / token
-                if not dst.exists() and not dst.is_symlink():
+                # The agent controls its own home, so an intermediate path
+                # component (e.g. ``.config`` in ``.config/gh``) may be a
+                # symlink planted to redirect a root-run revoke outside the
+                # sandbox. remove_under walks with O_NOFOLLOW and refuses such
+                # components instead of deleting through them.
+                try:
+                    if remove_under(target_home, token, recursive=True):
+                        removed.append(str(dst))
+                except UnsafePathError:
                     continue
-                if dst.is_symlink() or dst.is_file():
-                    dst.unlink(missing_ok=True)
-                elif dst.is_dir():
-                    shutil.rmtree(dst)
-                removed.append(str(dst))
         return self._dedupe_paths(removed)
 
     def _sync_shared_provider_auth(

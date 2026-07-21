@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from clawie.service import (
     STATUS_SECTIONS,
     ClawieService,
 )
-from clawie.store import StateStore
+from clawie.store import ConcurrentStateWriteError, StateStore
 from clawie.ui import (
     print_error,
     print_info,
@@ -1388,9 +1389,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     args = parser.parse_args(effective_argv)
     set_color_enabled(False if bool(args.no_color) else None)
-    service = ClawieService(StateStore(config_dir=args.config_dir))
 
     try:
+        service = ClawieService(StateStore(config_dir=args.config_dir))
         handler = getattr(args, "func", None)
         if handler is None:
             parser.print_help()
@@ -1400,12 +1401,18 @@ def main(argv: list[str] | None = None) -> int:
         SetupError,
         AgentExistsError,
         AgentNotFoundError,
+        ConcurrentStateWriteError,
         ValueError,
-        FileNotFoundError,
         json.JSONDecodeError,
-        PermissionError,
         subprocess.CalledProcessError,
+        sqlite3.Error,
+        OSError,
     ) as exc:
+        # OSError subsumes FileNotFoundError/PermissionError (and disk-full,
+        # I/O errors); sqlite3.Error covers a corrupt/locked/incompatible state
+        # DB; ConcurrentStateWriteError is the CAS-conflict signal. All of these
+        # are operator-facing conditions that must render as a clean message,
+        # never a raw traceback.
         if bool(getattr(args, "json", False)):
             print(
                 json.dumps({"ok": False, "error": str(exc), "error_type": type(exc).__name__}),

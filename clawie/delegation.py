@@ -1387,13 +1387,16 @@ class DelegationCoordinator:
 
             self.tree.update_status(child_id, "completed")
             return dict(result.payload)
+        except TimeoutError:
+            # Must precede OSError: TimeoutError is a subclass of OSError, so a
+            # broader `except (ConnectionError, OSError)` first would swallow
+            # timeouts and misreport them as connection failures.
+            self.tree.update_status(child_id, "timeout")
+            return {"error": f"timed out after {timeout}s"}
         except (ConnectionError, OSError) as exc:
             self.tree.update_status(child_id, "failed")
             self.tree.remove(child_id)
             return {"error": f"connection failed: {exc}"}
-        except TimeoutError:
-            self.tree.update_status(child_id, "timeout")
-            return {"error": f"timed out after {timeout}s"}
 
     def delegate_many(
         self,
@@ -1471,8 +1474,28 @@ class DelegationCoordinator:
 # Utilities
 # ---------------------------------------------------------------------------
 
+def _socket_is_alive(path: Path, *, timeout: float = 0.5) -> bool:
+    """Return True if a Unix socket at *path* currently accepts a connection."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(str(path))
+        finally:
+            sock.close()
+        return True
+    except OSError:
+        return False
+
+
 def cleanup_stale_sockets(max_age_seconds: float = 600.0) -> list[str]:
-    """Remove socket files older than *max_age_seconds*. Returns removed paths."""
+    """Remove *dead* socket files older than *max_age_seconds*.
+
+    A Unix socket's mtime is fixed at bind time, so age alone does not indicate
+    staleness: a healthy long-lived session-agent has an old socket. Only unlink
+    a socket that is both old and not currently connectable, so a live REPL is
+    never orphaned by cleanup. Returns removed paths.
+    """
     removed: list[str] = []
     if not DELEGATION_DIR.exists():
         return removed
@@ -1480,9 +1503,13 @@ def cleanup_stale_sockets(max_age_seconds: float = 600.0) -> list[str]:
     for path in DELEGATION_DIR.glob("*.sock"):
         try:
             age = now - path.stat().st_mtime
-            if age > max_age_seconds:
-                path.unlink()
-                removed.append(str(path))
+        except OSError:
+            continue
+        if age <= max_age_seconds or _socket_is_alive(path):
+            continue
+        try:
+            path.unlink()
+            removed.append(str(path))
         except OSError:
             pass
     return removed
@@ -1497,24 +1524,14 @@ def list_active_agents() -> list[dict[str, Any]]:
         agent_id = path.stem
         try:
             stat = path.stat()
-            # Try connecting to see if it's alive
-            alive = False
-            try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                sock.settimeout(0.5)
-                sock.connect(str(path))
-                alive = True
-                sock.close()
-            except (ConnectionRefusedError, OSError):
-                pass
-            agents.append({
-                "agent_id": agent_id,
-                "socket": str(path),
-                "alive": alive,
-                "age_seconds": round(time.time() - stat.st_mtime, 1),
-            })
         except OSError:
-            pass
+            continue
+        agents.append({
+            "agent_id": agent_id,
+            "socket": str(path),
+            "alive": _socket_is_alive(path),
+            "age_seconds": round(time.time() - stat.st_mtime, 1),
+        })
     return agents
 
 

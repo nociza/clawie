@@ -130,7 +130,14 @@ class ReconcileOpsMixin:
                         "error": str(exc),
                     }
                 )
-                break
+                # ensure_agent is the foundational action — everything else
+                # needs the agent/home to exist, so if it fails there is nothing
+                # further to try. Every other action (individual channels,
+                # addons, limits) is independent, so one failure must not starve
+                # the actions ordered after it; record it and keep going.
+                if action.kind == "ensure_agent":
+                    break
+                continue
             applied.append(
                 {
                     **self._reconcile_action_payload(action),
@@ -162,10 +169,34 @@ class ReconcileOpsMixin:
         }
 
     def reconcile_all_manifests(self, *, dry_run: bool = False) -> list[dict[str, Any]]:
-        return [
-            self.reconcile_agent_manifest(path, dry_run=dry_run)
-            for path in self.list_agent_manifests()
-        ]
+        results: list[dict[str, Any]] = []
+        for path in self.list_agent_manifests():
+            try:
+                results.append(self.reconcile_agent_manifest(path, dry_run=dry_run))
+            except Exception as exc:  # noqa: BLE001 - isolate one bad manifest.
+                # A single malformed/unreadable manifest (parse error, I/O
+                # error, schema drift) must never abort the whole pass and take
+                # the daemon down into a watchdog restart loop. Record it as an
+                # error row so run_once still writes status and continues.
+                results.append(
+                    {
+                        "agent_id": path.stem,
+                        "manifest_path": str(path),
+                        "dry_run": bool(dry_run),
+                        "converged": False,
+                        "actions": [],
+                        "applied": [],
+                        "remaining": [],
+                        "errors": [
+                            {
+                                "kind": "manifest",
+                                "detail": {"path": str(path)},
+                                "error": str(exc),
+                            }
+                        ],
+                    }
+                )
+        return results
 
     @staticmethod
     def _coerce_agent_manifest(manifest: AgentManifest | dict[str, Any] | str | Path) -> AgentManifest:

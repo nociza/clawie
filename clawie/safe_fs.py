@@ -349,11 +349,11 @@ def read_text_under(
     return read_bytes_under(root, relative, max_bytes=max_bytes).decode("utf-8")
 
 
-def _remove_entry(parent_fd: int, name: str, *, recursive: bool) -> None:
+def _remove_entry(parent_fd: int, name: str, *, recursive: bool) -> bool:
     try:
         st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return
+        return False
     if stat.S_ISDIR(st.st_mode):
         if not recursive:
             raise UnsafePathError(f"refusing to remove directory without recursive=True: {name}")
@@ -367,8 +367,9 @@ def _remove_entry(parent_fd: int, name: str, *, recursive: bool) -> None:
         finally:
             os.close(directory_fd)
         os.rmdir(name, dir_fd=parent_fd)
-        return
+        return True
     os.unlink(name, dir_fd=parent_fd)
+    return True
 
 
 def remove_under(
@@ -376,8 +377,14 @@ def remove_under(
     relative: str | Path,
     *,
     recursive: bool = False,
-) -> None:
-    """Remove an entry below *root* without following symlinks."""
+) -> bool:
+    """Remove an entry below *root* without following symlinks.
+
+    Returns ``True`` if an entry existed and was removed, ``False`` if there
+    was nothing to remove. Intermediate path components that are symlinks are
+    refused (``UnsafePathError``) rather than followed, so a caller operating
+    on an untrusted home cannot be tricked into deleting outside *root*.
+    """
     root_path = Path(root)
     parts = _relative_parts(relative)
     root_fd = _open_root(root_path)
@@ -390,9 +397,9 @@ def remove_under(
             mode=0o700,
             owner=None,
         )
-        _remove_entry(parent_fd, parts[-1], recursive=recursive)
+        return _remove_entry(parent_fd, parts[-1], recursive=recursive)
     except FileNotFoundError:
-        return
+        return False
     finally:
         if parent_fd is not None:
             os.close(parent_fd)

@@ -307,6 +307,15 @@ class ControlWatchdogMixin:
             "Description=Clawie control watchdog",
             "After=network-online.target",
             "Wants=network-online.target",
+            # Bound the restart loop. Without a start limit, Restart=always with
+            # a fixed RestartSec means a persistently-failing clawied hot-loops
+            # forever AND never enters the `failed` state, so OnFailure= (the
+            # operator alert) never fires. A bounded burst lets transient faults
+            # self-heal via a few quick restarts, but a sustained crash-loop
+            # trips the limit -> the unit enters `failed` -> the loop stops and
+            # the alert fires. These keys are available on systemd >=230.
+            "StartLimitIntervalSec=120",
+            "StartLimitBurst=8",
         ]
         if str(notify_command or "").strip():
             lines.append(f"OnFailure={self.CONTROL_WATCHDOG_ALERT_UNIT_FILE.name}")

@@ -195,6 +195,36 @@ def test_clawied_run_once_reconciles_stored_manifests_and_writes_status(tmp_path
     assert stored["results"][0]["agent_id"] == "bob"
 
 
+def test_clawied_run_once_isolates_one_malformed_manifest(tmp_path: Path) -> None:
+    """A single unparseable manifest must not abort the pass or crash the
+    daemon; the valid manifests still reconcile and status is still written."""
+    service = _setup_service(tmp_path)
+    service.write_agent_manifest(
+        AgentManifest(
+            id="bob",
+            provider="openclaw",
+            channels=[ChannelSpec("telegram", "ops")],
+        )
+    )
+    # A hand-corrupted / truncated manifest file dropped into the store.
+    broken = service.agent_manifest_dir() / "broken.json"
+    broken.write_text("{ this is not valid json", encoding="utf-8")
+
+    daemon = Clawied(service, interval_seconds=2)
+    result = daemon.run_once()  # must not raise
+
+    assert result["manifests"] == 2
+    assert result["errors"] >= 1
+    assert result["status"] == "error"
+    by_agent = {row["agent_id"]: row for row in result["results"]}
+    assert by_agent["bob"]["converged"] is True
+    assert by_agent["broken"]["errors"]
+    # The status file is still written despite the bad manifest.
+    stored = json.loads((tmp_path / "clawied-status.json").read_text(encoding="utf-8"))
+    assert stored["manifests"] == 2
+    assert service.observed_agent_manifest_state("bob") is not None
+
+
 def test_clawied_cli_reconcile_json_reports_plan(
     tmp_path: Path,
     capsys: CaptureFixture[str],

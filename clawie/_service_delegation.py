@@ -902,22 +902,32 @@ class DelegationOpsMixin:
             resolved = executable or self._resolve_provider_executable(provider_name)
             argv = [resolved, *list(cmd)[1:]]
             wrapped = self._wrap_user_command(argv, linux_user, purpose="agent delegation")
+            # start_new_session=True isolates the delivery command (and the sudo
+            # wrapper that spawns it) in its own process group. subprocess.run's
+            # timeout only SIGKILLs the direct child (sudo), which does not
+            # forward the signal, so the provider-CLI grandchild would survive
+            # and keep running the task after we report it failed — duplicating
+            # side effects when the parent retries. Reaping the whole group on
+            # timeout stops the work for real.
+            process = subprocess.Popen(
+                wrapped,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=self._service_env(linux_user),
+                start_new_session=True,
+            )
             try:
-                result = subprocess.run(
-                    wrapped,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    env=self._service_env(linux_user),
-                    timeout=timeout + 10.0,
-                )
+                stdout, stderr = process.communicate(timeout=timeout + 10.0)
             except subprocess.TimeoutExpired as exc:
+                self._terminate_timed_out_process_group(process)
                 raise SetupError(
                     f"{provider_name} agent delivery exceeded {timeout:g}s timeout"
                 ) from exc
-            if result.returncode != 0 and not str(result.stdout).strip():
-                detail = (result.stderr or "").strip() or f"exit {result.returncode}"
+            returncode = int(process.returncode or 0)
+            if returncode != 0 and not str(stdout or "").strip():
+                detail = (stderr or "").strip() or f"exit {returncode}"
                 raise SetupError(f"{provider_name} agent delivery failed: {detail}")
-            return result.stdout
+            return stdout or ""
 
         return _run

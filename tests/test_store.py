@@ -12,6 +12,37 @@ from pytest import MonkeyPatch, raises
 from clawie.store import ConcurrentStateWriteError, StateStore
 
 
+def test_legacy_json_migration_completes_without_recursion(tmp_path: Path) -> None:
+    """Regression: ensure() -> _migrate_legacy_json() -> write_config() ->
+    ensure() recursed until RecursionError, crashing every command on upgrade
+    from a pre-SQLite install. The migration must complete, import the legacy
+    values, and retire the legacy files so a later ensure() cannot re-import
+    them and clobber subsequent changes."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "config.json").write_text(
+        json.dumps({"provider": "openclaw", "workspace": "legacy-ws"}), encoding="utf-8"
+    )
+    (state / "state.json").write_text(
+        json.dumps({"agents": {}, "templates": {}, "events": []}), encoding="utf-8"
+    )
+
+    store = StateStore(config_dir=state)
+    store.ensure()  # must not raise RecursionError
+
+    assert store.read_config()["workspace"] == "legacy-ws"
+    assert not (state / "config.json").exists()
+    assert not (state / "state.json").exists()
+    assert (state / "config.json.migrated").exists()
+
+    # A change made after migration must survive the next ensure() rather than
+    # being reverted by a re-import of the retired legacy file.
+    config = store.read_config()
+    config["workspace"] = "post-migration"
+    store.write_config(config)
+    assert StateStore(config_dir=state).read_config()["workspace"] == "post-migration"
+
+
 def test_store_uses_wal_and_busy_timeout(tmp_path: Path) -> None:
     store = StateStore(config_dir=tmp_path)
     store.ensure()

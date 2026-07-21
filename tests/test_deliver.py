@@ -75,6 +75,45 @@ def test_deliver_to_agent_enforces_manifest_gateway_timeout(tmp_path: Path) -> N
     assert result["timeout_seconds"] == 15.0
 
 
+def test_default_deliver_runner_reaps_process_group_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default delivery runner must launch the command in its own session
+    and, on timeout, kill the whole process group. subprocess.run's timeout
+    only SIGKILLs the direct child (sudo), leaving the provider-CLI grandchild
+    running the task after we report it failed."""
+    import subprocess
+
+    service = _service_with_agent(tmp_path, linux_user="")
+    killed: list[tuple[int, int]] = []
+
+    class FakeProc:
+        pid = 4242
+        returncode = None
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            raise subprocess.TimeoutExpired(cmd="openclaw", timeout=timeout or 0)
+
+    popen_kwargs: dict[str, object] = {}
+
+    def fake_popen(_cmd: list[str], **kwargs: object) -> FakeProc:
+        popen_kwargs.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        service, "_terminate_timed_out_process_group",
+        lambda proc: (killed.append((proc.pid, 9)), ("", ""))[1],
+    )
+
+    runner = service._default_deliver_runner("openclaw", "", timeout=1.0, executable="/usr/bin/openclaw")
+    with pytest.raises(SetupError, match="exceeded 1s timeout"):
+        runner(["openclaw", "agent"])
+
+    assert popen_kwargs.get("start_new_session") is True
+    assert killed == [(4242, 9)]
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
 def test_deliver_to_agent_rejects_invalid_timeout(tmp_path: Path, timeout: float) -> None:
     service = _service_with_agent(tmp_path)
@@ -373,12 +412,13 @@ def test_default_deliver_runner_resolves_agent_provider(
     monkeypatch.setattr(service, "_wrap_user_command", fake_wrap)
     monkeypatch.setattr(service, "_service_env", lambda lu: {})
 
-    class _R:
+    class _Proc:
         returncode = 0
-        stdout = '{"payloads":[{"text":"ok"}]}'
-        stderr = ""
 
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return '{"payloads":[{"text":"ok"}]}', ""
+
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Proc())
 
     # no run injected -> exercises _default_deliver_runner, which swaps argv[0]
     # for the resolved executable path
@@ -405,12 +445,13 @@ def test_default_deliver_runner_reports_agent_provider(
     monkeypatch.setattr(service, "_wrap_user_command", lambda argv, lu, purpose="": list(argv))
     monkeypatch.setattr(service, "_service_env", lambda lu: {})
 
-    class _R:
+    class _Proc:
         returncode = 1
-        stdout = ""
-        stderr = "gateway unavailable"
 
-    monkeypatch.setattr("subprocess.run", lambda *a, **k: _R())
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            return "", "gateway unavailable"
+
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: _Proc())
 
     with pytest.raises(SetupError, match="openclaw agent delivery failed: gateway unavailable"):
         service.deliver_to_agent("alice", "x")

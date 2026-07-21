@@ -198,11 +198,13 @@ See [docs/backup.md](docs/backup.md).
 - **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
 - **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout; manifests can lower depth and gateway timeout limits per agent.
 - **SQLite storage** — uses WAL, a busy timeout, and revision-based compare-and-swap for JSON state/config snapshots so stale writers fail instead of silently losing updates. `clawied` hosts manifest reconciliation, mutating service operations, and a capability-gated control RPC.
-- **Acceptance is host-specific** — the production/stable classification is
-  backed by the [0.1.8 wheel proof](docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md),
-  including live OpenClaw delivery and destructive watchdog recovery. A new
-  deployment host must still run both exercises in `production verify` against
-  its exact artifact; one accepted host does not certify another.
+- **Acceptance is host- and artifact-specific** — the most recent full
+  aggregate proof (live OpenClaw delivery + destructive watchdog recovery) is
+  the [0.1.8 wheel proof](docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
+  The current 0.1.9 release adds post-audit security and robustness fixes on top
+  of that code, so it must be re-proven: run both exercises in `production
+  verify` against your exact 0.1.9 artifact before treating it as accepted. One
+  accepted host or version does not certify another.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.

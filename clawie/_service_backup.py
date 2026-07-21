@@ -385,7 +385,9 @@ class BackupOpsMixin:
             elif not commit:
                 push_error = "remote push requested but the backup repository has no commit"
             else:
-                outcome = self._run_backup_git(repo, "push", "-u", "origin", "HEAD", check=False)
+                outcome = self._run_backup_git(
+                    repo, "push", "-u", "origin", "HEAD", check=False, timeout=300.0
+                )
                 if outcome.returncode == 0:
                     pushed = True
                 else:
@@ -1548,6 +1550,7 @@ class BackupOpsMixin:
         repo: Path,
         *args: str,
         check: bool = True,
+        timeout: float = 120.0,
     ) -> subprocess.CompletedProcess[str]:
         git_cmd = [
             "git",
@@ -1583,7 +1586,18 @@ class BackupOpsMixin:
         # Read-only status calls must not refresh the Git index or create lock
         # files. Required locks for mutating commands are unaffected.
         git_env["GIT_OPTIONAL_LOCKS"] = "0"
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=git_env)
+        # Bound every git call: a network op (push/fetch) against a dead remote,
+        # or a local op on a hung filesystem, would otherwise block forever.
+        # The maintenance daemon serves IPC only between reconcile cycles, so an
+        # unbounded git call here wedges the whole control plane with no alert.
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, env=git_env, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SetupError(
+                f"git {' '.join(args)} timed out after {timeout:g}s"
+            ) from exc
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise SetupError(f"git {' '.join(args)} failed: {detail or f'exit {result.returncode}'}")

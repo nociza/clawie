@@ -109,6 +109,12 @@ RestartSec=3
 WantedBy=multi-user.target
 """
 
+# x11vnc runs without a VNC password (-nopw), so it MUST stay bound to
+# localhost. noVNC/websockify (below) also binds localhost and proxies to it,
+# so browser access still works; remote operators reach it through an SSH
+# tunnel. Do not switch either service back to -listen 0.0.0.0 / a wildcard
+# bind without also adding VNC authentication — that would expose an
+# unauthenticated remote desktop of the agent session on every interface.
 _X11VNC_UNIT = """\
 [Unit]
 Description=Clawie x11vnc on display :{display_num}
@@ -119,7 +125,7 @@ After=clawie-xvfb-{display_num}.service
 Type=simple
 User={linux_user}
 Environment=DISPLAY=:{display_num}
-ExecStart=/usr/bin/x11vnc -display :{display_num} -nopw -listen 0.0.0.0 -xkb -ncache 10 -forever -rfbport {vnc_port}
+ExecStart=/usr/bin/x11vnc -display :{display_num} -nopw -localhost -xkb -ncache 10 -forever -rfbport {vnc_port}
 Restart=on-failure
 RestartSec=3
 
@@ -137,7 +143,7 @@ After=clawie-x11vnc-{display_num}.service
 Type=simple
 User={linux_user}
 Environment=DISPLAY=:{display_num}
-ExecStart=/usr/bin/websockify --web {novnc_web_dir} {novnc_port} localhost:{vnc_port}
+ExecStart=/usr/bin/websockify --web {novnc_web_dir} localhost:{novnc_port} localhost:{vnc_port}
 Restart=on-failure
 RestartSec=3
 

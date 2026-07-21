@@ -86,6 +86,7 @@ class StateStore:
 
     def __init__(self, config_dir: str | Path | None = None) -> None:
         self._read_only_depth = 0
+        self._ensuring = False
         self._explicit_config_dir = config_dir is not None
         self._allow_tmp_fallback = config_dir is None and "CLAWIE_HOME" not in os.environ
         if config_dir is None:
@@ -116,6 +117,20 @@ class StateStore:
                             "command as the state owner to repair them"
                         )
             return
+        if self._ensuring:
+            # Re-entrant ensure(): a migration step below calls write_config/
+            # write_state, which call ensure() again.  The schema is already
+            # created by the outer call, so return immediately.  Without this
+            # guard the legacy-JSON migration recurses until RecursionError,
+            # crashing every command on an upgrade from a pre-SQLite install.
+            return
+        self._ensuring = True
+        try:
+            self._ensure_locked()
+        finally:
+            self._ensuring = False
+
+    def _ensure_locked(self) -> None:
         self._ensure_root_dir()
         with self._connect() as conn:
             conn.executescript(
@@ -1235,6 +1250,16 @@ class StateStore:
         if self.state_path.exists():
             state = self._read_json(self.state_path, copy.deepcopy(DEFAULT_STATE))
             self.write_state(state)
+
+        # Retire the legacy inputs so a subsequent ensure() cannot re-import
+        # them and clobber changes made after this migration (an install with
+        # no agents/events would otherwise re-run this import on every call).
+        for legacy_path in (self.config_path, self.state_path):
+            try:
+                if legacy_path.exists():
+                    legacy_path.replace(legacy_path.with_suffix(legacy_path.suffix + ".migrated"))
+            except OSError:
+                pass
 
     def _migrate_schema(self) -> None:
         current = self._stored_schema_version()

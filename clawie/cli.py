@@ -2727,10 +2727,21 @@ def _status_section_error(payload: Any) -> str | None:
 
 
 def _status_snapshot_exit_code(snapshot: dict[str, Any]) -> int:
-    for payload in snapshot.values():
-        error = _status_section_error(payload)
-        if error is not None and _fatal_status_error(error):
+    sections = [key for key in snapshot if key in STATUS_SECTIONS]
+    errored = 0
+    for name in sections:
+        error = _status_section_error(snapshot.get(name))
+        if error is None:
+            continue
+        errored += 1
+        if _fatal_status_error(error):
             return 1
+    # A store-wide read failure (e.g. a corrupt or unreadable database)
+    # surfaces as an error in every section rather than any single fatal
+    # prefix. Treat "no section could be read" as unsafe so `status --json`
+    # is a trustworthy monitoring gate, per the documented contract.
+    if sections and errored == len(sections):
+        return 1
     health = snapshot.get("health")
     if isinstance(health, dict) and _status_section_error(health) is None:
         health_status = str(health.get("status", "unknown")).strip().lower()
@@ -2754,7 +2765,21 @@ def _fatal_status_error(error: str) -> bool:
         "read-only status cannot inspect an uncheckpointed clawie WAL;",
         "timed out waiting for the clawie database lock",
     )
-    return error.startswith(fatal_prefixes)
+    if error.startswith(fatal_prefixes):
+        return True
+    # SQLite corruption / unavailability signatures: the store itself cannot be
+    # trusted, so status must fail closed even for a single affected section.
+    lowered = error.lower()
+    corruption_signatures = (
+        "file is not a database",
+        "database disk image is malformed",
+        "malformed database schema",
+        "unable to open database file",
+        "disk i/o error",
+        "database or disk is full",
+        "no such table",
+    )
+    return any(sig in lowered for sig in corruption_signatures)
 
 
 def _print_status(snapshot: dict[str, Any]) -> None:

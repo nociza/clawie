@@ -685,10 +685,16 @@ class SpawnOpsMixin:
     def _set_password_hash(username: str, password_hash: str) -> None:
         if not password_hash:
             raise ValueError("password_hash cannot be empty")
+        # Feed the crypt hash to `chpasswd -e` on stdin rather than passing it as
+        # a `usermod -p <hash>` argv element: /proc/<pid>/cmdline is
+        # world-readable, so any local user (including a managed agent) could
+        # read the hash during the brief root exec and crack the shared spawn
+        # password offline. stdin is not exposed that way.
         result = subprocess.run(
-            ["usermod", "-p", password_hash, username],
-            capture_output=True,
+            ["chpasswd", "-e"],
+            input=f"{username}:{password_hash}\n",
             text=True,
+            capture_output=True,
             check=False,
         )
         if result.returncode != 0:

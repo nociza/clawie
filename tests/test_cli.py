@@ -84,7 +84,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.8" in capsys.readouterr().out
+    assert "clawie 0.1.9" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 
@@ -130,6 +130,31 @@ def test_corrupt_state_db_status_json_degrades_and_exits_nonzero(
     assert code == 1
     payload = json.loads(capsys.readouterr().out)
     assert "health" in payload
+
+
+def test_corrupt_private_db_status_exits_nonzero(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    """Real-world corruption path: a state dir with correct private permissions
+    whose database content is unreadable must still fail the monitoring gate.
+    Regression for a bug where SQLite corruption errors ("file is not a
+    database") did not match the fatal-error allowlist, so status exited 0."""
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    assert run_cli(state, "config", "set", "--workspace", "x") == 0
+    capsys.readouterr()
+
+    db = state / "clawie.db"
+    db.write_bytes(os.urandom(4096))
+    db.chmod(0o600)
+
+    code = main(["--config-dir", str(state), "--no-color", "status", "--json"])
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out)
+    # Every data section reports the store-level read failure.
+    errored = [k for k, v in payload.items() if isinstance(v, dict) and set(v) == {"error"}]
+    assert errored, payload
 
 
 def test_json_command_errors_are_structured_on_stderr(
@@ -2005,7 +2030,11 @@ def test_spawn_uses_global_password_hash(
     output = capsys.readouterr().out
     assert code == 0, output
     assert "Spawned linux user sam" in output
-    assert any(cmd[:2] == ["usermod", "-p"] for cmd in calls)
+    # The pre-hashed password is applied via `chpasswd -e` on stdin, never as a
+    # `usermod -p <hash>` argv element (which would leak the hash through
+    # world-readable /proc/<pid>/cmdline).
+    assert any(cmd == ["chpasswd", "-e"] for cmd in calls)
+    assert not any(cmd[:2] == ["usermod", "-p"] for cmd in calls)
 
 
 def test_spawn_generates_password_and_prints_it(

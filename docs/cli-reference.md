@@ -160,7 +160,7 @@ only when the runtime should reuse shared provider auth.
 ```bash
 clawie auth show
 clawie auth login PROVIDER
-clawie auth import PROVIDER [--from codex|claude|provider] [--source-home PATH]
+clawie auth import PROVIDER --from codex|claude|provider [--source-home PATH]
 clawie auth port --from PROVIDER --to PROVIDER   # port sessions between claws
 clawie auth apply [AGENT_ID]
 ```

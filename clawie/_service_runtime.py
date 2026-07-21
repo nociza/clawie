@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import pwd
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from clawie.providers import (
     get_provider,
     provider_names,
 )
-from clawie.ipc_paths import control_socket_path
+from clawie.ipc_paths import control_socket_path, delegation_socket_path
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
@@ -121,6 +122,7 @@ class RuntimeOpsMixin:
                 "runtime_version": runtime_version,
             }
 
+        shared_toolchain: Path | None = None
         if spec.install_method == "brew":
             brew = self._resolve_executable_in_service_env("brew")
             if not brew:
@@ -130,13 +132,26 @@ class RuntimeOpsMixin:
             pnpm = self._resolve_executable_in_service_env("pnpm")
             if not pnpm:
                 raise SetupError("pnpm is required to install provider runtimes but was not found in PATH.")
-            cmd = [pnpm, "add", "-g", spec.install_package or spec.name]
+            shared_toolchain = self._ensure_shared_toolchain_root()
+            cmd = [
+                pnpm,
+                "add",
+                "-g",
+                "--global-dir",
+                str(shared_toolchain / "pnpm-global"),
+                spec.install_package or spec.name,
+            ]
         else:
             raise SetupError(f"provider '{spec.name}' does not define an install method")
 
         env = self._service_env("")
+        if shared_toolchain is not None:
+            env["CLAWIE_SHARED_TOOLCHAIN"] = str(shared_toolchain)
+            env["PNPM_HOME"] = str(shared_toolchain / "bin")
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
         output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
+        if shared_toolchain is not None:
+            self._harden_shared_toolchain_permissions(shared_toolchain)
         if result.returncode != 0:
             raise SetupError(
                 f"failed to install runtime for {spec.name} via {spec.install_method}: {output or f'exit {result.returncode}'}"
@@ -570,27 +585,72 @@ class RuntimeOpsMixin:
         except SetupError:
             return ""
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
                 env=self._service_env(linux_user),
-                timeout=5,
+                start_new_session=True,
             )
-        except subprocess.TimeoutExpired as exc:
-            output = self._join_process_output(exc.stdout, exc.stderr)
+        except OSError as exc:
+            return f"{provider} foreground startup probe could not start: {exc}"
+        stdout: str | None
+        stderr: str | None
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = self._terminate_timed_out_process_group(process)
+            output = self._join_process_output(stdout, stderr)
             prefix = f"{provider} foreground startup probe stayed alive for 5s; process detection may be wrong"
             return f"{prefix}\n{output}".strip()
 
-        output = self._join_process_output(result.stdout, result.stderr)
-        if result.returncode == 0 and not output:
+        output = self._join_process_output(stdout, stderr)
+        returncode = int(process.returncode or 0)
+        if returncode == 0 and not output:
             return ""
-        if result.returncode == 0:
+        if returncode == 0:
             return f"{provider} foreground startup probe output:\n{output}".strip()
         if output:
-            return f"{provider} foreground startup probe exited {result.returncode}:\n{output}".strip()
-        return f"{provider} foreground startup probe exited {result.returncode}"
+            return f"{provider} foreground startup probe exited {returncode}:\n{output}".strip()
+        return f"{provider} foreground startup probe exited {returncode}"
+
+    @staticmethod
+    def _terminate_timed_out_process_group(
+        process: subprocess.Popen[str],
+    ) -> tuple[str | None, str | None]:
+        """Terminate a timed-out probe and every descendant in its session."""
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            process.terminate()
+
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                process.kill()
+            stdout, stderr = process.communicate()
+            return stdout, stderr
+
+        # The immediate wrapper (often sudo) can exit before a descendant that
+        # closed its inherited pipes. Fence the whole session before returning.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        return stdout, stderr
 
     def _assert_provider_postflight_ready(
         self,
@@ -1208,6 +1268,7 @@ class RuntimeOpsMixin:
 
     def _service_env(self, linux_user: str) -> dict[str, str]:
         env = dict(os.environ)
+        shared_toolchain = self._shared_toolchain_home()
         current_path = env.get("PATH", "")
         required_paths = [
             *self._shared_toolchain_path_entries(),
@@ -1223,6 +1284,8 @@ class RuntimeOpsMixin:
                 continue
             merged.append(piece)
         env["PATH"] = ":".join(merged)
+        env["CLAWIE_SHARED_TOOLCHAIN"] = str(shared_toolchain)
+        env["PNPM_HOME"] = str(shared_toolchain / "bin")
 
         if linux_user:
             home = self._linux_home_for_user(linux_user)
@@ -1261,6 +1324,7 @@ class RuntimeOpsMixin:
         path_entries = self._service_env("").get("PATH", "")
         pickup = self._staged_prompt_pickup_shell(provider, state_dir, workspace_dir)
         control_socket = control_socket_path(self.store.root, "%U")
+        delegation_socket = delegation_socket_path(self.store.root, "%U")
         shell = (
             f'mkdir -p "$HOME/{state_dir}" "$HOME/{state_dir}/{workspace_dir}"; '
             f'cd "$HOME/{state_dir}/{workspace_dir}"; '
@@ -1278,6 +1342,7 @@ class RuntimeOpsMixin:
             "Environment=USER=%u",
             "Environment=LOGNAME=%u",
             f"Environment=CLAWIE_CONTROL_SOCKET={control_socket}",
+            f"Environment=CLAWIE_DELEGATION_SOCKET={delegation_socket}",
             f"Environment=PATH={path_entries}",
             f"ExecStartPre=/bin/bash -c {shlex.quote(pickup)}",
             f"ExecStart=/bin/bash -lc {shlex.quote(shell)}",
@@ -1316,6 +1381,10 @@ class RuntimeOpsMixin:
         for candidate in candidates:
             if candidate == "root":
                 continue
+            direct = self._run_direct_systemd_user_command(candidate, args)
+            if direct.get("ok", False):
+                return direct
+            last_output = str(direct.get("output", "") or last_output)
             cmd = ["systemctl", "--machine", f"{candidate}@", "--user", *args]
             try:
                 result = subprocess.run(
@@ -1350,6 +1419,54 @@ class RuntimeOpsMixin:
         except Exception as exc:
             last_output = str(exc)
         return {"ok": False, "output": last_output, "command": cmd}
+
+    def _run_direct_systemd_user_command(
+        self,
+        linux_user: str,
+        args: list[str],
+    ) -> dict[str, Any]:
+        """Run systemctl as the target user against that user's own bus."""
+        token = str(linux_user).strip()
+        if not token:
+            return {"ok": False, "output": "linux user is required", "command": []}
+        env = self._service_env(token)
+        base = ["systemctl", "--user", *args]
+        if os.geteuid() == 0 and token != self._current_linux_user():
+            try:
+                uid = int(pwd.getpwnam(token).pw_uid)
+            except KeyError:
+                return {"ok": False, "output": f"linux user not found: {token}", "command": []}
+            cmd = [
+                "sudo",
+                "-u",
+                token,
+                "-H",
+                "--",
+                "env",
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                f"PATH={env.get('PATH', '')}",
+                *base,
+            ]
+        else:
+            cmd = base
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        except Exception as exc:
+            return {"ok": False, "output": str(exc), "command": cmd}
+        output = (result.stdout or result.stderr or "").strip()
+        return {
+            "ok": result.returncode == 0,
+            "output": output or ("" if result.returncode == 0 else f"exit {result.returncode}"),
+            "command": cmd,
+            "returncode": int(result.returncode),
+        }
 
     def _process_service_shell(self, provider: str, executable: str, action: str) -> str:
         spec = get_provider(provider)
@@ -1652,6 +1769,9 @@ class RuntimeOpsMixin:
 
     def _systemd_user_candidates(self, linux_user: str, provider: str = "") -> list[str]:
         candidates: list[str] = []
+        explicit = str(linux_user).strip()
+        if explicit and explicit != "root":
+            return [explicit]
         hint = str(self._local_linux_user_hint(provider, "")).strip() if provider else ""
         for token in (
             str(linux_user).strip(),
@@ -1678,6 +1798,18 @@ class RuntimeOpsMixin:
         for candidate in candidates:
             if candidate == "root":
                 continue
+            direct = self._run_direct_systemd_user_command(
+                candidate,
+                ["is-active", service],
+            )
+            parsed = self._parse_systemctl_status(
+                str(direct.get("output", "")),
+                "",
+            )
+            if parsed == "running":
+                return "running"
+            if parsed == "stopped":
+                saw_stopped = True
             cmd = ["systemctl", "--machine", f"{candidate}@", "--user", "is-active", service]
             env = self._systemctl_env()
             try:
@@ -1716,6 +1848,13 @@ class RuntimeOpsMixin:
         for candidate in candidates:
             if candidate == "root":
                 continue
+            direct = self._run_direct_systemd_user_command(
+                candidate,
+                [action, service],
+            )
+            if direct.get("ok", False):
+                return direct
+            last_output = str(direct.get("output", "") or last_output)
             cmd = ["systemctl", "--machine", f"{candidate}@", "--user", action, service]
             try:
                 result = subprocess.run(

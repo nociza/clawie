@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import tempfile
@@ -85,6 +86,21 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
     assert exc.value.code == 0
     assert "clawie 0.1.8" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
+
+
+def test_cli_without_arguments_prints_help_without_creating_state(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    assert main([]) == 0
+
+    output = capsys.readouterr().out
+    assert "Clawie control plane" in output
+    assert "{status,config,agent" in output
+    assert not (tmp_path / ".clawie").exists()
 
 
 def test_json_command_errors_are_structured_on_stderr(
@@ -952,6 +968,7 @@ def test_runtime_install_uses_pinned_openclaw_package_and_verifies_result(
 ) -> None:
     service = ClawieService(StateStore(config_dir=tmp_path))
     calls: list[list[str]] = []
+    environments: list[dict[str, str]] = []
     monkeypatch.setattr(
         service,
         "_resolve_executable_in_service_env",
@@ -968,6 +985,9 @@ def test_runtime_install_uses_pinned_openclaw_package_and_verifies_result(
 
     def fake_run(command: list[str], **kwargs: object) -> Result:
         calls.append(command)
+        environment = kwargs.get("env")
+        if isinstance(environment, dict):
+            environments.append({str(key): str(value) for key, value in environment.items()})
         if command == ["/mock/bin/openclaw", "--version"]:
             return Result("openclaw 2026.7.1")
         return Result("installed")
@@ -976,18 +996,30 @@ def test_runtime_install_uses_pinned_openclaw_package_and_verifies_result(
 
     result = service.install_provider_runtime("openclaw")
 
-    assert calls[0] == ["/mock/bin/pnpm", "add", "-g", "openclaw@2026.7.1"]
+    toolchain = tmp_path / "shared-toolchain"
+    assert calls[0] == [
+        "/mock/bin/pnpm",
+        "add",
+        "-g",
+        "--global-dir",
+        str(toolchain / "pnpm-global"),
+        "openclaw@2026.7.1",
+    ]
     assert calls[1] == ["/mock/bin/openclaw", "--version"]
+    assert environments[0]["PNPM_HOME"] == str(toolchain / "bin")
+    assert environments[0]["CLAWIE_SHARED_TOOLCHAIN"] == str(toolchain)
+    assert str(toolchain / "bin") in environments[0]["PATH"].split(":")
     assert result["runtime_version"] == "2026.7.1"
 
 
-def test_generated_openclaw_unit_exposes_request_only_control_socket(tmp_path: Path) -> None:
+def test_generated_openclaw_unit_exposes_request_only_agent_sockets(tmp_path: Path) -> None:
     service = ClawieService(StateStore(config_dir=tmp_path))
 
     unit = service._generated_user_service_unit_contents("openclaw", "/usr/bin/openclaw")
 
     assert "Environment=CLAWIE_CONTROL_SOCKET=/run/clawie/control/%U-" in unit
-    assert ".sock" in unit
+    assert "Environment=CLAWIE_DELEGATION_SOCKET=/run/clawie/control/delegation-%U-" in unit
+    assert unit.count(".sock") >= 2
 
 
 def test_addon_install_cli(
@@ -2183,6 +2215,53 @@ def test_purge_removes_agent_and_linux_user_with_root(
     assert "teleclaw" not in StateStore(config_dir=tmp_path).read_state()["agents"]
 
 
+def test_purge_stops_managed_user_manager_before_userdel(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    calls: list[list[str]] = []
+    process_states = iter((True, False))
+
+    class Result:
+        def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+            self.returncode = returncode
+            self.stdout = ""
+            self.stderr = stderr
+
+    def fake_run(command: list[str], **_kwargs: object) -> Result:
+        calls.append(command)
+        if command[1:2] == ["terminate-user"]:
+            return Result(1, "not logged in")
+        return Result()
+
+    monkeypatch.setattr(service, "_run_managed_provider_service_action", lambda **_kwargs: {"service_status": "stopped"})
+    monkeypatch.setattr(service, "_run_systemd_user_command", lambda *_args: {"ok": True})
+    monkeypatch.setattr(service, "_linux_home_for_user", lambda _user: None)
+    monkeypatch.setattr(service, "_managed_provider_process_live_for_purge", lambda *_args: False)
+    monkeypatch.setattr(
+        service,
+        "_linux_uid_has_processes_for_purge",
+        lambda _uid: next(process_states),
+    )
+    monkeypatch.setattr(
+        "clawie._service_agents.shutil.which",
+        lambda command: f"/usr/bin/{command}" if command in {"loginctl", "systemctl"} else None,
+    )
+    monkeypatch.setattr("clawie._service_agents.subprocess.run", fake_run)
+
+    stopped = service._stop_managed_runtime_for_purge(
+        agent_id="worker",
+        linux_user="worker",
+        info={"provider": "openclaw", "linux_uid": 12345},
+    )
+
+    assert stopped is True
+    assert ["/usr/bin/loginctl", "disable-linger", "worker"] in calls
+    assert ["/usr/bin/loginctl", "terminate-user", "worker"] in calls
+    assert ["/usr/bin/systemctl", "stop", "user@12345.service"] in calls
+
+
 def test_purge_preserves_agent_and_user_when_runtime_cannot_be_stopped(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -2391,6 +2470,36 @@ def test_delete_refuses_to_orphan_a_managed_linux_runtime(tmp_path: Path) -> Non
     assert "alice" in service.store.read_state()["agents"]
 
 
+def test_agent_delete_requires_confirmation(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "draft") == 0
+    capsys.readouterr()
+    monkeypatch.setattr("builtins.input", lambda _prompt: "no")
+
+    assert run_cli(tmp_path, "agent", "delete", "draft") == 1
+
+    assert "delete cancelled" in capsys.readouterr().err
+    assert "draft" in StateStore(config_dir=tmp_path).read_state()["agents"]
+
+
+def test_agent_delete_yes_is_noninteractive(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "draft") == 0
+    capsys.readouterr()
+
+    assert run_cli(tmp_path, "agent", "delete", "draft", "--yes") == 0
+
+    assert "Deleted agent draft" in capsys.readouterr().out
+    assert "draft" not in StateStore(config_dir=tmp_path).read_state()["agents"]
+
+
 def test_purge_accepts_positional_agent_id(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -2525,6 +2634,23 @@ def test_spawn_clones_core_prompts_from_local_source_home(
     agent = StateStore(config_dir=tmp_path).read_state()["agents"]["teleclaw2"]
     prompts = agent.get("core_prompts", {})
     assert str(prompts.get("SOUL.md", "")) == "You are teleclaw.\n"
+
+
+def test_source_prompt_discovery_ignores_provider_workspace_symlink(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    source_home = tmp_path / "source-home"
+    provider_home = source_home / ".openclaw"
+    external_workspace = tmp_path / "external-workspace"
+    provider_home.mkdir(parents=True)
+    external_workspace.mkdir()
+    (external_workspace / "SOUL.md").write_text("must not be followed\n", encoding="utf-8")
+    (provider_home / "workspace").symlink_to(external_workspace, target_is_directory=True)
+
+    prompts = service._read_core_prompts_from_home("openclaw", source_home)
+
+    assert prompts
+    assert all(value == "" for value in prompts.values())
+    assert (external_workspace / "SOUL.md").read_text(encoding="utf-8") == "must not be followed\n"
 
 
 def test_agents_clone_prompts_copies_core_prompt_payload(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
@@ -4356,6 +4482,35 @@ def test_doctor_verifies_private_shared_provider_auth_copy(
     assert not any(row["status"] == "fail" for row in report["checks"])
 
 
+def test_doctor_accepts_headless_delegation_agents(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="zeroclaw",
+        api_key="test-key",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.zeroclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="worker",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+        provider="zeroclaw",
+    )
+
+    report = service.doctor()
+
+    assert report["status"] == "healthy"
+    assert any(
+        row["message"] == "Headless agents available through delegation or CLI: worker"
+        for row in report["checks"]
+    )
+
+
 def test_host_validation_skips_without_linux_proc(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     service = ClawieService(StateStore(config_dir=tmp_path))
     monkeypatch.setattr(service, "_linux_proc_available", lambda: False)
@@ -4609,7 +4764,11 @@ def test_dashboard_refresh_local_status_uses_sudo_user_context(
     snapshot = service.performance_snapshot(refresh=True)
     row = next(r for r in snapshot["rows"] if r["agent_id"] == "@local:zeroclaw")
     assert row["status"] == "running"
-    assert any(cmd[:4] == ["systemctl", "--machine", "alice@", "--user"] for cmd in calls)
+    assert any(
+        cmd[:5] == ["sudo", "-u", "alice", "-H", "--"]
+        and cmd[-3:] == ["--user", "is-active", "zeroclaw.service"]
+        for cmd in calls
+    )
 
 
 def test_local_agent_view_refreshes_service_status(
@@ -5100,7 +5259,7 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     )
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
     assert (home / ".openclaw" / "auth-profiles.json").is_file()
     assert not (home / ".openclaw" / "auth-profiles.json").is_symlink()
     assert (home / ".openclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
@@ -5605,7 +5764,7 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["gateway"]["mode"] == "local"
     assert config["agents"]["defaults"]["workspace"] == str(home / ".openclaw" / "workspace")
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
     assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
     assert config["agents"]["defaults"]["heartbeat"]["directPolicy"] == "block"
     assert config["agents"]["defaults"]["heartbeat"]["lightContext"] is True
@@ -5618,7 +5777,7 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
         "useIndicator": False,
     }
     assert config["channels"]["telegram"]["botToken"] == token
-    assert config["channels"]["telegram"]["streaming"] == "off"
+    assert config["channels"]["telegram"]["streaming"] == {"mode": "off"}
     assert config["channels"]["telegram"]["allowFrom"] == ["tg:123"]
     assert config["channels"]["telegram"]["dmPolicy"] == "allowlist"
     assert config["channels"]["telegram"]["groups"]["*"]["requireMention"] is True
@@ -5655,7 +5814,7 @@ def test_ensure_openclaw_home_prepared_preserves_reachability_when_migrating_tel
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
-    assert config["channels"]["telegram"]["streaming"] == "off"
+    assert config["channels"]["telegram"]["streaming"] == {"mode": "off"}
     assert config["channels"]["telegram"]["allowFrom"] == ["*"]
     assert config["channels"]["telegram"]["dmPolicy"] == "open"
 
@@ -5692,7 +5851,7 @@ def test_ensure_openclaw_home_prepared_heals_legacy_pairing_dm_policy_without_al
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
-    assert config["channels"]["telegram"]["streaming"] == "off"
+    assert config["channels"]["telegram"]["streaming"] == {"mode": "off"}
     assert config["channels"]["telegram"]["allowFrom"] == ["*"]
     assert config["channels"]["telegram"]["dmPolicy"] == "open"
 
@@ -5713,6 +5872,11 @@ def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without
                         "enabled": True,
                         "botToken": _fake_telegram_token(),
                         "streaming": "partial",
+                        "streamMode": "partial",
+                        "chunkMode": "newline",
+                        "blockStreaming": True,
+                        "draftChunk": {"minChars": 50},
+                        "blockStreamingCoalesce": {"idleMs": 100},
                     }
                 }
             }
@@ -5731,7 +5895,16 @@ def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without
     )
 
     config = json.loads((root / "openclaw.json").read_text(encoding="utf-8"))
-    assert config["channels"]["telegram"]["streaming"] == "off"
+    telegram = config["channels"]["telegram"]
+    assert telegram["streaming"] == {"mode": "off"}
+    for legacy_key in (
+        "streamMode",
+        "chunkMode",
+        "blockStreaming",
+        "draftChunk",
+        "blockStreamingCoalesce",
+    ):
+        assert legacy_key not in telegram
     assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
     assert config["channels"]["defaults"]["heartbeat"]["showAlerts"] is False
 
@@ -6003,7 +6176,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     assert result["stopped_service"]["provider"] == "zeroclaw"
     assert config["gateway"]["mode"] == "local"
     assert config["channels"]["telegram"]["botToken"] == _fake_telegram_token()
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
     assert ("openclaw", "start", "teleclaw") in unit_actions
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
 
@@ -7001,8 +7174,64 @@ def test_agent_service_start_surfaces_picoclaw_probe_output_when_log_is_empty(
     monkeypatch.setattr("shutil.which", lambda _: "picoclaw")
     monkeypatch.setattr("subprocess.run", fake_run)
 
+    class ProbeProcess:
+        pid = 4321
+        returncode = 1
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            del timeout
+            return "", "Error starting channels: failed to create telegram bot: invalid token format"
+
+    monkeypatch.setattr(
+        "clawie._service_runtime.subprocess.Popen",
+        lambda *_args, **_kwargs: ProbeProcess(),
+    )
+
     with raises(SetupError, match="foreground startup probe exited 1"):
         service.agent_service_action("teleclaw", "start")
+
+
+def test_provider_start_probe_terminates_the_full_process_group_on_timeout(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    popen_kwargs: dict[str, object] = {}
+    signals: list[tuple[int, int]] = []
+
+    class ProbeProcess:
+        pid = 9876
+        returncode = -15
+        calls = 0
+
+        def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["openclaw", "gateway", "run"], 5)
+            return "gateway booted", ""
+
+    process = ProbeProcess()
+
+    def fake_popen(*_args: object, **kwargs: object) -> ProbeProcess:
+        popen_kwargs.update(kwargs)
+        return process
+
+    def fake_killpg(pid: int, signum: int) -> None:
+        signals.append((pid, signum))
+        if signum == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "/usr/bin/openclaw")
+    monkeypatch.setattr(service, "_wrap_user_command", lambda command, *_args, **_kwargs: command)
+    monkeypatch.setattr("clawie._service_runtime.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("clawie._service_runtime.os.killpg", fake_killpg)
+
+    output = service._provider_start_probe_output(provider="openclaw", linux_user="agent-a")
+
+    assert "stayed alive for 5s" in output
+    assert "gateway booted" in output
+    assert popen_kwargs["start_new_session"] is True
+    assert signals == [(9876, signal.SIGTERM), (9876, 0)]
 
 
 def test_attach_agent_runtime_status_marks_managed_agent_stopped_when_no_live_daemon(
@@ -7736,6 +7965,54 @@ def test_systemd_status_prefers_any_running_candidate_over_stopped(
     assert status == "running"
 
 
+def test_managed_systemd_command_runs_as_exact_target_user(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    calls: list[list[str]] = []
+
+    class PwdRow:
+        pw_uid = 12345
+        pw_dir = "/home/managed-agent"
+
+    class Result:
+        returncode = 0
+        stdout = "active\n"
+        stderr = ""
+
+    def fake_run(command: list[str], **_kwargs: object) -> Result:
+        calls.append(command)
+        return Result()
+
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(service, "_current_linux_user", lambda: "root")
+    monkeypatch.setattr("clawie._service_runtime.pwd.getpwnam", lambda _user: PwdRow())
+    monkeypatch.setattr("clawie._service_runtime.subprocess.run", fake_run)
+
+    result = service._run_systemd_user_command("managed-agent", ["is-active", "openclaw.service"])
+
+    assert result["ok"] is True
+    assert calls == [
+        [
+            "sudo",
+            "-u",
+            "managed-agent",
+            "-H",
+            "--",
+            "env",
+            "XDG_RUNTIME_DIR=/run/user/12345",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/12345/bus",
+            f"PATH={service._service_env('managed-agent')['PATH']}",
+            "systemctl",
+            "--user",
+            "is-active",
+            "openclaw.service",
+        ]
+    ]
+    assert service._systemd_user_candidates("managed-agent", "openclaw") == ["managed-agent"]
+
+
 def test_channel_inventory_includes_agent_and_local_channels(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -8247,7 +8524,7 @@ def test_status_command_does_not_initialize_or_chmod_an_unconfigured_state_root(
 
     code = run_cli(shared, "status", "--json")
 
-    assert code == 0
+    assert code == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["setup"]["configured"] is False
     assert not (shared / "clawie.db").exists()

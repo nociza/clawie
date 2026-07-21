@@ -105,13 +105,18 @@ class DelegationOpsMixin:
         payload: dict[str, Any] | None = None,
         timeout: float = 300.0,
         model_tier: str = "",
+        parent_task_id: str = "",
     ) -> dict[str, Any]:
         from clawie.delegation import (
-            DEFAULT_TIER,
+            MAX_CHILDREN_PER_AGENT,
+            MAX_RECURSION_DEPTH,
+            ContextBudget,
             DelegationBus,
             DelegationCoordinator,
             DelegationTree,
+            estimate_payload_tokens,
             get_model_tier,
+            recommend_tier,
         )
 
         parent_id = self._validate_agent_id(parent_id)
@@ -128,123 +133,114 @@ class DelegationOpsMixin:
         effective_timeout = float(timeout)
         if not math.isfinite(effective_timeout) or effective_timeout <= 0:
             raise ValueError("delegation timeout must be a positive finite number")
-        depth_limit = self._delegation_depth_limit(parent_id)
-        if 1 >= depth_limit:
-            raise ValueError(
-                f"max recursion depth ({depth_limit}) exceeded at depth=1"
-            )
-        tier = model_tier or DEFAULT_TIER
+        clean_payload = dict(payload or {})
+        task_message = self._delegation_payload_message(clean_payload)
+        tier = model_tier or recommend_tier(task_message, clean_payload)
         get_model_tier(tier)
+        budget = ContextBudget.for_tier(tier)
+        budget.record_payload(estimate_payload_tokens(clean_payload))
+        if budget.over_budget:
+            raise ValueError(
+                f"delegation payload exceeds the {tier} context budget "
+                f"({budget.tokens_used}>{budget.total_budget} estimated tokens)"
+            )
         task_id = uuid.uuid4().hex
         created_at = now_iso()
-        self.store.write_delegation_task(
+        reservation = self.store.reserve_delegation_task(
             task_id=task_id,
             parent_agent_id=parent_id,
             child_agent_id=child_id,
-            payload=payload or {},
-            depth=0,
+            payload=clean_payload,
             created_at=created_at,
             timeout_seconds=effective_timeout,
             model_tier=tier,
+            context_budget=budget.to_dict(),
+            depth_limits=self._delegation_depth_limits(),
+            max_depth=MAX_RECURSION_DEPTH,
+            max_children=MAX_CHILDREN_PER_AGENT,
+            parent_task_id=parent_task_id,
         )
         if not child_socket_alive:
             return self._deliver_managed_delegation(
                 task_id=task_id,
                 parent_id=parent_id,
                 child_id=child_id,
-                payload=payload or {},
+                payload=clean_payload,
                 timeout=effective_timeout,
                 tier=tier,
-                created_at=created_at,
+                reservation=reservation,
+                budget=budget,
             )
         bus = DelegationBus(parent_id)
+        depth_limit = self._delegation_depth_limit(str(reservation["root_agent_id"]))
         tree = DelegationTree(max_depth=depth_limit)
         coordinator = DelegationCoordinator(parent_id, bus, tree, model_tier=tier)
+        clean_result: dict[str, Any]
+        error = ""
+        status = "completed"
         try:
-            result = coordinator.delegate(child_id, payload or {}, timeout=effective_timeout)
-        except Exception as exc:
-            self.store.write_delegation_task(
-                task_id=task_id,
-                parent_agent_id=parent_id,
-                child_agent_id=child_id,
-                payload=payload or {},
-                depth=0,
-                timeout_seconds=effective_timeout,
-                status="failed",
-                error=str(exc),
-                created_at=created_at,
-                completed_at=now_iso(),
+            result = coordinator.delegate(
+                child_id,
+                clean_payload,
+                depth=int(reservation["depth"]),
+                timeout=effective_timeout,
                 model_tier=tier,
             )
-            state = self.store.read_state()
-            self._event(
-                state,
-                "delegation.failed",
-                f"Delegation {parent_id}->{child_id} failed: {exc}",
-                {"task_id": task_id, "parent": parent_id, "child": child_id},
-            )
-            self.store.write_state(state)
-            return {"task_id": task_id, "status": "failed", "error": str(exc)}
+        except Exception as exc:
+            clean_result = {"error": str(exc)}
+            error = str(exc)
+            status = "failed"
         finally:
             bus.close()
-        tree_data = tree.to_dict()
-        self.store.write_delegation_tree(parent_id, tree_data)
-        clean_result = dict(result)
-        child_node = tree.get_node(child_id)
-        failed = child_node is None or child_node.status in {"failed", "timeout"}
-        if failed:
-            status_detail = child_node.status if child_node is not None else "failed"
-            error = str(clean_result.get("error") or f"delegation {status_detail}")
-            self.store.write_delegation_task(
-                task_id=task_id,
-                parent_agent_id=parent_id,
-                child_agent_id=child_id,
-                payload=payload or {},
-                depth=0,
-                timeout_seconds=timeout,
-                status="failed",
-                result=clean_result,
-                error=error,
-                created_at=created_at,
-                completed_at=now_iso(),
-                model_tier=tier,
-            )
-            state = self.store.read_state()
-            self._event(
-                state,
-                "delegation.failed",
-                f"Delegation {parent_id}->{child_id} failed: {error}",
-                {"task_id": task_id, "parent": parent_id, "child": child_id},
-            )
-            self.store.write_state(state)
-            return {
-                "task_id": task_id,
-                "status": "failed",
-                "error": error,
-                "result": clean_result,
-            }
-        self.store.write_delegation_task(
+        if not error:
+            clean_result = dict(result)
+            child_node = tree.get_node(child_id)
+            if child_node is None or child_node.status in {"failed", "timeout"}:
+                status_detail = child_node.status if child_node is not None else "failed"
+                error = str(clean_result.get("error") or f"delegation {status_detail}")
+                status = "timeout" if status_detail == "timeout" else "failed"
+
+        budget.record_result(estimate_payload_tokens(clean_result))
+        context_budget = budget.to_dict()
+        metadata = self.store.complete_delegation_task(
             task_id=task_id,
-            parent_agent_id=parent_id,
-            child_agent_id=child_id,
-            payload=payload or {},
-            depth=0,
-            timeout_seconds=timeout,
-            status="completed",
+            status=status,
             result=clean_result,
-            created_at=created_at,
+            error=error,
             completed_at=now_iso(),
-            model_tier=tier,
+            context_budget=context_budget,
         )
         state = self.store.read_state()
+        event_type = "delegation.completed" if status == "completed" else "delegation.failed"
+        message = (
+            f"Delegation {parent_id}->{child_id} completed"
+            if status == "completed"
+            else f"Delegation {parent_id}->{child_id} failed: {error}"
+        )
         self._event(
             state,
-            "delegation.completed",
-            f"Delegation {parent_id}->{child_id} completed",
-            {"task_id": task_id, "parent": parent_id, "child": child_id},
+            event_type,
+            message,
+            {
+                "task_id": task_id,
+                "parent": parent_id,
+                "child": child_id,
+                "root": metadata["root_agent_id"],
+                "depth": metadata["depth"],
+                "model_tier": tier,
+            },
         )
+        self._record_delegation_budget_event(state, metadata, context_budget)
         self.store.write_state(state)
-        return {"task_id": task_id, "status": "completed", "result": clean_result}
+        response: dict[str, Any] = {
+            **metadata,
+            "status": status,
+            "result": clean_result,
+            "context_budget": context_budget,
+        }
+        if error:
+            response["error"] = error
+        return response
 
     def _deliver_managed_delegation(
         self,
@@ -255,15 +251,16 @@ class DelegationOpsMixin:
         payload: dict[str, Any],
         timeout: float,
         tier: str,
-        created_at: str,
+        reservation: dict[str, Any],
+        budget: Any,
     ) -> dict[str, Any]:
-        from clawie.delegation import DelegationTree
+        from clawie.delegation import estimate_payload_tokens
 
         error = ""
         try:
             result = self.deliver_to_agent(
                 child_id,
-                self._delegation_payload_message(payload),
+                self._managed_delegation_message(payload, reservation),
                 tier=tier,
                 timeout=timeout,
             )
@@ -274,27 +271,16 @@ class DelegationOpsMixin:
             error = str(exc)
 
         status = "failed" if error else "completed"
-        completed_at = now_iso()
-        self.store.write_delegation_task(
+        budget.record_result(estimate_payload_tokens(result))
+        context_budget = budget.to_dict()
+        metadata = self.store.complete_delegation_task(
             task_id=task_id,
-            parent_agent_id=parent_id,
-            child_agent_id=child_id,
-            payload=payload,
-            depth=1,
-            timeout_seconds=timeout,
             status=status,
             result=result,
             error=error,
-            created_at=created_at,
-            completed_at=completed_at,
-            model_tier=tier,
+            completed_at=now_iso(),
+            context_budget=context_budget,
         )
-        tree = DelegationTree(max_depth=self._delegation_depth_limit(parent_id))
-        tree.register(parent_id, "", f"{task_id}:root", depth=0, model_tier=tier)
-        tree.update_status(parent_id, "running")
-        tree.register(child_id, parent_id, task_id, depth=1, model_tier=tier)
-        tree.update_status(child_id, status)
-        self.store.write_delegation_tree(parent_id, tree.to_dict())
         state = self.store.read_state()
         event_type = "delegation.failed" if error else "delegation.completed"
         message = (
@@ -306,13 +292,85 @@ class DelegationOpsMixin:
             state,
             event_type,
             message,
-            {"task_id": task_id, "parent": parent_id, "child": child_id, "gateway": True},
+            {
+                "task_id": task_id,
+                "parent": parent_id,
+                "child": child_id,
+                "root": metadata["root_agent_id"],
+                "depth": metadata["depth"],
+                "model_tier": tier,
+                "gateway": True,
+            },
         )
+        self._record_delegation_budget_event(state, metadata, context_budget)
         self.store.write_state(state)
-        response = {"task_id": task_id, "status": status, "result": result}
+        response = {
+            **metadata,
+            "status": status,
+            "result": result,
+            "context_budget": context_budget,
+        }
         if error:
             response["error"] = error
         return response
+
+    def _delegation_depth_limits(self) -> dict[str, int]:
+        state = self.store.read_state()
+        agents = state.get("agents", {}) if isinstance(state.get("agents"), dict) else {}
+        return {
+            str(agent_id): self._delegation_depth_limit(str(agent_id))
+            for agent_id in agents
+        }
+
+    @classmethod
+    def _managed_delegation_message(
+        cls,
+        payload: dict[str, Any],
+        reservation: dict[str, Any],
+    ) -> str:
+        task_id = str(reservation.get("task_id", ""))
+        depth = int(reservation.get("depth", 0))
+        lineage = (
+            "[Clawie delegation context]\n"
+            f"task_id: {task_id}\n"
+            f"depth: {depth}\n"
+            "If you delegate a subtask, pass this active lineage explicitly: "
+            f"clawie delegation submit --parent-task {shlex.quote(task_id)} ...\n"
+            "[Task]\n"
+        )
+        return lineage + cls._delegation_payload_message(payload)
+
+    def _record_delegation_budget_event(
+        self,
+        state: dict[str, Any],
+        metadata: dict[str, Any],
+        context_budget: dict[str, Any],
+    ) -> None:
+        if not bool(context_budget.get("needs_warning", False)):
+            return
+        compact = bool(context_budget.get("needs_compaction", False))
+        event_type = (
+            "delegation.context_compaction_required"
+            if compact
+            else "delegation.context_warning"
+        )
+        task_id = str(metadata.get("task_id", ""))
+        used = int(context_budget.get("tokens_used", 0))
+        total = int(context_budget.get("total_budget", 0))
+        self._event(
+            state,
+            event_type,
+            f"Delegation {task_id} used {used}/{total} estimated context tokens",
+            {
+                "task_id": task_id,
+                "root": metadata.get("root_agent_id", ""),
+                "depth": metadata.get("depth", 0),
+                "tokens_used": used,
+                "total_budget": total,
+                "needs_compaction": compact,
+                "over_budget": bool(context_budget.get("over_budget", False)),
+            },
+        )
 
     def delegation_tree(self, root_agent_id: str) -> dict[str, Any]:
         return self.store.read_delegation_tree(root_agent_id) or {}

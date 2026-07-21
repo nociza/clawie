@@ -418,8 +418,8 @@ class ClawieService(
         no_channels = [aid for aid, row in agents.items() if not row.get("channels")]
         if no_channels:
             checks.append({
-                "status": "warn",
-                "message": "Agents without channels: " + ", ".join(no_channels),
+                "status": "pass",
+                "message": "Headless agents available through delegation or CLI: " + ", ".join(no_channels),
             })
         checks.extend(self._host_isolation_checks(agents))
 
@@ -883,7 +883,10 @@ class ClawieService(
             )
             if not bool(delivery.get("ok", False)):
                 raise SetupError(str(delivery.get("error", "live delivery failed")))
-            if nonce not in str(delivery.get("output", "")):
+            delivery_output = str(delivery.get("output", ""))
+            if nonce not in delivery_output:
+                evidence["delivery_output_excerpt"] = delivery_output[:500]
+                evidence["delivery_status"] = str(delivery.get("delivery_status", ""))
                 raise SetupError("live delivery reply did not contain the challenge marker")
             if str(delivery.get("transport", "")).strip().lower() == "embedded" or str(
                 delivery.get("fallback_from", "")

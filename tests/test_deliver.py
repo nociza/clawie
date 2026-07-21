@@ -7,6 +7,8 @@ agents/providers fail cleanly.
 """
 from __future__ import annotations
 
+import re
+import threading
 from pathlib import Path
 
 import pytest
@@ -47,12 +49,12 @@ def test_deliver_to_agent_success(tmp_path: Path) -> None:
     assert result["delivery_status"] == "sent"
     cmd = captured["cmd"]
     assert cmd[:2] == ["openclaw", "agent"]
-    assert cmd[cmd.index("--agent") + 1] == "alice"
+    assert cmd[cmd.index("--agent") + 1] == "main"
     assert cmd[cmd.index("--message") + 1] == "do the thing"
     assert cmd[cmd.index("--timeout") + 1] == "60"
     assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"  # fast tier
     # session key is task-scoped
-    assert cmd[cmd.index("--session-key") + 1].startswith("agent:alice:clawie:")
+    assert cmd[cmd.index("--session-key") + 1].startswith("agent:main:clawie:")
     assert any(e["type"] == "delegation.delivered" for e in service.list_events(limit=5))
 
 
@@ -140,14 +142,210 @@ def test_delegate_task_delivers_to_managed_child(
 
     assert result["status"] == "completed"
     assert result["result"]["output"] == "gateway-computed"
-    assert seen == {
-        "agent_id": "alice",
-        "message": "analyze this",
-        "kwargs": {"tier": "fast", "timeout": 45},
-    }
+    assert seen["agent_id"] == "alice"
+    assert "[Clawie delegation context]" in str(seen["message"])
+    assert "analyze this" in str(seen["message"])
+    assert f"--parent-task {result['task_id']}" in str(seen["message"])
+    assert seen["kwargs"] == {"tier": "fast", "timeout": 45}
+    assert result["model_tier"] == "fast"
+    assert result["depth"] == 1
+    assert result["root_agent_id"] == "planner"
+    assert result["context_budget"]["total_budget"] == 4_000
+    assert result["context_budget"]["tokens_used"] > 0
     tasks = service.delegation_tasks(agent_id="planner", status="completed")
     assert len(tasks) == 1
     assert tasks[0]["result"]["output"] == "gateway-computed"
+    assert tasks[0]["root_agent_id"] == "planner"
+    assert tasks[0]["root_task_id"] == result["task_id"]
+
+
+def _service_with_agents(tmp_path: Path, *agent_ids: str) -> ClawieService:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    state = service.store.read_state()
+    state["agents"] = {
+        agent_id: {
+            "agent_id": agent_id,
+            "agent": {
+                "provider": "openclaw",
+                "linux_user": agent_id,
+                "model_tier": "balanced",
+            },
+        }
+        for agent_id in agent_ids
+    }
+    service.store.write_state(state)
+    return service
+
+
+def _task_id_from_managed_message(message: str) -> str:
+    match = re.search(r"^task_id: ([0-9a-f]+)$", message, flags=re.MULTILINE)
+    assert match is not None
+    return match.group(1)
+
+
+def test_managed_delegation_persists_recursive_lineage_and_auto_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_agents(tmp_path, "planner", "worker", "researcher")
+    nested_result: dict[str, object] = {}
+
+    def fake_deliver(agent_id: str, message: str, **kwargs: object) -> dict[str, object]:
+        if agent_id == "worker":
+            nested_result.update(
+                service.delegate_task(
+                    "worker",
+                    "researcher",
+                    {"task": "check status"},
+                    parent_task_id=_task_id_from_managed_message(message),
+                )
+            )
+        return {"ok": True, "output": f"done:{agent_id}", "delivery_status": "sent"}
+
+    monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
+    result = service.delegate_task("planner", "worker", {"task": "analyze architecture"})
+
+    assert result["status"] == "completed"
+    assert result["model_tier"] == "power"
+    assert nested_result["status"] == "completed"
+    assert nested_result["model_tier"] == "fast"
+    assert nested_result["root_agent_id"] == "planner"
+    assert nested_result["root_task_id"] == result["root_task_id"]
+    assert nested_result["parent_task_id"] == result["task_id"]
+    assert nested_result["depth"] == 2
+    tree = service.delegation_tree("planner")
+    assert tree["planner"]["children"] == ["worker"]
+    assert tree["worker"]["children"] == ["researcher"]
+    assert tree["researcher"]["depth"] == 2
+    assert tree["planner"]["status"] == "completed"
+
+
+def test_managed_delegation_rejects_active_recursive_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_agents(tmp_path, "alpha", "beta")
+    cycle_error = ""
+
+    def fake_deliver(agent_id: str, message: str, **_kwargs: object) -> dict[str, object]:
+        nonlocal cycle_error
+        if agent_id == "beta":
+            with pytest.raises(ValueError, match="cycle detected") as exc:
+                service.delegate_task(
+                    "beta",
+                    "alpha",
+                    {"task": "recurse"},
+                    parent_task_id=_task_id_from_managed_message(message),
+                )
+            cycle_error = str(exc.value)
+        return {"ok": True, "output": "stopped", "delivery_status": "sent"}
+
+    monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
+    result = service.delegate_task("alpha", "beta", {"task": "start"})
+
+    assert result["status"] == "completed"
+    assert "alpha already in ancestry" in cycle_error
+    assert len(service.delegation_tasks()) == 1
+
+
+def test_managed_delegation_rejects_depth_overflow_from_active_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_agents(tmp_path, "root", "middle", "leaf")
+    state = service.store.read_state()
+    state["agents"]["root"]["agent"]["limits"] = {"delegation_depth": 2}
+    service.store.write_state(state)
+    depth_error = ""
+
+    def fake_deliver(agent_id: str, message: str, **_kwargs: object) -> dict[str, object]:
+        nonlocal depth_error
+        if agent_id == "middle":
+            with pytest.raises(ValueError, match="max recursion depth") as exc:
+                service.delegate_task(
+                    "middle",
+                    "leaf",
+                    {"task": "too deep"},
+                    parent_task_id=_task_id_from_managed_message(message),
+                )
+            depth_error = str(exc.value)
+        return {"ok": True, "output": "done", "delivery_status": "sent"}
+
+    monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
+    result = service.delegate_task("root", "middle", {"task": "start"})
+
+    assert result["status"] == "completed"
+    assert "depth=2" in depth_error
+
+
+def test_managed_delegation_reservation_prevents_concurrent_duplicate_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_agents(tmp_path, "p1", "p2", "worker")
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+    first_result: dict[str, object] = {}
+
+    def fake_deliver(_agent_id: str, _message: str, **_kwargs: object) -> dict[str, object]:
+        delivery_started.set()
+        assert release_delivery.wait(timeout=5)
+        return {"ok": True, "output": "done", "delivery_status": "sent"}
+
+    def run_first() -> None:
+        first_result.update(service.delegate_task("p1", "worker", {"task": "work"}))
+
+    monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    assert delivery_started.wait(timeout=5)
+    try:
+        with pytest.raises(ValueError, match="already participates"):
+            service.delegate_task("p2", "worker", {"task": "other"})
+    finally:
+        release_delivery.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert first_result["status"] == "completed"
+
+
+def test_managed_delegation_emits_persisted_context_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_agents(tmp_path, "planner", "worker")
+    monkeypatch.setattr(
+        service,
+        "deliver_to_agent",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "output": "x" * 12_500,
+            "delivery_status": "sent",
+        },
+    )
+
+    result = service.delegate_task(
+        "planner", "worker", {"task": "check"}, model_tier="fast"
+    )
+
+    assert result["context_budget"]["needs_warning"] is True
+    assert result["context_budget"]["needs_compaction"] is False
+    tasks = service.delegation_tasks(agent_id="planner")
+    assert tasks[0]["context_budget"] == result["context_budget"]
+    assert any(
+        event["type"] == "delegation.context_warning"
+        for event in service.list_events(limit=10)
+    )
+
+
+def test_managed_delegation_rejects_payload_over_selected_budget(tmp_path: Path) -> None:
+    service = _service_with_agents(tmp_path, "planner", "worker")
+
+    with pytest.raises(ValueError, match="exceeds the power context budget"):
+        service.delegate_task("planner", "worker", {"task": "analyze", "data": "x" * 300_000})
+
+    assert service.delegation_tasks() == []
 
 
 def test_default_deliver_runner_resolves_agent_provider(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -907,6 +908,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         metavar="AGENT_ID",
         help_text="Agent ID to delete",
     )
+    agent_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation prompt",
+    )
     agent_delete.set_defaults(func=cmd_agents_delete)
 
     agent_purge = agent_sub.add_parser(
@@ -1158,6 +1164,11 @@ def _build_delegation_parser(subparsers: argparse._SubParsersAction[argparse.Arg
     deleg_submit.add_argument("--payload", default="{}", help="JSON payload")
     deleg_submit.add_argument("--timeout", type=float, default=300.0, help="Timeout seconds")
     deleg_submit.add_argument("--tier", choices=["fast", "balanced", "power"], help="Model tier")
+    deleg_submit.add_argument(
+        "--parent-task",
+        default="",
+        help="Active task ID that assigned work to --parent (for explicit recursive lineage)",
+    )
     deleg_submit.set_defaults(func=cmd_delegation_submit)
 
     deleg_deliver = delegation_sub.add_parser(
@@ -1371,7 +1382,11 @@ def _add_positional_argument(
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if not effective_argv:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(effective_argv)
     set_color_enabled(False if bool(args.no_color) else None)
     service = ClawieService(StateStore(config_dir=args.config_dir))
 
@@ -1521,7 +1536,7 @@ def cmd_config_set(args: argparse.Namespace, service: ClawieService) -> int:
             f"auth_mode: {config.get('auth_mode', '')}",
             f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
             f"runtime_installed: {status.get('runtime_installed', False)}",
-            f"api_key: {status.get('api_key', '')}",
+            f"api_key: {status.get('api_key', '') or '<not set>'}",
         ],
     )
     if control_settings:
@@ -1554,7 +1569,7 @@ def _print_setup_status(service: ClawieService) -> int:
             f"subscription: {status.get('subscription', '')}",
             f"api_url: {status.get('api_url', '') or '<not set>'}",
             f"auth_mode: {status.get('auth_mode', '')}",
-            f"api_key: {status.get('api_key', '')}",
+            f"api_key: {status.get('api_key', '') or '<not set>'}",
             f"spawn_password_default: {'set' if status.get('spawn_password_configured') else 'not set'}",
             f"runtime_installed: {status.get('runtime_installed', False)}",
             f"updated_at: {status.get('updated_at', '')}",
@@ -2444,6 +2459,19 @@ def cmd_agents_show(args: argparse.Namespace, service: ClawieService) -> int:
 
 def cmd_agents_delete(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_agent_id(args.agent_id)
+    if not bool(getattr(args, "yes", False)):
+        print_warning(
+            f"This will permanently delete agent definition '{agent_id}', including its prompts and channels."
+        )
+        try:
+            confirmation = input("Proceed? [y/N]: ").strip().lower()
+        except EOFError:
+            raise ValueError(
+                "delete cancelled: no confirmation input available "
+                "(use --yes for non-interactive runs)"
+            ) from None
+        if confirmation not in {"y", "yes"}:
+            raise ValueError("delete cancelled by user")
     result = _clawied_service_call_or_unavailable(
         service,
         "delete_agent",
@@ -2695,6 +2723,11 @@ def _status_snapshot_exit_code(snapshot: dict[str, Any]) -> int:
     for payload in snapshot.values():
         error = _status_section_error(payload)
         if error is not None and _fatal_status_error(error):
+            return 1
+    health = snapshot.get("health")
+    if isinstance(health, dict) and _status_section_error(health) is None:
+        health_status = str(health.get("status", "unknown")).strip().lower()
+        if health_status not in {"healthy", "degraded", "passed"}:
             return 1
     return 0
 
@@ -3473,7 +3506,7 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"agent_id: {agent.get('agent_id', agent.get('user_id', ''))}",
             f"display_name: {agent.get('display_name', '')}",
             f"template: {agent.get('source_template', '')}",
-            f"clone_from: {agent.get('clone_from', '')}",
+            f"clone_from: {agent.get('clone_from', '') or '<none>'}",
             f"channel_strategy: {agent.get('channel_strategy', '')}",
             f"channels: {len(channels)}",
             f"migrated_channels: {migrated}",
@@ -3759,30 +3792,55 @@ def cmd_delegation_submit(args: argparse.Namespace, service: ClawieService) -> i
     import json as _json
 
     payload = _json.loads(args.payload)
-    result = _clawied_service_call_or_unavailable(
-        service,
-        "delegate_task",
-        {
-            "parent_id": args.parent,
-            "child_id": args.child,
-            "payload": payload,
-            "timeout": args.timeout,
-            "model_tier": getattr(args, "tier", "") or "",
-        },
-    )
-    if result is _CLAWIED_UNAVAILABLE:
-        result = service.delegate_task(
-            parent_id=args.parent,
-            child_id=args.child,
-            payload=payload,
-            timeout=args.timeout,
-            model_tier=getattr(args, "tier", "") or "",
+    if not isinstance(payload, dict):
+        raise ValueError("--payload must be a JSON object")
+    delegation_socket = str(os.environ.get("CLAWIE_DELEGATION_SOCKET", "")).strip()
+    if delegation_socket:
+        from clawie.daemon import request_ipc_socket
+
+        # The daemon derives parent identity from the authenticated peer/socket
+        # binding. Do not forward the user-supplied --parent value.
+        result = request_ipc_socket(
+            delegation_socket,
+            "delegation_request",
+            {
+                "child_id": args.child,
+                "payload": payload,
+                "timeout": args.timeout,
+                "model_tier": getattr(args, "tier", "") or "",
+                "parent_task_id": getattr(args, "parent_task", "") or "",
+            },
+            timeout=max(10.0, float(args.timeout) + 10.0),
         )
+    else:
+        result = _clawied_service_call_or_unavailable(
+            service,
+            "delegate_task",
+            {
+                "parent_id": args.parent,
+                "child_id": args.child,
+                "payload": payload,
+                "timeout": args.timeout,
+                "model_tier": getattr(args, "tier", "") or "",
+                "parent_task_id": getattr(args, "parent_task", "") or "",
+            },
+        )
+        if result is _CLAWIED_UNAVAILABLE:
+            result = service.delegate_task(
+                parent_id=args.parent,
+                child_id=args.child,
+                payload=payload,
+                timeout=args.timeout,
+                model_tier=getattr(args, "tier", "") or "",
+                parent_task_id=getattr(args, "parent_task", "") or "",
+            )
     print_panel(
         "Delegation Result",
         [
             f"task_id: {result.get('task_id', '')}",
             f"status: {result.get('status', '')}",
+            f"tier: {result.get('model_tier', '')}",
+            f"depth: {result.get('depth', '')}",
             *([f"error: {result.get('error', '')}"] if result.get("error") else []),
             f"result: {_json.dumps(result.get('result', {}), indent=2)[:200]}",
         ],

@@ -268,7 +268,10 @@ class PromptOpsMixin:
             path = self._core_prompt_path(provider, home, name)
             try:
                 rows[name] = read_text_under(home, path.relative_to(home), max_bytes=4 * 1024 * 1024)
-            except FileNotFoundError:
+            except (FileNotFoundError, PermissionError):
+                # Source-home prompts are optional discovery input. Never
+                # follow an unsafe workspace symlink, but do not make a normal
+                # provider-managed symlink prevent isolated runtime creation.
                 rows[name] = ""
         return rows
 

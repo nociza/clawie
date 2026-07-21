@@ -11,7 +11,7 @@ from pathlib import Path
 from pytest import CaptureFixture, MonkeyPatch, raises
 
 from clawie.cli import main
-from clawie.daemon import Clawied
+from clawie.daemon import Clawied, request_ipc_socket
 from clawie.manifest import AgentManifest, ChannelSpec, CredentialRef
 from clawie.service import ClawieService
 from clawie.service_common import AgentNotFoundError, SetupError
@@ -404,7 +404,7 @@ def test_clawied_cli_agent_create_and_delete_route_through_daemon(
         create_code = run_cli(tmp_path, "agent", "create", "iris", "--model-tier", "fast")
         create_output = capsys.readouterr().out
         created = service.get_agent("iris")
-        delete_code = run_cli(tmp_path, "agent", "delete", "iris")
+        delete_code = run_cli(tmp_path, "agent", "delete", "iris", "--yes")
         delete_output = capsys.readouterr().out
     finally:
         daemon.request("stop", {})
@@ -936,6 +936,83 @@ def test_control_agent_socket_is_request_only(
         daemon.request("stop", {})
         thread.join(timeout=5)
         shutil.rmtree(short_root, ignore_errors=True)
+
+
+def test_agent_delegation_socket_is_identity_bound_request_only_and_recursive(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = _setup_service(tmp_path / "state")
+    short_root = Path("/tmp") / f"clawie-delegation-test-{os.getpid()}-{time.time_ns()}"
+    socket_parent = short_root / "ipc"
+    short_root.mkdir(mode=0o700)
+    delegation_socket = socket_parent / "clawied.sock"
+    uid = os.getuid()
+    gid = os.getgid()
+    calls: list[dict[str, object]] = []
+
+    def fake_delegate_task(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        if kwargs["child_id"] == "worker":
+            nested = request_ipc_socket(
+                delegation_socket,
+                "delegation_request",
+                {
+                    "child_id": "leaf",
+                    "payload": {"task": "nested"},
+                    "timeout": 2.0,
+                    "parent_task_id": "outer-task",
+                },
+                timeout=5.0,
+            )
+            return {"task_id": "outer-task", "status": "completed", "result": nested}
+        return {"task_id": "nested-task", "status": "completed", "result": {"ok": True}}
+
+    monkeypatch.setattr(service, "delegate_task", fake_delegate_task)
+    daemon = Clawied(service, interval_seconds=30)
+    monkeypatch.setattr(daemon, "_control_socket_specs", lambda: [])
+    monkeypatch.setattr(
+        daemon,
+        "_delegation_socket_specs",
+        lambda: [(delegation_socket, uid, gid, "worker")],
+    )
+    thread = threading.Thread(target=daemon.run_forever, daemon=True)
+    thread.start()
+    _wait_for_socket(daemon.socket_path)
+    _wait_for_socket(delegation_socket)
+
+    try:
+        outer = daemon.request(
+            "service_call",
+            {
+                "method": "delegate_task",
+                "kwargs": {
+                    "parent_id": "planner",
+                    "child_id": "worker",
+                    "payload": {"task": "outer"},
+                    "timeout": 5.0,
+                },
+            },
+            timeout=10.0,
+        )
+        with raises(SetupError, match="only permits delegation_request"):
+            request_ipc_socket(delegation_socket, "service_call", {}, timeout=2.0)
+        with raises(SetupError, match="unsupported delegation_request argument"):
+            request_ipc_socket(
+                delegation_socket,
+                "delegation_request",
+                {"parent_id": "attacker", "child_id": "leaf", "payload": {}},
+                timeout=2.0,
+            )
+    finally:
+        daemon.request("stop", {})
+        thread.join(timeout=5)
+        shutil.rmtree(short_root, ignore_errors=True)
+
+    assert outer["result"]["result"]["task_id"] == "nested-task"
+    assert calls[0]["parent_id"] == "planner"
+    assert calls[1]["parent_id"] == "worker"
+    assert calls[1]["parent_task_id"] == "outer-task"
 
 
 def test_control_listener_rejects_writable_parent(tmp_path: Path) -> None:

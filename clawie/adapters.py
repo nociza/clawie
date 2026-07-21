@@ -141,6 +141,7 @@ class ProviderAdapter(Protocol):
     def tier_to_model(self, tier: str) -> str: ...
 
     # delivery (the bridge)
+    def runtime_agent_id(self, managed_agent_id: str) -> str: ...
     def deliver_command(
         self, agent_id: str, task: Task, *, timeout: float, openclaw_bin: str = ...
     ) -> list[str]: ...
@@ -270,6 +271,10 @@ class GatewayCliAdapter:
         human channel history and isn't mistaken for a HEARTBEAT poll."""
         return f"agent:{agent_id}:clawie:{task_id}"
 
+    def runtime_agent_id(self, managed_agent_id: str) -> str:
+        """Map a Clawie agent ID to the provider runtime's internal agent ID."""
+        return str(managed_agent_id).strip()
+
     def deliver_command(
         self, agent_id: str, task: Task, *, timeout: float, openclaw_bin: str = ""
     ) -> list[str]:
@@ -279,16 +284,19 @@ class GatewayCliAdapter:
         and richer control, but the CLI is the trivially-correct first cut and
         the verified fallback.
         """
-        aid = str(agent_id).strip()
-        if not aid:
+        managed_id = str(agent_id).strip()
+        if not managed_id:
             raise AdapterError("agent_id is required")
+        runtime_id = self.runtime_agent_id(managed_id)
+        if not runtime_id:
+            raise AdapterError(f"{self.name} runtime agent_id is required")
         cmd = [
             openclaw_bin or self.binary,
             "agent",
             "--agent",
-            aid,
+            runtime_id,
             "--session-key",
-            self.session_key(aid, task.task_id),
+            self.session_key(runtime_id, task.task_id),
             "--message",
             task.message,
             "--json",
@@ -303,10 +311,10 @@ class GatewayCliAdapter:
     def parse_reply(self, stdout: str) -> Reply:
         """Parse the JSON from ``openclaw agent --json``.
 
-        Shape (Appendix A / docs/cli/agent.md):
-        ``{"payloads":[{"text":...}], "meta":{...}, "deliveryStatus":{...},
-        "result":{"deliveryStatus":{...}}}``. Diagnostics go to stderr, so stdout
-        is reserved for the JSON object.
+        Shape (Appendix A / docs/cli/agent.md): the gateway response wraps the
+        reply under ``result`` (``result.payloads`` and ``result.meta``), while
+        older/embedded responses may put those fields at the top level.
+        Diagnostics go to stderr, so stdout is reserved for the JSON object.
         """
         text = str(stdout or "").strip()
         if not text:
@@ -318,22 +326,31 @@ class GatewayCliAdapter:
         if not isinstance(data, dict):
             return Reply(ok=False, output="", error="agent JSON was not an object", raw={})
 
-        payloads = data.get("payloads", [])
+        raw_result = data.get("result")
+        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
+        payloads = data.get("payloads")
+        if not isinstance(payloads, list):
+            payloads = result.get("payloads", [])
         parts: list[str] = []
+        payload_error = False
         if isinstance(payloads, list):
             for item in payloads:
                 if isinstance(item, dict):
+                    payload_error = payload_error or item.get("isError") is True
                     chunk = str(item.get("text", "") or "").strip()
                     if chunk:
                         parts.append(chunk)
         output = "\n".join(parts)
 
-        raw_result = data.get("result")
-        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
         delivery = data.get("deliveryStatus") or result.get("deliveryStatus") or {}
-        delivery_status = str(delivery.get("status", "")) if isinstance(delivery, dict) else ""
+        if isinstance(delivery, dict):
+            delivery_status = str(delivery.get("status", ""))
+        else:
+            delivery_status = str(delivery or "")
 
         raw_meta = data.get("meta")
+        if not isinstance(raw_meta, dict):
+            raw_meta = result.get("meta")
         meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
         usage = {}
         for src in (meta.get("usage"), result.get("usage"), data.get("usage")):
@@ -341,9 +358,11 @@ class GatewayCliAdapter:
                 usage = src
                 break
 
-        error = str(data.get("error", "") or "")
+        error = str(data.get("error", result.get("error", "")) or "")
         status = str(data.get("status", "") or "")
-        ok = not error and status not in {"error", "in_flight"}
+        if payload_error and not error:
+            error = output or "agent reply contained an error payload"
+        ok = not error and status in {"", "ok"}
         if not ok and not error:
             error = status or "agent run did not complete"
         return Reply(
@@ -352,7 +371,7 @@ class GatewayCliAdapter:
             usage=usage,
             delivery_status=delivery_status,
             error="" if ok else error,
-            raw=data,
+            raw={**data, "meta": meta},
         )
 
     # --- auth (replaces hand-written auth-profiles.json) ---------------------
@@ -417,10 +436,16 @@ class OpenclawAdapter(GatewayCliAdapter):
     # `openclaw doctor --fix` rewrites (Appendix A).
     TIER_MODELS = {
         "fast": "openai/gpt-5.5",
-        "balanced": "openai/gpt-5.6",
-        "power": "openai/gpt-5.6",
+        "balanced": "openai/gpt-5.5",
+        "power": "openai/gpt-5.5",
     }
-    DEFAULT_MODEL = "openai/gpt-5.6"
+    DEFAULT_MODEL = "openai/gpt-5.5"
+
+    def runtime_agent_id(self, managed_agent_id: str) -> str:
+        """Each isolated Clawie Linux user owns OpenClaw's default agent."""
+        if not str(managed_agent_id).strip():
+            return ""
+        return "main"
 
 
 class HermesAdapter(GatewayCliAdapter):

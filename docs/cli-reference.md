@@ -26,6 +26,8 @@ clawie status --refresh       # sample live CPU/memory once
 blanking the whole report. It does not initialize, migrate, chmod, or rewrite
 the state store; `--refresh` is the explicit exception that records fresh
 metrics. Existing unsafe database paths still render error details.
+An embedded `unhealthy` health result or unsafe state-integrity error makes the
+command exit nonzero; `healthy` and `degraded` snapshots exit zero.
 
 ## config
 
@@ -46,13 +48,14 @@ clawie agent create [AGENT_ID] [--display-name N] [--template T] [--clone-from A
 clawie agent clone SOURCE TARGET [--display-name N] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
 clawie agent list
 clawie agent show AGENT_ID
-clawie agent delete AGENT_ID
-clawie agent purge AGENT_ID
+clawie agent delete AGENT_ID [--yes]
+clawie agent purge AGENT_ID [--yes]
 clawie agent create-batch FILE
 ```
 
-`delete` is only for definition-only agents. It refuses any record attached to
-a Linux runtime; use confirmed `purge` to stop and remove that runtime safely.
+`delete` is confirmed by default and is only for definition-only agents. It
+refuses any record attached to a Linux runtime; use confirmed `purge` to stop
+and remove that runtime safely. `--yes` is required for unattended deletion.
 
 ### agent prompt
 
@@ -109,7 +112,7 @@ clawie channel move SOURCE_AGENT TARGET_AGENT
 ## delegation
 
 ```bash
-clawie delegation submit --parent P --child C [--payload JSON] [--timeout S] [--tier fast|balanced|power]
+clawie delegation submit --parent P --child C [--payload JSON] [--timeout S] [--tier fast|balanced|power] [--parent-task TASK_ID]
 clawie delegation deliver --agent A --message TEXT [--timeout S] [--tier fast|balanced|power] [--json]
 clawie delegation repl --agent-id ID --executor-agent MANAGED_ID [--tier fast|balanced|power]
 clawie delegation tree --agent-id ID
@@ -279,11 +282,11 @@ the configured provider and any providers already assigned to agents; add
 `--all-provider-contracts` for package release acceptance across every verified
 production delivery provider. A production pass requires both
 `--exercise-watchdog-restart` and `--exercise-runtime-delivery`; without them
-the command exits nonzero. The older wheel has a historical Colima
-Linux/systemd proof recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md);
-that predates mandatory live delivery and does not accept the current tree or a
-different host.
+the command exits nonzero. The exact 0.1.8 wheel's Colima Linux/systemd proof is
+recorded in
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
+It includes mandatory live delivery and accepts only that artifact on the
+recorded host, not a different deployment host.
 
 ## backup
 

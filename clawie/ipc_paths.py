@@ -13,3 +13,10 @@ def control_socket_path(state_root: str | Path, uid: int | str) -> Path:
     canonical_root = str(Path(state_root).expanduser().absolute())
     manager_id = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()[:16]
     return CONTROL_SOCKET_ROOT / f"{uid}-{manager_id}.sock"
+
+
+def delegation_socket_path(state_root: str | Path, uid: int | str) -> Path:
+    """Return the request-only delegation socket for one manager and agent UID."""
+    canonical_root = str(Path(state_root).expanduser().absolute())
+    manager_id = hashlib.sha256(canonical_root.encode("utf-8")).hexdigest()[:16]
+    return CONTROL_SOCKET_ROOT / f"delegation-{uid}-{manager_id}.sock"

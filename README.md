@@ -31,16 +31,21 @@ agent homes, and port sessions between claws with `clawie auth port`.
 - **Python dependencies** — stdlib on Python 3.11+; Python 3.10 installs `tomli` for TOML parsing.
 - **Root/sudo** required for runtime isolation (`runtime create`, `credentials sync`, `provider set`, `auth apply`). Agent creation and `clawie status` work without root.
 - **State root under sudo** — normal `sudo clawie ...` uses the invoking user's `~/.clawie` via `SUDO_USER`. For service accounts or custom layouts, set `CLAWIE_HOME` or pass `--config-dir` consistently.
-- **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw, pnpm or npm for openclaw.
+- **Provider runtimes** (optional): Homebrew for zeroclaw/picoclaw; pnpm and a
+  Node version accepted by pinned OpenClaw (currently Node `>=22.22.3 <23`,
+  `>=24.15.0 <25`, or `>=25.9.0`).
 - **Terminal**: UTF-8. Colors are automatic on TTYs and can be disabled with
   `--no-color` or `NO_COLOR`.
 
 ## Install
 
 ```bash
-uv tool install clawie        # from PyPI
-uv tool install .             # immutable install from source
-sudo ./install.sh             # system install for sudo/runtime automation
+uv tool install clawie        # unprivileged inspection/definition commands
+sudo ./install.sh             # production system install from a source checkout
+
+# Production system install from a pinned PyPI release (no checkout required)
+sudo env UV_TOOL_DIR=/opt/clawie/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+  uv tool install 'clawie==X.Y.Z' --python 3.12
 ```
 
 Use the root-owned system install for operational agents, cron, and the
@@ -50,11 +55,21 @@ definition and inspection commands, but must not be executed as root.
 ## Quick start
 
 ```bash
-clawie config set --provider openclaw --subscription pro
+clawie config set --provider openclaw --auth-mode linked --subscription pro --workspace production
 sudo clawie runtime install openclaw
-sudo clawie runtime create alice --user alice --template baseline
+clawie auth login openclaw
+sudo clawie runtime create alice --user alice --template baseline \
+  --credential-bundle provider-auth --no-global-password
+sudo clawie agent service start alice
+clawie delegation deliver --agent alice --message 'Reply with exactly: clawie ready'
 clawie status
 ```
+
+That journey installs the pinned delivery runtime, records native provider auth,
+copies it privately into the isolated agent home, starts the gateway, proves one
+live response, and then shows fleet health. Use `clawie auth import openclaw
+--from codex` only when adopting an existing session before refreshing it with
+the native OpenClaw login flow.
 
 Later `config set` calls update only the options supplied; omitted provider,
 auth, workspace, subscription, and API settings are preserved.
@@ -82,7 +97,13 @@ clawie delegation stop-session --parent planner --child researcher
 clawie delegation tree --agent-id planner
 ```
 
-Tiers include context budgets that track token usage and trigger compaction warnings to prevent context rot in deep delegation chains.
+When `--tier` is omitted, clawie recommends a tier from the task text and payload
+size. Each task persists estimated payload/result usage, emits a warning at 75%,
+and emits `delegation.context_compaction_required` at 90%. Inputs larger than the
+selected budget fail before delivery; clawie never silently rewrites model output.
+Managed agents recurse through a per-agent `0600` Unix socket whose peer UID and
+agent identity are bound by clawied. That endpoint accepts delegation requests
+only, so a child cannot spoof its parent or reach generic operator methods.
 
 ## Key commands
 
@@ -146,7 +167,9 @@ clawie status --watch         # live view; refresh until Ctrl-C
 
 It aggregates setup, health, agents, runtimes, auth, delegation, maintenance,
 backup, and recent events — and degrades gracefully if any one section can't
-be read. `clawie dashboard` is a deprecated alias for `clawie status --watch`.
+be read. The command exits nonzero when the embedded health result is unhealthy
+or state integrity is unsafe, so `--json` is suitable as a monitoring gate.
+`clawie dashboard` is a deprecated alias for `clawie status --watch`.
 
 ## Backup
 
@@ -175,7 +198,11 @@ See [docs/backup.md](docs/backup.md).
 - **User-level isolation, not container-level** — agents get separate Linux users and home directories, but share the same kernel, `/tmp`, and localhost. No Docker/VM boundary.
 - **Delegation depth capped at 10**, max 50 children per agent, 5-minute default timeout; manifests can lower depth and gateway timeout limits per agent.
 - **SQLite storage** — uses WAL, a busy timeout, and revision-based compare-and-swap for JSON state/config snapshots so stale writers fail instead of silently losing updates. `clawied` hosts manifest reconciliation, mutating service operations, and a capability-gated control RPC.
-- **Acceptance is host-specific** — earlier records under `docs/proofs/` are historical evidence, not evidence for the hardened tree or a new host. Run both destructive exercises in `production verify` on the exact built artifact and deployment host. The package remains Beta until that fresh Linux/systemd acceptance is recorded.
+- **Acceptance is host-specific** — the production/stable classification is
+  backed by the [0.1.8 wheel proof](docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md),
+  including live OpenClaw delivery and destructive watchdog recovery. A new
+  deployment host must still run both exercises in `production verify` against
+  its exact artifact; one accepted host does not certify another.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.

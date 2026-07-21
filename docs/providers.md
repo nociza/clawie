@@ -28,8 +28,8 @@ clawie agent create alice --provider openclaw
 ```
 
 `agent create` is definition-only. Use `sudo clawie runtime create alice
---provider openclaw` when the command should also create and start an isolated
-Linux runtime.
+--provider openclaw` to create an isolated Linux runtime, then `sudo clawie
+agent service start alice` to launch it.
 
 ## Auth modes
 

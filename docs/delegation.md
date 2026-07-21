@@ -1,6 +1,8 @@
 # Delegation & Orchestration
 
-clawie includes a recursive task delegation system that lets agents hand off work to each other over Unix domain sockets.
+clawie includes a recursive task delegation system that lets agents hand off
+work through private Unix sockets for same-user session workers and through the
+source-pinned runtime gateway for managed cross-user agents.
 
 ## How it works
 
@@ -24,6 +26,14 @@ MiB, and each REPL admits at most 16 concurrent connections. A symlink-safe
 file mailbox is available only as a same-user fallback; managed cross-user work
 uses the runtime gateway.
 
+Each managed runtime also receives a distinct request-only socket through
+`CLAWIE_DELEGATION_SOCKET`. Clawie owns the containing runtime directory, makes
+the socket `0600` for the agent's Linux UID, authenticates the peer UID, and
+binds that endpoint to one agent ID. The endpoint accepts only recursive
+delegation requests: callers cannot spoof their parent identity, confirm control
+actions, or invoke generic service methods. A bounded daemon worker pool keeps
+recursive requests responsive while the parent delivery is still waiting.
+
 ## Model tiers
 
 Every delegation can specify a tier that controls the context budget and signals task complexity:
@@ -46,7 +56,30 @@ clawie delegation submit \
   --payload '{"task": "check status"}'
 ```
 
-The child must be running a REPL. The command blocks until the result arrives or the timeout expires.
+A session child must be running a REPL. A managed child with a verified live
+gateway is delivered to directly. The command blocks until the result arrives
+or the timeout expires.
+
+If `--tier` is omitted, clawie selects `fast`, `balanced`, or `power` from the
+task text and payload size. Managed tasks include their active task ID in the
+child's task context. A child that recursively submits another CLI task should
+preserve the lineage explicitly:
+
+```bash
+clawie delegation submit \
+  --parent worker \
+  --child researcher \
+  --parent-task ACTIVE_TASK_ID \
+  --payload '{"task": "investigate"}'
+```
+
+Inside a managed runtime the CLI automatically uses its request-only socket;
+`--parent` remains syntactically required for a consistent command shape, but
+the daemon derives the real parent from the authenticated socket binding.
+Clawie can infer one unambiguous active task for compatibility, but explicit
+`--parent-task` lineage is preferred. The SQLite reservation is atomic across
+CLI and daemon processes, preventing concurrent calls from racing cycle, depth,
+duplicate-target, or child-count checks.
 
 ### Start a REPL
 
@@ -108,7 +141,11 @@ clawie delegation cleanup         # Remove stale sockets
 
 ## Context budgets
 
-Each tier gets a token budget. The system tracks payload and result tokens, warning at 75% and triggering compaction at 90%.
+Each tier gets a token budget. The system persists estimated payload and result
+tokens, records a warning event at 75%, and records a
+`delegation.context_compaction_required` event at 90%. An input larger than the
+selected budget is rejected before delivery. Clawie exposes compaction pressure
+without silently truncating, summarizing, or rewriting a result.
 
 **Summarization depth rules:**
 
@@ -126,7 +163,8 @@ Each tier gets a token budget. The system tracks payload and result tokens, warn
 
 ## Automatic tier recommendation
 
-The `recommend_tier()` function selects a tier based on task description and payload size:
+The managed CLI/service path calls `recommend_tier()` when `--tier` is omitted.
+The same function is available to Python callers:
 
 ```python
 from clawie.delegation import recommend_tier
@@ -200,6 +238,8 @@ mgr.stop_all()
 - Max recursion depth: 10 by default; manifests can lower it per agent
 - Max children per agent: 50
 - Cycle detection prevents A -> B -> A loops
+- A child can participate in only one active tree, preventing ambiguous lineage
+- Abandoned active tasks expire after their timeout plus a short grace period
 - Socket cleanup only removes dead socket entries owned within the private runtime directory
 
 ## Error handling
@@ -212,4 +252,5 @@ mgr.stop_all()
 | Timeout | Timeout error; task marked failed |
 | Depth at or beyond the configured limit | `ValueError` before delegation starts |
 | Cycle detected | `ValueError` before delegation starts |
-| Budget >= 90% | Compaction triggered automatically |
+| Input exceeds selected budget | `ValueError` before delivery starts |
+| Budget >= 90% after result | Persisted compaction-required event; result preserved |

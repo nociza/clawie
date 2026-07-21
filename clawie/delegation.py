@@ -99,7 +99,7 @@ and the REPL loop you can use.
 |---|---|
 | **Parent agent** | The agent that initiates a delegation (you, when you delegate). |
 | **Child agent** | The agent that receives and executes a delegated task. |
-| **REPL** | A long-running loop on a Unix domain socket that listens for incoming tasks. An agent must be running a REPL to accept delegations. |
+| **REPL** | A long-running loop on a Unix domain socket for same-user session tasks. Managed cross-user agents receive tasks through their verified runtime gateway. |
 | **Delegation tree** | The hierarchy of parent → child relationships. Tracked to prevent infinite recursion (max depth 10) and cycles. |
 | **Payload** | A JSON object describing what the child should do. |
 | **Model tier** | The capability level assigned to an agent: fast, balanced, or power. Determines context budget and intended task complexity. |
@@ -126,6 +126,13 @@ UID-scoped system-temp fallback) with a 4-byte length-prefixed JSON protocol.
 Directories are `0700`, sockets are `0600`, peer UIDs are checked where the OS
 supports it, and a symlink-safe file mailbox is available for same-user
 fallback. Managed cross-user tasks use the runtime gateway.
+
+Managed runtimes also receive a request-only, peer-authenticated socket through
+`$CLAWIE_DELEGATION_SOCKET`. The socket is bound by Clawie to that runtime's
+Linux UID and agent ID: recursive `clawie delegation submit` calls may request
+only a child delegation, cannot spoof the parent identity, and cannot invoke
+generic daemon methods. Daemon IPC uses a bounded worker pool so a recursive
+request remains available while the parent delivery is waiting.
 
 ---
 
@@ -155,6 +162,9 @@ the capability level and context budget.
 ```bash
 # Delegate with a specific tier
 clawie delegation submit --parent p --child c --tier fast --payload '{}'
+
+# Omit --tier for automatic recommendation from task text and payload size
+clawie delegation submit --parent p --child c --payload '{"task":"check status"}'
 
 # Start a REPL with a tier
 clawie delegation repl --agent-id worker --executor-agent planner --tier power
@@ -233,12 +243,21 @@ clawie delegation submit \
   --payload '{"task": "summarize", "input": "..."}'
 ```
 
-The child agent **must** already be running a REPL.  The command blocks until
-the child returns a result or the timeout expires.
+A same-user session child **must** already be running a REPL. A managed child
+with a verified runtime gateway is delivered to directly. The command blocks
+until the child returns a result or the timeout expires.
+
+Managed task context includes its active task ID. When recursively submitting a
+CLI subtask, preserve that lineage with `--parent-task <active-task-id>`. In a
+managed runtime, the CLI automatically uses `$CLAWIE_DELEGATION_SOCKET`; the
+daemon ignores the supplied `--parent` identity and uses the authenticated
+runtime identity instead. Clawie also infers a single unambiguous active parent
+for compatibility.
 
 Options:
 - `--timeout <seconds>` — max wait time (default 300).
-- `--tier fast|balanced|power` — model tier for this task.
+- `--tier fast|balanced|power` — model tier; omitted means automatic recommendation.
+- `--parent-task <task-id>` — explicit active lineage for recursive CLI work.
 
 ### View the delegation tree
 
@@ -362,7 +381,8 @@ def planning_handler(msg: Message, repl: AgentREPL) -> dict:
 | Timeout exceeded | Parent receives a timeout error; task marked `failed`. |
 | Recursion too deep (>10) | `ValueError` raised before delegation starts. |
 | Cycle detected (A→B→A) | `ValueError` raised before delegation starts. |
-| Context budget exceeded | Warning at 75%, compaction triggered at 90%. Results summarized. |
+| Context budget pressure | Warning at 75%, compaction-required event at 90%; results are preserved. |
+| Input exceeds selected budget | `ValueError` before delivery starts. |
 
 ---
 
@@ -548,6 +568,10 @@ class ContextBudget:
     def needs_compaction(self) -> bool:
         return self.usage_ratio >= 0.90
 
+    @property
+    def over_budget(self) -> bool:
+        return self.tokens_used > self.total_budget
+
     def record_payload(self, tokens: int) -> None:
         self.payload_tokens += tokens
         self.tokens_used += tokens
@@ -569,6 +593,10 @@ class ContextBudget:
             "result_tokens": self.result_tokens,
             "compaction_count": self.compaction_count,
             "tier": self.tier,
+            "usage_ratio": self.usage_ratio,
+            "needs_warning": self.needs_warning,
+            "needs_compaction": self.needs_compaction,
+            "over_budget": self.over_budget,
         }
 
     @classmethod

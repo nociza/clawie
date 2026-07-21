@@ -39,11 +39,16 @@ Provider runtimes are external tools installed separately. They are only needed 
 
 | Provider | Install method | Requires | Production delegated-task delivery |
 |----------|---------------|----------|----------------------------------|
-| openclaw | `pnpm add -g openclaw` | pnpm or npm, Node.js | verified |
+| openclaw | pinned `pnpm add -g` into Clawie's shared toolchain | pnpm, Node.js matching the pinned package engine | verified |
 | picoclaw | `brew install picoclaw` | [Homebrew](https://brew.sh) (Linuxbrew) | gated until source-pinned |
 | zeroclaw | `brew install zeroclaw` | [Homebrew](https://brew.sh) (Linuxbrew) | gated until source-pinned |
 
-clawie can install these for you with `clawie runtime install <provider>`, but the underlying package manager must already be available on `PATH`.
+clawie can install these for you with `clawie runtime install <provider>`, but
+the underlying package manager must already be available on `PATH`. For the
+pinned OpenClaw 2026.7.1 contract, Node must satisfy `>=22.22.3 <23`,
+`>=24.15.0 <25`, or `>=25.9.0`. Clawie places pnpm's global packages and bin
+links below its shared toolchain rather than root's private home, then hardens
+the resulting tree to remove group/world write access.
 
 Additional tools that may be auto-installed:
 - **gcloud SDK** — downloaded automatically if needed for Google Workspace addon auth setup
@@ -97,11 +102,12 @@ Linux/root host validation, watchdog restart verification, and configured
 runtime checks and a live gateway challenge. Package release acceptance should add
 `--all-provider-contracts` so every verified production delivery provider has a
 source-pinned delivery adapter contract. Running without either required
-exercise cannot produce a production pass. The older built wheel has a
-historical Colima Linux/systemd proof recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md);
-that predates mandatory live delivery. It does not accept the hardened tree or
-any deployment host.
+exercise cannot produce a production pass. The exact 0.1.8 wheel has a complete
+Colima Linux/systemd proof recorded in
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md),
+including live delivery, watchdog restart, isolation, and cleanup. That proof
+accepts the recorded artifact on that host; every deployment host still needs
+its own run.
 
 ## Delegation system
 
@@ -121,6 +127,20 @@ A symlink-safe file mailbox under the same private per-user delegation
 directory is available for same-user fallback. Managed cross-user tasks go
 through the runtime gateway instead of a world-writable mailbox.
 
+Managed runtimes receive an additional request-only socket under
+`/run/clawie/control`. Its path is manager- and UID-scoped, the socket is
+`0600`, the peer UID is authenticated, and clawied binds it to one agent ID.
+It accepts only child-delegation requests. Bounded IPC workers allow a nested
+request to complete while the outer gateway delivery remains in flight.
+
+Managed task edges are reserved atomically in SQLite before delivery. Active
+lineage is persisted with root and parent task IDs, so concurrent CLI/daemon
+calls cannot race past cycle, depth, duplicate-target, or child-count limits.
+Abandoned active leases expire after their delivery timeout plus a short grace
+period. A child performing explicit recursive CLI delegation should pass the
+active `--parent-task` ID included in its managed task context; an unambiguous
+active parent is also inferred for compatibility.
+
 ### Context budgets
 
 | Tier | Context window | Token budget |
@@ -129,7 +149,11 @@ through the runtime gateway instead of a world-writable mailbox.
 | balanced | 32,000 | 16,000 |
 | power | 128,000 | 64,000 |
 
-Token estimation uses a `len(text) / 4` heuristic. This is a rough approximation, not a real tokenizer.
+Token estimation uses a `len(text) / 4` heuristic. This is a rough approximation,
+not a real tokenizer. Payload and result estimates are persisted per task;
+warnings are recorded at 75% and a compaction-required event at 90%. Oversized
+inputs are rejected before delivery. Clawie reports compaction pressure but does
+not silently discard or rewrite model output.
 
 ## Limitations
 

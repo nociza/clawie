@@ -138,11 +138,11 @@ def test_deep_merge_is_recursive_and_nondestructive() -> None:
 
 def test_tier_to_model_uses_canonical_openai_ids(adapter: OpenclawAdapter) -> None:
     assert adapter.tier_to_model("fast") == "openai/gpt-5.5"
-    assert adapter.tier_to_model("balanced") == "openai/gpt-5.6"
-    assert adapter.tier_to_model("power") == "openai/gpt-5.6"
+    assert adapter.tier_to_model("balanced") == "openai/gpt-5.5"
+    assert adapter.tier_to_model("power") == "openai/gpt-5.5"
     # unknown tier falls back to a real default, never the legacy openai-codex id
     model = adapter.tier_to_model("nonsense")
-    assert model == "openai/gpt-5.6"
+    assert model == "openai/gpt-5.5"
     for value in adapter.TIER_MODELS.values():
         assert not value.startswith("openai-codex/")
 
@@ -157,8 +157,8 @@ def test_deliver_command_structure(adapter: OpenclawAdapter) -> None:
     task = Task(task_id="t123", message="summarize logs", tier="fast")
     cmd = adapter.deliver_command("ops", task, timeout=90.0)
     assert cmd[:2] == ["openclaw", "agent"]
-    assert "--agent" in cmd and cmd[cmd.index("--agent") + 1] == "ops"
-    assert cmd[cmd.index("--session-key") + 1] == "agent:ops:clawie:t123"
+    assert "--agent" in cmd and cmd[cmd.index("--agent") + 1] == "main"
+    assert cmd[cmd.index("--session-key") + 1] == "agent:main:clawie:t123"
     assert cmd[cmd.index("--message") + 1] == "summarize logs"
     assert "--json" in cmd
     # timeout coerced to int string
@@ -196,10 +196,17 @@ def test_parse_reply_success(adapter: OpenclawAdapter) -> None:
 
 
 def test_parse_reply_nested_result_delivery(adapter: OpenclawAdapter) -> None:
-    stdout = '{"payloads":[{"text":"ok"}],"result":{"deliveryStatus":{"status":"suppressed"}}}'
+    stdout = (
+        '{"status":"ok","result":{"payloads":[{"text":"ok"}],'
+        '"meta":{"transport":"gateway","usage":{"input":3}},'
+        '"deliveryStatus":{"status":"suppressed"}}}'
+    )
     reply = adapter.parse_reply(stdout)
     assert reply.ok is True
+    assert reply.output == "ok"
+    assert reply.usage == {"input": 3}
     assert reply.delivery_status == "suppressed"
+    assert reply.raw["meta"]["transport"] == "gateway"
 
 
 def test_parse_reply_empty_is_error(adapter: OpenclawAdapter) -> None:
@@ -224,6 +231,20 @@ def test_parse_reply_in_flight_is_not_ok(adapter: OpenclawAdapter) -> None:
     reply = adapter.parse_reply('{"status":"in_flight","payloads":[]}')
     assert reply.ok is False
     assert reply.error == "in_flight"
+
+
+def test_parse_reply_timeout_is_not_ok(adapter: OpenclawAdapter) -> None:
+    reply = adapter.parse_reply('{"status":"timeout","result":{"payloads":[]}}')
+    assert reply.ok is False
+    assert reply.error == "timeout"
+
+
+def test_parse_reply_error_payload_is_not_ok(adapter: OpenclawAdapter) -> None:
+    reply = adapter.parse_reply(
+        '{"status":"ok","result":{"payloads":[{"text":"provider failed","isError":true}]}}'
+    )
+    assert reply.ok is False
+    assert reply.error == "provider failed"
 
 
 # --- auth ------------------------------------------------------------------

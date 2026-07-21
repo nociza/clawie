@@ -18,7 +18,7 @@ from typing import Any
 
 from clawie import __version__
 from clawie.control import ControlGate
-from clawie.ipc_paths import CONTROL_SOCKET_ROOT, control_socket_path
+from clawie.ipc_paths import CONTROL_SOCKET_ROOT, control_socket_path, delegation_socket_path
 from clawie.safe_fs import read_text_under, write_text_under
 from clawie.service_common import SetupError, now_iso
 
@@ -29,6 +29,45 @@ except ImportError:  # pragma: no cover - non-POSIX fallback
 
 
 IPC_CLIENT_TIMEOUT_SECONDS = 2.0
+MAX_IPC_WORKERS = 16
+
+
+def request_ipc_socket(
+    socket_path: str | Path,
+    command: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Send one authenticated-by-peer command to a local Clawie Unix socket."""
+    request = {"command": str(command), "payload": payload or {}}
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    chunks: list[bytes] = []
+    try:
+        client.connect(str(Path(socket_path).expanduser()))
+        client.sendall(json.dumps(request, sort_keys=True).encode("utf-8"))
+        client.shutdown(socket.SHUT_WR)
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        client.close()
+    if not chunks:
+        raise SetupError("clawied IPC returned an empty response")
+    try:
+        response = json.loads(b"".join(chunks).decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SetupError(f"clawied IPC returned invalid JSON: {exc}") from exc
+    if not isinstance(response, dict):
+        raise SetupError("clawied IPC returned a non-object response")
+    if not response.get("ok", False):
+        error = str(response.get("error", "clawied IPC request failed"))
+        raise SetupError(error)
+    result = response.get("result", {})
+    return result if isinstance(result, dict) else {"result": result}
 
 
 class Clawied:
@@ -76,7 +115,9 @@ class Clawied:
                 "plugin_overrides",
             }
         ),
-        "delegate_task": frozenset({"parent_id", "child_id", "payload", "timeout", "model_tier"}),
+        "delegate_task": frozenset(
+            {"parent_id", "child_id", "payload", "timeout", "model_tier", "parent_task_id"}
+        ),
         "deliver_to_agent": frozenset({"agent_id", "message", "tier", "timeout"}),
         "delete_agent": frozenset({"agent_id"}),
         "disable_agent_addon": frozenset({"agent_id", "addon"}),
@@ -150,6 +191,10 @@ class Clawied:
         self._lock_handle: Any = None
         self._server: socket.socket | None = None
         self._control_servers: list[tuple[socket.socket, Path, int]] = []
+        self._delegation_servers: list[tuple[socket.socket, Path, int, str]] = []
+        self._ipc_slots = threading.BoundedSemaphore(MAX_IPC_WORKERS)
+        self._ipc_threads: set[threading.Thread] = set()
+        self._ipc_threads_lock = threading.Lock()
         self._control_gate = ControlGate(allowlist=self._control_allowlist())
 
     def status(self) -> dict[str, Any]:
@@ -163,6 +208,9 @@ class Clawied:
             "lock_file": str(self.lock_path),
             "socket_file": str(self.socket_path),
             "control_socket_files": [str(path) for _server, path, _uid in self._control_servers],
+            "delegation_socket_files": [
+                str(path) for _server, path, _uid, _agent_id in self._delegation_servers
+            ],
             "last": last,
         }
 
@@ -210,6 +258,7 @@ class Clawied:
             while not self._stop:
                 last = self.run_once(dry_run=dry_run)
                 self._refresh_control_ipc()
+                self._refresh_delegation_ipc()
                 cycles += 1
                 if max_cycles is not None and cycles >= max_cycles:
                     break
@@ -243,36 +292,9 @@ class Clawied:
         timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Send one command to a running clawied instance over its Unix socket."""
-        request = {"command": str(command), "payload": payload or {}}
         override = str(os.environ.get("CLAWIE_CONTROL_SOCKET", "")).strip()
-        request_socket = Path(override).expanduser() if override else self.socket_path
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(timeout)
-        try:
-            client.connect(str(request_socket))
-            client.sendall(json.dumps(request, sort_keys=True).encode("utf-8"))
-            client.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while True:
-                chunk = client.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        finally:
-            client.close()
-        if not chunks:
-            raise SetupError("clawied IPC returned an empty response")
-        try:
-            response = json.loads(b"".join(chunks).decode("utf-8"))
-        except json.JSONDecodeError as exc:
-            raise SetupError(f"clawied IPC returned invalid JSON: {exc}") from exc
-        if not isinstance(response, dict):
-            raise SetupError("clawied IPC returned a non-object response")
-        if not response.get("ok", False):
-            error = str(response.get("error", "clawied IPC request failed"))
-            raise SetupError(error)
-        result = response.get("result", {})
-        return result if isinstance(result, dict) else {"result": result}
+        target = Path(override).expanduser() if override else self.socket_path
+        return request_ipc_socket(target, command, payload, timeout=timeout)
 
     def _start_ipc(self) -> None:
         self.service.store.ensure()
@@ -299,6 +321,7 @@ class Clawied:
             raise
         self._server = server
         self._refresh_control_ipc()
+        self._refresh_delegation_ipc()
 
     def _stop_ipc(self) -> None:
         server = self._server
@@ -309,15 +332,29 @@ class Clawied:
             control_server.close()
             self._unlink_control_socket(path, _uid)
         self._control_servers = []
+        for delegation_server, path, uid, _agent_id in self._delegation_servers:
+            delegation_server.close()
+            self._unlink_control_socket(path, uid)
+        self._delegation_servers = []
         if self.socket_path.exists() or self.socket_path.is_symlink():
             self.socket_path.unlink()
+        with self._ipc_threads_lock:
+            workers = list(self._ipc_threads)
+        current = threading.current_thread()
+        for worker in workers:
+            if worker is not current:
+                worker.join(timeout=2.0)
 
     def _serve_ipc_once(self, *, timeout: float = 0.5) -> None:
         server = self._server
         if server is None:
             time.sleep(timeout)
             return
-        servers = [server, *[item[0] for item in self._control_servers]]
+        servers = [
+            server,
+            *[item[0] for item in self._control_servers],
+            *[item[0] for item in self._delegation_servers],
+        ]
         try:
             ready, _writable, _errors = select.select(servers, [], [], max(0.0, timeout))
         except OSError:
@@ -329,30 +366,94 @@ class Clawied:
             conn, _ = selected.accept()
         except OSError:
             return
-        with conn:
-            # A local peer must not be able to freeze the single-writer
-            # reconcile loop by opening a socket and withholding EOF.
-            conn.settimeout(IPC_CLIENT_TIMEOUT_SECONDS)
-            peer_uid = self._peer_uid(conn)
-            control_entry = next(
-                (item for item in self._control_servers if item[0] is selected),
-                None,
-            )
-            scope = "control" if control_entry is not None else "operator"
-            allowed_uids = (
-                {control_entry[2]} if control_entry is not None else {os.geteuid(), self._state_owner()[0]}
-            )
-            if peer_uid is None or peer_uid not in allowed_uids:
-                try:
-                    conn.sendall(b'{"ok":false,"error":"clawied IPC peer is not authorized"}')
-                except OSError:
-                    pass
-                return
-            response = self._handle_ipc_connection(conn, scope=scope, peer_uid=peer_uid)
+        # A local peer must not be able to freeze reconciliation or an active
+        # parent delivery by opening a socket and withholding EOF. Bounded
+        # workers also let a child make a recursive delegation request while
+        # its parent's request is still awaiting the child gateway response.
+        conn.settimeout(IPC_CLIENT_TIMEOUT_SECONDS)
+        peer_uid = self._peer_uid(conn)
+        control_entry = next(
+            (item for item in self._control_servers if item[0] is selected),
+            None,
+        )
+        delegation_entry = next(
+            (item for item in self._delegation_servers if item[0] is selected),
+            None,
+        )
+        if control_entry is not None:
+            scope = "control"
+            allowed_uids = {control_entry[2]}
+            scoped_agent_id = ""
+        elif delegation_entry is not None:
+            scope = "delegation"
+            allowed_uids = {delegation_entry[2]}
+            scoped_agent_id = delegation_entry[3]
+        else:
+            scope = "operator"
+            allowed_uids = {os.geteuid(), self._state_owner()[0]}
+            scoped_agent_id = ""
+        if peer_uid is None or peer_uid not in allowed_uids:
             try:
-                conn.sendall(json.dumps(self._json_safe(response), sort_keys=True).encode("utf-8"))
-            except BrokenPipeError:
-                return
+                conn.sendall(b'{"ok":false,"error":"clawied IPC peer is not authorized"}')
+            except OSError:
+                pass
+            conn.close()
+            return
+        if not self._ipc_slots.acquire(blocking=False):
+            try:
+                conn.sendall(b'{"ok":false,"error":"clawied IPC worker limit reached"}')
+            except OSError:
+                pass
+            conn.close()
+            return
+        worker = threading.Thread(
+            target=self._serve_authorized_ipc_connection,
+            args=(conn,),
+            kwargs={
+                "scope": scope,
+                "peer_uid": peer_uid,
+                "scoped_agent_id": scoped_agent_id,
+            },
+            name=f"clawied-ipc-{scope}",
+            daemon=True,
+        )
+        with self._ipc_threads_lock:
+            self._ipc_threads.add(worker)
+        try:
+            worker.start()
+        except Exception:
+            with self._ipc_threads_lock:
+                self._ipc_threads.discard(worker)
+            self._ipc_slots.release()
+            conn.close()
+            raise
+
+    def _serve_authorized_ipc_connection(
+        self,
+        conn: socket.socket,
+        *,
+        scope: str,
+        peer_uid: int,
+        scoped_agent_id: str,
+    ) -> None:
+        try:
+            with conn:
+                response = self._handle_ipc_connection(
+                    conn,
+                    scope=scope,
+                    peer_uid=peer_uid,
+                    scoped_agent_id=scoped_agent_id,
+                )
+                try:
+                    conn.sendall(
+                        json.dumps(self._json_safe(response), sort_keys=True).encode("utf-8")
+                    )
+                except OSError:
+                    return
+        finally:
+            with self._ipc_threads_lock:
+                self._ipc_threads.discard(threading.current_thread())
+            self._ipc_slots.release()
 
     def _handle_ipc_connection(
         self,
@@ -360,6 +461,7 @@ class Clawied:
         *,
         scope: str,
         peer_uid: int,
+        scoped_agent_id: str = "",
     ) -> dict[str, Any]:
         try:
             request_bytes = self._recv_all(conn, max_bytes=1_000_000)
@@ -370,7 +472,13 @@ class Clawied:
             payload = request.get("payload", {})
             if not isinstance(payload, dict):
                 raise ValueError("payload must be a JSON object")
-            result = self._handle_ipc_command(command, payload, scope=scope, peer_uid=peer_uid)
+            result = self._handle_ipc_command(
+                command,
+                payload,
+                scope=scope,
+                peer_uid=peer_uid,
+                scoped_agent_id=scoped_agent_id,
+            )
             return {"ok": True, "result": result}
         except Exception as exc:  # noqa: BLE001 - return errors to the client.
             return {"ok": False, "error": str(exc)}
@@ -382,9 +490,16 @@ class Clawied:
         *,
         scope: str = "operator",
         peer_uid: int | None = None,
+        scoped_agent_id: str = "",
     ) -> dict[str, Any]:
         if scope == "control" and command != "control_request":
             raise PermissionError("control-agent IPC only permits control_request")
+        if scope == "delegation":
+            if command != "delegation_request":
+                raise PermissionError("agent delegation IPC only permits delegation_request")
+            if not scoped_agent_id:
+                raise PermissionError("agent delegation IPC is missing its bound agent identity")
+            return self._handle_delegation_request(payload, parent_id=scoped_agent_id)
         if command == "status":
             result = self.status()
             result["via"] = "ipc"
@@ -416,6 +531,32 @@ class Clawied:
                 raise PermissionError("control confirmation requires an authenticated local peer")
             return self._handle_control_confirm(payload, peer_uid=peer_uid)
         raise ValueError(f"unsupported clawied IPC command: {command}")
+
+    def _handle_delegation_request(
+        self,
+        payload: dict[str, Any],
+        *,
+        parent_id: str,
+    ) -> dict[str, Any]:
+        allowed = {"child_id", "payload", "timeout", "model_tier", "parent_task_id"}
+        extra = sorted(str(key) for key in payload if str(key) not in allowed)
+        if extra:
+            raise ValueError(f"unsupported delegation_request argument(s): {', '.join(extra)}")
+        child_id = str(payload.get("child_id", "") or "").strip()
+        if not child_id:
+            raise ValueError("delegation_request child_id is required")
+        task_payload = payload.get("payload", {})
+        if not isinstance(task_payload, dict):
+            raise ValueError("delegation_request payload must be a JSON object")
+        result = self.service.delegate_task(
+            parent_id=parent_id,
+            child_id=child_id,
+            payload=task_payload,
+            timeout=float(payload.get("timeout", 300.0) or 300.0),
+            model_tier=str(payload.get("model_tier", "") or ""),
+            parent_task_id=str(payload.get("parent_task_id", "") or ""),
+        )
+        return self._json_safe(result)
 
     def _handle_service_call(self, payload: dict[str, Any]) -> dict[str, Any]:
         method = str(payload.get("method", "") or "").strip()
@@ -651,6 +792,44 @@ class Clawied:
             rows.append((path, int(record.pw_uid), int(record.pw_gid)))
         return rows
 
+    def _delegation_socket_specs(self) -> list[tuple[Path, int, int, str]]:
+        """Return peer-bound recursive delegation endpoints for managed agents."""
+        state = self.service.store.read_state()
+        agents = state.get("agents", {})
+        if not isinstance(agents, dict):
+            return []
+        rows: list[tuple[Path, int, int, str]] = []
+        owners: dict[Path, str] = {}
+        for key, agent in agents.items():
+            if not isinstance(agent, dict):
+                continue
+            info = agent.get("agent", {})
+            if not isinstance(info, dict):
+                continue
+            plugins = info.get("plugins", {})
+            if isinstance(plugins, dict) and not bool(plugins.get("delegation", True)):
+                continue
+            linux_user = str(info.get("linux_user", "")).strip()
+            if not linux_user:
+                continue
+            agent_id = str(agent.get("agent_id", key) or key).strip()
+            if not agent_id:
+                continue
+            try:
+                record = pwd.getpwnam(linux_user)
+            except KeyError:
+                continue
+            path = delegation_socket_path(self.service.store.root, int(record.pw_uid))
+            existing = owners.get(path)
+            if existing is not None and existing != agent_id:
+                raise SetupError(
+                    "refusing ambiguous delegation IPC: managed agents "
+                    f"{existing!r} and {agent_id!r} share uid {record.pw_uid}"
+                )
+            owners[path] = agent_id
+            rows.append((path, int(record.pw_uid), int(record.pw_gid), agent_id))
+        return rows
+
     def _refresh_control_ipc(self) -> None:
         desired = {path: (uid, gid) for path, uid, gid in self._control_socket_specs()}
         retained: list[tuple[socket.socket, Path, int]] = []
@@ -668,6 +847,30 @@ class Clawied:
         self._control_servers = retained
         for path, (uid, gid) in desired.items():
             self._control_servers.append(self._start_control_listener(path, uid=uid, gid=gid))
+
+    def _refresh_delegation_ipc(self) -> None:
+        desired = {
+            path: (uid, gid, agent_id)
+            for path, uid, gid, agent_id in self._delegation_socket_specs()
+        }
+        retained: list[tuple[socket.socket, Path, int, str]] = []
+        for server, path, uid, agent_id in self._delegation_servers:
+            spec = desired.get(path)
+            if (
+                spec is not None
+                and spec[0] == uid
+                and spec[2] == agent_id
+                and self._control_listener_current(path, uid)
+            ):
+                retained.append((server, path, uid, agent_id))
+                desired.pop(path, None)
+                continue
+            server.close()
+            self._unlink_control_socket(path, uid)
+        self._delegation_servers = retained
+        for path, (uid, gid, agent_id) in desired.items():
+            server, socket_path, socket_uid = self._start_control_listener(path, uid=uid, gid=gid)
+            self._delegation_servers.append((server, socket_path, socket_uid, agent_id))
 
     def _start_control_listener(
         self,

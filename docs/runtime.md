@@ -96,10 +96,10 @@ files are private and not symlinks, and one agent user cannot read another
 agent's sensitive paths. A skipped or failed report is not production evidence.
 The repository includes historical Linux/root proof records in
 [`docs/proofs/host-validation-linux-container-2026-06-14.md`](proofs/host-validation-linux-container-2026-06-14.md);
-and a Colima Linux/systemd aggregate proof in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md`](proofs/production-verify-colima-systemd-wheel-0.1.7-2026-06-19.md).
-Those records predate mandatory live runtime delivery and do not accept the
-current tree or any deployment host.
+the exact 0.1.8 wheel's current Colima Linux/systemd aggregate proof is in
+[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
+The current proof includes mandatory live runtime delivery, but accepts only
+the recorded artifact and host.
 
 For full target-host acceptance, run the aggregate verifier:
 

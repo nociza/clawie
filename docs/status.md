@@ -46,6 +46,11 @@ clawie status --json
 clawie status delegation --json
 ```
 
+The command exits nonzero if the embedded health status is unhealthy or a
+state-integrity error is detected. Degraded health and unrelated section probe
+errors remain visible but do not make the entire snapshot unusable. Use
+`clawie health` when only the health report is needed.
+
 ## Live view
 
 `--watch` redraws the overview on an interval until you press `Ctrl-C`. When the

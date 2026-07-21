@@ -159,7 +159,12 @@ class StateStore:
                     error TEXT DEFAULT '',
                     created_at TEXT,
                     completed_at TEXT,
-                    timeout_seconds REAL DEFAULT 300.0
+                    timeout_seconds REAL DEFAULT 300.0,
+                    model_tier TEXT DEFAULT '',
+                    context_budget TEXT DEFAULT '{}',
+                    root_agent_id TEXT DEFAULT '',
+                    root_task_id TEXT DEFAULT '',
+                    parent_task_id TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS delegation_trees (
                     root_agent_id TEXT PRIMARY KEY,
@@ -446,7 +451,7 @@ class StateStore:
         return grouped
 
     def _migrate_delegation_schema(self) -> None:
-        """Add model_tier and context_budget columns if missing."""
+        """Add delegation columns and indexes introduced after the base schema."""
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -461,6 +466,36 @@ class StateStore:
                     "delegation_tasks",
                     "context_budget",
                     "TEXT DEFAULT '{}'",
+                )
+                self._add_column_if_missing(
+                    conn,
+                    "delegation_tasks",
+                    "root_agent_id",
+                    "TEXT DEFAULT ''",
+                )
+                self._add_column_if_missing(
+                    conn,
+                    "delegation_tasks",
+                    "root_task_id",
+                    "TEXT DEFAULT ''",
+                )
+                self._add_column_if_missing(
+                    conn,
+                    "delegation_tasks",
+                    "parent_task_id",
+                    "TEXT DEFAULT ''",
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS delegation_tasks_status_parent "
+                    "ON delegation_tasks(status, parent_agent_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS delegation_tasks_status_child "
+                    "ON delegation_tasks(status, child_agent_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS delegation_tasks_root "
+                    "ON delegation_tasks(root_task_id, created_at)"
                 )
                 conn.commit()
             except Exception:
@@ -506,6 +541,9 @@ class StateStore:
         timeout_seconds: float = 300.0,
         model_tier: str = "",
         context_budget: dict[str, Any] | None = None,
+        root_agent_id: str = "",
+        root_task_id: str = "",
+        parent_task_id: str = "",
     ) -> None:
         self.ensure()
         with self._connect() as conn:
@@ -514,8 +552,8 @@ class StateStore:
                 INSERT OR REPLACE INTO delegation_tasks
                 (task_id, parent_agent_id, child_agent_id, depth, status,
                  payload, result, error, created_at, completed_at, timeout_seconds,
-                 model_tier, context_budget)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 model_tier, context_budget, root_agent_id, root_task_id, parent_task_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -531,9 +569,389 @@ class StateStore:
                     timeout_seconds,
                     model_tier,
                     json.dumps(context_budget or {}, sort_keys=True),
+                    root_agent_id,
+                    root_task_id,
+                    parent_task_id,
                 ),
             )
             conn.commit()
+
+    def reserve_delegation_task(
+        self,
+        *,
+        task_id: str,
+        parent_agent_id: str,
+        child_agent_id: str,
+        payload: dict[str, Any],
+        created_at: str,
+        timeout_seconds: float,
+        model_tier: str,
+        context_budget: dict[str, Any],
+        depth_limits: dict[str, int],
+        max_depth: int,
+        max_children: int,
+        parent_task_id: str = "",
+    ) -> dict[str, Any]:
+        """Atomically validate and reserve one edge in the active task graph.
+
+        The state-directory lock and ``BEGIN IMMEDIATE`` make graph validation
+        race-free across CLI and daemon processes.  Only active tasks constrain
+        a new independent tree, while every node already recorded in the same
+        active tree remains protected from cycles and duplicate placement.
+        """
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stale_rows = conn.execute(
+                """
+                SELECT * FROM delegation_tasks
+                 WHERE status IN ('pending', 'running')
+                   AND COALESCE(created_at, '') <> ''
+                   AND (julianday(?) - julianday(created_at)) * 86400.0
+                       > MAX(timeout_seconds, 0.0) + 30.0
+                """,
+                (created_at,),
+            ).fetchall()
+            conn.execute(
+                """
+                UPDATE delegation_tasks
+                   SET status = 'timeout',
+                       completed_at = ?,
+                       error = CASE WHEN error = ''
+                           THEN 'delegation lease expired before completion'
+                           ELSE error END
+                 WHERE status IN ('pending', 'running')
+                   AND COALESCE(created_at, '') <> ''
+                   AND (julianday(?) - julianday(created_at)) * 86400.0
+                       > MAX(timeout_seconds, 0.0) + 30.0
+                """,
+                (created_at, created_at),
+            )
+            stale_generations = {
+                (
+                    str(row["root_agent_id"] or row["parent_agent_id"]),
+                    str(row["root_task_id"] or row["task_id"]),
+                )
+                for row in stale_rows
+            }
+            for stale_root_agent, stale_root_task in stale_generations:
+                stale_tree_row = conn.execute(
+                    "SELECT tree_data FROM delegation_trees WHERE root_agent_id = ?",
+                    (stale_root_agent,),
+                ).fetchone()
+                if stale_tree_row is None:
+                    continue
+                stale_tree = self._decode_json_obj(str(stale_tree_row["tree_data"] or "{}"))
+                root_node = stale_tree.get(stale_root_agent)
+                if not isinstance(root_node, dict) or str(root_node.get("task_id", "")) != (
+                    f"{stale_root_task}:root"
+                ):
+                    continue
+                for stale_row in stale_rows:
+                    row_root_agent = str(
+                        stale_row["root_agent_id"] or stale_row["parent_agent_id"]
+                    )
+                    row_root_task = str(stale_row["root_task_id"] or stale_row["task_id"])
+                    if (row_root_agent, row_root_task) != (
+                        stale_root_agent,
+                        stale_root_task,
+                    ):
+                        continue
+                    node = stale_tree.get(str(stale_row["child_agent_id"]))
+                    if isinstance(node, dict) and str(node.get("task_id", "")) == str(
+                        stale_row["task_id"]
+                    ):
+                        node["status"] = "timeout"
+                active_in_generation = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM delegation_tasks "
+                        "WHERE root_task_id = ? AND status IN ('pending', 'running')",
+                        (stale_root_task,),
+                    ).fetchone()[0]
+                )
+                if active_in_generation == 0:
+                    root_node["status"] = "failed"
+                conn.execute(
+                    """
+                    UPDATE delegation_trees SET tree_data = ?, updated_at = ?
+                    WHERE root_agent_id = ?
+                    """,
+                    (json.dumps(stale_tree, sort_keys=True), created_at, stale_root_agent),
+                )
+            active = conn.execute(
+                "SELECT * FROM delegation_tasks "
+                "WHERE status IN ('pending', 'running') ORDER BY created_at, task_id"
+            ).fetchall()
+            active_by_task = {str(row["task_id"]): row for row in active}
+            incoming = [row for row in active if str(row["child_agent_id"]) == parent_agent_id]
+            requested_parent_task = str(parent_task_id or "").strip()
+
+            lineage_row: sqlite3.Row | None = None
+            if requested_parent_task:
+                lineage_row = active_by_task.get(requested_parent_task)
+                if lineage_row is None:
+                    raise ValueError(
+                        f"parent task is not active: {requested_parent_task}"
+                    )
+                if str(lineage_row["child_agent_id"]) != parent_agent_id:
+                    raise ValueError(
+                        f"parent task {requested_parent_task} belongs to "
+                        f"{lineage_row['child_agent_id']}, not {parent_agent_id}"
+                    )
+            elif len(incoming) == 1:
+                lineage_row = incoming[0]
+            elif len(incoming) > 1:
+                raise ValueError(
+                    f"agent {parent_agent_id} has multiple active parent tasks; "
+                    "specify --parent-task"
+                )
+
+            root_agent_id = parent_agent_id
+            root_task_id = task_id
+            effective_parent_task = ""
+            tree_data: dict[str, Any] = {}
+            if lineage_row is not None:
+                root_agent_id = str(lineage_row["root_agent_id"] or "") or str(
+                    lineage_row["parent_agent_id"]
+                )
+                root_task_id = str(lineage_row["root_task_id"] or "") or str(
+                    lineage_row["task_id"]
+                )
+                effective_parent_task = str(lineage_row["task_id"])
+            else:
+                direct_roots = {
+                    str(row["root_task_id"] or row["task_id"])
+                    for row in active
+                    if str(row["parent_agent_id"]) == parent_agent_id
+                    and (str(row["root_agent_id"] or "") or parent_agent_id)
+                    == parent_agent_id
+                    and not str(row["parent_task_id"] or "")
+                }
+                if len(direct_roots) > 1:
+                    raise ValueError(
+                        f"agent {parent_agent_id} has multiple active root trees; "
+                        "wait for one to finish"
+                    )
+                if direct_roots:
+                    root_task_id = next(iter(direct_roots))
+
+            tree_row = conn.execute(
+                "SELECT tree_data FROM delegation_trees WHERE root_agent_id = ?",
+                (root_agent_id,),
+            ).fetchone()
+            if tree_row is not None:
+                decoded = self._decode_json_obj(str(tree_row["tree_data"] or "{}"))
+                root_node = decoded.get(root_agent_id)
+                expected_root_task = f"{root_task_id}:root"
+                if isinstance(root_node, dict) and str(root_node.get("task_id", "")) == expected_root_task:
+                    tree_data = decoded
+
+            if not tree_data:
+                if lineage_row is not None:
+                    raise ValueError(
+                        f"active delegation lineage for {parent_agent_id} has no durable tree"
+                    )
+                tree_data = {
+                    root_agent_id: {
+                        "agent_id": root_agent_id,
+                        "parent_id": "",
+                        "task_id": f"{root_task_id}:root",
+                        "depth": 0,
+                        "status": "running",
+                        "children": [],
+                        "model_tier": model_tier,
+                    }
+                }
+
+            parent_node = tree_data.get(parent_agent_id)
+            if not isinstance(parent_node, dict):
+                raise ValueError(
+                    f"parent {parent_agent_id} is not present in active delegation tree "
+                    f"rooted at {root_agent_id}"
+                )
+            ancestry: set[str] = set()
+            current = parent_agent_id
+            while current:
+                if current in ancestry:
+                    raise ValueError(f"active delegation tree already contains a cycle at {current}")
+                ancestry.add(current)
+                current_node = tree_data.get(current)
+                if not isinstance(current_node, dict):
+                    raise ValueError(f"active delegation tree is missing node {current}")
+                current = str(current_node.get("parent_id", ""))
+            if child_agent_id in ancestry:
+                raise ValueError(
+                    f"delegation cycle detected: {child_agent_id} already in ancestry"
+                )
+
+            active_participants = {
+                str(value)
+                for row in active
+                for value in (row["parent_agent_id"], row["child_agent_id"])
+            }
+            if child_agent_id in active_participants:
+                raise ValueError(
+                    f"child {child_agent_id} already participates in an active delegation tree"
+                )
+            if child_agent_id in tree_data:
+                raise ValueError(
+                    f"child {child_agent_id} already appears in the current delegation tree"
+                )
+
+            parent_depth = int(parent_node.get("depth", 0))
+            depth = parent_depth + 1
+            depth_limit = int(depth_limits.get(root_agent_id, max_depth))
+            if depth >= depth_limit:
+                raise ValueError(
+                    f"max recursion depth ({depth_limit}) exceeded at depth={depth}"
+                )
+            children = parent_node.get("children", [])
+            if not isinstance(children, list):
+                raise ValueError(f"active delegation tree has invalid children for {parent_agent_id}")
+            if len(children) >= max_children:
+                raise ValueError(
+                    f"max children ({max_children}) exceeded for {parent_agent_id}"
+                )
+
+            parent_node["status"] = "running"
+            children.append(child_agent_id)
+            tree_data[child_agent_id] = {
+                "agent_id": child_agent_id,
+                "parent_id": parent_agent_id,
+                "task_id": task_id,
+                "depth": depth,
+                "status": "running",
+                "children": [],
+                "model_tier": model_tier,
+            }
+            conn.execute(
+                """
+                INSERT INTO delegation_tasks
+                (task_id, parent_agent_id, child_agent_id, depth, status,
+                 payload, result, error, created_at, completed_at, timeout_seconds,
+                 model_tier, context_budget, root_agent_id, root_task_id, parent_task_id)
+                VALUES (?, ?, ?, ?, 'running', ?, '{}', '', ?, '', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    parent_agent_id,
+                    child_agent_id,
+                    depth,
+                    json.dumps(payload, sort_keys=True),
+                    created_at,
+                    timeout_seconds,
+                    model_tier,
+                    json.dumps(context_budget, sort_keys=True),
+                    root_agent_id,
+                    root_task_id,
+                    effective_parent_task,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO delegation_trees(root_agent_id, tree_data, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (root_agent_id, json.dumps(tree_data, sort_keys=True), created_at),
+            )
+            conn.commit()
+        return {
+            "task_id": task_id,
+            "root_agent_id": root_agent_id,
+            "root_task_id": root_task_id,
+            "parent_task_id": effective_parent_task,
+            "depth": depth,
+        }
+
+    def complete_delegation_task(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        result: dict[str, Any],
+        error: str,
+        completed_at: str,
+        context_budget: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete a reserved task and its durable tree node atomically."""
+        if status not in {"completed", "failed", "timeout"}:
+            raise ValueError("delegation completion status must be completed, failed, or timeout")
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM delegation_tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"delegation task not found: {task_id}")
+            current_status = str(row["status"])
+            if current_status not in {"pending", "running"}:
+                raise ValueError(
+                    f"delegation task is no longer active: {task_id} ({current_status})"
+                )
+            conn.execute(
+                """
+                UPDATE delegation_tasks
+                   SET status = ?, result = ?, error = ?, completed_at = ?, context_budget = ?
+                 WHERE task_id = ?
+                """,
+                (
+                    status,
+                    json.dumps(result, sort_keys=True),
+                    error,
+                    completed_at,
+                    json.dumps(context_budget, sort_keys=True),
+                    task_id,
+                ),
+            )
+            root_agent_id = str(row["root_agent_id"] or row["parent_agent_id"])
+            root_task_id = str(row["root_task_id"] or row["task_id"])
+            tree_row = conn.execute(
+                "SELECT tree_data FROM delegation_trees WHERE root_agent_id = ?",
+                (root_agent_id,),
+            ).fetchone()
+            if tree_row is not None:
+                tree_data = self._decode_json_obj(str(tree_row["tree_data"] or "{}"))
+                child_id = str(row["child_agent_id"])
+                child_node = tree_data.get(child_id)
+                if isinstance(child_node, dict) and str(child_node.get("task_id", "")) == task_id:
+                    child_node["status"] = status
+                active_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM delegation_tasks "
+                        "WHERE root_task_id = ? AND status IN ('pending', 'running')",
+                        (root_task_id,),
+                    ).fetchone()[0]
+                )
+                if active_count == 0:
+                    failed_count = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM delegation_tasks "
+                            "WHERE root_task_id = ? AND status IN ('failed', 'timeout')",
+                            (root_task_id,),
+                        ).fetchone()[0]
+                    )
+                    root_node = tree_data.get(root_agent_id)
+                    if isinstance(root_node, dict):
+                        root_node["status"] = "failed" if failed_count else "completed"
+                conn.execute(
+                    """
+                    UPDATE delegation_trees SET tree_data = ?, updated_at = ?
+                    WHERE root_agent_id = ?
+                    """,
+                    (json.dumps(tree_data, sort_keys=True), completed_at, root_agent_id),
+                )
+            conn.commit()
+        return {
+            "task_id": task_id,
+            "parent_agent_id": str(row["parent_agent_id"]),
+            "child_agent_id": str(row["child_agent_id"]),
+            "root_agent_id": root_agent_id,
+            "root_task_id": root_task_id,
+            "parent_task_id": str(row["parent_task_id"] or ""),
+            "depth": int(row["depth"]),
+            "model_tier": str(row["model_tier"] or ""),
+        }
 
     def read_delegation_tasks(
         self,
@@ -597,6 +1015,11 @@ class StateStore:
                 d["context_budget"] = self._decode_json_obj(str(row["context_budget"] or "{}"))
             except (IndexError, KeyError):
                 d["context_budget"] = {}
+            for column in ("root_agent_id", "root_task_id", "parent_task_id"):
+                try:
+                    d[column] = str(row[column] or "")
+                except (IndexError, KeyError):
+                    d[column] = ""
             results.append(d)
         return results
 

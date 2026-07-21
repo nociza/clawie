@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from clawie.providers import PROVIDERS
-from clawie.ipc_paths import control_socket_path
+from clawie.ipc_paths import control_socket_path, delegation_socket_path
 from clawie.store import DEFAULT_CONFIG
 
 if sys.version_info >= (3, 11):
@@ -21,9 +21,9 @@ def test_package_metadata_matches_current_production_readiness() -> None:
 
     assert project["license"] == "Apache-2.0"
     assert not any(classifier.startswith("License ::") for classifier in classifiers)
-    assert "Development Status :: 5 - Production/Stable" not in classifiers
+    assert "Development Status :: 5 - Production/Stable" in classifiers
     assert "Development Status :: 3 - Alpha" not in classifiers
-    assert "Development Status :: 4 - Beta" in classifiers
+    assert "Development Status :: 4 - Beta" not in classifiers
     assert "Operating System :: POSIX :: Linux" in classifiers
     assert "Operating System :: OS Independent" not in classifiers
     assert not any("MacOS" in classifier or "Microsoft :: Windows" in classifier for classifier in classifiers)
@@ -49,6 +49,12 @@ def test_control_socket_paths_are_manager_scoped() -> None:
     assert first.suffix == ".sock"
     assert first != second
 
+    delegated = delegation_socket_path("/var/lib/clawie-a", 1001)
+    assert delegated.parent == Path("/run/clawie/control")
+    assert delegated.name.startswith("delegation-1001-")
+    assert delegated.suffix == ".sock"
+    assert delegated != first
+
 
 def test_release_workflow_is_pinned_and_uses_trusted_publishing() -> None:
     workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
@@ -67,6 +73,7 @@ def test_release_workflow_is_pinned_and_uses_trusted_publishing() -> None:
 def test_production_fixture_exercises_the_real_public_user_journey() -> None:
     fixture = Path("scripts/production_verify_fixture.py").read_text(encoding="utf-8")
 
+    assert '"runtime",\n                "install",\n                "openclaw"' in fixture
     assert '"runtime",\n                    "create"' in fixture
     assert '"agent",\n                    "service",\n                    "start"' in fixture
     assert '"--exercise-runtime-delivery"' in fixture
@@ -74,6 +81,8 @@ def test_production_fixture_exercises_the_real_public_user_journey() -> None:
     assert 'proof_payload["cleanup"] = cleanup' in fixture
     assert '"user_absent": absent' in fixture
     assert '"preserved_state_root"' in fixture
+    assert "wrapper_dir = _trusted_wrapper_dir(version_token)" in fixture
+    assert 'dir=home' in fixture
     assert "_seed_state" not in fixture
     assert "_create_user_with_private_auth" not in fixture
     assert 'required=True,\n        help="Home containing real provider or linked auth' in fixture

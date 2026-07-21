@@ -21,9 +21,11 @@ PyPI with short-lived OIDC credentials. Long-lived PyPI API tokens are not used.
 3. When the workflow's build job passes, download its immutable
    `python-package-distributions` artifact. Run that exact wheel through the
    disposable target-host journey. The source home must contain real linked
-   credentials; the fixture copies them into two private agent homes, starts
-   both gateways, exercises nonce-bearing delivery and watchdog restart,
-   verifies cleanup, and emits the artifact SHA-256 with the proof:
+   credentials and the host must provide the runtime's underlying package
+   manager. The fixture installs the pinned runtime through the wheel, copies
+   credentials into two private agent homes, starts both gateways, exercises
+   nonce-bearing delivery and watchdog restart, verifies cleanup, and emits the
+   artifact SHA-256 with the proof:
 
    ```bash
    sudo python3 scripts/production_verify_fixture.py \
@@ -37,7 +39,10 @@ PyPI with short-lived OIDC credentials. Long-lived PyPI API tokens are not used.
    exercise, failed fixture cleanup, or proof from a different wheel is not
    acceptable. Inspect the JSON and require both `result.status` to be `passed`
    and `cleanup.ok` to be `true`. Attach the proof to the GitHub release and
-   confirm its `wheel_sha256` matches the downloaded artifact.
+   confirm its `wheel_sha256` matches the downloaded artifact. The fixture
+   creates its root-automation wrapper below root's trusted, owner-only home;
+   a wrapper below `/tmp` or another group/world-writable ancestor must be
+   rejected by production verification.
 
 4. Only after the exact artifact proof passes, approve the `pypi` environment
    deployment. The release workflow independently

@@ -617,6 +617,99 @@ class TestStoreDelegation:
         store.ensure()
         assert store.read_delegation_tree("nobody") == {}
 
+    def test_atomic_reservation_enforces_tree_child_limit_and_completion(
+        self, tmp_path: Path
+    ) -> None:
+        store = StateStore(config_dir=tmp_path)
+
+        def reserve(task_id: str, child_id: str) -> dict[str, object]:
+            return store.reserve_delegation_task(
+                task_id=task_id,
+                parent_agent_id="root",
+                child_agent_id=child_id,
+                payload={"task": child_id},
+                created_at="2026-07-20T12:00:00Z",
+                timeout_seconds=300,
+                model_tier="balanced",
+                context_budget={"total_budget": 16_000},
+                depth_limits={"root": 10},
+                max_depth=10,
+                max_children=2,
+            )
+
+        first = reserve("t1", "a")
+        second = reserve("t2", "b")
+        with pytest.raises(ValueError, match="max children \(2\)"):
+            reserve("t3", "c")
+
+        assert first["root_task_id"] == "t1"
+        assert second["root_task_id"] == "t1"
+        assert store.read_delegation_tree("root")["root"]["children"] == ["a", "b"]
+
+        store.complete_delegation_task(
+            task_id="t1",
+            status="completed",
+            result={"ok": True},
+            error="",
+            completed_at="2026-07-20T12:00:01Z",
+            context_budget={"total_budget": 16_000, "tokens_used": 1},
+        )
+        assert store.read_delegation_tree("root")["root"]["status"] == "running"
+        store.complete_delegation_task(
+            task_id="t2",
+            status="completed",
+            result={"ok": True},
+            error="",
+            completed_at="2026-07-20T12:00:02Z",
+            context_budget={"total_budget": 16_000, "tokens_used": 1},
+        )
+        assert store.read_delegation_tree("root")["root"]["status"] == "completed"
+
+    def test_atomic_reservation_expires_abandoned_task_lease(self, tmp_path: Path) -> None:
+        store = StateStore(config_dir=tmp_path)
+        common: dict[str, object] = {
+            "parent_agent_id": "root",
+            "payload": {"task": "work"},
+            "timeout_seconds": 1,
+            "model_tier": "balanced",
+            "context_budget": {"total_budget": 16_000},
+            "depth_limits": {"root": 10},
+            "max_depth": 10,
+            "max_children": 50,
+        }
+        store.reserve_delegation_task(
+            task_id="stale",
+            child_agent_id="worker",
+            created_at="2026-07-20T12:00:00Z",
+            **common,
+        )
+
+        fresh = store.reserve_delegation_task(
+            task_id="fresh",
+            child_agent_id="worker",
+            created_at="2026-07-20T12:01:00Z",
+            **common,
+        )
+
+        stale = next(row for row in store.read_delegation_tasks() if row["task_id"] == "stale")
+        assert stale["status"] == "timeout"
+        assert "lease expired" in stale["error"]
+        assert fresh["root_task_id"] == "fresh"
+        with pytest.raises(ValueError, match="no longer active.*timeout"):
+            store.complete_delegation_task(
+                task_id="stale",
+                status="completed",
+                result={"late": True},
+                error="",
+                completed_at="2026-07-20T12:01:01Z",
+                context_budget={"total_budget": 16_000},
+            )
+        stale_after = next(
+            row for row in store.read_delegation_tasks() if row["task_id"] == "stale"
+        )
+        assert stale_after["status"] == "timeout"
+        assert stale_after["result"] == {}
+
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -1756,6 +1849,55 @@ class TestDelegationCLITier:
             "--payload", "{}",
         ])
         assert args.tier == "fast"
+
+    def test_scoped_submit_uses_peer_bound_delegation_socket(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        calls: list[tuple[object, str, dict[str, object], float]] = []
+
+        def fake_request(
+            socket_path: object,
+            command: str,
+            payload: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            calls.append((socket_path, command, payload, timeout))
+            return {
+                "task_id": "scoped-task",
+                "status": "completed",
+                "model_tier": "fast",
+                "depth": 2,
+                "result": {"ok": True},
+            }
+
+        monkeypatch.setenv("CLAWIE_DELEGATION_SOCKET", "/run/clawie/control/delegation.sock")
+        monkeypatch.setattr("clawie.daemon.request_ipc_socket", fake_request)
+
+        code = run_cli(
+            tmp_path,
+            "delegation",
+            "submit",
+            "--parent",
+            "spoofed-parent",
+            "--child",
+            "leaf",
+            "--tier",
+            "fast",
+            "--parent-task",
+            "active-task",
+            "--payload",
+            '{"task":"nested"}',
+        )
+
+        assert code == 0
+        assert calls[0][0] == "/run/clawie/control/delegation.sock"
+        assert calls[0][1] == "delegation_request"
+        assert "parent_id" not in calls[0][2]
+        assert calls[0][2]["child_id"] == "leaf"
+        assert calls[0][2]["parent_task_id"] == "active-task"
 
     def test_parser_has_tier_on_spawn(self) -> None:
         from clawie.cli import build_parser

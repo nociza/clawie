@@ -14,9 +14,11 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -59,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     version = str(args.version).strip()
     version_token = re.sub(r"[^0-9a-z]", "", version.lower()) or "release"
     state_root = Path(tempfile.mkdtemp(prefix=f"clawie-release-proof-{version_token}-"))
-    wrapper_dir = Path(tempfile.mkdtemp(prefix=f"clawie-wheel-proof-bin-{version_token}-"))
+    wrapper_dir = _trusted_wrapper_dir(version_token)
     nonce = re.sub(r"[^0-9a-z]", "", state_root.name.rsplit("-", 1)[-1].lower())
     suffix = f"{version_token}{nonce}"[-20:]
     users = [f"clawier{suffix}a", f"clawier{suffix}b"]
@@ -100,6 +102,18 @@ def main(argv: list[str] | None = None) -> int:
                 "pro",
                 "--workspace",
                 "production-proof",
+            ],
+            env=env,
+        )
+        _run(
+            [
+                "clawie",
+                "--no-color",
+                "--config-dir",
+                str(state_root),
+                "runtime",
+                "install",
+                "openclaw",
             ],
             env=env,
         )
@@ -219,7 +233,10 @@ def main(argv: list[str] | None = None) -> int:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"production verify did not emit JSON: {verify.stdout!r}") from exc
         if verify.returncode != 0 or result_payload.get("status") != "passed":
-            raise RuntimeError(f"production verify failed with exit {verify.returncode}")
+            detail = json.dumps(result_payload, indent=2, sort_keys=True)
+            raise RuntimeError(
+                f"production verify failed with exit {verify.returncode}:\n{detail}"
+            )
 
         proof_payload = {
             "version": version,
@@ -328,6 +345,32 @@ def _write_wrapper(wrapper_dir: Path, wheel: Path) -> None:
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
+
+
+def _trusted_wrapper_dir(version_token: str) -> Path:
+    """Create the proof executable below the effective user's trusted home.
+
+    The fixture requires uid 0 before calling this helper, so the resulting
+    wrapper and every normal parent component are root-owned.  Using the system
+    temporary directory would put the executable below world-writable ``/tmp``
+    and the watchdog's root-automation validator would correctly reject it.
+    """
+    effective_uid = os.geteuid()
+    try:
+        home = Path(pwd.getpwuid(effective_uid).pw_dir).expanduser().resolve(strict=True)
+        home_st = home.stat()
+    except (KeyError, OSError) as exc:
+        raise RuntimeError(f"cannot resolve trusted home for uid {effective_uid}: {exc}") from exc
+    if not stat.S_ISDIR(home_st.st_mode):
+        raise RuntimeError(f"trusted wrapper parent is not a directory: {home}")
+    if int(home_st.st_uid) != effective_uid or stat.S_IMODE(home_st.st_mode) & 0o022:
+        raise RuntimeError(
+            "trusted wrapper parent must be owned by the effective user and not "
+            f"group/world-writable: {home}"
+        )
+    return Path(
+        tempfile.mkdtemp(prefix=f"clawie-wheel-proof-bin-{version_token}-", dir=home)
+    )
 
 
 def _sha256(path: Path) -> str:

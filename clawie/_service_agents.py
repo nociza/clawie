@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -935,7 +936,7 @@ class AgentOpsMixin:
 
         existing_telegram_cfg = channels_cfg.get("telegram", {})
         if isinstance(existing_telegram_cfg, dict):
-            existing_telegram_cfg["streaming"] = "off"
+            self._set_openclaw_telegram_streaming_off(existing_telegram_cfg)
             channels_cfg["telegram"] = existing_telegram_cfg
         login_env = self._login_shell_env(linux_user)
         payload_by_kind: dict[str, dict[str, Any]] = {}
@@ -960,7 +961,7 @@ class AgentOpsMixin:
             telegram_cfg = channels_cfg.get("telegram", {})
             if not isinstance(telegram_cfg, dict):
                 telegram_cfg = {}
-            telegram_cfg["streaming"] = "off"
+            self._set_openclaw_telegram_streaming_off(telegram_cfg)
             token = (
                 str(settings.get("botToken", "")).strip()
                 or str(settings.get("bot_token", "")).strip()
@@ -1038,6 +1039,28 @@ class AgentOpsMixin:
                 workspace=workspace,
                 linux_user=linux_user,
             )
+
+    @staticmethod
+    def _set_openclaw_telegram_streaming_off(telegram_cfg: dict[str, Any]) -> None:
+        """Write the pinned OpenClaw canonical streaming schema.
+
+        OpenClaw 2026.7.1 rejects the historical scalar ``streaming`` value
+        and related top-level preview keys. Preserve supported nested tuning,
+        force preview delivery off, and remove every legacy key called out by
+        the pinned runtime's schema validator.
+        """
+        streaming = telegram_cfg.get("streaming", {})
+        canonical = dict(streaming) if isinstance(streaming, dict) else {}
+        canonical["mode"] = "off"
+        telegram_cfg["streaming"] = canonical
+        for key in (
+            "streamMode",
+            "chunkMode",
+            "blockStreaming",
+            "draftChunk",
+            "blockStreamingCoalesce",
+        ):
+            telegram_cfg.pop(key, None)
 
     def _remove_picoclaw_channel_from_home(
         self,
@@ -1323,7 +1346,58 @@ class AgentOpsMixin:
                     f"refusing to purge agent '{agent_id}': failed to disable systemd lingering "
                     f"for {linux_user}: {detail or f'exit {linger.returncode}'}"
                 )
+            terminate = subprocess.run(
+                [loginctl, "terminate-user", linux_user],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if terminate.returncode != 0 and self._linux_uid_has_processes_for_purge(recorded_uid):
+                systemctl = shutil.which("systemctl")
+                if systemctl:
+                    subprocess.run(
+                        [systemctl, "stop", f"user@{recorded_uid}.service"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+            deadline = time.monotonic() + 5.0
+            while self._linux_uid_has_processes_for_purge(recorded_uid):
+                if time.monotonic() >= deadline:
+                    detail = (terminate.stderr or terminate.stdout or "").strip()
+                    raise SetupError(
+                        f"refusing to purge agent '{agent_id}': processes remain for managed "
+                        f"uid {recorded_uid} after terminating {linux_user}"
+                        + (f": {detail}" if detail else "")
+                    )
+                time.sleep(0.1)
         return True
+
+    @staticmethod
+    def _linux_uid_has_processes_for_purge(linux_uid: int) -> bool:
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "uid="],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise SetupError(f"could not verify managed user processes: {exc}") from exc
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise SetupError(
+                "could not verify managed user processes: "
+                + (detail or f"ps exited {result.returncode}")
+            )
+        target = int(linux_uid)
+        for line in result.stdout.splitlines():
+            try:
+                if int(line.strip()) == target:
+                    return True
+            except ValueError:
+                continue
+        return False
 
     def _managed_provider_process_live_for_purge(
         self,

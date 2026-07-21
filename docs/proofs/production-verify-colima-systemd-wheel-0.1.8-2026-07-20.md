@@ -6,7 +6,7 @@ Date: 2026-07-20 PDT
 
 - Artifact: `dist/clawie-0.1.8-py3-none-any.whl`
 - Installed version: `clawie 0.1.8`
-- SHA-256: `49068363669459f782fe19c6524b554f423dbf63c420a78f4aeae60b182106de`
+- SHA-256: `a4e836498069d6248f6b812dd7b0be1248f3519bb1c031e42acbfc25118df995`
 - Classification: `Development Status :: 5 - Production/Stable`
 - Verified delivery runtime: OpenClaw `2026.7.1`
 - Verified model identifier: `openai/gpt-5.5`
@@ -26,6 +26,13 @@ temporary wrapper exported the wheel as `PYTHONPATH` and ran
 - Effective verifier: root through passwordless `sudo`
 - Auth input: real Codex-linked auth copied privately into the fixture; no
   credential values are included in this record
+
+## Compatibility gate
+
+The complete test suite passed on clean Linux CPython 3.10, 3.11, 3.12, 3.13,
+and 3.14 environments: 620 tests on each interpreter, with 72.28%–72.30%
+coverage. The matrix includes detached session launch and its shell-free
+fallback for platforms where `posix_spawn(setsid=...)` is unavailable.
 
 ## Journey
 
@@ -99,8 +106,8 @@ or any fallback marker would have failed the proof.
 - Each agent user was unable to read the other agent's home or credential
   files.
 - The watchdog unit was active and enabled with `Restart=always`.
-- The verifier sent `SIGTERM` to watchdog PID `2900817`; systemd restarted it
-  as PID `2901008`, with `NRestarts` increasing from 0 to 1.
+- The verifier sent `SIGTERM` to watchdog PID `2921670`; systemd restarted it
+  as PID `2921860`, with `NRestarts` increasing from 0 to 1.
 - The OpenClaw adapter used the isolated runtime's internal `main` agent and
   parsed the source-pinned nested gateway response envelope.
 
@@ -108,11 +115,11 @@ or any fallback marker would have failed the proof.
 
 Cleanup returned `ok: true`:
 
-- `clawier018x3dg8v5fa` absent
-- `clawier018x3dg8v5fb` absent
+- `clawier018stnnlq5ca` absent
+- `clawier018stnnlq5cb` absent
 - watchdog unit absent
-- `/tmp/clawie-release-proof-018-x3dg8v5f` absent
-- `/root/clawie-wheel-proof-bin-018-xax2jzi1` absent
+- `/tmp/clawie-release-proof-018-stnnlq5c` absent
+- `/root/clawie-wheel-proof-bin-018-bq7vqogr` absent
 
 No fixture user, home, watchdog unit, state root, or wrapper was retained.
 

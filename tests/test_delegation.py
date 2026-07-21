@@ -639,7 +639,7 @@ class TestStoreDelegation:
 
         first = reserve("t1", "a")
         second = reserve("t2", "b")
-        with pytest.raises(ValueError, match="max children \(2\)"):
+        with pytest.raises(ValueError, match=r"max children \(2\)"):
             reserve("t3", "c")
 
         assert first["root_task_id"] == "t1"
@@ -1273,8 +1273,9 @@ class TestSessionCLI:
                 "--timeout",
                 "5",
             )
-            output = capsys.readouterr().out
-            assert code == 0
+            captured = capsys.readouterr()
+            output = captured.out + captured.err
+            assert code == 0, output
             assert "child-1" in output
             assert "pid:" in output
             spawned = True
@@ -1286,8 +1287,9 @@ class TestSessionCLI:
                 "--parent",
                 "parent",
             )
-            output = capsys.readouterr().out
-            assert code == 0
+            captured = capsys.readouterr()
+            output = captured.out + captured.err
+            assert code == 0, output
             assert "child-1" in output
             assert "running=True" in output
 
@@ -1304,8 +1306,9 @@ class TestSessionCLI:
                 "--timeout",
                 "5",
             )
-            output = capsys.readouterr().out
-            assert code == 0
+            captured = capsys.readouterr()
+            output = captured.out + captured.err
+            assert code == 0, output
             assert "managed gateway result" in output
 
             code = run_cli(
@@ -1317,8 +1320,9 @@ class TestSessionCLI:
                 "--status",
                 "completed",
             )
-            output = capsys.readouterr().out
-            assert code == 0
+            captured = capsys.readouterr()
+            output = captured.out + captured.err
+            assert code == 0, output
             assert "child-1" in output
         finally:
             if spawned:
@@ -1373,6 +1377,39 @@ class TestSessionCLI:
             service.spawn_session_agent("parent", "child", timeout=float("nan"), detached=True)
 
         assert service.store.read_session_agents("parent") == []
+
+    def test_detached_session_falls_back_when_posix_spawn_setsid_is_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from clawie.service import ClawieService
+
+        _use_short_delegation_dir(monkeypatch)
+        _register_managed_agent(tmp_path, "parent")
+        service = ClawieService(StateStore(config_dir=tmp_path))
+        popen_calls: list[dict[str, object]] = []
+
+        def unsupported_spawn(*_args: object, **_kwargs: object) -> int:
+            raise NotImplementedError("setsid unavailable")
+
+        class FakeProcess:
+            pid = 43210
+
+        def fake_popen(*_args: object, **kwargs: object) -> FakeProcess:
+            popen_calls.append(dict(kwargs))
+            return FakeProcess()
+
+        monkeypatch.setattr(os, "posix_spawn", unsupported_spawn)
+        monkeypatch.setattr("subprocess.Popen", fake_popen)
+        monkeypatch.setattr(service, "_wait_for_session_socket", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(service, "_persist_session_tree", lambda *_args, **_kwargs: None)
+
+        info = service.spawn_session_agent("parent", "child", detached=True)
+
+        assert info["pid"] == 43210
+        assert len(popen_calls) == 1
+        assert popen_calls[0]["start_new_session"] is True
+        assert popen_calls[0]["close_fds"] is True
+        assert service.store.read_session_agent("parent", "child") is not None
 
     def test_tree_uses_ascii_art(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

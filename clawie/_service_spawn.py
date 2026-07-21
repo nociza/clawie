@@ -891,18 +891,35 @@ class SpawnOpsMixin:
                     raise UnsafePathError(f"refusing non-regular session log: {log_path}")
                 os.fchmod(log_fd, 0o600)
                 null_fd = os.open(os.devnull, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
-                pid = os.posix_spawn(
-                    sys.executable,
-                    cmd,
-                    os.environ.copy(),
-                    file_actions=[
-                        (os.POSIX_SPAWN_DUP2, null_fd, 0),
-                        (os.POSIX_SPAWN_DUP2, log_fd, 1),
-                        (os.POSIX_SPAWN_DUP2, log_fd, 2),
-                    ],
-                    setsid=True,
-                )
-            except (OSError, NotImplementedError) as exc:
+                try:
+                    pid = os.posix_spawn(
+                        sys.executable,
+                        cmd,
+                        os.environ.copy(),
+                        file_actions=[
+                            (os.POSIX_SPAWN_DUP2, null_fd, 0),
+                            (os.POSIX_SPAWN_DUP2, log_fd, 1),
+                            (os.POSIX_SPAWN_DUP2, log_fd, 2),
+                        ],
+                        setsid=True,
+                    )
+                except NotImplementedError:
+                    # CPython 3.10 exposes the ``setsid`` argument even when
+                    # the platform's posix_spawn implementation cannot honor
+                    # it. Popen's start_new_session path provides the same
+                    # process isolation without a shell or unsafe preexec_fn.
+                    process = subprocess.Popen(
+                        cmd,
+                        executable=sys.executable,
+                        stdin=null_fd,
+                        stdout=log_fd,
+                        stderr=log_fd,
+                        env=os.environ.copy(),
+                        close_fds=True,
+                        start_new_session=True,
+                    )
+                    pid = int(process.pid)
+            except OSError as exc:
                 raise SetupError(f"could not start detached session agent: {exc}") from exc
             finally:
                 if null_fd is not None:

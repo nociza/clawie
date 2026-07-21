@@ -1204,6 +1204,27 @@ def test_service_env_includes_shared_toolchain_paths(tmp_path: Path) -> None:
     assert str(service._shared_toolchain_home() / "google-cloud-sdk" / "bin") in path_entries
 
 
+def test_resolve_executable_skips_inaccessible_path(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    blocked = Path("/blocked-for-clawie/tool")
+
+    def inaccessible_lookup(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError("blocked PATH")
+
+    monkeypatch.setattr("shutil.which", inaccessible_lookup)
+
+    def inaccessible(candidate: Path) -> bool:
+        if candidate == blocked:
+            raise PermissionError("blocked")
+        return False
+
+    monkeypatch.setattr(Path, "is_file", inaccessible)
+
+    assert service._resolve_executable_in_service_env(str(blocked)) == ""
+
+
 def test_install_support_tool_gcloud_downloads_into_shared_toolchain(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

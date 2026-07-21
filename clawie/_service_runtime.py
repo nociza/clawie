@@ -1239,23 +1239,37 @@ class RuntimeOpsMixin:
         try:
             resolved = shutil.which(token, path=env_path)
         except TypeError:
-            resolved = shutil.which(token)
+            try:
+                resolved = shutil.which(token)
+            except OSError:
+                resolved = None
+        except OSError:
+            resolved = None
         if resolved:
             return resolved
         if "/" in token:
             candidate = Path(token)
-            if candidate.exists() and os.access(candidate, os.X_OK):
-                return str(candidate)
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                return ""
         for segment in env_path.split(":"):
             piece = segment.strip()
             if not piece:
                 continue
             candidate = Path(piece) / token
-            if candidate.exists() and os.access(candidate, os.X_OK):
-                return str(candidate)
+            try:
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    return str(candidate)
+            except OSError:
+                continue
         fallback = f"/home/linuxbrew/.linuxbrew/bin/{token}"
-        if Path(fallback).exists():
-            return fallback
+        try:
+            if Path(fallback).is_file() and os.access(fallback, os.X_OK):
+                return fallback
+        except OSError:
+            pass
         return ""
 
     def _resolve_provider_executable(self, provider: str) -> str:

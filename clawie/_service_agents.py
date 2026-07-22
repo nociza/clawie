@@ -7,6 +7,7 @@ import os
 import pwd
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import time
@@ -582,7 +583,13 @@ class AgentOpsMixin:
 
         One openclaw gateway runs per agent Linux user, so each managed agent
         needs a distinct loopback port (mirrors display VNC port allocation).
+        State roots are intentionally independent, so the persisted assignments
+        in this store are not enough: also consult the host's live listeners to
+        avoid colliding with an agent managed by another Clawie state root.
         """
+        port = int(base)
+        if not 1024 <= port <= 65535:
+            raise ValueError("gateway port base must be between 1024 and 65535")
         state = self.store.read_state()
         agents = state.get("agents", {})
         used: set[int] = set()
@@ -593,9 +600,29 @@ class AgentOpsMixin:
             if port:
                 used.add(port)
         port = int(base)
-        while port in used:
+        while port <= 65535 and (port in used or not self._gateway_port_available(port)):
             port += 1
+        if port > 65535:
+            raise SetupError("no free loopback gateway port is available")
         return port
+
+    @staticmethod
+    def _gateway_port_available(port: int) -> bool:
+        """Return whether both loopback families can accept a gateway bind."""
+        probes: list[tuple[int, tuple[Any, ...]]] = [
+            (socket.AF_INET, ("127.0.0.1", int(port))),
+        ]
+        if socket.has_ipv6:
+            probes.append((socket.AF_INET6, ("::1", int(port), 0, 0)))
+        for family, address in probes:
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as probe:
+                    if family == socket.AF_INET6 and hasattr(socket, "IPV6_V6ONLY"):
+                        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    probe.bind(address)
+            except OSError:
+                return False
+        return True
 
     def _prepare_agent_provider_home(
         self,
@@ -962,28 +989,80 @@ class AgentOpsMixin:
             if not isinstance(telegram_cfg, dict):
                 telegram_cfg = {}
             self._set_openclaw_telegram_streaming_off(telegram_cfg)
+            token_file = (
+                str(settings.get("tokenFile", "")).strip()
+                or str(settings.get("token_file", "")).strip()
+                or str(telegram_cfg.get("tokenFile", "")).strip()
+                or str(telegram_cfg.get("token_file", "")).strip()
+            )
             token = (
                 str(settings.get("botToken", "")).strip()
                 or str(settings.get("bot_token", "")).strip()
                 or str(settings.get("token", "")).strip()
                 or str(telegram_cfg.get("botToken", "")).strip()
             )
-            if not token:
+            if not token_file and not token:
                 raise SetupError(
-                    "openclaw telegram bootstrap could not find a bot token; sync live channels or re-link Telegram first"
+                    "openclaw telegram bootstrap could not find a bot token or token file; "
+                    "sync live channels or re-link Telegram first"
                 )
-            if self._looks_like_unresolved_secret(token):
-                raise SetupError(
-                    "openclaw telegram bootstrap found an unresolved token placeholder; "
-                    "export the bot token in the target user's login shell or re-link Telegram first"
-                )
-            if not self._looks_like_telegram_bot_token(token):
-                raise SetupError(
-                    "openclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
-                    "re-link Telegram or update the target user's Telegram token"
-                )
+            if token_file:
+                if self._looks_like_unresolved_secret(token_file):
+                    raise SetupError(
+                        "openclaw telegram bootstrap found an unresolved token-file placeholder; "
+                        "export the path in the target user's login shell or re-link Telegram first"
+                    )
+                if token_file.startswith("~/"):
+                    token_path = home / token_file[2:]
+                else:
+                    token_path = Path(token_file)
+                    if not token_path.is_absolute():
+                        token_path = home / ".openclaw" / token_path
+                try:
+                    token_stat = token_path.lstat()
+                except OSError as exc:
+                    raise SetupError(
+                        "openclaw telegram token file is missing or inaccessible; "
+                        "re-link Telegram or repair the token-file path"
+                    ) from exc
+                if not stat.S_ISREG(token_stat.st_mode) or not 0 < token_stat.st_size <= 4096:
+                    raise SetupError(
+                        "openclaw telegram token file must be a non-empty regular file no larger than 4096 bytes"
+                    )
+                if stat.S_IMODE(token_stat.st_mode) & 0o077:
+                    raise SetupError(
+                        "openclaw telegram token file must be private (mode 0600 or stricter)"
+                    )
+                if os.geteuid() == 0 and linux_user:
+                    try:
+                        expected_uid = int(pwd.getpwnam(linux_user).pw_uid)
+                    except KeyError as exc:
+                        raise SetupError(
+                            f"openclaw telegram token-file owner does not exist: {linux_user}"
+                        ) from exc
+                    if int(token_stat.st_uid) != expected_uid:
+                        raise SetupError(
+                            "openclaw telegram token file must be owned by the managed Linux user"
+                        )
+                # OpenClaw gives tokenFile precedence over botToken and rejects
+                # symlinks itself. Preserve the private file reference instead
+                # of copying its secret into openclaw.json.
+                telegram_cfg["tokenFile"] = token_file
+                telegram_cfg.pop("token_file", None)
+                telegram_cfg.pop("botToken", None)
+            else:
+                if self._looks_like_unresolved_secret(token):
+                    raise SetupError(
+                        "openclaw telegram bootstrap found an unresolved token placeholder; "
+                        "export the bot token in the target user's login shell or re-link Telegram first"
+                    )
+                if not self._looks_like_telegram_bot_token(token):
+                    raise SetupError(
+                        "openclaw telegram bootstrap found an invalid Telegram bot token in live channel settings; "
+                        "re-link Telegram or update the target user's Telegram token"
+                    )
+                telegram_cfg["botToken"] = token
             telegram_cfg["enabled"] = True
-            telegram_cfg["botToken"] = token
             allow_from = self._coerce_string_list(
                 settings.get("allowFrom", settings.get("allow_from", telegram_cfg.get("allowFrom", [])))
             )
@@ -995,14 +1074,15 @@ class AgentOpsMixin:
             if effective_allow_from:
                 telegram_cfg["allowFrom"] = effective_allow_from
                 telegram_cfg["dmPolicy"] = "open" if "*" in set(effective_allow_from) else "allowlist"
-            elif explicit_dm_policy in {"open", "allowlist", "disabled"}:
+            elif explicit_dm_policy in {"open", "allowlist", "pairing", "disabled"}:
                 telegram_cfg["dmPolicy"] = explicit_dm_policy
             else:
-                # Managed Telegram cutovers should stay reachable by default.
-                # Heal older Clawie-generated openclaw configs that inherited the runtime default
-                # pairing mode without an explicit allowlist.
-                telegram_cfg["allowFrom"] = ["*"]
-                telegram_cfg["dmPolicy"] = "open"
+                # Keep the runtime's secure one-owner default. The first DM
+                # receives a pairing code that the host operator approves;
+                # never make a newly managed bot public merely to make it
+                # appear reachable.
+                telegram_cfg.pop("allowFrom", None)
+                telegram_cfg["dmPolicy"] = "pairing"
             proxy = str(settings.get("proxy", telegram_cfg.get("proxy", ""))).strip()
             if proxy:
                 telegram_cfg["proxy"] = proxy

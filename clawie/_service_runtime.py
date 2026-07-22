@@ -1,6 +1,7 @@
 """Provider runtime install, process supervision, and service control (ClawieService mixin)."""
 from __future__ import annotations
 
+import json
 import os
 import pwd
 import re
@@ -666,6 +667,11 @@ class RuntimeOpsMixin:
         auth_mode: str,
     ) -> None:
         spec = get_provider(provider)
+        self._wait_for_provider_gateway_ready(
+            provider=provider,
+            linux_user=linux_user,
+            timeout_seconds=15.0,
+        )
         command = tuple(str(part).strip() for part in spec.readiness_command if str(part).strip())
         if command:
             executable = self._resolve_provider_executable(provider)
@@ -710,6 +716,59 @@ class RuntimeOpsMixin:
                     + (f" for {linux_user}" if linux_user else "")
                     + f": {status.get('auth_status', 'unknown')}{suffix}"
                 )
+
+    def _wait_for_provider_gateway_ready(
+        self,
+        *,
+        provider: str,
+        linux_user: str,
+        timeout_seconds: float,
+    ) -> None:
+        """Wait for a gateway RPC handshake, not merely a live daemon process."""
+        from clawie.adapters import AdapterError, get_adapter
+
+        try:
+            adapter = get_adapter(provider)
+        except AdapterError:
+            return
+        status_command = getattr(adapter, "gateway_status_command", None)
+        if not callable(status_command):
+            return
+        executable = self._resolve_provider_executable(provider)
+        command = status_command(executable)
+        wrapped = self._wrap_user_command(command, linux_user, purpose="provider gateway probe")
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.1)
+        last_detail = "gateway RPC is not ready"
+        while time.monotonic() < deadline:
+            remaining = max(deadline - time.monotonic(), 0.1)
+            try:
+                result = subprocess.run(
+                    wrapped,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=self._service_env(linux_user),
+                    timeout=min(5.0, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                last_detail = "gateway status probe timed out"
+            else:
+                try:
+                    payload = json.loads(result.stdout or "")
+                except json.JSONDecodeError:
+                    payload = {}
+                rpc = payload.get("rpc", {}) if isinstance(payload, dict) else {}
+                if result.returncode == 0 and isinstance(rpc, dict) and rpc.get("ok") is True:
+                    return
+                if result.returncode != 0:
+                    last_detail = f"gateway status exited {result.returncode}"
+                elif not isinstance(rpc, dict) or rpc.get("ok") is not True:
+                    last_detail = "gateway RPC handshake is not ready"
+            time.sleep(min(0.25, max(deadline - time.monotonic(), 0.0)))
+        suffix = f" for {linux_user}" if linux_user else ""
+        raise SetupError(
+            f"{provider} gateway did not become reachable after startup{suffix}: {last_detail}"
+        )
 
     @staticmethod
     def _join_process_output(stdout: Any, stderr: Any) -> str:
@@ -824,6 +883,30 @@ class RuntimeOpsMixin:
             linux_user=linux_user,
             agent_info=agent_info,
         )
+        if provider == "openclaw" and command in {"start", "restart"} and str(
+            result.get("service_status", "")
+        ).strip().lower() == "running":
+            try:
+                self._assert_provider_postflight_ready(
+                    provider=provider,
+                    linux_user=linux_user,
+                    home=home,
+                    auth_mode=str(agent_info.get("auth_mode", "")),
+                )
+            except Exception:
+                # A process is not a usable service until its gateway and auth
+                # are ready. Stop a failed startup so callers cannot mistake a
+                # restart loop or an occupied-port fallback for production.
+                try:
+                    self._run_managed_provider_service_action(
+                        provider=provider,
+                        action="stop",
+                        linux_user=linux_user,
+                        agent_info=agent_info,
+                    )
+                except Exception:
+                    pass
+                raise
         agent_info["service_status"] = str(result.get("service_status", "unknown"))
         agent_info["service_mode"] = str(result.get("service_mode", "unknown"))
         if "fallback_pid" in agent_info or int(result.get("fallback_pid", 0) or 0) > 0:

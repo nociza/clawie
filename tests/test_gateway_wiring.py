@@ -64,8 +64,11 @@ def test_home_prep_without_gateway_args_sets_only_mode(
     assert "auth" not in gw
 
 
-def test_allocate_gateway_port_avoids_collisions(tmp_path: Path) -> None:
+def test_allocate_gateway_port_avoids_collisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service(tmp_path)
+    monkeypatch.setattr(service, "_gateway_port_available", lambda _port: True)
     state = service.store.read_state()
     state["agents"] = {
         "a": {"agent": {"gateway_port": 18789}},
@@ -76,9 +79,35 @@ def test_allocate_gateway_port_avoids_collisions(tmp_path: Path) -> None:
     assert service._allocate_gateway_port() == 18791
 
 
-def test_allocate_gateway_port_default_base(tmp_path: Path) -> None:
+def test_allocate_gateway_port_default_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service(tmp_path)
+    monkeypatch.setattr(service, "_gateway_port_available", lambda _port: True)
     assert service._allocate_gateway_port() == 18789
+
+
+def test_allocate_gateway_port_avoids_live_host_listeners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    monkeypatch.setattr(
+        service,
+        "_gateway_port_available",
+        lambda port: port not in {18789, 18790},
+    )
+
+    assert service._allocate_gateway_port() == 18791
+
+
+def test_allocate_gateway_port_fails_when_range_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(tmp_path)
+    monkeypatch.setattr(service, "_gateway_port_available", lambda _port: False)
+
+    with pytest.raises(RuntimeError, match="no free loopback gateway port"):
+        service._allocate_gateway_port(base=65535)
 
 
 def test_backup_redacts_gateway_token(tmp_path: Path) -> None:

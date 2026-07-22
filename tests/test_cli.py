@@ -84,7 +84,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.9" in capsys.readouterr().out
+    assert "clawie 0.1.10" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 
@@ -5849,6 +5849,8 @@ def test_switch_agent_provider_cuts_over_runtime_and_reconnects_channels(
         calls.append(cmd)
         if cmd == ["/usr/bin/openclaw", "--version"]:
             return Result(stdout="openclaw 2026.7.1")
+        if cmd[-3:] == ["gateway", "status", "--json"]:
+            return Result(stdout='{"rpc":{"ok":true}}')
         if cmd[:2] == ["ps", "-eo"]:
             lines: list[str] = []
             if runtime_state["zeroclaw"]:
@@ -5984,7 +5986,77 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     assert config["channels"]["telegram"]["groups"]["*"]["requireMention"] is True
 
 
-def test_ensure_openclaw_home_prepared_preserves_reachability_when_migrating_telegram_without_allowlist(
+def test_ensure_openclaw_home_prepared_preserves_private_telegram_token_file(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    home = tmp_path / "teleclaw-home"
+    token_path = home / ".openclaw" / "telegram.token"
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text(_fake_telegram_token() + "\n", encoding="utf-8")
+    token_path.chmod(0o600)
+    monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
+
+    service._ensure_openclaw_home_prepared(
+        home=home,
+        linux_user="teleclaw",
+        channels=[{"kind": "telegram", "name": "telegram", "enabled": True}],
+        live_payloads={
+            ("telegram", "telegram"): {
+                "kind": "telegram",
+                "name": "telegram",
+                "provider": "openclaw",
+                "settings": {
+                    "enabled": True,
+                    "tokenFile": str(token_path),
+                },
+            }
+        },
+        auth_mode="linked",
+        api_key="",
+    )
+
+    config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
+    telegram = config["channels"]["telegram"]
+    assert telegram["enabled"] is True
+    assert telegram["tokenFile"] == str(token_path)
+    assert "botToken" not in telegram
+    assert "allowFrom" not in telegram
+    assert telegram["dmPolicy"] == "pairing"
+
+
+def test_ensure_openclaw_home_prepared_rejects_exposed_telegram_token_file(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    home = tmp_path / "teleclaw-home"
+    token_path = home / ".openclaw" / "telegram.token"
+    token_path.parent.mkdir(parents=True)
+    token_path.write_text(_fake_telegram_token() + "\n", encoding="utf-8")
+    token_path.chmod(0o640)
+    monkeypatch.setattr(service, "_login_shell_env", lambda _linux_user: {})
+
+    with raises(SetupError, match="token file must be private"):
+        service._ensure_openclaw_home_prepared(
+            home=home,
+            linux_user="teleclaw",
+            channels=[{"kind": "telegram", "name": "telegram", "enabled": True}],
+            live_payloads={
+                ("telegram", "telegram"): {
+                    "kind": "telegram",
+                    "name": "telegram",
+                    "provider": "openclaw",
+                    "settings": {"tokenFile": str(token_path)},
+                }
+            },
+            auth_mode="linked",
+            api_key="",
+        )
+
+
+def test_ensure_openclaw_home_prepared_defaults_to_pairing_when_migrating_telegram_without_allowlist(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -6016,11 +6088,11 @@ def test_ensure_openclaw_home_prepared_preserves_reachability_when_migrating_tel
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
     assert config["channels"]["telegram"]["streaming"] == {"mode": "off"}
-    assert config["channels"]["telegram"]["allowFrom"] == ["*"]
-    assert config["channels"]["telegram"]["dmPolicy"] == "open"
+    assert "allowFrom" not in config["channels"]["telegram"]
+    assert config["channels"]["telegram"]["dmPolicy"] == "pairing"
 
 
-def test_ensure_openclaw_home_prepared_heals_legacy_pairing_dm_policy_without_allowlist(
+def test_ensure_openclaw_home_prepared_preserves_pairing_dm_policy_without_allowlist(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -6053,8 +6125,8 @@ def test_ensure_openclaw_home_prepared_heals_legacy_pairing_dm_policy_without_al
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["channels"]["telegram"]["botToken"] == token
     assert config["channels"]["telegram"]["streaming"] == {"mode": "off"}
-    assert config["channels"]["telegram"]["allowFrom"] == ["*"]
-    assert config["channels"]["telegram"]["dmPolicy"] == "open"
+    assert "allowFrom" not in config["channels"]["telegram"]
+    assert config["channels"]["telegram"]["dmPolicy"] == "pairing"
 
 
 def test_ensure_openclaw_home_prepared_heals_existing_telegram_streaming_without_live_channel(
@@ -6206,6 +6278,8 @@ def test_assert_provider_postflight_ready_runs_openclaw_models_status(
 
     def fake_run(cmd: list[str], **_: object) -> object:
         calls.append(cmd)
+        if "gateway" in cmd and "status" in cmd:
+            return Result(stdout='{"rpc":{"ok":true}}')
         return Result(stdout="ok")
 
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -6220,6 +6294,7 @@ def test_assert_provider_postflight_ready_runs_openclaw_models_status(
     )
 
     assert any(cmd[:5] == ["sudo", "-u", "teleclaw", "-H", "--"] and cmd[-2:] == ["models", "status"] for cmd in calls)
+    assert any("gateway" in cmd and "status" in cmd for cmd in calls)
 
 
 def test_provider_from_process_args_detects_openclaw_module_process() -> None:

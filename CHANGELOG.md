@@ -3,6 +3,21 @@
 All notable changes to clawie are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.10
+
+### Fixed
+
+- **OpenClaw Telegram `tokenFile` configurations now start correctly.** Clawie
+  recognizes OpenClaw's private token-file setting, validates that it references
+  a bounded, private, managed-user-owned regular file, and preserves the file
+  reference instead of copying the bot token into `openclaw.json`. Newly managed
+  bots also retain Telegram's secure pairing policy instead of being opened to
+  every sender by default.
+- **Independent Clawie installations no longer collide on gateway ports.** Port
+  allocation now checks live host listeners as well as the current state store,
+  and service startup requires a successful gateway RPC handshake before it is
+  reported as running.
+
 ## 0.1.9
 
 Security and robustness fixes from a full audit. The exact 0.1.9 wheel recorded

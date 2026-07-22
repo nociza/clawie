@@ -84,7 +84,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.12" in capsys.readouterr().out
+    assert "clawie 0.1.13" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 

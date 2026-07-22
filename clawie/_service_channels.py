@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hmac
 import http.client
 import json
@@ -10,6 +11,8 @@ import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 try:
@@ -28,6 +31,34 @@ from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
 class ChannelOpsMixin:
+
+    @staticmethod
+    @contextmanager
+    def _openclaw_telegram_setup_lock(home: Path, agent_id: str) -> Iterator[None]:
+        """Serialize setup without creating lock files in the managed home."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(home, flags)
+        except OSError as exc:
+            raise SetupError(
+                f"could not safely lock the managed home for '{agent_id}'; "
+                "no files, services, or agent state were changed"
+            ) from exc
+        locked = False
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                raise SetupError(
+                    f"Telegram setup is already running for '{agent_id}'; wait for it to finish, "
+                    "then run the status command (no files, services, or agent state were changed)"
+                ) from None
+            yield
+        finally:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def _openclaw_telegram_agent_context(
         self,
@@ -525,6 +556,34 @@ class ChannelOpsMixin:
         return {"agent_id": target, "channel": "telegram", "status": "approved"}
 
     def configure_openclaw_telegram(
+        self,
+        agent_id: str,
+        token: str,
+        *,
+        wait_seconds: float = 30.0,
+        replace: bool = False,
+    ) -> dict[str, Any]:
+        """Serialize and execute one rollback-safe Telegram setup transaction."""
+        target = str(agent_id).strip()
+        bot_token = str(token).strip()
+        if not self._looks_like_telegram_bot_token(bot_token):
+            raise ValueError("invalid Telegram bot token; copy the complete token from BotFather")
+        wait_timeout = float(wait_seconds)
+        if not math.isfinite(wait_timeout) or not 0.0 <= wait_timeout <= 300.0:
+            raise ValueError("wait_seconds must be finite and between 0 and 300")
+        _, _, _, home = self._openclaw_telegram_agent_context(
+            target,
+            purpose="Telegram setup",
+        )
+        with self._openclaw_telegram_setup_lock(home, target):
+            return self._configure_openclaw_telegram_locked(
+                target,
+                bot_token,
+                wait_seconds=wait_timeout,
+                replace=replace,
+            )
+
+    def _configure_openclaw_telegram_locked(
         self,
         agent_id: str,
         token: str,

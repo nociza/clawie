@@ -3,6 +3,16 @@
 All notable changes to clawie are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.13
+
+### Fixed
+
+- **Concurrent Telegram setup is now fail-closed.** A per-agent, cross-process
+  lock serializes the complete preflight/write/restart/probe/commit transaction.
+  A contending setup exits before token validation or any machine mutation and
+  directs the operator to wait and rerun status. The lock is held on the
+  already-open managed-home directory, so it creates no lock-file residue.
+
 ## 0.1.12
 
 ### Fixed

@@ -7,6 +7,8 @@ requires a live Telegram API probe before setup succeeds. Setup is a guarded
 transaction: it validates the bot identity before its first write, commits
 Clawie ownership only after live health passes, and restores the prior files
 and running/stopped service state if any later step fails.
+The complete transaction is serialized per agent; a concurrent setup fails
+before preflight or mutation and tells the operator to wait and rerun status.
 
 ## Set up a bot
 

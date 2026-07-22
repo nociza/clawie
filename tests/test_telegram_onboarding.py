@@ -183,6 +183,26 @@ def test_existing_bot_requires_explicit_replace_before_probe_or_mutation(
     assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
 
 
+def test_concurrent_setup_fails_before_probe_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service,
+        "_probe_telegram_bot_token",
+        lambda _token: pytest.fail("a contending setup must not reach token preflight"),
+    )
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+
+    with service._openclaw_telegram_setup_lock(home, "teleclaw"):
+        with pytest.raises(SetupError, match="already running"):
+            service.configure_openclaw_telegram("teleclaw", BOT_TOKEN, wait_seconds=0)
+
+    assert not (home / ".openclaw").exists()
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
+
+
 def test_rejected_preflight_changes_nothing_and_never_touches_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

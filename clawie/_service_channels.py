@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 try:
@@ -23,6 +25,397 @@ from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
 class ChannelOpsMixin:
+
+    def _openclaw_telegram_agent_context(
+        self,
+        agent_id: str,
+        *,
+        purpose: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str, Path]:
+        """Resolve a managed OpenClaw agent and enforce its OS boundary."""
+        self._require_setup()
+        target = str(agent_id).strip()
+        if not target:
+            raise ValueError("agent_id is required")
+        if target.startswith("@local:"):
+            raise ValueError("Telegram management is only supported for managed agents")
+        self._refresh_managed_agent_provider_alignment(target)
+
+        state = self.store.read_state()
+        agent = state.setdefault("agents", {}).get(target)
+        if not agent:
+            raise AgentNotFoundError(f"agent not found: {target}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        if provider != "openclaw":
+            raise SetupError(
+                f"Telegram onboarding currently requires an OpenClaw agent; "
+                f"'{target}' uses {provider or 'no provider'}"
+            )
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            raise SetupError(
+                f"agent '{target}' has no managed Linux user; create it with "
+                f"'sudo clawie runtime create {target}' first"
+            )
+        self._require_linux_user_access(linux_user, purpose)
+        home = self._agent_linux_home(agent)
+        if home is None:
+            raise SetupError(f"could not resolve the managed home for agent '{target}'")
+        return agent, info, linux_user, home
+
+    @staticmethod
+    def _parse_openclaw_json_output(output: str, *, purpose: str) -> dict[str, Any]:
+        """Parse OpenClaw JSON even when a version warning precedes it."""
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(output or "")).strip()
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                raise SetupError(
+                    f"OpenClaw returned an unreadable response while {purpose}; "
+                    "verify the pinned runtime with 'clawie runtime version'"
+                ) from None
+            try:
+                payload = json.loads(text[start : end + 1])
+            except json.JSONDecodeError as exc:
+                raise SetupError(
+                    f"OpenClaw returned invalid JSON while {purpose}; "
+                    "verify the pinned runtime with 'clawie runtime version'"
+                ) from exc
+        if not isinstance(payload, dict):
+            raise SetupError(f"OpenClaw returned an invalid response while {purpose}")
+        return payload
+
+    def _run_openclaw_agent_command(
+        self,
+        agent_id: str,
+        arguments: list[str],
+        *,
+        purpose: str,
+        timeout: float = 45.0,
+        expect_json: bool = False,
+    ) -> dict[str, Any] | None:
+        _, _, linux_user, _ = self._openclaw_telegram_agent_context(
+            agent_id,
+            purpose=purpose,
+        )
+        executable = self._resolve_provider_executable("openclaw")
+        command = self._wrap_user_command(
+            [executable, *arguments],
+            linux_user,
+            purpose=purpose,
+        )
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=self._service_env(linux_user),
+                timeout=max(1.0, float(timeout)),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SetupError(
+                f"OpenClaw timed out while {purpose}; run "
+                f"'sudo clawie channel telegram status {agent_id}' to retry the probe"
+            ) from exc
+        if result.returncode != 0:
+            # OpenClaw/provider stderr can contain request URLs. Keep the error
+            # deliberately generic so a bot token can never reach the terminal,
+            # event log, or JSON error surface.
+            raise SetupError(
+                f"OpenClaw failed while {purpose} (exit {result.returncode}); run "
+                f"'sudo clawie channel telegram status {agent_id}' for safe diagnostics"
+            )
+        if not expect_json:
+            return None
+        return self._parse_openclaw_json_output(result.stdout, purpose=purpose)
+
+    @staticmethod
+    def _safe_telegram_diagnostic(value: Any, *, limit: int = 500) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\d{5,}:[A-Za-z0-9_-]{20,}", "[redacted]", text)
+        return text[:limit]
+
+    def openclaw_telegram_status(self, agent_id: str) -> dict[str, Any]:
+        """Return a stable, secret-free Telegram readiness contract."""
+        target = str(agent_id).strip()
+        payload = self._run_openclaw_agent_command(
+            target,
+            ["channels", "status", "--probe", "--json"],
+            purpose="checking Telegram health",
+            expect_json=True,
+        )
+        assert isinstance(payload, dict)
+
+        channels = payload.get("channels", {})
+        telegram = channels.get("telegram", {}) if isinstance(channels, dict) else {}
+        if not isinstance(telegram, dict):
+            telegram = {}
+        accounts_root = payload.get("channelAccounts", {})
+        accounts = accounts_root.get("telegram", []) if isinstance(accounts_root, dict) else []
+        account = next((row for row in accounts if isinstance(row, dict)), {}) if isinstance(accounts, list) else {}
+
+        probe = telegram.get("probe", {})
+        if not isinstance(probe, dict):
+            probe = {}
+        account_probe = account.get("probe", {}) if isinstance(account, dict) else {}
+        if not isinstance(account_probe, dict):
+            account_probe = {}
+        effective_probe = probe or account_probe
+        bot_info = effective_probe.get("botInfo", {})
+        if not isinstance(bot_info, dict):
+            bot_info = {}
+
+        configured = bool(telegram.get("configured", account.get("configured", False)))
+        running = bool(telegram.get("running", account.get("running", False)))
+        connected = bool(telegram.get("connected", account.get("connected", False)))
+        probe_ok = bool(effective_probe.get("ok", False))
+        healthy = configured and running and connected and probe_ok
+        last_error = self._safe_telegram_diagnostic(
+            telegram.get("lastError", account.get("lastError", effective_probe.get("error", "")))
+        )
+        token_source = self._safe_telegram_diagnostic(
+            telegram.get("tokenSource", account.get("tokenSource", "")),
+            limit=80,
+        )
+        token_status = self._safe_telegram_diagnostic(account.get("tokenStatus", ""), limit=80)
+        bot_username = self._safe_telegram_diagnostic(
+            bot_info.get("username", account.get("botUsername", "")),
+            limit=80,
+        )
+        mode = self._safe_telegram_diagnostic(
+            telegram.get("mode", account.get("mode", "")),
+            limit=80,
+        )
+
+        pairing_requests: list[dict[str, str]] = []
+        pairing_check_error = ""
+        try:
+            pairing_result = self.list_openclaw_telegram_pairings(target)
+            pairing_requests = pairing_result.get("requests", [])
+        except SetupError as exc:
+            pairing_check_error = self._safe_telegram_diagnostic(exc)
+
+        if not configured:
+            remediation = (
+                f"Run 'sudo clawie channel telegram setup {target} --token-file PATH'"
+            )
+        elif not running:
+            remediation = f"Run 'sudo clawie agent service restart {target}'"
+        elif not probe_ok:
+            remediation = (
+                f"Verify the BotFather token, then rerun 'sudo clawie channel telegram setup "
+                f"{target} --token-file PATH'"
+            )
+        elif not connected:
+            remediation = (
+                f"Run 'sudo clawie agent service restart {target}', then retry this status command"
+            )
+        elif pairing_requests:
+            remediation = (
+                f"Approve the pending sender with 'sudo clawie channel telegram "
+                f"pairing-approve {target} CODE'"
+            )
+        else:
+            remediation = ""
+
+        return {
+            "agent_id": target,
+            "healthy": healthy,
+            "configured": configured,
+            "running": running,
+            "connected": connected,
+            "probe_ok": probe_ok,
+            "bot_username": bot_username,
+            "mode": mode,
+            "token_source": token_source,
+            "token_status": token_status,
+            "last_error": last_error,
+            "pending_pairing_count": len(pairing_requests),
+            "pending_pairings": pairing_requests,
+            "pairing_check_error": pairing_check_error,
+            "remediation": remediation,
+        }
+
+    def list_openclaw_telegram_pairings(self, agent_id: str) -> dict[str, Any]:
+        target = str(agent_id).strip()
+        payload = self._run_openclaw_agent_command(
+            target,
+            ["pairing", "list", "telegram", "--json"],
+            purpose="listing Telegram pairing requests",
+            expect_json=True,
+        )
+        assert isinstance(payload, dict)
+        raw_requests = payload.get("requests", [])
+        requests: list[dict[str, str]] = []
+        if isinstance(raw_requests, list):
+            for row in raw_requests:
+                if not isinstance(row, dict):
+                    continue
+                metadata = row.get("meta", row.get("metadata", {}))
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                code = self._safe_telegram_diagnostic(
+                    row.get("code", row.get("pairingCode", "")),
+                    limit=128,
+                )
+                first_name = self._safe_telegram_diagnostic(metadata.get("firstName", ""), limit=80)
+                last_name = self._safe_telegram_diagnostic(metadata.get("lastName", ""), limit=80)
+                metadata_display_name = " ".join(
+                    item for item in (first_name, last_name) if item
+                )
+                requests.append(
+                    {
+                        "code": code,
+                        "sender_id": self._safe_telegram_diagnostic(
+                            row.get(
+                                "senderId",
+                                row.get(
+                                    "userId",
+                                    row.get(
+                                        "chatId",
+                                        metadata.get("senderId", row.get("id", "")),
+                                    ),
+                                ),
+                            ),
+                            limit=128,
+                        ),
+                        "username": self._safe_telegram_diagnostic(
+                            row.get("username", metadata.get("username", "")),
+                            limit=128,
+                        ),
+                        "display_name": self._safe_telegram_diagnostic(
+                            row.get(
+                                "displayName",
+                                row.get(
+                                    "name",
+                                    metadata.get(
+                                        "displayName",
+                                        metadata.get("name", metadata_display_name),
+                                    ),
+                                ),
+                            ),
+                            limit=160,
+                        ),
+                        "requested_at": self._safe_telegram_diagnostic(
+                            row.get("requestedAt", row.get("createdAt", row.get("timestamp", ""))),
+                            limit=80,
+                        ),
+                    }
+                )
+        return {"agent_id": target, "channel": "telegram", "requests": requests}
+
+    def approve_openclaw_telegram_pairing(self, agent_id: str, code: str) -> dict[str, Any]:
+        target = str(agent_id).strip()
+        pairing_code = str(code).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{3,127}", pairing_code):
+            raise ValueError("pairing code must be 4-128 letters, numbers, hyphens, or underscores")
+        self._run_openclaw_agent_command(
+            target,
+            ["pairing", "approve", "telegram", pairing_code],
+            purpose="approving a Telegram pairing request",
+        )
+        return {"agent_id": target, "channel": "telegram", "status": "approved"}
+
+    def configure_openclaw_telegram(
+        self,
+        agent_id: str,
+        token: str,
+        *,
+        wait_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        """Securely configure, restart, and prove Telegram for an agent."""
+        target = str(agent_id).strip()
+        bot_token = str(token).strip()
+        if not self._looks_like_telegram_bot_token(bot_token):
+            raise ValueError("invalid Telegram bot token; copy the complete token from BotFather")
+        _, _, linux_user, home = self._openclaw_telegram_agent_context(
+            target,
+            purpose="Telegram setup",
+        )
+        token_path = self._write_agent_text_file(
+            home,
+            ".openclaw/telegram.token",
+            bot_token + "\n",
+            linux_user,
+            mode=0o600,
+        )
+
+        self.assign_channel_to_agent("", "telegram", "telegram", target)
+        state = self.store.read_state()
+        refreshed = state.setdefault("agents", {}).get(target)
+        if not refreshed:
+            raise AgentNotFoundError(f"agent not found: {target}")
+        self._hydrate_agent_controls(refreshed)
+        info = refreshed.setdefault("agent", {})
+        live_payloads = {
+            ("telegram", "telegram"): {
+                "kind": "telegram",
+                "name": "telegram",
+                "provider": "openclaw",
+                "settings": {
+                    "enabled": True,
+                    "tokenFile": str(token_path),
+                    "dmPolicy": "pairing",
+                },
+            }
+        }
+        self._prepare_agent_provider_home(
+            provider="openclaw",
+            agent=refreshed,
+            linux_user=linux_user,
+            home=home,
+            channels=self._effective_agent_channels(refreshed),
+            live_payloads=live_payloads,
+        )
+        info["last_sync"] = now_iso()
+        self._event(
+            state,
+            "channels.telegram_configured",
+            f"Configured private Telegram token file for {target}",
+            {
+                "agent_id": target,
+                "provider": "openclaw",
+                "kind": "telegram",
+                "name": "telegram",
+                "token_source": "tokenFile",
+                "dm_policy": "pairing",
+            },
+        )
+        self.store.write_state(state)
+
+        action = "restart" if self._provider_process_live("openclaw", linux_user) else "start"
+        service_result = self.agent_service_action(target, action)
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        status: dict[str, Any] | None = None
+        while True:
+            try:
+                status = self.openclaw_telegram_status(target)
+            except SetupError:
+                status = None
+            if status and bool(status.get("healthy")):
+                break
+            if time.monotonic() >= deadline:
+                detail = str((status or {}).get("last_error", "")).strip()
+                suffix = f" Last error: {detail}." if detail else ""
+                raise SetupError(
+                    f"Telegram configuration was saved securely, but its live probe is not healthy.{suffix} "
+                    f"Run 'sudo clawie channel telegram status {target}' for recovery steps."
+                )
+            time.sleep(1.0)
+
+        return {
+            "agent_id": target,
+            "status": status,
+            "service_action": str(service_result.get("action", action)),
+            "token_file": str(token_path),
+            "dm_policy": "pairing",
+        }
 
     def toggle_agent_channel(self, agent_id: str, channel_index: int) -> dict[str, Any]:
         self._require_setup()

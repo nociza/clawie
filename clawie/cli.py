@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import errno
+import getpass
 import json
 import os
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -960,7 +962,7 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     channel_sub = channel.add_subparsers(
         dest="channel_command",
         required=True,
-        metavar="{apply,move}",
+        metavar="{apply,move,telegram}",
     )
 
     apply_preset = channel_sub.add_parser(
@@ -1007,6 +1009,91 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         help="Replace destination channels instead of merging",
     )
     move.set_defaults(func=cmd_channel_move)
+
+    telegram = channel_sub.add_parser(
+        "telegram",
+        help="Securely set up, diagnose, and pair an OpenClaw Telegram bot",
+    )
+    telegram_sub = telegram.add_subparsers(
+        dest="telegram_command",
+        required=True,
+        metavar="{setup,status,pairing-list,pairing-approve}",
+    )
+
+    telegram_setup = telegram_sub.add_parser(
+        "setup",
+        help="Install a private bot token, restart the agent, and prove live health",
+    )
+    _add_positional_argument(
+        telegram_setup,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Managed OpenClaw agent ID",
+    )
+    token_source = telegram_setup.add_mutually_exclusive_group()
+    token_source.add_argument(
+        "--token-file",
+        metavar="PATH",
+        help="Read the token from a private (0600) regular file",
+    )
+    token_source.add_argument(
+        "--token-stdin",
+        action="store_true",
+        help="Read the token from standard input (never from argv)",
+    )
+    telegram_setup.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=30.0,
+        help="Wait this long for Telegram's live health probe (default: 30)",
+    )
+    telegram_setup.add_argument("--json", action="store_true", help="Emit safe JSON")
+    telegram_setup.set_defaults(func=cmd_channel_telegram_setup)
+
+    telegram_status = telegram_sub.add_parser(
+        "status",
+        help="Probe Telegram and print actionable, secret-free diagnostics",
+    )
+    _add_positional_argument(
+        telegram_status,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Managed OpenClaw agent ID",
+    )
+    telegram_status.add_argument("--json", action="store_true", help="Emit safe JSON")
+    telegram_status.set_defaults(func=cmd_channel_telegram_status)
+
+    pairing_list = telegram_sub.add_parser(
+        "pairing-list",
+        help="List users waiting for approval after they message the bot",
+    )
+    _add_positional_argument(
+        pairing_list,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Managed OpenClaw agent ID",
+    )
+    pairing_list.add_argument("--json", action="store_true", help="Emit safe JSON")
+    pairing_list.set_defaults(func=cmd_channel_telegram_pairing_list)
+
+    pairing_approve = telegram_sub.add_parser(
+        "pairing-approve",
+        help="Approve one Telegram pairing code",
+    )
+    _add_positional_argument(
+        pairing_approve,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Managed OpenClaw agent ID",
+    )
+    _add_positional_argument(
+        pairing_approve,
+        "code",
+        metavar="CODE",
+        help_text="Pairing code shown after messaging the bot",
+    )
+    pairing_approve.add_argument("--json", action="store_true", help="Emit safe JSON")
+    pairing_approve.set_defaults(func=cmd_channel_telegram_pairing_approve)
 
 
 def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2588,6 +2675,177 @@ def cmd_channel_move(args: argparse.Namespace, service: ClawieService) -> int:
     print_success(
         f"Migrated channels {from_agent} -> {to_agent} ({len(agent.get('channels', []))} channels)"
     )
+    return 0
+
+
+def _read_private_telegram_token_file(value: str) -> str:
+    source = Path(value).expanduser()
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"could not safely open Telegram token file '{source}'; "
+            "use a non-symlink regular file readable by the current operator"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError("Telegram token file must be a regular file with one hard link")
+        if not 0 < metadata.st_size <= 4096:
+            raise ValueError("Telegram token file must be non-empty and no larger than 4096 bytes")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError(
+                f"Telegram token file is not private; run 'chmod 600 {source}' and retry"
+            )
+        content = os.read(descriptor, 4097)
+        if len(content) > 4096:
+            raise ValueError("Telegram token file must be no larger than 4096 bytes")
+        try:
+            return content.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError("Telegram token file must contain UTF-8 text") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _read_telegram_token(args: argparse.Namespace) -> str:
+    token_file = str(getattr(args, "token_file", "") or "").strip()
+    if token_file:
+        return _read_private_telegram_token_file(token_file)
+    if bool(getattr(args, "token_stdin", False)):
+        content = sys.stdin.read(4097)
+        if len(content.encode("utf-8")) > 4096:
+            raise ValueError("Telegram token from stdin must be no larger than 4096 bytes")
+        return content.strip()
+    if bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        return getpass.getpass("Telegram bot token (input hidden): ").strip()
+    raise ValueError(
+        "no Telegram token source was provided; use --token-file PATH or --token-stdin"
+    )
+
+
+def cmd_channel_telegram_setup(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    token = _read_telegram_token(args)
+    try:
+        result = service.configure_openclaw_telegram(
+            agent_id,
+            token,
+            wait_seconds=float(args.wait_seconds),
+        )
+    finally:
+        token = ""
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    status = result.get("status", {})
+    username = str(status.get("bot_username", "")).strip()
+    bot_label = f"@{username.lstrip('@')}" if username else "the bot"
+    print_success(f"Telegram is healthy for {agent_id} ({bot_label})")
+    print_panel(
+        "Finish pairing your Telegram account",
+        [
+            f"1. Send /start or any message to {bot_label}.",
+            f"2. sudo clawie channel telegram pairing-list {agent_id}",
+            f"3. sudo clawie channel telegram pairing-approve {agent_id} CODE",
+            f"4. sudo clawie channel telegram status {agent_id}",
+        ],
+    )
+    print_info("The bot token is stored only in the managed user's private 0600 token file.")
+    return 0
+
+
+def cmd_channel_telegram_status(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    result = service.openclaw_telegram_status(agent_id)
+    healthy = bool(result.get("healthy"))
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if healthy else 1
+
+    print_panel(
+        f"Telegram · {agent_id}",
+        [
+            f"healthy: {'yes' if healthy else 'no'}",
+            f"configured: {'yes' if result.get('configured') else 'no'}",
+            f"running: {'yes' if result.get('running') else 'no'}",
+            f"connected: {'yes' if result.get('connected') else 'no'}",
+            f"live probe: {'ok' if result.get('probe_ok') else 'failed'}",
+            f"bot: {('@' + str(result.get('bot_username')).lstrip('@')) if result.get('bot_username') else 'unknown'}",
+            f"mode: {result.get('mode') or 'unknown'}",
+            f"token source: {result.get('token_source') or 'unknown'}",
+            f"pending pairings: {int(result.get('pending_pairing_count', 0) or 0)}",
+        ],
+    )
+    if healthy:
+        print_success("Telegram can reach the bot API and the agent listener is connected")
+        pending = result.get("pending_pairings", [])
+        if isinstance(pending, list) and pending:
+            rows = [
+                [
+                    str(row.get("code", "")),
+                    str(row.get("username", "")),
+                    str(row.get("display_name", "")),
+                    str(row.get("sender_id", "")),
+                ]
+                for row in pending
+                if isinstance(row, dict)
+            ]
+            print_warning("The bot is healthy, but these users still need pairing approval:")
+            print_table(["code", "username", "name", "sender"], rows)
+            print_info(
+                f"Approve with: sudo clawie channel telegram pairing-approve {agent_id} CODE"
+            )
+        elif result.get("pairing_check_error"):
+            print_warning("Telegram is healthy, but pending pairing requests could not be checked")
+        return 0
+    if result.get("last_error"):
+        print_warning(f"Last error: {result['last_error']}")
+    print_error(str(result.get("remediation") or "Telegram is not healthy"))
+    return 1
+
+
+def cmd_channel_telegram_pairing_list(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    result = service.list_openclaw_telegram_pairings(agent_id)
+    requests = result.get("requests", [])
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if not requests:
+        print_info(
+            "No pending pairing requests. Send /start or any message to the bot, then rerun this command."
+        )
+        return 0
+    rows = [
+        [
+            str(row.get("code", "")),
+            str(row.get("username", "")),
+            str(row.get("display_name", "")),
+            str(row.get("sender_id", "")),
+            str(row.get("requested_at", "")),
+        ]
+        for row in requests
+        if isinstance(row, dict)
+    ]
+    print_table(["code", "username", "name", "sender", "requested"], rows)
+    print_info(f"Approve with: sudo clawie channel telegram pairing-approve {agent_id} CODE")
+    return 0
+
+
+def cmd_channel_telegram_pairing_approve(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    code = _resolve_required_value(args.code, field_name="code")
+    result = service.approve_openclaw_telegram_pairing(agent_id, code)
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print_success(f"Approved Telegram pairing for {agent_id}")
+    print_info("Send the bot another message; it should now reply normally.")
     return 0
 
 

@@ -3,6 +3,24 @@
 All notable changes to clawie are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.11
+
+### Added
+
+- **Telegram now has a guided, production-safe onboarding and recovery path.**
+  `clawie channel telegram setup` reads BotFather tokens only from a hidden
+  prompt, private file, or stdin; installs a managed-user-owned `0600` token
+  file; reconciles and restarts the OpenClaw agent; and requires configured,
+  running, connected, live-probe health before succeeding. Dedicated `status`,
+  `pairing-list`, and `pairing-approve` commands provide secret-free,
+  actionable diagnostics for the full first-message journey.
+
+### Security
+
+- Telegram tokens are rejected on argv, never copied into Clawie state or
+  events, and never echoed from provider stderr. File input rejects symlinks,
+  extra hard links, oversized content, and group/world-readable modes.
+
 ## 0.1.10
 
 ### Fixed

@@ -107,7 +107,16 @@ clawie agent addon apply AGENT_ID ADDON
 ```bash
 clawie channel apply AGENT_ID --preset minimal|growth|enterprise
 clawie channel move SOURCE_AGENT TARGET_AGENT
+sudo clawie channel telegram setup AGENT_ID [--token-file PATH | --token-stdin] [--wait-seconds N] [--json]
+sudo clawie channel telegram status AGENT_ID [--json]
+sudo clawie channel telegram pairing-list AGENT_ID [--json]
+sudo clawie channel telegram pairing-approve AGENT_ID CODE [--json]
 ```
+
+Telegram setup accepts a hidden interactive prompt by default. Tokens are never
+accepted on argv. `status` probes the listener, connection, and Telegram Bot API
+and exits nonzero when unhealthy; pairing remains the secure default. See
+[Telegram](telegram.md).
 
 ## delegation
 

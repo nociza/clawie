@@ -74,6 +74,23 @@ the native OpenClaw login flow.
 Later `config set` calls update only the options supplied; omitted provider,
 auth, workspace, subscription, and API settings are preserved.
 
+### Connect Telegram
+
+For a managed OpenClaw agent, run the guided command and enter the BotFather
+token at the hidden prompt:
+
+```bash
+sudo clawie channel telegram setup alice
+sudo clawie channel telegram pairing-list alice
+sudo clawie channel telegram pairing-approve alice CODE
+sudo clawie channel telegram status alice
+```
+
+The token is never accepted on argv or stored inline. Setup keeps direct
+messages on the secure pairing policy and succeeds only after the listener is
+connected and a live Telegram API probe passes. See the
+[Telegram guide](docs/telegram.md) for automation and recovery.
+
 ## Agent orchestration
 
 Agents delegate work to each other through a recursive task system with three model tiers:
@@ -134,6 +151,10 @@ clawie auth login picoclaw                        # authorize the manager-side s
 clawie auth import openclaw --from codex          # adopt an existing session
 clawie auth port --from openclaw --to picoclaw    # port sessions between claws
 sudo clawie auth apply                            # copy private auth files into eligible agents
+
+# Telegram
+sudo clawie channel telegram setup alice          # hidden prompt; never pass the token on argv
+sudo clawie channel telegram status alice         # live, secret-free health gate
 
 # Backup (git-backed, continuously maintained)
 clawie backup init --remote git@github.com:you/agent-backup.git

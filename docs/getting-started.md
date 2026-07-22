@@ -93,6 +93,29 @@ gateway after provisioning. The default baseline enables delegation and
 uses the balanced model tier. The home and provider tree stay owner-only;
 cross-user management requires sudo/root or the authenticated `clawied` service.
 
+## Connect Telegram (optional)
+
+For an OpenClaw agent, Clawie can securely install and validate a Telegram bot
+without putting its token on the command line:
+
+```bash
+sudo clawie channel telegram setup alice
+```
+
+After the hidden token prompt succeeds, message the bot and follow the exact
+pairing commands printed by setup:
+
+```bash
+sudo clawie channel telegram pairing-list alice
+sudo clawie channel telegram pairing-approve alice CODE
+sudo clawie channel telegram status alice
+```
+
+`status` is a live monitoring gate and exits nonzero unless the bot is
+configured, running, connected, and reachable through Telegram's API. See
+[Telegram](telegram.md) for automation-safe token input and the short recovery
+flow when a bot does not reply.
+
 Options:
 
 ```bash
@@ -152,3 +175,4 @@ pushes are opt-in; review the repository before enabling them with
 - [Providers & Auth](providers.md) — multi-provider setup, shared auth, porting between claws
 - [Backup & Restore](backup.md) — git-backed knowledge backup
 - [Status](status.md) — fleet overview, `--json`, live `--watch`
+- [Telegram](telegram.md) — secure bot setup, pairing, health, and recovery

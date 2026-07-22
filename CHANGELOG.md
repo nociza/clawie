@@ -3,6 +3,30 @@
 All notable changes to clawie are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.12
+
+### Fixed
+
+- **Telegram setup is now replacement-safe and rollback-safe.** Clawie validates
+  a candidate token with Telegram before the first mutation, refuses bot
+  identity changes unless `--replace` is explicit, and commits channel
+  ownership only after the gateway and Telegram probe are healthy. Failures
+  after mutation restore the exact prior token/configuration contents and the
+  prior running or stopped service intent; a failed registry commit rolls back
+  the live replacement as well.
+- **Telegram channels no longer collide across agents.** Existing channel names
+  are preserved, new names are agent-scoped, and ownership conflicts fail
+  before mutation instead of silently moving another agent's channel.
+- **Telegram diagnostics are observational.** `status` and `pairing-list` no
+  longer trigger managed-agent reconciliation or state writes, and unhealthy
+  token remediation now includes the required `--replace` confirmation.
+
+### Security
+
+- Bot API transport/provider failures remain token-redacted, token validation
+  is bounded, source and destination files remain private and symlink-safe, and
+  setup health waits reject negative, non-finite, or unbounded values.
+
 ## 0.1.11
 
 ### Added

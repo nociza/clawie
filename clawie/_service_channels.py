@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import copy
+import hmac
+import http.client
 import json
+import math
 import os
 import re
 import subprocess
@@ -39,8 +42,6 @@ class ChannelOpsMixin:
             raise ValueError("agent_id is required")
         if target.startswith("@local:"):
             raise ValueError("Telegram management is only supported for managed agents")
-        self._refresh_managed_agent_provider_alignment(target)
-
         state = self.store.read_state()
         agent = state.setdefault("agents", {}).get(target)
         if not agent:
@@ -64,6 +65,199 @@ class ChannelOpsMixin:
         if home is None:
             raise SetupError(f"could not resolve the managed home for agent '{target}'")
         return agent, info, linux_user, home
+
+    @staticmethod
+    def _probe_telegram_bot_token(token: str, *, timeout: float = 10.0) -> dict[str, str]:
+        """Verify a bot token without allowing provider errors to disclose it."""
+        connection = http.client.HTTPSConnection(
+            "api.telegram.org",
+            timeout=max(1.0, float(timeout)),
+        )
+        try:
+            connection.request(
+                "POST",
+                f"/bot{token}/getMe",
+                body=b"",
+                headers={"Content-Length": "0"},
+            )
+            response = connection.getresponse()
+            body = response.read(65_537)
+            if response.status != 200 or len(body) > 65_536:
+                raise SetupError(
+                    "Telegram rejected the bot token; no files, services, or agent state were changed"
+                )
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise SetupError(
+                    "Telegram returned an unreadable token-validation response; "
+                    "no files, services, or agent state were changed"
+                ) from None
+            result = payload.get("result", {}) if isinstance(payload, dict) else {}
+            if (
+                not isinstance(payload, dict)
+                or payload.get("ok") is not True
+                or not isinstance(result, dict)
+                or result.get("is_bot") is not True
+            ):
+                raise SetupError(
+                    "Telegram rejected the bot token; no files, services, or agent state were changed"
+                )
+            return {
+                "bot_id": str(result.get("id", "")).strip(),
+                "bot_username": str(result.get("username", "")).strip()[:80],
+            }
+        except SetupError:
+            raise
+        except Exception:
+            # Transport exceptions may embed the request path in their text.
+            # Never chain or surface them because that path contains the token.
+            raise SetupError(
+                "Telegram token validation could not reach the Bot API; "
+                "no files, services, or agent state were changed"
+            ) from None
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _parse_existing_openclaw_config(content: str, *, exists: bool) -> dict[str, Any]:
+        if not exists:
+            return {}
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            raise SetupError(
+                "the existing OpenClaw configuration is invalid JSON; repair it before Telegram setup "
+                "(no files, services, or agent state were changed)"
+            ) from None
+        if not isinstance(payload, dict):
+            raise SetupError(
+                "the existing OpenClaw configuration must be a JSON object; repair it before "
+                "Telegram setup (no files, services, or agent state were changed)"
+            )
+        return payload
+
+    def _telegram_channel_name_for_agent(
+        self,
+        state: dict[str, Any],
+        agent_id: str,
+    ) -> str:
+        agents = state.get("agents", {})
+        target = agents.get(agent_id, {}) if isinstance(agents, dict) else {}
+        rows = target.get("channels", []) if isinstance(target, dict) else []
+        names = {
+            str(row.get("name", "")).strip()
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("kind", "")).strip().lower() == "telegram"
+            and str(row.get("name", "")).strip()
+        }
+        if len(names) > 1:
+            raise SetupError(
+                f"agent '{agent_id}' has multiple Telegram channel assignments; remove the stale "
+                "assignment before setup (no files, services, or agent state were changed)"
+            )
+        channel_name = next(iter(names), f"{agent_id}-telegram")
+        if isinstance(agents, dict):
+            self._assert_channels_unclaimed(
+                agents,
+                agent_id,
+                [{"kind": "telegram", "name": channel_name}],
+            )
+        return channel_name
+
+    @staticmethod
+    def _existing_telegram_token(
+        config: dict[str, Any],
+        token_file_content: str,
+        *,
+        token_file_exists: bool,
+    ) -> tuple[bool, str]:
+        channels = config.get("channels", {})
+        telegram = channels.get("telegram", {}) if isinstance(channels, dict) else {}
+        telegram = telegram if isinstance(telegram, dict) else {}
+        configured = bool(
+            telegram.get("enabled", False)
+            or telegram.get("tokenFile")
+            or telegram.get("token_file")
+            or telegram.get("botToken")
+        )
+        if token_file_exists:
+            return True, token_file_content.strip()
+        inline = str(telegram.get("botToken", "")).strip()
+        return configured, inline
+
+    def _write_scoped_openclaw_telegram_config(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        config: dict[str, Any],
+        token_path: Path,
+    ) -> tuple[Path, str]:
+        next_config = copy.deepcopy(config)
+        channels = next_config.get("channels", {})
+        if not isinstance(channels, dict):
+            channels = {}
+        telegram = channels.get("telegram", {})
+        if not isinstance(telegram, dict):
+            telegram = {}
+        self._set_openclaw_telegram_streaming_off(telegram)
+        telegram["enabled"] = True
+        telegram["tokenFile"] = str(token_path)
+        telegram.pop("token_file", None)
+        telegram.pop("botToken", None)
+        telegram.pop("bot_token", None)
+        telegram.pop("token", None)
+        allow_from = self._coerce_string_list(telegram.get("allowFrom", []))
+        if allow_from:
+            telegram["allowFrom"] = allow_from
+            telegram["dmPolicy"] = "open" if "*" in set(allow_from) else "allowlist"
+        else:
+            telegram.pop("allowFrom", None)
+            telegram["dmPolicy"] = "pairing"
+        channels["telegram"] = telegram
+        next_config["channels"] = channels
+        return (
+            self._write_agent_json_file(
+                home,
+                ".openclaw/openclaw.json",
+                next_config,
+                linux_user,
+            ),
+            str(telegram["dmPolicy"]),
+        )
+
+    def _restore_telegram_files(
+        self,
+        *,
+        home: Path,
+        linux_user: str,
+        token_existed: bool,
+        token_content: str,
+        config_existed: bool,
+        config_content: str,
+    ) -> None:
+        if token_existed:
+            self._write_agent_text_file(
+                home,
+                ".openclaw/telegram.token",
+                token_content,
+                linux_user,
+                mode=0o600,
+            )
+        else:
+            self._remove_agent_path(home, ".openclaw/telegram.token")
+        if config_existed:
+            self._write_agent_text_file(
+                home,
+                ".openclaw/openclaw.json",
+                config_content,
+                linux_user,
+                mode=0o600,
+            )
+        else:
+            self._remove_agent_path(home, ".openclaw/openclaw.json")
 
     @staticmethod
     def _parse_openclaw_json_output(output: str, *, purpose: str) -> dict[str, Any]:
@@ -143,6 +337,10 @@ class ChannelOpsMixin:
 
     def openclaw_telegram_status(self, agent_id: str) -> dict[str, Any]:
         """Return a stable, secret-free Telegram readiness contract."""
+        with self.store.read_only():
+            return self._openclaw_telegram_status_read_only(agent_id)
+
+    def _openclaw_telegram_status_read_only(self, agent_id: str) -> dict[str, Any]:
         target = str(agent_id).strip()
         payload = self._run_openclaw_agent_command(
             target,
@@ -210,7 +408,7 @@ class ChannelOpsMixin:
         elif not probe_ok:
             remediation = (
                 f"Verify the BotFather token, then rerun 'sudo clawie channel telegram setup "
-                f"{target} --token-file PATH'"
+                f"{target} --token-file PATH --replace'"
             )
         elif not connected:
             remediation = (
@@ -243,6 +441,10 @@ class ChannelOpsMixin:
         }
 
     def list_openclaw_telegram_pairings(self, agent_id: str) -> dict[str, Any]:
+        with self.store.read_only():
+            return self._list_openclaw_telegram_pairings_read_only(agent_id)
+
+    def _list_openclaw_telegram_pairings_read_only(self, agent_id: str) -> dict[str, Any]:
         target = str(agent_id).strip()
         payload = self._run_openclaw_agent_command(
             target,
@@ -328,93 +530,278 @@ class ChannelOpsMixin:
         token: str,
         *,
         wait_seconds: float = 30.0,
+        replace: bool = False,
     ) -> dict[str, Any]:
-        """Securely configure, restart, and prove Telegram for an agent."""
+        """Configure Telegram as a rollback-safe transaction."""
         target = str(agent_id).strip()
         bot_token = str(token).strip()
         if not self._looks_like_telegram_bot_token(bot_token):
             raise ValueError("invalid Telegram bot token; copy the complete token from BotFather")
-        _, _, linux_user, home = self._openclaw_telegram_agent_context(
+        wait_timeout = float(wait_seconds)
+        if not math.isfinite(wait_timeout) or not 0.0 <= wait_timeout <= 300.0:
+            raise ValueError("wait_seconds must be finite and between 0 and 300")
+        agent, info, linux_user, home = self._openclaw_telegram_agent_context(
             target,
             purpose="Telegram setup",
         )
-        token_path = self._write_agent_text_file(
-            home,
-            ".openclaw/telegram.token",
-            bot_token + "\n",
-            linux_user,
-            mode=0o600,
-        )
+        gateway_port = int(info.get("gateway_port", 0) or 0)
+        gateway_token = str(info.get("gateway_token", "")).strip()
+        if gateway_port <= 0 or not gateway_token:
+            raise SetupError(
+                f"agent '{target}' is not fully provisioned; run "
+                f"'sudo clawie agent service start {target}' first "
+                "(no files, services, or agent state were changed)"
+            )
 
-        self.assign_channel_to_agent("", "telegram", "telegram", target)
-        state = self.store.read_state()
-        refreshed = state.setdefault("agents", {}).get(target)
-        if not refreshed:
-            raise AgentNotFoundError(f"agent not found: {target}")
-        self._hydrate_agent_controls(refreshed)
-        info = refreshed.setdefault("agent", {})
-        live_payloads = {
-            ("telegram", "telegram"): {
-                "kind": "telegram",
-                "name": "telegram",
-                "provider": "openclaw",
-                "settings": {
+        # Resolve and version-gate the runtime before touching the managed home.
+        executable = self._resolve_provider_executable("openclaw")
+        self._verify_installed_runtime_version("openclaw", executable)
+
+        state_before = self.store.read_state()
+        channel_name = self._telegram_channel_name_for_agent(state_before, target)
+        try:
+            token_before = self._read_agent_text_file(
+                home,
+                ".openclaw/telegram.token",
+                max_bytes=4096,
+            )
+            token_existed = True
+        except FileNotFoundError:
+            token_before = ""
+            token_existed = False
+        try:
+            config_before = self._read_agent_text_file(
+                home,
+                ".openclaw/openclaw.json",
+                max_bytes=16 * 1024 * 1024,
+            )
+            config_existed = True
+        except FileNotFoundError:
+            config_before = ""
+            config_existed = False
+        config = self._parse_existing_openclaw_config(config_before, exists=config_existed)
+        already_configured, old_token = self._existing_telegram_token(
+            config,
+            token_before,
+            token_file_exists=token_existed,
+        )
+        same_token = bool(old_token) and hmac.compare_digest(old_token, bot_token)
+        if already_configured and not same_token and not bool(replace):
+            raise SetupError(
+                f"Telegram is already configured for '{target}'; rerun with --replace to "
+                "confirm changing the bot identity (no files, services, or agent state were changed)"
+            )
+
+        # A well-shaped token is not necessarily valid. Validate identity before
+        # the first write or service operation so bad secrets cannot take a
+        # working bot offline.
+        token_identity = self._probe_telegram_bot_token(bot_token)
+        was_running = self._provider_process_live("openclaw", linux_user)
+        detached_agent = copy.deepcopy(agent)
+        self._hydrate_agent_controls(detached_agent)
+        detached_info = detached_agent.setdefault("agent", {})
+        detached_channels = detached_agent.setdefault("channels", [])
+        if not isinstance(detached_channels, list):
+            detached_channels = []
+            detached_agent["channels"] = detached_channels
+        channel_index = self._find_channel(detached_channels, "telegram", channel_name)
+        if channel_index is None:
+            detached_channels.append(
+                {
+                    "kind": "telegram",
+                    "name": channel_name,
                     "enabled": True,
-                    "tokenFile": str(token_path),
-                    "dmPolicy": "pairing",
-                },
-            }
-        }
-        self._prepare_agent_provider_home(
-            provider="openclaw",
-            agent=refreshed,
-            linux_user=linux_user,
-            home=home,
-            channels=self._effective_agent_channels(refreshed),
-            live_payloads=live_payloads,
-        )
-        info["last_sync"] = now_iso()
-        self._event(
-            state,
-            "channels.telegram_configured",
-            f"Configured private Telegram token file for {target}",
-            {
-                "agent_id": target,
-                "provider": "openclaw",
-                "kind": "telegram",
-                "name": "telegram",
-                "token_source": "tokenFile",
-                "dm_policy": "pairing",
-            },
-        )
-        self.store.write_state(state)
+                    "external_id": f"{target}:telegram:{len(detached_channels) + 1}",
+                }
+            )
+        else:
+            detached_channels[channel_index]["enabled"] = True
 
-        action = "restart" if self._provider_process_live("openclaw", linux_user) else "start"
-        service_result = self.agent_service_action(target, action)
-        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        token_path = home / ".openclaw" / "telegram.token"
+        action = "restart" if was_running else "start"
+        service_touched = False
+        service_result: dict[str, Any] = {}
         status: dict[str, Any] | None = None
-        while True:
-            try:
-                status = self.openclaw_telegram_status(target)
-            except SetupError:
-                status = None
-            if status and bool(status.get("healthy")):
-                break
-            if time.monotonic() >= deadline:
-                detail = str((status or {}).get("last_error", "")).strip()
-                suffix = f" Last error: {detail}." if detail else ""
-                raise SetupError(
-                    f"Telegram configuration was saved securely, but its live probe is not healthy.{suffix} "
-                    f"Run 'sudo clawie channel telegram status {target}' for recovery steps."
-                )
-            time.sleep(1.0)
+        dm_policy = "pairing"
+        try:
+            token_path = self._write_agent_text_file(
+                home,
+                ".openclaw/telegram.token",
+                bot_token + "\n",
+                linux_user,
+                mode=0o600,
+            )
+            _, dm_policy = self._write_scoped_openclaw_telegram_config(
+                home=home,
+                linux_user=linux_user,
+                config=config,
+                token_path=token_path,
+            )
+            service_touched = True
+            service_result = self._run_managed_provider_service_action(
+                provider="openclaw",
+                action=action,
+                linux_user=linux_user,
+                agent_info=detached_info,
+            )
+            if str(service_result.get("service_status", "")).strip().lower() != "running":
+                raise SetupError("OpenClaw did not report a running service after Telegram setup")
+            self._assert_provider_postflight_ready(
+                provider="openclaw",
+                linux_user=linux_user,
+                home=home,
+                auth_mode=str(detached_info.get("auth_mode", "")),
+            )
 
+            deadline = time.monotonic() + wait_timeout
+            while True:
+                try:
+                    status = self.openclaw_telegram_status(target)
+                except SetupError:
+                    status = None
+                if status and bool(status.get("healthy")):
+                    break
+                if time.monotonic() >= deadline:
+                    detail = self._safe_telegram_diagnostic(
+                        (status or {}).get("last_error", ""),
+                        limit=240,
+                    )
+                    suffix = f" Last error: {detail}." if detail else ""
+                    raise SetupError(f"Telegram's live probe did not become healthy.{suffix}")
+                time.sleep(1.0)
+
+            # Commit ownership and runtime metadata only after live health is
+            # proven. Re-read to retain unrelated concurrent updates; the
+            # store's revision check still rejects a race during this commit.
+            state = self.store.read_state()
+            agents = state.setdefault("agents", {})
+            persisted = agents.get(target)
+            if not persisted:
+                raise AgentNotFoundError(f"agent not found: {target}")
+            self._assert_channels_unclaimed(
+                agents,
+                target,
+                [{"kind": "telegram", "name": channel_name}],
+            )
+            self._hydrate_agent_controls(persisted)
+            persisted_channels = persisted.setdefault("channels", [])
+            if not isinstance(persisted_channels, list):
+                persisted_channels = []
+                persisted["channels"] = persisted_channels
+            persisted_index = self._find_channel(
+                persisted_channels,
+                "telegram",
+                channel_name,
+            )
+            if persisted_index is None:
+                persisted_channels.append(
+                    {
+                        "kind": "telegram",
+                        "name": channel_name,
+                        "enabled": True,
+                        "external_id": f"{target}:telegram:{len(persisted_channels) + 1}",
+                    }
+                )
+            else:
+                persisted_channels[persisted_index]["enabled"] = True
+            persisted_info = persisted.setdefault("agent", {})
+            for key in ("gateway_port", "gateway_token"):
+                persisted_info[key] = detached_info[key]
+            persisted_info["service_status"] = str(
+                service_result.get("service_status", "running")
+            )
+            persisted_info["service_mode"] = str(
+                service_result.get("service_mode", "unknown")
+            )
+            if "fallback_pid" in persisted_info or int(
+                service_result.get("fallback_pid", 0) or 0
+            ) > 0:
+                persisted_info["fallback_pid"] = int(
+                    service_result.get("fallback_pid", 0) or 0
+                )
+            persisted_info["last_sync"] = now_iso()
+            self._event(
+                state,
+                "channels.telegram_configured",
+                f"Configured private Telegram token file for {target}",
+                {
+                    "agent_id": target,
+                    "provider": "openclaw",
+                    "kind": "telegram",
+                    "name": channel_name,
+                    "token_source": "tokenFile",
+                    "dm_policy": dm_policy,
+                    "bot_id": token_identity.get("bot_id", ""),
+                    "bot_username": token_identity.get("bot_username", ""),
+                    "replaced": bool(already_configured and not same_token),
+                },
+            )
+            self.store.write_state(state)
+        except BaseException as exc:
+            rollback_errors: list[str] = []
+            try:
+                self._restore_telegram_files(
+                    home=home,
+                    linux_user=linux_user,
+                    token_existed=token_existed,
+                    token_content=token_before,
+                    config_existed=config_existed,
+                    config_content=config_before,
+                )
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback_errors.append(
+                    "could not restore the previous Telegram files: "
+                    + self._safe_telegram_diagnostic(rollback_exc, limit=180)
+                )
+            if service_touched:
+                rollback_action = "restart" if was_running else "stop"
+                try:
+                    rollback_result = self._run_managed_provider_service_action(
+                        provider="openclaw",
+                        action=rollback_action,
+                        linux_user=linux_user,
+                        agent_info=info,
+                    )
+                    expected_status = "running" if was_running else "stopped"
+                    if str(rollback_result.get("service_status", "")).strip().lower() != expected_status:
+                        rollback_errors.append(
+                            f"the prior service state was not restored ({expected_status} expected)"
+                        )
+                    elif was_running:
+                        self._assert_provider_postflight_ready(
+                            provider="openclaw",
+                            linux_user=linux_user,
+                            home=home,
+                            auth_mode=str(info.get("auth_mode", "")),
+                        )
+                except Exception as rollback_exc:  # noqa: BLE001
+                    rollback_errors.append(
+                        "could not restore the prior service state: "
+                        + self._safe_telegram_diagnostic(rollback_exc, limit=180)
+                    )
+            reason = self._safe_telegram_diagnostic(exc, limit=240)
+            if rollback_errors:
+                joined = "; ".join(rollback_errors)
+                raise SetupError(
+                    f"Telegram setup failed ({reason}). Automatic rollback was incomplete: {joined}. "
+                    f"Run 'sudo clawie channel telegram status {target}' before retrying."
+                ) from None
+            raise SetupError(
+                f"Telegram setup failed ({reason}). The previous files and service state were restored; "
+                "agent state was not changed."
+            ) from None
+        finally:
+            bot_token = ""
+
+        assert status is not None
         return {
             "agent_id": target,
             "status": status,
             "service_action": str(service_result.get("action", action)),
             "token_file": str(token_path),
-            "dm_policy": "pairing",
+            "dm_policy": dm_policy,
+            "channel_name": channel_name,
+            "replaced": bool(already_configured and not same_token),
         }
 
     def toggle_agent_channel(self, agent_id: str, channel_index: int) -> dict[str, Any]:

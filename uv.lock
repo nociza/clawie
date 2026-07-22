@@ -67,7 +67,7 @@ wheels = [
 
 [[package]]
 name = "clawie"
-version = "0.1.11"
+version = "0.1.12"
 source = { editable = "." }
 dependencies = [
     { name = "tomli", marker = "python_full_version < '3.11'" },

@@ -88,7 +88,9 @@ sudo clawie channel telegram status alice
 
 The token is never accepted on argv or stored inline. Setup keeps direct
 messages on the secure pairing policy and succeeds only after the listener is
-connected and a live Telegram API probe passes. See the
+connected and a live Telegram API probe passes. Existing bots cannot be
+replaced accidentally: a new token requires `--replace`, is validated before
+the first write, and is rolled back if live startup fails. See the
 [Telegram guide](docs/telegram.md) for automation and recovery.
 
 ## Agent orchestration

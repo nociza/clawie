@@ -114,7 +114,9 @@ sudo clawie channel telegram status alice
 `status` is a live monitoring gate and exits nonzero unless the bot is
 configured, running, connected, and reachable through Telegram's API. See
 [Telegram](telegram.md) for automation-safe token input and the short recovery
-flow when a bot does not reply.
+flow when a bot does not reply. Changing an existing bot requires an explicit
+`--replace`; Clawie validates the replacement before mutation and restores the
+prior files and service state if setup cannot prove live health.
 
 Options:
 

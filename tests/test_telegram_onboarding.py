@@ -9,11 +9,12 @@ from typing import Any
 import pytest
 
 from clawie.cli import _read_private_telegram_token_file, main
-from clawie.service import ClawieService
+from clawie.service import ClawieService, SetupError
 from clawie.store import StateStore
 
 
 BOT_TOKEN = "123456:" + "A" * 36
+ALT_BOT_TOKEN = "654321:" + "B" * 36
 
 
 def _service_with_managed_openclaw_agent(
@@ -39,7 +40,10 @@ def _service_with_managed_openclaw_agent(
         provider="openclaw",
     )
     state = service.store.read_state()
-    state["agents"]["teleclaw"]["agent"]["linux_user"] = "teleclaw"
+    info = state["agents"]["teleclaw"]["agent"]
+    info["linux_user"] = "teleclaw"
+    info["gateway_port"] = 18789
+    info["gateway_token"] = "gateway-secret"
     service.store.write_state(state)
     home = tmp_path / "home"
     home.mkdir()
@@ -54,20 +58,24 @@ def test_configure_telegram_uses_private_token_file_and_proves_health(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
-    prepared: dict[str, Any] = {}
-
-    def fake_prepare(**kwargs: Any) -> None:
-        prepared.update(kwargs)
-        kwargs["agent"]["agent"]["gateway_port"] = 18789
-        kwargs["agent"]["agent"]["gateway_token"] = "gateway-secret"
-
-    monkeypatch.setattr(service, "_prepare_agent_provider_home", fake_prepare)
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "openclaw")
+    monkeypatch.setattr(service, "_verify_installed_runtime_version", lambda *_args: "2026.7.1")
+    monkeypatch.setattr(
+        service,
+        "_probe_telegram_bot_token",
+        lambda _token: {"bot_id": "123", "bot_username": "teleclaw_bot"},
+    )
     monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
     monkeypatch.setattr(
         service,
-        "agent_service_action",
-        lambda agent_id, action: {"agent_id": agent_id, "action": action},
+        "_run_managed_provider_service_action",
+        lambda **kwargs: {
+            "action": kwargs["action"],
+            "service_status": "running",
+            "service_mode": "systemd",
+        },
     )
+    monkeypatch.setattr(service, "_assert_provider_postflight_ready", lambda **_kwargs: None)
     monkeypatch.setattr(
         service,
         "openclaw_telegram_status",
@@ -87,21 +95,251 @@ def test_configure_telegram_uses_private_token_file_and_proves_health(
     token_path = home / ".openclaw" / "telegram.token"
     assert token_path.read_text(encoding="utf-8").strip() == BOT_TOKEN
     assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
-    payload = prepared["live_payloads"][("telegram", "telegram")]
-    assert payload["settings"] == {
-        "enabled": True,
-        "tokenFile": str(token_path),
+    config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
+    assert config["channels"]["telegram"] == {
         "dmPolicy": "pairing",
+        "enabled": True,
+        "streaming": {"mode": "off"},
+        "tokenFile": str(token_path),
     }
-    assert len(prepared["channels"]) == 1
-    assert prepared["channels"][0]["kind"] == "telegram"
-    assert prepared["channels"][0]["name"] == "telegram"
-    assert prepared["channels"][0]["enabled"] is True
     persisted = service.store.read_state()
     assert BOT_TOKEN not in json.dumps(persisted)
     assert persisted["agents"]["teleclaw"]["agent"]["gateway_port"] == 18789
+    assert persisted["agents"]["teleclaw"]["channels"] == [
+        {
+            "enabled": True,
+            "external_id": "teleclaw:telegram:1",
+            "kind": "telegram",
+            "name": "teleclaw-telegram",
+        }
+    ]
     assert result["service_action"] == "restart"
+    assert result["channel_name"] == "teleclaw-telegram"
     assert result["status"]["healthy"] is True
+
+
+def _mock_telegram_setup_preflight(
+    service: ClawieService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "openclaw")
+    monkeypatch.setattr(service, "_verify_installed_runtime_version", lambda *_args: "2026.7.1")
+    monkeypatch.setattr(
+        service,
+        "_probe_telegram_bot_token",
+        lambda _token: {"bot_id": "654", "bot_username": "replacement_bot"},
+    )
+    monkeypatch.setattr(service, "_assert_provider_postflight_ready", lambda **_kwargs: None)
+
+
+def _write_existing_telegram_setup(home: Path) -> tuple[Path, Path, str]:
+    root = home / ".openclaw"
+    root.mkdir(exist_ok=True)
+    token_path = root / "telegram.token"
+    token_path.write_text(BOT_TOKEN + "\n", encoding="utf-8")
+    token_path.chmod(0o600)
+    config_path = root / "openclaw.json"
+    config_content = json.dumps(
+        {
+            "gateway": {"mode": "local"},
+            "channels": {
+                "telegram": {
+                    "enabled": True,
+                    "tokenFile": str(token_path),
+                    "dmPolicy": "pairing",
+                }
+            },
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+    config_path.write_text(config_content, encoding="utf-8")
+    config_path.chmod(0o600)
+    return token_path, config_path, config_content
+
+
+def test_existing_bot_requires_explicit_replace_before_probe_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    token_path, config_path, config_before = _write_existing_telegram_setup(home)
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "openclaw")
+    monkeypatch.setattr(service, "_verify_installed_runtime_version", lambda *_args: "2026.7.1")
+    probe_calls: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "_probe_telegram_bot_token",
+        lambda token: probe_calls.append(token),
+    )
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+
+    with pytest.raises(Exception, match="--replace"):
+        service.configure_openclaw_telegram("teleclaw", ALT_BOT_TOKEN, wait_seconds=0)
+
+    assert probe_calls == []
+    assert token_path.read_text(encoding="utf-8") == BOT_TOKEN + "\n"
+    assert config_path.read_text(encoding="utf-8") == config_before
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
+
+
+def test_rejected_preflight_changes_nothing_and_never_touches_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(service, "_resolve_provider_executable", lambda _provider: "openclaw")
+    monkeypatch.setattr(service, "_verify_installed_runtime_version", lambda *_args: "2026.7.1")
+    monkeypatch.setattr(
+        service,
+        "_probe_telegram_bot_token",
+        lambda _token: (_ for _ in ()).throw(Exception("rejected safely")),
+    )
+    monkeypatch.setattr(
+        service,
+        "_run_managed_provider_service_action",
+        lambda **_kwargs: pytest.fail("service must not be touched before token preflight"),
+    )
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+
+    with pytest.raises(Exception, match="rejected safely"):
+        service.configure_openclaw_telegram("teleclaw", BOT_TOKEN, wait_seconds=0)
+
+    assert not (home / ".openclaw" / "telegram.token").exists()
+    assert not (home / ".openclaw" / "openclaw.json").exists()
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
+
+
+def test_token_probe_never_surfaces_secret_from_transport_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingConnection:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        @staticmethod
+        def request(_method: str, path: str, **_kwargs: Any) -> None:
+            raise RuntimeError(f"request failed at {path}")
+
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr("clawie._service_channels.http.client.HTTPSConnection", FailingConnection)
+
+    with pytest.raises(SetupError) as error:
+        ClawieService._probe_telegram_bot_token(BOT_TOKEN)
+
+    assert BOT_TOKEN not in str(error.value)
+    assert error.value.__cause__ is None
+    assert "no files, services, or agent state were changed" in str(error.value)
+
+
+def test_failed_replacement_restores_exact_files_service_and_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    token_path, config_path, config_before = _write_existing_telegram_setup(home)
+    _mock_telegram_setup_preflight(service, monkeypatch)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
+    actions: list[str] = []
+
+    def fake_service_action(**kwargs: Any) -> dict[str, Any]:
+        actions.append(kwargs["action"])
+        if len(actions) == 1:
+            raise RuntimeError("simulated start failure")
+        return {"action": kwargs["action"], "service_status": "running"}
+
+    monkeypatch.setattr(service, "_run_managed_provider_service_action", fake_service_action)
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+
+    with pytest.raises(Exception, match="previous files and service state were restored"):
+        service.configure_openclaw_telegram(
+            "teleclaw",
+            ALT_BOT_TOKEN,
+            wait_seconds=0,
+            replace=True,
+        )
+
+    assert actions == ["restart", "restart"]
+    assert token_path.read_text(encoding="utf-8") == BOT_TOKEN + "\n"
+    assert config_path.read_text(encoding="utf-8") == config_before
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
+
+
+def test_failed_fresh_setup_removes_partial_files_and_restores_stopped_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    _mock_telegram_setup_preflight(service, monkeypatch)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: False)
+    actions: list[str] = []
+
+    def fake_service_action(**kwargs: Any) -> dict[str, Any]:
+        actions.append(kwargs["action"])
+        if len(actions) == 1:
+            raise RuntimeError("simulated start failure")
+        return {"action": kwargs["action"], "service_status": "stopped"}
+
+    monkeypatch.setattr(service, "_run_managed_provider_service_action", fake_service_action)
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+
+    with pytest.raises(Exception, match="previous files and service state were restored"):
+        service.configure_openclaw_telegram("teleclaw", BOT_TOKEN, wait_seconds=0)
+
+    assert actions == ["start", "stop"]
+    assert not (home / ".openclaw" / "telegram.token").exists()
+    assert not (home / ".openclaw" / "openclaw.json").exists()
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
+
+
+def test_state_commit_failure_rolls_back_live_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, home = _service_with_managed_openclaw_agent(tmp_path, monkeypatch)
+    token_path, config_path, config_before = _write_existing_telegram_setup(home)
+    _mock_telegram_setup_preflight(service, monkeypatch)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
+    actions: list[str] = []
+
+    def fake_service_action(**kwargs: Any) -> dict[str, Any]:
+        actions.append(kwargs["action"])
+        return {
+            "action": kwargs["action"],
+            "service_status": "running",
+            "service_mode": "systemd",
+        }
+
+    monkeypatch.setattr(service, "_run_managed_provider_service_action", fake_service_action)
+    monkeypatch.setattr(service, "_assert_provider_postflight_ready", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "openclaw_telegram_status",
+        lambda _agent: {"healthy": True, "bot_username": "replacement_bot"},
+    )
+    state_before = json.dumps(service.store.read_state(), sort_keys=True)
+    monkeypatch.setattr(
+        service.store,
+        "write_state",
+        lambda _state: (_ for _ in ()).throw(RuntimeError("simulated commit race")),
+    )
+
+    with pytest.raises(Exception, match="previous files and service state were restored"):
+        service.configure_openclaw_telegram(
+            "teleclaw",
+            ALT_BOT_TOKEN,
+            wait_seconds=0,
+            replace=True,
+        )
+
+    assert actions == ["restart", "restart"]
+    assert token_path.read_text(encoding="utf-8") == BOT_TOKEN + "\n"
+    assert config_path.read_text(encoding="utf-8") == config_before
+    assert json.dumps(service.store.read_state(), sort_keys=True) == state_before
 
 
 def test_telegram_status_is_stable_actionable_and_redacts_tokens(
@@ -211,8 +449,14 @@ def test_telegram_setup_cli_never_prints_or_accepts_token_on_argv(
         token: str,
         *,
         wait_seconds: float,
+        replace: bool,
     ) -> dict[str, Any]:
-        captured.update(agent_id=agent_id, token=token, wait_seconds=str(wait_seconds))
+        captured.update(
+            agent_id=agent_id,
+            token=token,
+            wait_seconds=str(wait_seconds),
+            replace=str(replace),
+        )
         return {
             "agent_id": agent_id,
             "status": {"healthy": True, "bot_username": "teleclaw_bot"},
@@ -240,6 +484,7 @@ def test_telegram_setup_cli_never_prints_or_accepts_token_on_argv(
     output = capsys.readouterr()
     assert code == 0
     assert captured["token"] == BOT_TOKEN
+    assert captured["replace"] == "False"
     assert BOT_TOKEN not in output.out
     assert BOT_TOKEN not in output.err
     assert "pairing-list teleclaw" in output.out

@@ -1047,6 +1047,11 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
         default=30.0,
         help="Wait this long for Telegram's live health probe (default: 30)",
     )
+    telegram_setup.add_argument(
+        "--replace",
+        action="store_true",
+        help="Explicitly replace an existing bot token after preflight validation",
+    )
     telegram_setup.add_argument("--json", action="store_true", help="Emit safe JSON")
     telegram_setup.set_defaults(func=cmd_channel_telegram_setup)
 
@@ -2735,6 +2740,7 @@ def cmd_channel_telegram_setup(args: argparse.Namespace, service: ClawieService)
             agent_id,
             token,
             wait_seconds=float(args.wait_seconds),
+            replace=bool(args.replace),
         )
     finally:
         token = ""

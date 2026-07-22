@@ -1276,6 +1276,18 @@ class ProviderAuthMixin:
         if cli_status:
             payload.update(cli_status)
             payload["source"] = str(cli_status.get("source", "cli"))
+            # The runtime CLI is authoritative for whether the session is
+            # usable, but some OpenClaw versions omit identity metadata from
+            # their JSON status response. Enrich only blank descriptive fields
+            # from the same private native store; never replace the CLI status.
+            file_status = inspect_auth_files(provider=spec.name, home=home)
+            enriched = False
+            for key in ("auth_profile", "account", "expires_at", "last_refresh", "detail"):
+                if not str(payload.get(key, "")).strip() and str(file_status.get(key, "")).strip():
+                    payload[key] = file_status[key]
+                    enriched = True
+            if enriched:
+                payload["metadata_source"] = str(file_status.get("source", "files"))
             payload["login_required"] = login_required(str(payload.get("auth_status", "")))
             return payload
 

@@ -50,6 +50,12 @@ pinned OpenClaw 2026.7.1 contract, Node must satisfy `>=22.22.3 <23`,
 links below its shared toolchain rather than root's private home, then hardens
 the resulting tree to remove group/world write access.
 
+The OpenClaw package version is pinned, while its compatible transitive versions
+are selected by pnpm when the host installs it. Production acceptance is
+therefore host-specific: inspect the installed pnpm graph during release
+validation and run the complete live verifier on each deployment host. An audit
+lock resolved independently by npm is not evidence for the deployed pnpm graph.
+
 Additional tools that may be auto-installed:
 - **gcloud SDK** — downloaded automatically if needed for Google Workspace addon auth setup
 - **fnm** — Node version manager, used for managing Node.js versions
@@ -102,12 +108,12 @@ Linux/root host validation, watchdog restart verification, and configured
 runtime checks and a live gateway challenge. Package release acceptance should add
 `--all-provider-contracts` so every verified production delivery provider has a
 source-pinned delivery adapter contract. Running without either required
-exercise cannot produce a production pass. The exact 0.1.8 wheel has a complete
-Colima Linux/systemd proof recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md),
+exercise cannot produce a production pass. The exact accepted 0.1.9 wheel has a
+complete Debian/systemd proof recorded in
+[`docs/proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md`](proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md),
 including live delivery, watchdog restart, isolation, and cleanup. That proof
-accepts the recorded artifact on that host; every deployment host still needs
-its own run.
+accepts the recorded artifact on that host; every other artifact and deployment
+host still needs its own run.
 
 ## Delegation system
 

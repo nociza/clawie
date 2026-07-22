@@ -435,11 +435,11 @@ class OpenclawAdapter(GatewayCliAdapter):
     # Canonical ``openai/*`` ids — NOT the legacy ``openai-codex/*`` ids that
     # `openclaw doctor --fix` rewrites (Appendix A).
     TIER_MODELS = {
-        "fast": "openai/gpt-5.5",
-        "balanced": "openai/gpt-5.5",
-        "power": "openai/gpt-5.5",
+        "fast": "openai/gpt-5.6-sol",
+        "balanced": "openai/gpt-5.6-sol",
+        "power": "openai/gpt-5.6-sol",
     }
-    DEFAULT_MODEL = "openai/gpt-5.5"
+    DEFAULT_MODEL = "openai/gpt-5.6-sol"
 
     def runtime_agent_id(self, managed_agent_id: str) -> str:
         """Each isolated Clawie Linux user owns OpenClaw's default agent."""

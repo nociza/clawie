@@ -137,12 +137,12 @@ def test_deep_merge_is_recursive_and_nondestructive() -> None:
 # --- models ----------------------------------------------------------------
 
 def test_tier_to_model_uses_canonical_openai_ids(adapter: OpenclawAdapter) -> None:
-    assert adapter.tier_to_model("fast") == "openai/gpt-5.5"
-    assert adapter.tier_to_model("balanced") == "openai/gpt-5.5"
-    assert adapter.tier_to_model("power") == "openai/gpt-5.5"
+    assert adapter.tier_to_model("fast") == "openai/gpt-5.6-sol"
+    assert adapter.tier_to_model("balanced") == "openai/gpt-5.6-sol"
+    assert adapter.tier_to_model("power") == "openai/gpt-5.6-sol"
     # unknown tier falls back to a real default, never the legacy openai-codex id
     model = adapter.tier_to_model("nonsense")
-    assert model == "openai/gpt-5.5"
+    assert model == "openai/gpt-5.6-sol"
     for value in adapter.TIER_MODELS.values():
         assert not value.startswith("openai-codex/")
 
@@ -164,7 +164,7 @@ def test_deliver_command_structure(adapter: OpenclawAdapter) -> None:
     # timeout coerced to int string
     assert cmd[cmd.index("--timeout") + 1] == "90"
     # fast tier maps to a real model
-    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"
+    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.6-sol"
 
 
 def test_deliver_command_respects_custom_bin(adapter: OpenclawAdapter) -> None:

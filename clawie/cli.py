@@ -458,7 +458,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     agent_sub = agent.add_subparsers(
         dest="agent_command",
         required=True,
-        metavar="{create,clone,prompt,credentials,addon,auth,provider,service,list,show,delete,purge,create-batch}",
+        metavar="{create,clone,prompt,credentials,addon,auth,service,fix-permissions,provider,list,show,delete,purge,create-batch}",
     )
 
     create = agent_sub.add_parser(
@@ -481,7 +481,10 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         "--channel-strategy",
         choices=["new", "migrate"],
         default="new",
-        help="Use new channel names or migrated channel names",
+        help=(
+            "Mint new channel names, or keep existing names; when cloning, "
+            "migrate transfers matching channel ownership from the source"
+        ),
     )
     create.add_argument(
         "--channel",
@@ -529,8 +532,11 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     clone.add_argument(
         "--channel-strategy",
         choices=["new", "migrate"],
-        default="migrate",
-        help="Keep copied channel names or mint new ones",
+        default="new",
+        help=(
+            "Mint new channel names (default), or keep names and transfer "
+            "matching channel ownership from the source"
+        ),
     )
     clone.add_argument(
         "--channel",
@@ -1914,6 +1920,11 @@ def cmd_agents_create(args: argparse.Namespace, service: ClawieService) -> int:
 def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     agent_id = _resolve_agent_id(args.agent_id)
+    source_channel_keys = {
+        (str(row.get("kind", "")).strip().lower(), str(row.get("name", "")).strip())
+        for row in service.get_agent(from_agent).get("channels", [])
+        if isinstance(row, dict)
+    }
     channels = _resolve_channels(args.channel, args.channels_file)
     plugin_overrides = {}
     if getattr(args, "no_delegation", False):
@@ -1956,6 +1967,18 @@ def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
             model_tier = service.set_agent_model_tier(agent_id, tier)
         agent.setdefault("agent", {})["model_tier"] = model_tier
     print_success(f"Cloned agent config from {from_agent} to {agent['agent_id']}")
+    if args.channel_strategy == "migrate":
+        remaining_channel_keys = {
+            (str(row.get("kind", "")).strip().lower(), str(row.get("name", "")).strip())
+            for row in service.get_agent(from_agent).get("channels", [])
+            if isinstance(row, dict)
+        }
+        moved_channels = len(source_channel_keys - remaining_channel_keys)
+        if moved_channels:
+            print_warning(
+                f"Transferred {moved_channels} channel(s) from {from_agent}; "
+                "the source agent no longer owns them."
+            )
     _print_agent(agent)
     return 0
 
@@ -3548,11 +3571,11 @@ def _print_agent(agent: dict[str, Any]) -> None:
             f"provider_remediation: {agent.get('agent', {}).get('provider_remediation', '')}",
             f"model_tier: {agent.get('agent', {}).get('model_tier', 'balanced')}",
             f"auth_mode: {agent.get('agent', {}).get('auth_mode', '')}",
-            f"auth_status: {agent.get('agent', {}).get('auth_status', 'unknown')}",
+            f"auth_status: {agent.get('agent', {}).get('auth_status', 'not checked')}",
             f"auth_profile: {agent.get('agent', {}).get('auth_profile', '')}",
             f"auth_account: {agent.get('agent', {}).get('auth_account', '')}",
             f"auth_expires_at: {agent.get('agent', {}).get('auth_expires_at', '')}",
-            f"channel_status: {agent.get('agent', {}).get('channel_status_source', 'state')}",
+            f"channel_source: {agent.get('agent', {}).get('channel_status_source', 'state')}",
             f"channel_detail: {agent.get('agent', {}).get('channel_status_detail', '')}",
             f"core_prompts: {len(agent.get('core_prompts', {}))}",
             f"credential_bundles: {selected_bundles}",

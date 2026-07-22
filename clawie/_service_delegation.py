@@ -836,6 +836,7 @@ class DelegationOpsMixin:
             effective_timeout = requested_timeout
 
         task = Task(task_id=uuid.uuid4().hex, message=str(message), tier=str(tier or "balanced"))
+        requested_model = adapter.tier_to_model(task.tier)
         cmd = adapter.deliver_command(agent_id, task, timeout=effective_timeout)
         runtime_version = ""
         if run is None:
@@ -862,6 +863,7 @@ class DelegationOpsMixin:
             "error": reply.error,
             "usage": reply.usage,
             "delivery_status": reply.delivery_status,
+            "model": requested_model,
             "transport": str(reply.raw.get("meta", {}).get("transport", ""))
             if isinstance(reply.raw.get("meta"), dict)
             else "",

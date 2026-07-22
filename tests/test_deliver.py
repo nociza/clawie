@@ -52,7 +52,8 @@ def test_deliver_to_agent_success(tmp_path: Path) -> None:
     assert cmd[cmd.index("--agent") + 1] == "main"
     assert cmd[cmd.index("--message") + 1] == "do the thing"
     assert cmd[cmd.index("--timeout") + 1] == "60"
-    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.5"  # fast tier
+    assert cmd[cmd.index("--model") + 1] == "openai/gpt-5.6-sol"  # fast tier
+    assert result["model"] == "openai/gpt-5.6-sol"
     # session key is task-scoped
     assert cmd[cmd.index("--session-key") + 1].startswith("agent:main:clawie:")
     assert any(e["type"] == "delegation.delivered" for e in service.list_events(limit=5))

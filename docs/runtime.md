@@ -96,8 +96,8 @@ files are private and not symlinks, and one agent user cannot read another
 agent's sensitive paths. A skipped or failed report is not production evidence.
 The repository includes historical Linux/root proof records in
 [`docs/proofs/host-validation-linux-container-2026-06-14.md`](proofs/host-validation-linux-container-2026-06-14.md);
-the exact 0.1.8 wheel's current Colima Linux/systemd aggregate proof is in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
+the exact 0.1.9 wheel's current `nw2-clawies` Linux/systemd aggregate proof is in
+[`docs/proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md`](proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md).
 The current proof includes mandatory live runtime delivery, but accepts only
 the recorded artifact and host.
 

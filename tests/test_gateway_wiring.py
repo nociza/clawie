@@ -186,7 +186,13 @@ def test_production_runtime_contract_executes_version_readiness_and_delivery(
 
     def fake_deliver(agent_id: str, message: str, **kwargs: object) -> dict[str, object]:
         marker = message.rsplit(" ", 1)[-1]
-        return {"ok": True, "output": marker, "transport": "gateway", "fallback_from": ""}
+        return {
+            "ok": True,
+            "output": marker,
+            "model": "openai/gpt-5.6-sol",
+            "transport": "gateway",
+            "fallback_from": "",
+        }
 
     monkeypatch.setattr(service, "deliver_to_agent", fake_deliver)
     row = service._production_runtime_adapter_contract_check(
@@ -195,6 +201,7 @@ def test_production_runtime_contract_executes_version_readiness_and_delivery(
 
     assert row["status"] == "pass"
     assert row["evidence"]["runtime_version"] == "2026.7.1"
+    assert row["evidence"]["delivery_model"] == "openai/gpt-5.6-sol"
     assert row["evidence"]["delivery_challenge_verified"] is True
 
 

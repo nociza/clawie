@@ -139,6 +139,8 @@ class RuntimeOpsMixin:
                 "-g",
                 "--global-dir",
                 str(shared_toolchain / "pnpm-global"),
+                "--global-bin-dir",
+                str(shared_toolchain / "bin"),
                 spec.install_package or spec.name,
             ]
         else:
@@ -147,7 +149,10 @@ class RuntimeOpsMixin:
         env = self._service_env("")
         if shared_toolchain is not None:
             env["CLAWIE_SHARED_TOOLCHAIN"] = str(shared_toolchain)
-            env["PNPM_HOME"] = str(shared_toolchain / "bin")
+            # pnpm 11 derives its executable directory as $PNPM_HOME/bin.
+            # Keep PNPM_HOME at the toolchain root and also pass the bin path
+            # explicitly above so older and newer pnpm releases agree.
+            env["PNPM_HOME"] = str(shared_toolchain)
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
         output = "\n".join(part for part in [result.stdout, result.stderr] if str(part).strip()).strip()
         if shared_toolchain is not None:
@@ -1299,7 +1304,7 @@ class RuntimeOpsMixin:
             merged.append(piece)
         env["PATH"] = ":".join(merged)
         env["CLAWIE_SHARED_TOOLCHAIN"] = str(shared_toolchain)
-        env["PNPM_HOME"] = str(shared_toolchain / "bin")
+        env["PNPM_HOME"] = str(shared_toolchain)
 
         if linux_user:
             home = self._linux_home_for_user(linux_user)

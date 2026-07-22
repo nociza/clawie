@@ -20,7 +20,7 @@ Options:
 |------|-------------|
 | `--display-name` | Human-readable name |
 | `--template` | Template to base config on (default: `baseline`) |
-| `--channel-strategy` | `new` (mint fresh names) or `migrate` (keep source names) |
+| `--channel-strategy` | `new` (default; mint fresh names without changing the source) or `migrate` (keep names and transfer matching channel ownership from the source) |
 | `--model-tier` | Default tier: `fast`, `balanced`, `power` |
 | `--provider` | Override provider for this agent |
 | `--no-delegation` | Disable delegation skill |
@@ -34,7 +34,11 @@ Copy an existing agent's configuration into a new one:
 clawie agent clone alice bob --channel-strategy migrate
 ```
 
-This copies channels, prompts, defaults, and addons. Use `--channel-strategy new` to mint fresh channel names instead of migrating.
+This copies prompts, defaults, and addons. The safe default, `--channel-strategy
+new`, also copies the channel definitions under freshly minted names and leaves
+Alice unchanged. The explicit `migrate` strategy keeps the existing channel
+names by transferring their ownership to Bob; Alice no longer owns those
+channels, and the command prints that transfer.
 
 ## List and inspect
 

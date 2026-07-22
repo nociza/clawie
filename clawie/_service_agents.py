@@ -1882,6 +1882,15 @@ class AgentOpsMixin:
             idx = list(VALID_TIER_NAMES).index(current) if current in VALID_TIER_NAMES else 0
             new_tier = VALID_TIER_NAMES[(idx + 1) % len(VALID_TIER_NAMES)]
 
+        if new_tier == current:
+            # An explicit request for the already-selected tier is a no-op, not
+            # a state transition. Older records may lack the normalized field,
+            # so persist it once without emitting a misleading change event.
+            if agent.get("model_tier") != new_tier:
+                agent["model_tier"] = new_tier
+                self.store.write_state(state)
+            return new_tier
+
         agent["model_tier"] = new_tier
         self._event(
             state,

@@ -18,7 +18,7 @@ from clawie.provider_auth import (
     parse_openclaw_models_status_output,
     parse_provider_auth_status_output,
 )
-from clawie.cli import main
+from clawie.cli import build_parser, main
 from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
 from clawie.addon_auth import parse_gws_status_output
@@ -1061,12 +1061,15 @@ def test_runtime_install_uses_pinned_openclaw_package_and_verifies_result(
         "-g",
         "--global-dir",
         str(toolchain / "pnpm-global"),
+        "--global-bin-dir",
+        str(toolchain / "bin"),
         "openclaw@2026.7.1",
     ]
     assert calls[1] == ["/mock/bin/openclaw", "--version"]
-    assert environments[0]["PNPM_HOME"] == str(toolchain / "bin")
+    assert environments[0]["PNPM_HOME"] == str(toolchain)
     assert environments[0]["CLAWIE_SHARED_TOOLCHAIN"] == str(toolchain)
     assert str(toolchain / "bin") in environments[0]["PATH"].split(":")
+    assert str(Path(environments[0]["PNPM_HOME"]) / "bin") == str(toolchain / "bin")
     assert result["runtime_version"] == "2026.7.1"
 
 
@@ -3498,6 +3501,49 @@ def test_shared_auth_status_prefers_linked_for_openclaw_when_shared_profiles_exi
     assert status["source"] == "file:auth-profiles.json"
 
 
+def test_auth_status_enriches_cli_ready_state_with_private_account_metadata(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(provider="openclaw", auth_mode="linked")
+    monkeypatch.setattr(
+        service,
+        "_run_provider_auth_status",
+        lambda **_kwargs: {
+            "auth_status": "ready",
+            "auth_profile": "",
+            "account": "",
+            "source": "cli",
+        },
+    )
+    monkeypatch.setattr(
+        "clawie._service_auth.inspect_auth_files",
+        lambda **_kwargs: {
+            "auth_status": "expired",
+            "auth_profile": "openai-codex:default",
+            "account": "acct-1",
+            "expires_at": "2000-01-01T00:00:00Z",
+            "detail": "oauth",
+            "source": "file:openclaw-agent.sqlite",
+        },
+    )
+
+    status = service._inspect_provider_auth_state(
+        provider="openclaw",
+        auth_mode="linked",
+        linux_user="",
+        home=tmp_path,
+    )
+
+    assert status["auth_status"] == "ready"
+    assert status["source"] == "cli"
+    assert status["login_required"] is False
+    assert status["auth_profile"] == "openai-codex:default"
+    assert status["account"] == "acct-1"
+    assert status["metadata_source"] == "file:openclaw-agent.sqlite"
+
+
 def test_auth_status_from_profiles_json_supports_openclaw_native_oauth_store(tmp_path: Path) -> None:
     path = tmp_path / "auth-profiles.json"
     expires_ms = 2147483647000
@@ -4650,6 +4696,22 @@ def test_doctor_accepts_headless_delegation_agents(tmp_path: Path) -> None:
     )
 
 
+def test_doctor_does_not_claim_linked_credentials_are_ready(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(
+        provider="openclaw",
+        auth_mode="linked",
+        subscription="pro",
+        workspace="production",
+    )
+
+    report = service.doctor()
+    messages = [str(row.get("message", "")) for row in report["checks"]]
+
+    assert any("Provider auth mode configured (openclaw/linked)" in message for message in messages)
+    assert not any("Provider auth configured" in message for message in messages)
+
+
 def test_host_validation_skips_without_linux_proc(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     service = ClawieService(StateStore(config_dir=tmp_path))
     monkeypatch.setattr(service, "_linux_proc_available", lambda: False)
@@ -5398,7 +5460,7 @@ def test_prepare_openclaw_home_prefers_linked_auth_when_shared_auth_exists(
     )
 
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6-sol"
     assert (home / ".openclaw" / "auth-profiles.json").is_file()
     assert not (home / ".openclaw" / "auth-profiles.json").is_symlink()
     assert (home / ".openclaw" / "auth-profiles.json").stat().st_mode & 0o777 == 0o600
@@ -5903,7 +5965,7 @@ def test_ensure_openclaw_home_prepared_sets_gateway_mode_and_telegram_config(
     config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
     assert config["gateway"]["mode"] == "local"
     assert config["agents"]["defaults"]["workspace"] == str(home / ".openclaw" / "workspace")
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6-sol"
     assert config["agents"]["defaults"]["heartbeat"]["every"] == "0m"
     assert config["agents"]["defaults"]["heartbeat"]["directPolicy"] == "block"
     assert config["agents"]["defaults"]["heartbeat"]["lightContext"] is True
@@ -6315,7 +6377,7 @@ def test_switch_agent_provider_reconciles_same_provider_runtime(
     assert result["stopped_service"]["provider"] == "zeroclaw"
     assert config["gateway"]["mode"] == "local"
     assert config["channels"]["telegram"]["botToken"] == _fake_telegram_token()
-    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.5"
+    assert config["agents"]["defaults"]["model"] == "openai/gpt-5.6-sol"
     assert ("openclaw", "start", "teleclaw") in unit_actions
     assert any(cmd[-3:] == ["/usr/bin/zeroclaw", "service", "stop"] for cmd in calls)
 
@@ -8734,6 +8796,118 @@ def test_agent_create_and_show_print_requested_model_tier(
     assert run_cli(tmp_path, "agent", "show", "alice") == 0
     show_output = capsys.readouterr().out
     assert "model_tier: fast" in show_output
+
+
+def test_agent_create_labels_uninspected_statuses_accurately(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+
+    assert run_cli(tmp_path, "agent", "create", "alice") == 0
+    output = capsys.readouterr().out
+
+    assert "auth_status: not checked" in output
+    assert "channel_source: state" in output
+    assert "channel_status:" not in output
+
+
+def test_agent_clone_defaults_to_nondestructive_channel_names(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert (
+        run_cli(
+            tmp_path,
+            "agent",
+            "create",
+            "alice",
+            "--channel",
+            "telegram:support",
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert run_cli(tmp_path, "agent", "clone", "alice", "bob") == 0
+    output = capsys.readouterr().out
+    state = StateStore(config_dir=tmp_path).read_state()["agents"]
+
+    assert "Transferred" not in output
+    assert [row["name"] for row in state["alice"]["channels"]] == ["alice-support"]
+    assert [row["name"] for row in state["bob"]["channels"]] == ["bob-alice-support"]
+
+
+def test_agent_clone_migrate_warns_that_channel_ownership_moves(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    capsys.readouterr()
+    assert (
+        run_cli(
+            tmp_path,
+            "agent",
+            "create",
+            "alice",
+            "--channel",
+            "telegram:support",
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    assert (
+        run_cli(
+            tmp_path,
+            "agent",
+            "clone",
+            "alice",
+            "bob",
+            "--channel-strategy",
+            "migrate",
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    state = StateStore(config_dir=tmp_path).read_state()["agents"]
+
+    assert "Transferred 1 channel(s) from alice" in output
+    assert state["alice"]["channels"] == []
+    assert [row["name"] for row in state["bob"]["channels"]] == ["alice-support"]
+
+
+def test_agent_help_lists_every_registered_subcommand(capsys: CaptureFixture[str]) -> None:
+    parser = build_parser()
+    with raises(SystemExit) as exc:
+        parser.parse_args(["agent", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert "fix-permissions" in output.split("positional arguments:", 1)[0]
+
+
+def test_setting_same_model_tier_does_not_emit_change_event(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(provider="openclaw")
+    service.create_agent(
+        agent_id="alice",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=None,
+        agent_version="1.0.0",
+    )
+    before = list(service.store.read_state()["events"])
+
+    assert service.set_agent_model_tier("alice", "balanced") == "balanced"
+
+    after = service.store.read_state()["events"]
+    assert after == before
 
 
 def test_status_agents_include_model_tier(

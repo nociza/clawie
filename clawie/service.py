@@ -379,7 +379,10 @@ class ClawieService(
             checks.append(
                 {
                     "status": "pass",
-                    "message": f"Provider auth configured ({provider}/{mode})",
+                    "message": (
+                        f"Provider auth mode configured ({provider}/{mode}); "
+                        "credential readiness is reported separately"
+                    ),
                 }
             )
         else:
@@ -892,6 +895,13 @@ class ClawieService(
                 delivery.get("fallback_from", "")
             ).strip():
                 raise SetupError("delivery fell back to embedded execution instead of the live gateway")
+            delivery_model = str(delivery.get("model", "") or "").strip()
+            evidence["delivery_model"] = delivery_model
+            if delivery_model != models["balanced"]:
+                raise SetupError(
+                    "live delivery did not request the adapter's balanced model: "
+                    f"expected {models['balanced']}, got {delivery_model or '<missing>'}"
+                )
             evidence["delivery_challenge_verified"] = True
             evidence["transport"] = str(delivery.get("transport", "") or "gateway")
         except Exception as exc:  # noqa: BLE001 - report the failed runtime proof.

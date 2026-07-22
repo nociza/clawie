@@ -292,8 +292,8 @@ Design details (verified against OpenClaw 2026.7.1 — see Appendix A):
   channel history and isn't mistaken for a `HEARTBEAT_OK` poll.
 - **Budgets become real.** openclaw reports usage/cost via `sessions.usage` /
   `usage.cost`; budgets consume that instead of the `len//4` heuristic, and tier
-  → model uses source-pinned ids (`openai/gpt-5.5` for fast and
-  `openai/gpt-5.5` for all current tiers, not legacy `openai-codex/*`) (C1).
+  → model uses source-pinned ids (`openai/gpt-5.6-sol` for all current
+  tiers, not legacy `openai-codex/*`) (C1).
 - **Echo REPL is demoted** to a `loopback` adapter for tests and the no-gateway
   dev path, preserving the existing delegation test suite.
 - **openclaw already has recursive primitives.** Its `tasks.*` ledger
@@ -674,11 +674,11 @@ historical test count.
 | **4** Control agent | **Core done** | `clawie/control.py` — `ControlGate` (capability tiers, nonce confirmation, fail-closed); `clawie/daemon.py` — `control_request` / `control_confirm` runtime RPC executing read/safe-heal verbs, confirmed destructive verbs, and confirmed GitHub `open_issue` / `open_pr` escalation through daemon-owned service calls with event-log audit; `clawie/cli.py` — `clawie control request` / `control confirm` daemon-client commands for live control workspaces plus `clawie production verify` for aggregate proof gates and `--all-provider-contracts` production-delivery adapter checks; `clawie/_service_escalation.py` validates the private GitHub token file, dedupes issues/PRs, and rate-limits new issue/PR creation; `clawie/_service_watchdog.py` renders/install/removes/verifies the systemd watchdog and optional alert unit for `clawied`. |
 | **5** Hardening + provider matrix | **Production surface scoped** | `HermesAdapter` + a parametrized adapter contract test prove extensibility; provider metadata now distinguishes verified production delivery from lifecycle/auth integrations; managed-agent refresh metrics now use live provider processes instead of usually-empty stored pids, preserve `ps` CPU, prefer cgroup memory accounting, and fall back to `/proc` RSS/memory. openclaw is the verified production delivery surface. picoclaw/zeroclaw and hermes are gated for delegated-task delivery until pinned to real source. **Deferred:** real contracts for those experimental delivery adapters; `cli.py` split |
 
-**Scoped production surface:** The exact 0.1.8 wheel and Linux/systemd fixture
-passed
+**Scoped production surface:** The exact 0.1.9 wheel on `nw2-clawies` passed
 `production verify --exercise-watchdog-restart --exercise-runtime-delivery --all-provider-contracts`,
 including live gateway delivery and complete cleanup. picoclaw, zeroclaw, and
 hermes remain lifecycle/auth or extensibility surfaces until their delegated
 delivery contracts are source-pinned. Each deployment host still needs its own
-target-host verifier run; the Colima proof accepts the recorded release
-fixture, not every future host.
+target-host verifier run; the
+[recorded proof](../proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md)
+accepts only its recorded artifact and host, not every future deployment.

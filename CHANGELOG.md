@@ -5,10 +5,10 @@ All notable changes to clawie are documented here. This project adheres to
 
 ## 0.1.9
 
-Security and robustness fixes from a full audit. These change behavior on top of
-the code proven in the 0.1.8 wheel proof, so 0.1.9 must be re-verified with
-`clawie production verify` against its exact artifact before it is treated as
-accepted on any host.
+Security and robustness fixes from a full audit. The exact 0.1.9 wheel recorded
+in the [nw2-clawies production proof](docs/proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md)
+passed live delivery, watchdog restart, host isolation, and cleanup. Other
+artifacts and deployment hosts still require their own production verification.
 
 ### Security
 
@@ -37,6 +37,25 @@ accepted on any host.
 - **Backup git calls are bounded.** Every `git` invocation (including the network
   `push`) now has a timeout, so a dead remote or hung filesystem can no longer
   wedge the maintenance daemon indefinitely.
+- **Status no longer overstates linked-auth readiness.** Health output now says
+  that the auth mode is configured and directs users to the separate credential
+  readiness result instead of implying that a linked session exists.
+- **Agent creation output distinguishes uninspected state.** A newly defined
+  agent reports auth as `not checked` and labels the channel value as its
+  discovery source, avoiding contradictory output between `create` and `show`.
+- **Agent cloning is non-destructive by default.** `agent clone` now mints new
+  channel names unless `--channel-strategy migrate` is explicit. Migration help
+  and output state clearly that matching channel ownership moves away from the
+  source, and `fix-permissions` is no longer missing from agent command usage.
+- **Re-selecting the current model tier is event-idempotent.** An explicit
+  no-op no longer writes a misleading `agent.model_tier.changed` event.
+- **Runtime installation works with pnpm 11.** Clawie now passes an explicit
+  global executable directory and treats `PNPM_HOME` as the toolchain root,
+  preventing pnpm from appending a second `/bin` and rejecting the install.
+- **OpenClaw delivery uses GPT-5.6 Sol.** All current model tiers now request
+  the explicit flagship identifier `openai/gpt-5.6-sol`; production evidence
+  also records the exact delivery model and requires the imported Codex-linked
+  account to be confirmed ready by OpenClaw's live CLI status surface.
 
 ### Docs
 

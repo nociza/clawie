@@ -110,6 +110,7 @@ only, so a child cannot spoof its parent or reach generic operator methods.
 ```bash
 # Definition-only agents (no Linux user or service)
 clawie agent create alice --model-tier balanced
+# Explicit migration keeps channel names by transferring ownership from alice.
 clawie agent clone alice bob --channel-strategy migrate
 clawie agent list
 clawie agent show alice
@@ -200,11 +201,10 @@ See [docs/backup.md](docs/backup.md).
 - **SQLite storage** — uses WAL, a busy timeout, and revision-based compare-and-swap for JSON state/config snapshots so stale writers fail instead of silently losing updates. `clawied` hosts manifest reconciliation, mutating service operations, and a capability-gated control RPC.
 - **Acceptance is host- and artifact-specific** — the most recent full
   aggregate proof (live OpenClaw delivery + destructive watchdog recovery) is
-  the [0.1.8 wheel proof](docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
-  The current 0.1.9 release adds post-audit security and robustness fixes on top
-  of that code, so it must be re-proven: run both exercises in `production
-  verify` against your exact 0.1.9 artifact before treating it as accepted. One
-  accepted host or version does not certify another.
+  the [0.1.9 wheel proof on nw2-clawies](docs/proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md).
+  That proof accepts only the recorded wheel hash on that host. Run both
+  exercises in `production verify` against every other artifact and deployment;
+  one accepted host or version does not certify another.
 - **Token estimation is approximate** — uses a chars/4 heuristic, not a real tokenizer.
 
 See [docs/requirements.md](docs/requirements.md) for full details.

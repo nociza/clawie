@@ -282,9 +282,9 @@ the configured provider and any providers already assigned to agents; add
 `--all-provider-contracts` for package release acceptance across every verified
 production delivery provider. A production pass requires both
 `--exercise-watchdog-restart` and `--exercise-runtime-delivery`; without them
-the command exits nonzero. The exact 0.1.8 wheel's Colima Linux/systemd proof is
-recorded in
-[`docs/proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md`](proofs/production-verify-colima-systemd-wheel-0.1.8-2026-07-20.md).
+the command exits nonzero. The exact 0.1.9 wheel's `nw2-clawies`
+Linux/systemd proof is recorded in
+[`docs/proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md`](proofs/production-verify-nw2-clawies-systemd-wheel-0.1.9-2026-07-21.md).
 It includes mandatory live delivery and accepts only that artifact on the
 recorded host, not a different deployment host.
 

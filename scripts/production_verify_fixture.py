@@ -133,6 +133,24 @@ def main(argv: list[str] | None = None) -> int:
             ],
             env=env,
         )
+        auth_probe = _run(
+            [
+                "clawie",
+                "--no-color",
+                "--config-dir",
+                str(state_root),
+                "status",
+                "auth",
+                "--json",
+                "--refresh",
+            ],
+            env=env,
+        )
+        auth_evidence = _validated_linked_auth_evidence(
+            auth_probe.stdout,
+            provider="openclaw",
+            require_account=str(args.auth_source) == "codex",
+        )
 
         for idx, user in enumerate(users):
             agent_id = f"release-{'a' if idx == 0 else 'b'}"
@@ -244,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
             "wheel_sha256": _sha256(wheel),
             "installed_version": installed_version,
             "auth_source": str(args.auth_source),
+            "auth": auth_evidence,
             "state_root": str(state_root),
             "wrapper": str(wrapper_dir / "clawie"),
             "agents": agent_rows,
@@ -379,6 +398,61 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validated_linked_auth_evidence(
+    stdout: str,
+    *,
+    provider: str,
+    require_account: bool,
+) -> dict[str, Any]:
+    """Require a live CLI-confirmed linked session and return sanitized proof."""
+    try:
+        snapshot = json.loads(str(stdout or ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"auth status did not emit JSON: {exc}") from exc
+    rows = snapshot.get("auth", []) if isinstance(snapshot, dict) else []
+    if not isinstance(rows, list):
+        raise RuntimeError("auth status JSON did not contain an auth list")
+    expected = str(provider).strip().lower()
+    match = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("provider", "")).strip().lower() == expected
+        ),
+        None,
+    )
+    if match is None:
+        raise RuntimeError(f"auth status did not contain provider {expected}")
+    auth_mode = str(match.get("auth_mode", "")).strip().lower()
+    auth_status = str(match.get("auth_status", "")).strip().lower()
+    source = str(match.get("source", "")).strip().lower()
+    account_present = bool(str(match.get("account", "")).strip())
+    login_required = bool(match.get("login_required", False))
+    if (
+        auth_mode != "linked"
+        or auth_status != "ready"
+        or source != "cli"
+        or login_required
+    ):
+        raise RuntimeError(
+            f"{expected} linked auth was not confirmed ready by its CLI "
+            f"(mode={auth_mode or '<missing>'}, status={auth_status or '<missing>'}, "
+            f"source={source or '<missing>'})"
+        )
+    if require_account and not account_present:
+        raise RuntimeError(f"{expected} linked auth did not report a Codex account")
+    return {
+        "provider": expected,
+        "auth_mode": auth_mode,
+        "auth_status": auth_status,
+        "auth_profile": str(match.get("auth_profile", "")).strip(),
+        "account_present": account_present,
+        "source": source,
+        "login_required": login_required,
+    }
 
 
 def _unit_exec_start(path: Path) -> str:

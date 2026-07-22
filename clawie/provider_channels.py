@@ -122,6 +122,8 @@ class OpenClawChannelAdapter:
                 if isinstance(value, dict):
                     if not bool(value.get("enabled", True)):
                         continue
+                    if is_openclaw_channel_placeholder(value):
+                        continue
                     channel_name = str(value.get("name", kind)).strip().lower().replace(" ", "-") or kind
                 else:
                     channel_name = kind
@@ -190,6 +192,21 @@ def dedupe_channels(channels: list[dict[str, str]]) -> list[dict[str, str]]:
         seen.add(key)
         deduped.append({"kind": kind, "name": name})
     return deduped
+
+
+def is_openclaw_channel_placeholder(value: object) -> bool:
+    """Return whether an OpenClaw channel object is Clawie-only scaffolding.
+
+    Older Clawie releases added ``channels.telegram.streaming.mode=off`` to
+    every new OpenClaw home. OpenClaw's channel discovery treats any channel
+    object as configured, so that harmless placeholder later became a phantom
+    Telegram assignment and blocked unrelated service starts. Only ignore the
+    exact empty/streaming-only shape; any explicit channel setting remains a
+    real provider channel.
+    """
+    if not isinstance(value, dict):
+        return False
+    return not value or set(value) <= {"streaming"}
 
 
 def _looks_like_sender_identity(value: str) -> bool:

@@ -3,6 +3,45 @@
 All notable changes to clawie are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 0.1.20
+
+### Added
+
+- **Guided WeChat and WhatsApp onboarding.** New `channel wechat` and
+  `channel whatsapp` setup, status, pairing-list, and pairing-approve commands
+  install version-pinned maintained plugins, require a real terminal for live
+  QR login, recover an already-healthy saved login without relinking, and only
+  commit channel ownership after live health passes.
+- **Durable logical agent rename.** `agent rename` changes the Clawie identity
+  while preserving the Linux sandbox, home, service, and credentials. Published
+  workspace aliases keep historical immutable artifacts accessible after the
+  rename.
+- **Rollback-safe gateway credential rotation.** `agent service
+  rotate-gateway-token` changes only the private loopback gateway credential,
+  validates the restarted runtime before commit, restores the exact prior
+  config and service state on failure, and never returns either token.
+
+### Fixed
+
+- Failed QR logins now restore the gateway's prior running/stopped intent, and
+  an unlinked WhatsApp account points directly to fresh QR setup instead of an
+  ineffective restart loop.
+- New OpenClaw homes no longer acquire a streaming-only phantom Telegram
+  channel; existing placeholders are ignored and safely removed during the
+  next reconciliation.
+- `workspace publish RELATIVE_PATH --agent AGENT` now resolves the path inside
+  the selected agent's workspace as documented, while preserving traversal,
+  symlink, special-file, and workspace-boundary checks.
+
+### Security
+
+- QR setup is serialized per managed home, fails before mutation without an
+  interactive terminal, keeps provider errors secret-free, scopes plugin
+  rollback, and retains the managed-user isolation boundary.
+- Agent rename and published-workspace alias updates are transactional across
+  SQLite state and the publication catalog, with compensation on partial
+  failure.
+
 ## 0.1.13
 
 ### Fixed

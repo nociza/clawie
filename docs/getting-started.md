@@ -118,6 +118,19 @@ flow when a bot does not reply. Changing an existing bot requires an explicit
 `--replace`; Clawie validates the replacement before mutation and restores the
 prior files and service state if setup cannot prove live health.
 
+## Connect WeChat or WhatsApp (optional)
+
+Run QR onboarding in an interactive terminal on the gateway host:
+
+```bash
+sudo clawie channel wechat setup alice
+sudo clawie channel whatsapp setup alice
+```
+
+Scan and confirm the live code, then follow the printed sender-pairing steps.
+Setup pins the maintained plugin and records ownership only after a live health
+probe passes. See [WeChat and WhatsApp](qr-channels.md).
+
 Options:
 
 ```bash

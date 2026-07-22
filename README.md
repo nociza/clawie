@@ -24,6 +24,10 @@ agent homes, and port sessions between claws with `clawie auth port`.
 
 **Unified status** — One read-only `clawie status` command shows agent status, runtimes, auth, delegation trees, backup, and health across your entire fleet — with `--json` for scripting and `--watch` for a live view.
 
+**Guided channels** — Telegram uses private token files; WeChat and WhatsApp
+use maintained, version-pinned plugins with interactive QR login, secure sender
+pairing, and nonzero live health gates.
+
 ## Requirements
 
 - **Linux** (Debian/Ubuntu recommended). Uses `useradd`, systemd, Unix domain sockets, and `/tmp` — no macOS or Windows support.
@@ -93,6 +97,20 @@ replaced accidentally: a new token requires `--replace`, is validated before
 the first write, and is rolled back if live startup fails. See the
 [Telegram guide](docs/telegram.md) for automation and recovery.
 
+### Connect WeChat or WhatsApp
+
+Run QR onboarding from a real terminal on the gateway host, including an
+interactive SSH session:
+
+```bash
+sudo clawie channel wechat setup alice
+sudo clawie channel whatsapp setup alice
+```
+
+Scan the live code, then use the exact pairing commands printed by setup.
+Clawie records channel ownership only after the target agent restarts and the
+live probe passes. See [WeChat and WhatsApp](docs/qr-channels.md).
+
 ## Agent orchestration
 
 Agents delegate work to each other through a recursive task system with three model tiers:
@@ -133,6 +151,7 @@ clawie agent create alice --model-tier balanced
 clawie agent clone alice bob --channel-strategy migrate
 clawie agent list
 clawie agent show alice
+clawie agent rename alice bidao
 
 # Operational isolated agent
 sudo clawie runtime create worker --user worker --provider openclaw
@@ -157,6 +176,10 @@ sudo clawie auth apply                            # copy private auth files into
 # Telegram
 sudo clawie channel telegram setup alice          # hidden prompt; never pass the token on argv
 sudo clawie channel telegram status alice         # live, secret-free health gate
+
+# WeChat / WhatsApp (interactive QR on the gateway host)
+sudo clawie channel wechat setup alice
+sudo clawie channel whatsapp setup alice
 
 # Backup (git-backed, continuously maintained)
 clawie backup init --remote git@github.com:you/agent-backup.git

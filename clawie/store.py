@@ -331,6 +331,114 @@ class StateStore:
             self._increment_revision(conn, "state_revision", current_revision)
             conn.commit()
 
+    def rename_agent_record(
+        self,
+        old_agent_id: str,
+        new_agent_id: str,
+        payload: dict[str, Any],
+        *,
+        timestamp: str,
+    ) -> None:
+        """Atomically rename one agent definition without touching its OS runtime.
+
+        The managed Linux user is deliberately not renamed: changing a Unix
+        account, home, lingering systemd unit, credentials, and live processes
+        is a materially different (and much riskier) operation.  The logical
+        Clawie identity can safely change while that isolation boundary stays
+        stable.
+        """
+        old_id = str(old_agent_id).strip()
+        new_id = str(new_agent_id).strip()
+        if not old_id or not new_id or old_id == new_id:
+            raise ValueError("old and new agent IDs must be different non-empty values")
+        if not isinstance(payload, dict):
+            raise ValueError("renamed agent payload must be a JSON object")
+        encoded = json.dumps(payload, sort_keys=True)
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute(
+                "SELECT 1 FROM agents WHERE agent_id = ?", (old_id,)
+            ).fetchone()
+            if source is None:
+                raise ValueError(f"agent not found: {old_id}")
+            destination = conn.execute(
+                "SELECT 1 FROM agents WHERE agent_id = ?", (new_id,)
+            ).fetchone()
+            if destination is not None:
+                raise ValueError(f"agent already exists: {new_id}")
+
+            active_tasks = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM delegation_tasks
+                    WHERE status IN ('pending', 'running')
+                      AND (parent_agent_id = ? OR child_agent_id = ? OR root_agent_id = ?)
+                    """,
+                    (old_id, old_id, old_id),
+                ).fetchone()[0]
+            )
+            if active_tasks:
+                raise ValueError(
+                    f"agent '{old_id}' has {active_tasks} active delegation task(s); "
+                    "wait for them to finish before renaming"
+                )
+            active_sessions = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM session_agents
+                    WHERE status = 'running'
+                      AND (parent_agent_id = ? OR child_agent_id = ?)
+                    """,
+                    (old_id, old_id),
+                ).fetchone()[0]
+            )
+            if active_sessions:
+                raise ValueError(
+                    f"agent '{old_id}' has {active_sessions} active session agent(s); "
+                    "stop them before renaming"
+                )
+
+            current_revision = self._read_revision(conn, "state_revision")
+            conn.execute(
+                "INSERT INTO agents(agent_id, payload) VALUES (?, ?)",
+                (new_id, encoded),
+            )
+            conn.execute("DELETE FROM agents WHERE agent_id = ?", (old_id,))
+
+            # clone_from is a live definition reference, not historical audit
+            # data. Keep it resolvable after the source identity changes.
+            for row in conn.execute(
+                "SELECT agent_id, payload FROM agents WHERE agent_id != ?", (new_id,)
+            ).fetchall():
+                other = self._decode_json_obj(str(row["payload"]))
+                if str(other.get("clone_from", "")).strip() != old_id:
+                    continue
+                other["clone_from"] = new_id
+                conn.execute(
+                    "UPDATE agents SET payload = ? WHERE agent_id = ?",
+                    (json.dumps(other, sort_keys=True), str(row["agent_id"])),
+                )
+
+            conn.execute(
+                "INSERT INTO events(timestamp, type, message, context) VALUES (?, ?, ?, ?)",
+                (
+                    str(timestamp),
+                    "agents.renamed",
+                    f"Renamed agent {old_id} to {new_id}",
+                    json.dumps(
+                        {
+                            "old_agent_id": old_id,
+                            "new_agent_id": new_id,
+                            "linux_user": str(payload.get("agent", {}).get("linux_user", "")),
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            self._increment_revision(conn, "state_revision", current_revision)
+            conn.commit()
+
     def write_snapshot(self, config: dict[str, Any], state: dict[str, Any]) -> None:
         """Replace configuration and state in one all-or-nothing transaction.
 

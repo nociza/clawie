@@ -15,11 +15,18 @@ from pathlib import Path
 from typing import Any
 
 from clawie.addon_integration import inject_addon_tools_snippet, remove_addon_tools_snippet
+from clawie.provider_channels import is_openclaw_channel_placeholder
 from clawie.providers import (
     get_provider,
     provider_names,
 )
-from clawie.service_common import SetupError, AgentExistsError, AgentNotFoundError, now_iso
+from clawie.service_common import (
+    SetupError,
+    AgentExistsError,
+    AgentNotFoundError,
+    now_iso,
+    _default_core_prompt_content,
+)
 from clawie.safe_fs import read_text_under, remove_under
 
 # Agent IDs become file names, backup paths, channel prefixes, and
@@ -272,6 +279,253 @@ class AgentOpsMixin:
             raise AgentNotFoundError(f"agent not found: {agent_id}")
         self._hydrate_agent_controls(agent)
         return agent
+
+    def rename_agent(self, old_agent_id: str, new_agent_id: str) -> dict[str, Any]:
+        """Rename a logical agent identity while preserving its Linux sandbox."""
+        self._require_setup()
+        old_id = self._validate_agent_id(old_agent_id)
+        new_id = self._validate_agent_id(new_agent_id)
+        if old_id == new_id:
+            raise ValueError("old and new agent IDs must differ")
+
+        state = self.store.read_state()
+        agents = state.setdefault("agents", {})
+        source = agents.get(old_id)
+        if not isinstance(source, dict):
+            raise AgentNotFoundError(f"agent not found: {old_id}")
+        if new_id in agents:
+            raise AgentExistsError(f"agent already exists: {new_id}")
+
+        renamed = copy.deepcopy(source)
+        old_display = str(renamed.get("display_name", "")).strip()
+        new_display = new_id if not old_display or old_display == old_id else old_display
+        renamed["agent_id"] = new_id
+        renamed["display_name"] = new_display
+        renamed["renamed_at"] = now_iso()
+        history = [
+            str(item).strip()
+            for item in renamed.get("identity_history", [])
+            if str(item).strip()
+        ]
+        if old_id not in history:
+            history.append(old_id)
+        renamed["identity_history"] = list(dict.fromkeys(history))
+
+        info = renamed.setdefault("agent", {})
+        previous_ids = [
+            str(item).strip()
+            for item in info.get("previous_agent_ids", [])
+            if str(item).strip()
+        ]
+        previous_ids.extend(renamed["identity_history"])
+        info["previous_agent_ids"] = list(dict.fromkeys(previous_ids))
+        info["last_sync"] = now_iso()
+
+        channels = renamed.get("channels", [])
+        if isinstance(channels, list):
+            for row in channels:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name", ""))
+                if name.startswith(f"{old_id}-"):
+                    row["name"] = f"{new_id}-{name[len(old_id) + 1:]}"
+                external_id = str(row.get("external_id", ""))
+                if external_id.startswith(f"{old_id}:"):
+                    row["external_id"] = f"{new_id}:{external_id[len(old_id) + 1:]}"
+
+        prompts = renamed.get("core_prompts", {})
+        if isinstance(prompts, dict):
+            for prompt_name, content in list(prompts.items()):
+                expected = _default_core_prompt_content(prompt_name, old_id, old_display or old_id)
+                if str(content) == expected:
+                    prompts[prompt_name] = _default_core_prompt_content(
+                        prompt_name, new_id, new_display
+                    )
+
+        published = self._published_workspace()
+        alias_added = False
+        if (published.root / "WORKSPACE.json").is_file() and published.catalog_path.is_file():
+            published.add_agent_alias(old_id, new_id)
+            alias_added = True
+        try:
+            self.store.rename_agent_record(
+                old_id,
+                new_id,
+                renamed,
+                timestamp=str(renamed["renamed_at"]),
+            )
+        except Exception:
+            if alias_added:
+                try:
+                    published.remove_agent_alias(old_id, new_id)
+                except Exception:
+                    pass
+            raise
+
+        warnings: list[str] = []
+        linux_user = str(info.get("linux_user", "")).strip()
+        home = self._agent_linux_home(renamed)
+        provider = str(info.get("provider", "")).strip().lower()
+        if home is not None and linux_user:
+            try:
+                self._require_linux_user_access(linux_user, "agent rename prompt sync")
+                self._write_prompt_files_for_home(
+                    provider,
+                    home,
+                    renamed.get("core_prompts", {}),
+                    linux_user,
+                )
+            except Exception as exc:  # Identity is already durable; report safe remediation.
+                warnings.append(f"prompt sync failed: {exc}")
+        if alias_added and home is not None:
+            try:
+                self.workspace_mount(agent_id=new_id)
+            except Exception as exc:
+                warnings.append(f"published-workspace remount failed: {exc}")
+
+        safe_agent = copy.deepcopy(self.get_agent(new_id))
+        safe_agent.setdefault("agent", {}).pop("gateway_token", None)
+        return {
+            "old_agent_id": old_id,
+            "new_agent_id": new_id,
+            "linux_user": linux_user,
+            "linux_user_renamed": False,
+            "published_workspace_alias": alias_added,
+            "warnings": warnings,
+            "agent": safe_agent,
+        }
+
+    def rotate_agent_gateway_token(self, agent_id: str) -> dict[str, Any]:
+        """Rotate one OpenClaw gateway token with config/service rollback."""
+        self._require_setup()
+        target = self._validate_agent_id(agent_id)
+        state_before = self.store.read_state()
+        source = state_before.setdefault("agents", {}).get(target)
+        if not isinstance(source, dict):
+            raise AgentNotFoundError(f"agent not found: {target}")
+        self._hydrate_agent_controls(source)
+        info = source.setdefault("agent", {})
+        if str(info.get("provider", "")).strip().lower() != "openclaw":
+            raise SetupError("gateway token rotation is only supported for OpenClaw agents")
+        linux_user = str(info.get("linux_user", "")).strip()
+        self._require_linux_user_access(linux_user, "gateway token rotation")
+        home = self._agent_linux_home(source)
+        if home is None:
+            raise SetupError(f"could not resolve the managed home for agent '{target}'")
+        gateway_port = int(info.get("gateway_port", 0) or 0)
+        old_token = str(info.get("gateway_token", "")).strip()
+        if gateway_port <= 0 or not old_token:
+            raise SetupError(f"agent '{target}' has no configured gateway token to rotate")
+
+        try:
+            config_before = self._read_agent_text_file(
+                home,
+                ".openclaw/openclaw.json",
+                max_bytes=16 * 1024 * 1024,
+            )
+        except FileNotFoundError as exc:
+            raise SetupError(f"agent '{target}' has no OpenClaw config to rotate") from exc
+        from clawie.adapters import OpenclawAdapter, deep_merge
+
+        new_token = OpenclawAdapter.new_gateway_token()
+        detached = copy.deepcopy(source)
+        detached_info = detached.setdefault("agent", {})
+        detached_info["gateway_token"] = new_token
+        was_running = self._provider_process_live("openclaw", linux_user)
+        service_touched = False
+        failure_stage = "validating the existing OpenClaw config"
+        try:
+            config = json.loads(config_before)
+            if not isinstance(config, dict):
+                raise SetupError("OpenClaw config root must be a JSON object")
+            config = deep_merge(
+                config,
+                OpenclawAdapter().gateway_config_patch(port=gateway_port, token=new_token),
+            )
+            failure_stage = "writing the candidate OpenClaw gateway config"
+            self._write_agent_json_file(
+                home,
+                ".openclaw/openclaw.json",
+                config,
+                linux_user,
+            )
+            service_touched = True
+            failure_stage = "restarting the OpenClaw service"
+            service_result = self._run_managed_provider_service_action(
+                provider="openclaw",
+                action="restart" if was_running else "start",
+                linux_user=linux_user,
+                agent_info=detached_info,
+            )
+            if str(service_result.get("service_status", "")).strip().lower() != "running":
+                raise SetupError("OpenClaw did not report a running service after token rotation")
+            failure_stage = "waiting for OpenClaw postflight readiness"
+            self._assert_provider_postflight_ready(
+                provider="openclaw",
+                linux_user=linux_user,
+                home=home,
+                auth_mode=str(detached_info.get("auth_mode", "")),
+            )
+
+            failure_stage = "committing the rotated credential to Clawie state"
+            state = self.store.read_state()
+            persisted = state.setdefault("agents", {}).get(target)
+            if not isinstance(persisted, dict):
+                raise AgentNotFoundError(f"agent not found: {target}")
+            persisted_info = persisted.setdefault("agent", {})
+            if str(persisted_info.get("gateway_token", "")).strip() != old_token:
+                raise SetupError("gateway token changed concurrently; the rotation was not committed")
+            persisted_info["gateway_token"] = new_token
+            persisted_info["service_status"] = "running"
+            persisted_info["service_mode"] = str(service_result.get("service_mode", "unknown"))
+            persisted_info["last_sync"] = now_iso()
+            self._event(
+                state,
+                "agents.gateway_token_rotated",
+                f"Rotated private gateway token for {target}",
+                {"agent_id": target, "linux_user": linux_user},
+            )
+            self.store.write_state(state)
+        except BaseException as exc:
+            rollback_errors: list[str] = []
+            try:
+                self._write_agent_text_file(
+                    home,
+                    ".openclaw/openclaw.json",
+                    config_before,
+                    linux_user,
+                    mode=0o600,
+                )
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback_errors.append(f"config restore failed: {rollback_exc}")
+            if service_touched:
+                try:
+                    self._run_managed_provider_service_action(
+                        provider="openclaw",
+                        action="restart" if was_running else "stop",
+                        linux_user=linux_user,
+                        agent_info=info,
+                    )
+                except Exception as rollback_exc:  # noqa: BLE001
+                    rollback_errors.append(f"service restore failed: {rollback_exc}")
+            if rollback_errors:
+                raise SetupError(
+                    "gateway token rotation failed and automatic rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from None
+            raise SetupError(
+                f"gateway token rotation failed while {failure_stage} ({type(exc).__name__}); "
+                "prior config, service, and Clawie state were restored"
+            ) from None
+        finally:
+            new_token = ""
+
+        return {
+            "agent_id": target,
+            "linux_user": linux_user,
+            "rotated": True,
+            "service_status": "running",
+        }
 
     def set_agent_provider(self, agent_id: str, provider: str) -> dict[str, Any]:
         return self.switch_agent_provider(agent_id, provider)["agent"]
@@ -961,10 +1215,15 @@ class AgentOpsMixin:
         channel_defaults["heartbeat"] = heartbeat_visibility
         channels_cfg["defaults"] = channel_defaults
 
-        existing_telegram_cfg = channels_cfg.get("telegram", {})
-        if isinstance(existing_telegram_cfg, dict):
-            self._set_openclaw_telegram_streaming_off(existing_telegram_cfg)
-            channels_cfg["telegram"] = existing_telegram_cfg
+        if "telegram" in channels_cfg:
+            existing_telegram_cfg = channels_cfg.get("telegram")
+            if is_openclaw_channel_placeholder(existing_telegram_cfg):
+                # Remove the inert placeholder written by older Clawie
+                # releases so OpenClaw cannot rediscover it as a live channel.
+                channels_cfg.pop("telegram", None)
+            elif isinstance(existing_telegram_cfg, dict):
+                self._set_openclaw_telegram_streaming_off(existing_telegram_cfg)
+                channels_cfg["telegram"] = existing_telegram_cfg
         login_env = self._login_shell_env(linux_user)
         payload_by_kind: dict[str, dict[str, Any]] = {}
         for payload in live_payloads.values():
@@ -1568,14 +1827,23 @@ class AgentOpsMixin:
             raise SetupError(f"refusing purge: managed-user marker is missing or invalid: {exc}") from exc
         expected = {
             "format_version": 1,
-            "agent_id": agent_id,
             "linux_user": linux_user,
             "operation_id": str(info.get("managed_user_operation_id", "") or ""),
             "state_root": str(self.store.root.resolve()),
         }
         if recorded_uid > 0:
             expected["linux_uid"] = recorded_uid
-        if not isinstance(marker, dict) or any(marker.get(key) != value for key, value in expected.items()):
+        valid_agent_ids = {agent_id}
+        valid_agent_ids.update(
+            str(item).strip()
+            for item in info.get("previous_agent_ids", [])
+            if str(item).strip()
+        )
+        if (
+            not isinstance(marker, dict)
+            or str(marker.get("agent_id", "")) not in valid_agent_ids
+            or any(marker.get(key) != value for key, value in expected.items())
+        ):
             raise SetupError("refusing purge: managed-user marker does not match the agent record")
         return home
 

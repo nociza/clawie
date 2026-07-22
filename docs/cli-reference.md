@@ -46,6 +46,7 @@ its safe defaults otherwise.
 ```bash
 clawie agent create [AGENT_ID] [--display-name N] [--template T] [--clone-from A] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
 clawie agent clone SOURCE TARGET [--display-name N] [--channel-strategy new|migrate] [--model-tier fast|balanced|power] [--provider P] [--no-delegation]
+clawie agent rename OLD_AGENT_ID NEW_AGENT_ID [--json]
 clawie agent list
 clawie agent show AGENT_ID
 clawie agent delete AGENT_ID [--yes]
@@ -56,6 +57,9 @@ clawie agent create-batch FILE
 `delete` is confirmed by default and is only for definition-only agents. It
 refuses any record attached to a Linux runtime; use confirmed `purge` to stop
 and remove that runtime safely. `--yes` is required for unattended deletion.
+`rename` changes the logical identity while preserving the Linux user, isolated
+home, credentials, service, and immutable publication history. It refuses an
+existing destination and active delegation/session work.
 
 ### agent prompt
 
@@ -80,8 +84,14 @@ clawie agent provider set AGENT_ID PROVIDER
 
 ```bash
 clawie agent service start|stop|restart|status AGENT_ID
+clawie agent service rotate-gateway-token AGENT_ID [--json]
 clawie agent service apply-prompts AGENT_ID
 ```
+
+Gateway-token rotation replaces the per-agent loopback gateway credential only
+after OpenClaw restarts and passes postflight checks. If any step fails, Clawie
+restores the exact prior config and service state. Neither text nor JSON output
+contains the old or new token.
 
 ### agent credentials
 
@@ -111,6 +121,14 @@ sudo clawie channel telegram setup AGENT_ID [--token-file PATH | --token-stdin] 
 sudo clawie channel telegram status AGENT_ID [--json]
 sudo clawie channel telegram pairing-list AGENT_ID [--json]
 sudo clawie channel telegram pairing-approve AGENT_ID CODE [--json]
+sudo clawie channel wechat setup AGENT_ID [--account ID] [--skip-install] [--wait-seconds N]
+sudo clawie channel wechat status AGENT_ID [--json]
+sudo clawie channel wechat pairing-list AGENT_ID [--json]
+sudo clawie channel wechat pairing-approve AGENT_ID CODE [--json]
+sudo clawie channel whatsapp setup AGENT_ID [--account ID] [--skip-install] [--wait-seconds N]
+sudo clawie channel whatsapp status AGENT_ID [--json]
+sudo clawie channel whatsapp pairing-list AGENT_ID [--json]
+sudo clawie channel whatsapp pairing-approve AGENT_ID CODE [--json]
 ```
 
 Telegram setup accepts a hidden interactive prompt by default. Tokens are never
@@ -119,6 +137,11 @@ and exits nonzero when unhealthy; pairing remains the secure default. Setup
 preflights tokens before mutation, requires `--replace` to change bot identity,
 and rolls back files and service state after any later failure. See
 [Telegram](telegram.md).
+
+WeChat and WhatsApp setup requires an interactive terminal because QR codes
+expire. Clawie installs and pins the maintained plugin in the target agent's
+private home and commits channel ownership only after restart and live health.
+See [WeChat & WhatsApp](qr-channels.md).
 
 ## delegation
 

@@ -23,7 +23,7 @@ from clawie.providers import credential_paths_for_providers
 from clawie.auth_sources import load_codex_auth
 from clawie.addon_auth import parse_gws_status_output
 from clawie.provider_channels import OpenClawChannelAdapter
-from clawie.service import SetupError, ClawieService
+from clawie.service import SetupError, AgentExistsError, ClawieService
 from clawie.store import StateStore
 import clawie._service_watchdog as watchdog_module
 import clawie._service_shared as shared_module
@@ -84,7 +84,7 @@ def test_cli_version_exits_without_state(tmp_path: Path, capsys: CaptureFixture[
         main(["--config-dir", str(tmp_path), "--version"])
 
     assert exc.value.code == 0
-    assert "clawie 0.1.13" in capsys.readouterr().out
+    assert "clawie 0.1.20" in capsys.readouterr().out
     assert not (tmp_path / "clawie.db").exists()
 
 
@@ -2554,6 +2554,269 @@ def test_delete_refuses_to_orphan_a_managed_linux_runtime(tmp_path: Path) -> Non
         service.delete_agent("alice")
 
     assert "alice" in service.store.read_state()["agents"]
+
+
+def test_agent_rename_preserves_linux_user_and_updates_default_identity(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+) -> None:
+    assert run_cli(tmp_path, "config", "set", "--provider", "openclaw") == 0
+    assert run_cli(tmp_path, "agent", "create", "carolclaw") == 0
+    capsys.readouterr()
+    store = StateStore(config_dir=tmp_path)
+    state = store.read_state()
+    state["agents"]["carolclaw"]["agent"].update(
+        {
+            "linux_user": "carol-runtime",
+            "gateway_port": 18789,
+            "gateway_token": "gateway-secret",
+        }
+    )
+    store.write_state(state)
+
+    assert run_cli(tmp_path, "agent", "rename", "carolclaw", "bidao", "--json") == 0
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    renamed = StateStore(config_dir=tmp_path).read_state()["agents"]["bidao"]
+
+    assert result["new_agent_id"] == "bidao"
+    assert "gateway_token" not in result["agent"]["agent"]
+    assert "gateway-secret" not in output
+    assert "carolclaw" not in StateStore(config_dir=tmp_path).read_state()["agents"]
+    assert renamed["agent"]["linux_user"] == "carol-runtime"
+    assert renamed["display_name"] == "bidao"
+    assert "Your agent ID is `bidao`." in renamed["core_prompts"]["SOUL.md"]
+    assert renamed["agent"]["previous_agent_ids"] == ["carolclaw"]
+
+
+def test_gateway_token_rotation_restores_config_and_state_on_restart_failure(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(provider="openclaw")
+    service.create_agent(
+        agent_id="bidao",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    config_path = home / ".openclaw" / "openclaw.json"
+    config_before = '{"gateway":{"auth":{"token":"old-token"}}}\n'
+    config_path.write_text(config_before, encoding="utf-8")
+    state = service.store.read_state()
+    state["agents"]["bidao"]["agent"].update(
+        {"linux_user": "carolclaw", "gateway_port": 18789, "gateway_token": "old-token"}
+    )
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_can_manage_linux_user", lambda _user: True)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
+
+    def fake_write(
+        _home: Path,
+        _relative_path: str,
+        payload: dict[str, Any],
+        _linux_user: str,
+    ) -> None:
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(service, "_write_agent_json_file", fake_write)
+    actions: list[str] = []
+
+    def fake_service(**kwargs: Any) -> dict[str, Any]:
+        actions.append(kwargs["action"])
+        if len(actions) == 1:
+            raise SetupError("restart failed")
+        return {"service_status": "running"}
+
+    monkeypatch.setattr(service, "_run_managed_provider_service_action", fake_service)
+
+    with raises(SetupError, match="prior config, service, and Clawie state were restored"):
+        service.rotate_agent_gateway_token("bidao")
+
+    assert actions == ["restart", "restart"]
+    assert config_path.read_text(encoding="utf-8") == config_before
+    assert service.store.read_state()["agents"]["bidao"]["agent"]["gateway_token"] == "old-token"
+
+
+def test_gateway_token_rotation_commits_only_after_postflight(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(provider="openclaw")
+    service.create_agent(
+        agent_id="bidao",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    config_path = home / ".openclaw" / "openclaw.json"
+    config_path.write_text('{"gateway":{"auth":{"token":"old-token"}}}\n', encoding="utf-8")
+    state = service.store.read_state()
+    state["agents"]["bidao"]["agent"].update(
+        {"linux_user": "carolclaw", "gateway_port": 18789, "gateway_token": "old-token"}
+    )
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_can_manage_linux_user", lambda _user: True)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
+
+    def fake_write(
+        _home: Path,
+        _relative_path: str,
+        payload: dict[str, Any],
+        _linux_user: str,
+    ) -> None:
+        token = payload["gateway"]["auth"]["token"]
+        assert token != "old-token"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        assert service.store.read_state()["agents"]["bidao"]["agent"]["gateway_token"] == "old-token"
+
+    monkeypatch.setattr(service, "_write_agent_json_file", fake_write)
+    monkeypatch.setattr(
+        service,
+        "_run_managed_provider_service_action",
+        lambda **_kwargs: {"service_status": "running", "service_mode": "systemd"},
+    )
+    postflight_tokens: list[str] = []
+
+    def fake_postflight(**_kwargs: Any) -> None:
+        postflight_tokens.append(
+            json.loads(config_path.read_text(encoding="utf-8"))["gateway"]["auth"]["token"]
+        )
+        assert service.store.read_state()["agents"]["bidao"]["agent"]["gateway_token"] == "old-token"
+
+    monkeypatch.setattr(service, "_assert_provider_postflight_ready", fake_postflight)
+
+    result = service.rotate_agent_gateway_token("bidao")
+    rotated_token = service.store.read_state()["agents"]["bidao"]["agent"]["gateway_token"]
+
+    assert result == {
+        "agent_id": "bidao",
+        "linux_user": "carolclaw",
+        "rotated": True,
+        "service_status": "running",
+    }
+    assert rotated_token != "old-token"
+    assert postflight_tokens == [rotated_token]
+    assert config_path.read_text(encoding="utf-8").count(rotated_token) == 1
+    assert "gateway_token" not in result
+
+
+def test_gateway_token_rotation_does_not_reconcile_unrelated_channels(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(provider="openclaw")
+    service.create_agent(
+        agent_id="bidao",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+    )
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    config_path = home / ".openclaw" / "openclaw.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "gateway": {"auth": {"token": "old-token"}},
+                "channels": {"telegram": {"enabled": True, "unrelated": "preserve-me"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = service.store.read_state()
+    state["agents"]["bidao"]["agent"].update(
+        {"linux_user": "carolclaw", "gateway_port": 18789, "gateway_token": "old-token"}
+    )
+    service.store.write_state(state)
+    monkeypatch.setattr(service, "_can_manage_linux_user", lambda _user: True)
+    monkeypatch.setattr(service, "_agent_linux_home", lambda _agent: home)
+    monkeypatch.setattr(service, "_provider_process_live", lambda *_args: True)
+    monkeypatch.setattr(
+        service,
+        "_run_managed_provider_service_action",
+        lambda **_kwargs: {"service_status": "running", "service_mode": "systemd"},
+    )
+    monkeypatch.setattr(service, "_assert_provider_postflight_ready", lambda **_kwargs: None)
+
+    service.rotate_agent_gateway_token("bidao")
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["channels"] == {
+        "telegram": {"enabled": True, "unrelated": "preserve-me"}
+    }
+    assert config["gateway"]["auth"]["token"] != "old-token"
+
+
+def test_agent_rename_is_atomic_when_destination_exists(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(provider="openclaw")
+    for agent_id in ("carolclaw", "bidao"):
+        service.create_agent(
+            agent_id=agent_id,
+            display_name=None,
+            template="baseline",
+            clone_from=None,
+            channel_strategy="new",
+            channels=[],
+            agent_version="1.0.0",
+        )
+
+    with raises(AgentExistsError, match="agent already exists: bidao"):
+        service.rename_agent("carolclaw", "bidao")
+
+    assert set(service.store.read_state()["agents"]) == {"carolclaw", "bidao"}
+
+
+def test_agent_rename_refuses_active_delegation_without_partial_change(tmp_path: Path) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path))
+    service.setup(provider="openclaw")
+    for agent_id in ("carolclaw", "teleclaw"):
+        service.create_agent(
+            agent_id=agent_id,
+            display_name=None,
+            template="baseline",
+            clone_from=None,
+            channel_strategy="new",
+            channels=[],
+            agent_version="1.0.0",
+        )
+    with service.store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO delegation_tasks(
+                task_id, parent_agent_id, child_agent_id, status, payload, result,
+                created_at, timeout_seconds, context_budget, root_agent_id,
+                root_task_id, parent_task_id
+            ) VALUES ('rename-active', 'carolclaw', 'teleclaw', 'running', '{}', '{}',
+                      '', 300.0, '{}', 'carolclaw', 'rename-active', '')
+            """
+        )
+        conn.commit()
+
+    with raises(ValueError, match="active delegation"):
+        service.rename_agent("carolclaw", "bidao")
+
+    assert "carolclaw" in service.store.read_state()["agents"]
+    assert "bidao" not in service.store.read_state()["agents"]
 
 
 def test_agent_delete_requires_confirmation(
@@ -6240,6 +6503,68 @@ def test_openclaw_channel_adapter_ignores_channel_defaults(tmp_path: Path) -> No
     channels = OpenClawChannelAdapter().discover_channels(root)
 
     assert channels == [{"kind": "telegram", "name": "telegram"}]
+
+
+def test_openclaw_channel_adapter_ignores_streaming_only_placeholder(tmp_path: Path) -> None:
+    root = tmp_path / ".openclaw"
+    root.mkdir()
+    (root / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "defaults": {"heartbeat": {"showOk": False}},
+                    "telegram": {"streaming": {"mode": "off"}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert OpenClawChannelAdapter().discover_channels(root) == []
+
+
+def test_prepare_openclaw_home_removes_streaming_only_telegram_placeholder(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    service = ClawieService(StateStore(config_dir=tmp_path / "state"))
+    service.setup(
+        provider="openclaw",
+        api_key="",
+        subscription="starter",
+        workspace="default",
+        api_url="https://api.openclaw.example/v1",
+    )
+    service.create_agent(
+        agent_id="whatsclaw",
+        display_name=None,
+        template="baseline",
+        clone_from=None,
+        channel_strategy="new",
+        channels=[],
+        agent_version="1.0.0",
+        provider="openclaw",
+    )
+    home = tmp_path / "home"
+    (home / ".openclaw").mkdir(parents=True)
+    (home / ".openclaw" / "openclaw.json").write_text(
+        json.dumps({"channels": {"telegram": {"streaming": {"mode": "off"}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service, "_ensure_openclaw_agent_auth_link", lambda **_kwargs: None)
+    monkeypatch.setattr(service, "_ensure_published_workspace_mount", lambda **_kwargs: None)
+
+    service._ensure_openclaw_home_prepared(
+        home=home,
+        linux_user="whatsclaw",
+        channels=[],
+        live_payloads={},
+        auth_mode="linked",
+        api_key="",
+    )
+
+    config = json.loads((home / ".openclaw" / "openclaw.json").read_text(encoding="utf-8"))
+    assert "telegram" not in config["channels"]
 
 
 def test_assert_provider_postflight_ready_runs_openclaw_models_status(

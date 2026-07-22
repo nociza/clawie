@@ -42,6 +42,7 @@ Linux with Python 3.10+. Python 3.10 installs `tomli`; Python 3.11+ uses only th
 | [Providers & Auth](providers.md) | Provider setup, auth modes, shared credentials, porting |
 | [Runtime Isolation](runtime.md) | Linux users, credential bundles, security model |
 | [Telegram](telegram.md) | Secure bot setup, pairing, health, and recovery |
+| [WeChat & WhatsApp](qr-channels.md) | Guided QR login, maintained plugins, pairing, and recovery |
 | [Backup & Restore](backup.md) | Continuous git-backed knowledge backup |
 | [Status](status.md) | Fleet overview, `--json`, live `--watch` |
 | [CLI Reference](cli-reference.md) | Every command and flag |

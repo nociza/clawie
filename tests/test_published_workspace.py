@@ -134,6 +134,53 @@ def test_workspace_publish_creates_publication_and_view(
     assert (bob_mount / "alice" / result["view_name"] / "files" / "report.md").stat().st_mode & 0o777 == 0o600
 
 
+def test_workspace_publish_resolves_relative_path_inside_selected_agent_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, homes = _service_with_agents(tmp_path, monkeypatch)
+    source = homes["alice-user"] / ".openclaw" / "workspace" / "nested" / "proof.txt"
+    source.parent.mkdir()
+    source.write_text("relative-path proof\n", encoding="utf-8")
+
+    result = service.workspace_publish(
+        Path("nested/proof.txt"),
+        agent_id="alice",
+        visible_to=["bob"],
+    )
+
+    publication = Path(result["path"])
+    assert (publication / "files" / "proof.txt").read_text(encoding="utf-8") == "relative-path proof\n"
+    manifest = json.loads((publication / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source"]["agent_workspace_relative_path"] == "nested/proof.txt"
+
+
+def test_agent_rename_preserves_access_to_immutable_publications(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, homes = _service_with_agents(tmp_path, monkeypatch)
+    source = homes["alice-user"] / ".openclaw" / "workspace" / "before-rename.md"
+    source.write_text("durable identity history\n", encoding="utf-8")
+    publication = service.workspace_publish(
+        source,
+        agent_id="alice",
+        visible_to=["bob"],
+        title="Before rename",
+    )
+
+    result = service.rename_agent("alice", "bidao")
+
+    assert result["new_agent_id"] == "bidao"
+    assert result["linux_user"] == "alice-user"
+    assert "alice" not in service.store.read_state()["agents"]
+    assert service.workspace_show(publication["publication_id"], agent_id="bidao")
+    visible = service.workspace_list(agent_id="bidao")
+    assert [item["publication_id"] for item in visible] == [publication["publication_id"]]
+    materialized = homes["alice-user"] / ".openclaw" / "workspace" / "published"
+    assert (materialized / "alice" / publication["view_name"] / "files" / "before-rename.md").is_file()
+
+
 def test_workspace_mount_replaces_symlink_without_touching_its_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -319,7 +366,7 @@ def test_cli_workspace_publish_and_list(
             str(config_dir),
             "workspace",
             "publish",
-            str(source),
+            "report.md",
             "--agent",
             "alice",
             "--to",

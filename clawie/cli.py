@@ -460,7 +460,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     agent_sub = agent.add_subparsers(
         dest="agent_command",
         required=True,
-        metavar="{create,clone,prompt,credentials,addon,auth,service,fix-permissions,provider,list,show,delete,purge,create-batch}",
+        metavar="{create,clone,rename,prompt,credentials,addon,auth,service,fix-permissions,provider,list,show,delete,purge,create-batch}",
     )
 
     create = agent_sub.add_parser(
@@ -568,6 +568,25 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
         help="Default model tier for this cloned agent",
     )
     clone.set_defaults(func=cmd_agents_clone)
+
+    rename = agent_sub.add_parser(
+        "rename",
+        help="Rename an agent identity while preserving its Linux runtime",
+    )
+    _add_positional_argument(
+        rename,
+        "old_agent_id",
+        metavar="OLD_AGENT_ID",
+        help_text="Existing agent ID",
+    )
+    _add_positional_argument(
+        rename,
+        "new_agent_id",
+        metavar="NEW_AGENT_ID",
+        help_text="New agent ID",
+    )
+    rename.add_argument("--json", action="store_true", help="Emit JSON")
+    rename.set_defaults(func=cmd_agents_rename)
 
     prompt = agent_sub.add_parser(
         "prompt",
@@ -826,7 +845,7 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
     service_sub = service.add_subparsers(
         dest="agent_service_command",
         required=True,
-        metavar="{start,stop,restart,status,apply-prompts}",
+        metavar="{start,stop,restart,status,rotate-gateway-token,apply-prompts}",
     )
     for action in ("start", "stop", "restart", "status"):
         action_parser = service_sub.add_parser(
@@ -840,6 +859,19 @@ def _build_agent_parser(subparsers: argparse._SubParsersAction[argparse.Argument
             help_text="Agent ID",
         )
         action_parser.set_defaults(func=cmd_agents_service)
+
+    rotate_gateway_token = service_sub.add_parser(
+        "rotate-gateway-token",
+        help="Rotate a private OpenClaw gateway token with automatic rollback",
+    )
+    _add_positional_argument(
+        rotate_gateway_token,
+        "agent_id",
+        metavar="AGENT_ID",
+        help_text="Agent ID",
+    )
+    rotate_gateway_token.add_argument("--json", action="store_true", help="Emit safe JSON")
+    rotate_gateway_token.set_defaults(func=cmd_agents_rotate_gateway_token)
 
     apply_prompts_parser = service_sub.add_parser(
         "apply-prompts",
@@ -962,7 +994,7 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     channel_sub = channel.add_subparsers(
         dest="channel_command",
         required=True,
-        metavar="{apply,move,telegram}",
+        metavar="{apply,move,telegram,wechat,whatsapp}",
     )
 
     apply_preset = channel_sub.add_parser(
@@ -1099,6 +1131,88 @@ def _build_channel_parser(subparsers: argparse._SubParsersAction[argparse.Argume
     )
     pairing_approve.add_argument("--json", action="store_true", help="Emit safe JSON")
     pairing_approve.set_defaults(func=cmd_channel_telegram_pairing_approve)
+
+    for channel_name, label in (("wechat", "WeChat"), ("whatsapp", "WhatsApp")):
+        qr = channel_sub.add_parser(
+            channel_name,
+            help=f"Set up, diagnose, and pair {label} through an interactive QR login",
+        )
+        qr_sub = qr.add_subparsers(
+            dest=f"{channel_name}_command",
+            required=True,
+            metavar="{setup,status,pairing-list,pairing-approve}",
+        )
+        qr_setup = qr_sub.add_parser(
+            "setup",
+            help=f"Install the maintained {label} plugin, scan a QR code, and prove live health",
+        )
+        _add_positional_argument(
+            qr_setup,
+            "agent_id",
+            metavar="AGENT_ID",
+            help_text="Managed OpenClaw agent ID",
+        )
+        qr_setup.add_argument("--account", default="", help="Optional OpenClaw account ID")
+        qr_setup.add_argument(
+            "--skip-install",
+            action="store_true",
+            help="Require the channel plugin to already be installed",
+        )
+        qr_setup.add_argument(
+            "--wait-seconds",
+            type=float,
+            default=45.0,
+            help="Wait this long for the live channel probe (default: 45)",
+        )
+        qr_setup.set_defaults(func=cmd_channel_qr_setup, qr_channel=channel_name)
+
+        qr_status = qr_sub.add_parser(
+            "status",
+            help=f"Probe {label} and print actionable diagnostics",
+        )
+        _add_positional_argument(
+            qr_status,
+            "agent_id",
+            metavar="AGENT_ID",
+            help_text="Managed OpenClaw agent ID",
+        )
+        qr_status.add_argument("--json", action="store_true", help="Emit safe JSON")
+        qr_status.set_defaults(func=cmd_channel_qr_status, qr_channel=channel_name)
+
+        qr_pairing_list = qr_sub.add_parser(
+            "pairing-list",
+            help=f"List {label} senders waiting for approval",
+        )
+        _add_positional_argument(
+            qr_pairing_list,
+            "agent_id",
+            metavar="AGENT_ID",
+            help_text="Managed OpenClaw agent ID",
+        )
+        qr_pairing_list.add_argument("--json", action="store_true", help="Emit safe JSON")
+        qr_pairing_list.set_defaults(func=cmd_channel_qr_pairing_list, qr_channel=channel_name)
+
+        qr_pairing_approve = qr_sub.add_parser(
+            "pairing-approve",
+            help=f"Approve one {label} sender pairing code",
+        )
+        _add_positional_argument(
+            qr_pairing_approve,
+            "agent_id",
+            metavar="AGENT_ID",
+            help_text="Managed OpenClaw agent ID",
+        )
+        _add_positional_argument(
+            qr_pairing_approve,
+            "code",
+            metavar="CODE",
+            help_text="Pairing code shown after messaging the account",
+        )
+        qr_pairing_approve.add_argument("--json", action="store_true", help="Emit safe JSON")
+        qr_pairing_approve.set_defaults(
+            func=cmd_channel_qr_pairing_approve,
+            qr_channel=channel_name,
+        )
 
 
 def _build_runtime_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -2075,6 +2189,36 @@ def cmd_agents_clone(args: argparse.Namespace, service: ClawieService) -> int:
     return 0
 
 
+def cmd_agents_rename(args: argparse.Namespace, service: ClawieService) -> int:
+    old_id = _resolve_required_value(args.old_agent_id, field_name="old_agent_id")
+    new_id = _resolve_required_value(args.new_agent_id, field_name="new_agent_id")
+    result = service.rename_agent(old_id, new_id)
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print_success(f"Renamed agent {old_id} -> {new_id}")
+    linux_user = str(result.get("linux_user", "")).strip()
+    if linux_user:
+        print_info(
+            f"Linux isolation user remains '{linux_user}' so the home, credentials, and service stay intact."
+        )
+    for warning in result.get("warnings", []):
+        print_warning(str(warning))
+    _print_agent(result["agent"])
+    return 0
+
+
+def cmd_agents_rotate_gateway_token(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    result = service.rotate_agent_gateway_token(agent_id)
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    print_success(f"Rotated private OpenClaw gateway token for {agent_id}")
+    print_info(f"Service status: {result.get('service_status', 'unknown')}")
+    return 0
+
+
 def cmd_agents_clone_prompts(args: argparse.Namespace, service: ClawieService) -> int:
     from_agent = _resolve_required_value(args.from_agent, field_name="from_agent")
     to_agent = _resolve_required_value(args.to_agent, field_name="to_agent")
@@ -2855,6 +2999,118 @@ def cmd_channel_telegram_pairing_approve(args: argparse.Namespace, service: Claw
     return 0
 
 
+def cmd_channel_qr_setup(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    channel = str(args.qr_channel)
+    label = "WeChat" if channel == "wechat" else "WhatsApp"
+    print_panel(
+        f"Connect {label} · {agent_id}",
+        [
+            "If no healthy saved login exists, a live QR code will appear below.",
+            f"Scan it in {label} on your phone and confirm the login.",
+            "Keep this terminal open until Clawie reports a healthy connection.",
+        ],
+    )
+    result = service.setup_openclaw_qr_channel(
+        agent_id,
+        channel,
+        account=str(args.account or ""),
+        install=not bool(args.skip_install),
+        wait_seconds=float(args.wait_seconds),
+    )
+    status = result.get("status", {})
+    print_success(f"{label} is healthy for {agent_id}")
+    if bool(result.get("resumed_existing_login", False)):
+        print_info("Recovered the existing healthy login; no new QR scan was needed.")
+    print_info(
+        f"Plugin version: {result.get('plugin', {}).get('version', 'unknown')} · "
+        f"accounts: {status.get('account_count', 0)}"
+    )
+    print_panel(
+        f"Finish pairing your {label} sender",
+        [
+            f"1. Send a direct message to the connected {label} account.",
+            f"2. sudo clawie channel {channel} pairing-list {agent_id}",
+            f"3. sudo clawie channel {channel} pairing-approve {agent_id} CODE",
+            f"4. sudo clawie channel {channel} status {agent_id}",
+        ],
+    )
+    return 0
+
+
+def cmd_channel_qr_status(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    channel = str(args.qr_channel)
+    result = service.openclaw_qr_channel_status(agent_id, channel)
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result.get("healthy") else 1
+    label = str(result.get("label", channel))
+    print_panel(
+        f"{label} · {agent_id}",
+        [
+            f"healthy: {'yes' if result.get('healthy') else 'no'}",
+            f"plugin installed: {'yes' if result.get('installed') else 'no'}",
+            f"plugin enabled: {'yes' if result.get('enabled') else 'no'}",
+            f"plugin version: {result.get('plugin_version') or 'unknown'}",
+            f"configured: {'yes' if result.get('configured') else 'no'}",
+            f"running: {'yes' if result.get('running') else 'no'}",
+            f"connected: {'yes' if result.get('connected') else 'no'}",
+            f"live probe: {'ok' if result.get('probe_ok') else 'failed'}",
+            f"accounts: {result.get('account_count', 0)}",
+        ],
+    )
+    if result.get("healthy"):
+        print_success(f"{label} is connected and its live probe is healthy")
+        return 0
+    if result.get("last_error"):
+        print_warning(f"Last error: {result['last_error']}")
+    print_error(str(result.get("remediation") or f"{label} is not healthy"))
+    return 1
+
+
+def cmd_channel_qr_pairing_list(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    channel = str(args.qr_channel)
+    result = service.list_openclaw_qr_pairings(agent_id, channel)
+    requests = result.get("requests", [])
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if not requests:
+        print_info("No pending pairing requests. Send a direct message, then rerun this command.")
+        return 0
+    print_table(
+        ["code", "name", "sender", "requested"],
+        [
+            [
+                str(row.get("code", "")),
+                str(row.get("display_name", "")),
+                str(row.get("sender_id", "")),
+                str(row.get("requested_at", "")),
+            ]
+            for row in requests
+            if isinstance(row, dict)
+        ],
+    )
+    print_info(f"Approve with: sudo clawie channel {channel} pairing-approve {agent_id} CODE")
+    return 0
+
+
+def cmd_channel_qr_pairing_approve(args: argparse.Namespace, service: ClawieService) -> int:
+    agent_id = _resolve_agent_id(args.agent_id)
+    channel = str(args.qr_channel)
+    code = _resolve_required_value(args.code, field_name="code")
+    result = service.approve_openclaw_qr_pairing(agent_id, channel, code)
+    if bool(args.json):
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    label = "WeChat" if channel == "wechat" else "WhatsApp"
+    print_success(f"Approved {label} pairing for {agent_id}")
+    print_info("Send another message; the agent should now reply normally.")
+    return 0
+
+
 def cmd_runtime_create(args: argparse.Namespace, service: ClawieService) -> int:
     agent_id = _resolve_new_agent_id(args.agent_id, service)
     linux_user = args.linux_user
@@ -3522,7 +3778,7 @@ def cmd_workspace_status(args: argparse.Namespace, service: ClawieService) -> in
 def cmd_workspace_publish(args: argparse.Namespace, service: ClawieService) -> int:
     source = _resolve_required_value(args.path, field_name="path")
     result = service.workspace_publish(
-        _resolve_path_arg(source),
+        Path(source).expanduser(),
         agent_id=str(args.agent or ""),
         visible_to=_parse_workspace_viewers(args.to),
         title=str(args.title or ""),

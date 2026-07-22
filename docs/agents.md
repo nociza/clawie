@@ -107,6 +107,21 @@ This creates a control-plane definition, not a Linux runtime. Use `sudo clawie
 runtime create` for an operational isolated agent. Set the tier programmatically
 via the service API.
 
+## Rename
+
+Rename an agent without recreating its runtime:
+
+```bash
+sudo clawie agent rename carolclaw bidao
+```
+
+The logical ID, generated identity prompt, future delegation records, and
+future publication ownership use the new name. The Linux username deliberately
+stays unchanged, preserving the sandbox and credentials. Historical immutable
+publications remain visible through a durable identity alias. Rename fails
+before mutation if the destination exists or the agent has active
+delegation/session work.
+
 ## Delete
 
 ```bash

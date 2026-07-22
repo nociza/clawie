@@ -63,9 +63,12 @@ class PublishedWorkspaceOpsMixin:
         if linux_user:
             self._require_linux_user_access(linux_user, "workspace publish")
 
+        requested_source = Path(source_path).expanduser()
+        if not requested_source.is_absolute():
+            requested_source = workspace_path / requested_source
         viewers = self._resolve_workspace_viewers(visible_to or [])
         result = self._published_workspace().publish(
-            source_path=Path(source_path),
+            source_path=requested_source,
             publisher_agent_id=publisher_id,
             visible_to=viewers,
             title=title,
@@ -121,8 +124,9 @@ class PublishedWorkspaceOpsMixin:
         viewer = ""
         if str(agent_id or "").strip():
             viewer = self._resolve_workspace_agent_id(agent_id)
-        result = self._published_workspace().show(publication_id, viewer_agent_id=viewer)
-        if viewer and viewer not in set(result.get("visible_to", [])):
+        workspace = self._published_workspace()
+        result = workspace.show(publication_id, viewer_agent_id=viewer)
+        if viewer and not workspace.can_view(publication_id, viewer):
             raise SetupError(f"agent '{viewer}' cannot view publication {publication_id}")
         return result
 

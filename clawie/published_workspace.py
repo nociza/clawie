@@ -202,9 +202,75 @@ class PublishedWorkspace:
                     ON publications(publisher_agent_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_publications_created
                     ON publications(created_at);
+                CREATE TABLE IF NOT EXISTS agent_aliases (
+                    alias_id TEXT PRIMARY KEY,
+                    target_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_aliases_target
+                    ON agent_aliases(target_id);
                 """
             )
             conn.commit()
+
+    def add_agent_alias(self, old_agent_id: str, new_agent_id: str) -> None:
+        """Preserve immutable-publication access across a logical agent rename."""
+        old_id = _safe_token(old_agent_id, field_name="old_agent_id")
+        new_id = _safe_token(new_agent_id, field_name="new_agent_id")
+        if old_id == new_id:
+            raise PublishedWorkspaceError("old and new agent IDs must differ")
+        self.ensure()
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT target_id FROM agent_aliases WHERE alias_id = ?", (old_id,)
+            ).fetchone()
+            if existing is not None and str(existing["target_id"]) != new_id:
+                raise PublishedWorkspaceError(
+                    f"published-workspace alias '{old_id}' already targets "
+                    f"'{existing['target_id']}'"
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO agent_aliases(alias_id, target_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (old_id, new_id, _now_iso()),
+            )
+            conn.commit()
+
+    def remove_agent_alias(self, old_agent_id: str, new_agent_id: str) -> None:
+        old_id = _safe_token(old_agent_id, field_name="old_agent_id")
+        new_id = _safe_token(new_agent_id, field_name="new_agent_id")
+        self.ensure()
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM agent_aliases WHERE alias_id = ? AND target_id = ?",
+                (old_id, new_id),
+            )
+            conn.commit()
+
+    def identity_equivalents(self, agent_id: str) -> set[str]:
+        token = _safe_token(agent_id, field_name="agent_id")
+        self.ensure()
+        equivalents = {token}
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT alias_id, target_id FROM agent_aliases"
+            ).fetchall()
+        changed = True
+        while changed:
+            changed = False
+            for row in rows:
+                alias_id = str(row["alias_id"])
+                target_id = str(row["target_id"])
+                if alias_id in equivalents or target_id in equivalents:
+                    before = len(equivalents)
+                    equivalents.update((alias_id, target_id))
+                    changed = changed or len(equivalents) != before
+        return equivalents
+
+    def can_view(self, publication_id: str, viewer_agent_id: str) -> bool:
+        viewer = _safe_token(viewer_agent_id, field_name="viewer_agent_id")
+        result = self.show(publication_id)
+        return bool(self.identity_equivalents(viewer) & set(result.get("visible_to", [])))
 
     def publish(
         self,
@@ -343,23 +409,17 @@ class PublishedWorkspace:
         viewer = str(viewer_agent_id or "").strip()
         publisher = str(publisher_agent_id or "").strip()
         rows: list[dict[str, Any]] = []
+        viewer_ids = self.identity_equivalents(viewer) if viewer else set()
+        publisher_ids = self.identity_equivalents(publisher) if publisher else set()
         with self._connect() as conn:
-            if publisher:
-                result = conn.execute(
-                    """
-                    SELECT manifest_json FROM publications
-                    WHERE publisher_agent_id = ?
-                    ORDER BY created_at DESC
-                    """,
-                    (publisher,),
-                ).fetchall()
-            else:
-                result = conn.execute(
-                    "SELECT manifest_json FROM publications ORDER BY created_at DESC"
-                ).fetchall()
+            result = conn.execute(
+                "SELECT manifest_json FROM publications ORDER BY created_at DESC"
+            ).fetchall()
         for row in result:
             manifest = self._decode_manifest(row["manifest_json"])
-            if viewer and viewer not in self._manifest_viewers(manifest):
+            if publisher and str(manifest.get("publisher_agent_id", "")) not in publisher_ids:
+                continue
+            if viewer and not (viewer_ids & set(self._manifest_viewers(manifest))):
                 continue
             rows.append(self._summary(manifest, viewer_agent_id=viewer))
         return rows

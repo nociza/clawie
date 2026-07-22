@@ -22,7 +22,11 @@ except ModuleNotFoundError:  # pragma: no cover
         import tomli as tomllib  # type: ignore[no-redef]  # Python 3.10 fallback
     except ModuleNotFoundError:
         tomllib = None  # type: ignore[assignment]
-from clawie.provider_channels import dedupe_channels, get_channel_adapter
+from clawie.provider_channels import (
+    dedupe_channels,
+    get_channel_adapter,
+    is_openclaw_channel_placeholder,
+)
 from clawie.providers import (
     get_provider,
     provider_names,
@@ -30,11 +34,43 @@ from clawie.providers import (
 from clawie.service_common import SetupError, AgentNotFoundError, now_iso
 
 
+_OPENCLAW_QR_CHANNELS: dict[str, dict[str, str]] = {
+    "wechat": {
+        "canonical": "openclaw-weixin",
+        "label": "WeChat",
+        "plugin_id": "openclaw-weixin",
+        "package": "@tencent-weixin/openclaw-weixin",
+    },
+    "openclaw-weixin": {
+        "canonical": "openclaw-weixin",
+        "label": "WeChat",
+        "plugin_id": "openclaw-weixin",
+        "package": "@tencent-weixin/openclaw-weixin",
+    },
+    "weixin": {
+        "canonical": "openclaw-weixin",
+        "label": "WeChat",
+        "plugin_id": "openclaw-weixin",
+        "package": "@tencent-weixin/openclaw-weixin",
+    },
+    "whatsapp": {
+        "canonical": "whatsapp",
+        "label": "WhatsApp",
+        "plugin_id": "whatsapp",
+        "package": "@openclaw/whatsapp",
+    },
+}
+
+
 class ChannelOpsMixin:
 
     @staticmethod
     @contextmanager
-    def _openclaw_telegram_setup_lock(home: Path, agent_id: str) -> Iterator[None]:
+    def _openclaw_telegram_setup_lock(
+        home: Path,
+        agent_id: str,
+        label: str = "Telegram",
+    ) -> Iterator[None]:
         """Serialize setup without creating lock files in the managed home."""
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -51,7 +87,7 @@ class ChannelOpsMixin:
                 locked = True
             except BlockingIOError:
                 raise SetupError(
-                    f"Telegram setup is already running for '{agent_id}'; wait for it to finish, "
+                    f"{label} setup is already running for '{agent_id}'; wait for it to finish, "
                     "then run the status command (no files, services, or agent state were changed)"
                 ) from None
             yield
@@ -96,6 +132,51 @@ class ChannelOpsMixin:
         if home is None:
             raise SetupError(f"could not resolve the managed home for agent '{target}'")
         return agent, info, linux_user, home
+
+    def _openclaw_qr_agent_context(
+        self,
+        agent_id: str,
+        *,
+        purpose: str,
+        label: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str, Path]:
+        self._require_setup()
+        target = str(agent_id).strip()
+        if not target:
+            raise ValueError("agent_id is required")
+        if target.startswith("@local:"):
+            raise ValueError(f"{label} management is only supported for managed agents")
+        state = self.store.read_state()
+        agent = state.setdefault("agents", {}).get(target)
+        if not isinstance(agent, dict):
+            raise AgentNotFoundError(f"agent not found: {target}")
+        self._hydrate_agent_controls(agent)
+        info = agent.setdefault("agent", {})
+        provider = str(info.get("provider", "")).strip().lower()
+        if provider != "openclaw":
+            raise SetupError(
+                f"{label} onboarding requires an OpenClaw agent; "
+                f"'{target}' uses {provider or 'no provider'}"
+            )
+        linux_user = str(info.get("linux_user", "")).strip()
+        if not linux_user:
+            raise SetupError(
+                f"agent '{target}' has no managed Linux user; create it with "
+                f"'sudo clawie runtime create {target}' first"
+            )
+        self._require_linux_user_access(linux_user, purpose)
+        home = self._agent_linux_home(agent)
+        if home is None:
+            raise SetupError(f"could not resolve the managed home for agent '{target}'")
+        return agent, info, linux_user, home
+
+    @staticmethod
+    def _openclaw_qr_channel_spec(channel: str) -> dict[str, str]:
+        token = str(channel).strip().lower()
+        spec = _OPENCLAW_QR_CHANNELS.get(token)
+        if spec is None:
+            raise ValueError("QR channel must be one of: wechat, whatsapp")
+        return dict(spec)
 
     @staticmethod
     def _probe_telegram_bot_token(token: str, *, timeout: float = 10.0) -> dict[str, str]:
@@ -554,6 +635,504 @@ class ChannelOpsMixin:
             purpose="approving a Telegram pairing request",
         )
         return {"agent_id": target, "channel": "telegram", "status": "approved"}
+
+    def _run_openclaw_qr_command(
+        self,
+        agent_id: str,
+        channel: str,
+        arguments: list[str],
+        *,
+        purpose: str,
+        timeout: float = 60.0,
+        expect_json: bool = False,
+        interactive: bool = False,
+    ) -> dict[str, Any] | None:
+        spec = self._openclaw_qr_channel_spec(channel)
+        _, _, linux_user, _ = self._openclaw_qr_agent_context(
+            agent_id,
+            purpose=purpose,
+            label=spec["label"],
+        )
+        executable = self._resolve_provider_executable("openclaw")
+        command = self._wrap_user_command(
+            [executable, *arguments],
+            linux_user,
+            purpose=purpose,
+        )
+        kwargs: dict[str, Any] = {
+            "check": False,
+            "env": self._service_env(linux_user),
+        }
+        if interactive:
+            if not os.isatty(0) or not os.isatty(1):
+                raise SetupError(
+                    f"{spec['label']} login needs an interactive terminal to display a live QR code; "
+                    "rerun this command directly in an SSH terminal (no plugin, credentials, service, "
+                    "or Clawie state were changed)"
+                )
+        else:
+            kwargs.update({"capture_output": True, "text": True, "timeout": max(1.0, timeout)})
+        try:
+            result = subprocess.run(command, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            raise SetupError(
+                f"OpenClaw timed out while {purpose}; run 'sudo clawie channel "
+                f"{channel} status {agent_id}' for safe diagnostics"
+            ) from exc
+        if result.returncode != 0:
+            raise SetupError(
+                f"OpenClaw failed while {purpose} (exit {result.returncode}); run "
+                f"'sudo clawie channel {channel} status {agent_id}' for safe diagnostics"
+            )
+        if not expect_json:
+            return None
+        return self._parse_openclaw_json_output(
+            str(getattr(result, "stdout", "")),
+            purpose=purpose,
+        )
+
+    def _openclaw_qr_plugin_status(
+        self,
+        agent_id: str,
+        channel: str,
+    ) -> dict[str, Any]:
+        spec = self._openclaw_qr_channel_spec(channel)
+        payload = self._run_openclaw_qr_command(
+            agent_id,
+            channel,
+            ["plugins", "list", "--json"],
+            purpose=f"checking the {spec['label']} plugin",
+            expect_json=True,
+        )
+        assert isinstance(payload, dict)
+        plugins = payload.get("plugins", [])
+        row = next(
+            (
+                item
+                for item in plugins
+                if isinstance(item, dict) and str(item.get("id", "")) == spec["plugin_id"]
+            ),
+            {},
+        ) if isinstance(plugins, list) else {}
+        return {
+            "installed": bool(row),
+            "enabled": bool(row.get("enabled", False)) if isinstance(row, dict) else False,
+            "status": str(row.get("status", "")) if isinstance(row, dict) else "",
+            "version": str(row.get("version", "")) if isinstance(row, dict) else "",
+        }
+
+    def _ensure_openclaw_qr_plugin(
+        self,
+        agent_id: str,
+        channel: str,
+        *,
+        install: bool,
+    ) -> dict[str, Any]:
+        spec = self._openclaw_qr_channel_spec(channel)
+        before = self._openclaw_qr_plugin_status(agent_id, channel)
+        installed_now = False
+        if not before["installed"]:
+            if not install:
+                raise SetupError(
+                    f"the {spec['label']} plugin is not installed for '{agent_id}'; rerun without "
+                    "--skip-install (no credentials, service, or Clawie state were changed)"
+                )
+            try:
+                self._run_openclaw_qr_command(
+                    agent_id,
+                    channel,
+                    ["plugins", "install", "--pin", spec["package"]],
+                    purpose=f"installing the {spec['label']} plugin",
+                    timeout=180.0,
+                )
+                installed_now = True
+            except Exception:
+                try:
+                    self._run_openclaw_qr_command(
+                        agent_id,
+                        channel,
+                        ["plugins", "uninstall", "--force", spec["plugin_id"]],
+                        purpose=f"rolling back the failed {spec['label']} plugin install",
+                        timeout=60.0,
+                    )
+                except Exception:
+                    pass
+                raise
+
+        try:
+            self._run_openclaw_qr_command(
+                agent_id,
+                channel,
+                ["config", "set", f"plugins.entries.{spec['plugin_id']}.enabled", "true"],
+                purpose=f"enabling the {spec['label']} plugin",
+            )
+        except Exception:
+            if installed_now:
+                try:
+                    self._run_openclaw_qr_command(
+                        agent_id,
+                        channel,
+                        ["plugins", "uninstall", "--force", spec["plugin_id"]],
+                        purpose=f"rolling back the {spec['label']} plugin install",
+                    )
+                except Exception:
+                    pass
+            raise
+        after = self._openclaw_qr_plugin_status(agent_id, channel)
+        if not after["installed"] or not after["enabled"]:
+            raise SetupError(
+                f"the {spec['label']} plugin did not become enabled; no QR login or Clawie "
+                "channel assignment was attempted"
+            )
+        after["installed_now"] = installed_now
+        return after
+
+    def openclaw_qr_channel_status(self, agent_id: str, channel: str) -> dict[str, Any]:
+        with self.store.read_only():
+            spec = self._openclaw_qr_channel_spec(channel)
+            target = str(agent_id).strip()
+            plugin = self._openclaw_qr_plugin_status(target, channel)
+            if not plugin["installed"]:
+                return {
+                    "agent_id": target,
+                    "channel": spec["canonical"],
+                    "label": spec["label"],
+                    "healthy": False,
+                    "installed": False,
+                    "enabled": False,
+                    "configured": False,
+                    "running": False,
+                    "connected": False,
+                    "probe_ok": False,
+                    "account_count": 0,
+                    "last_error": "",
+                    "remediation": f"Run 'sudo clawie channel {channel} setup {target}'",
+                }
+            payload = self._run_openclaw_qr_command(
+                target,
+                channel,
+                ["channels", "status", "--probe", "--json"],
+                purpose=f"checking {spec['label']} health",
+                expect_json=True,
+            )
+            assert isinstance(payload, dict)
+            channels = payload.get("channels", {})
+            root = channels.get(spec["canonical"], {}) if isinstance(channels, dict) else {}
+            root = root if isinstance(root, dict) else {}
+            accounts_root = payload.get("channelAccounts", {})
+            accounts = (
+                accounts_root.get(spec["canonical"], [])
+                if isinstance(accounts_root, dict)
+                else []
+            )
+            accounts = [item for item in accounts if isinstance(item, dict)] if isinstance(accounts, list) else []
+            configured = bool(root.get("configured", False)) or any(
+                bool(item.get("configured", False)) for item in accounts
+            )
+            running = bool(root.get("running", False)) or any(
+                bool(item.get("running", False)) for item in accounts
+            )
+            observations = [root, *accounts]
+            connected_reported = any("connected" in item for item in observations)
+            connected = (
+                any(bool(item.get("connected", False)) for item in observations)
+                if connected_reported
+                else running
+            )
+            probes = [root.get("probe", {})] + [item.get("probe", {}) for item in accounts]
+            probe_rows = [item for item in probes if isinstance(item, dict) and item]
+            probe_ok = any(bool(item.get("ok", False)) for item in probe_rows) if probe_rows else connected
+            last_error = self._safe_telegram_diagnostic(root.get("lastError", ""), limit=240)
+            if not last_error:
+                last_error = next(
+                    (
+                        self._safe_telegram_diagnostic(item.get("lastError", ""), limit=240)
+                        for item in accounts
+                        if str(item.get("lastError", "")).strip()
+                    ),
+                    "",
+                )
+            # OpenClaw may retain a historical lastError after a successful
+            # reconnect. Live connection and probe state are authoritative;
+            # keep the sanitized error only as diagnostic context.
+            healthy = bool(plugin["enabled"] and configured and running and connected and probe_ok)
+            login_required = bool(
+                re.search(
+                    r"\b(?:not linked|logged out|not logged in|link required)\b",
+                    last_error,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if healthy:
+                remediation = ""
+            elif not configured:
+                remediation = f"Run 'sudo clawie channel {channel} setup {target}' to scan a fresh QR code"
+            elif login_required:
+                remediation = f"Run 'sudo clawie channel {channel} setup {target}' to scan a fresh QR code"
+            elif not running or not connected:
+                remediation = f"Run 'sudo clawie agent service restart {target}', then retry status"
+            else:
+                remediation = f"Rerun 'sudo clawie channel {channel} setup {target}' to repair the login"
+            return {
+                "agent_id": target,
+                "channel": spec["canonical"],
+                "label": spec["label"],
+                "healthy": healthy,
+                "installed": bool(plugin["installed"]),
+                "enabled": bool(plugin["enabled"]),
+                "plugin_version": str(plugin["version"]),
+                "configured": configured,
+                "running": running,
+                "connected": connected,
+                "connected_inferred": not connected_reported,
+                "login_required": login_required,
+                "probe_ok": probe_ok,
+                "probe_inferred": not bool(probe_rows),
+                "account_count": len(accounts),
+                "last_error": last_error,
+                "remediation": remediation,
+            }
+
+    def setup_openclaw_qr_channel(
+        self,
+        agent_id: str,
+        channel: str,
+        *,
+        account: str = "",
+        install: bool = True,
+        wait_seconds: float = 45.0,
+    ) -> dict[str, Any]:
+        spec = self._openclaw_qr_channel_spec(channel)
+        target = str(agent_id).strip()
+        account_id = str(account).strip()
+        if account_id and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", account_id):
+            raise ValueError("account must contain only letters, numbers, '.', '_' or '-' (max 64)")
+        timeout = float(wait_seconds)
+        if not math.isfinite(timeout) or not 0.0 <= timeout <= 300.0:
+            raise ValueError("wait_seconds must be finite and between 0 and 300")
+        agent, info, linux_user, home = self._openclaw_qr_agent_context(
+            target,
+            purpose=f"{spec['label']} setup",
+            label=spec["label"],
+        )
+        existing_plugin: dict[str, Any] | None = None
+        existing_status: dict[str, Any] | None = None
+        try:
+            plugin_probe = self._openclaw_qr_plugin_status(target, channel)
+            if bool(plugin_probe.get("installed")) and bool(plugin_probe.get("enabled")):
+                status_probe = self.openclaw_qr_channel_status(target, channel)
+                if bool(status_probe.get("healthy")):
+                    existing_plugin = plugin_probe
+                    existing_status = status_probe
+        except SetupError:
+            pass
+        interactive = os.isatty(0) and os.isatty(1)
+        if existing_status is None and not interactive:
+            raise SetupError(
+                f"{spec['label']} setup needs an interactive terminal to display a live QR code; "
+                "rerun it directly in an SSH terminal (no plugin, credentials, service, or Clawie "
+                "state were changed)"
+            )
+        if int(info.get("gateway_port", 0) or 0) <= 0:
+            raise SetupError(
+                f"agent '{target}' is not fully provisioned; run 'sudo clawie agent service start "
+                f"{target}' first (no plugin, credentials, service, or Clawie state were changed)"
+            )
+        with self._openclaw_telegram_setup_lock(home, target, spec["label"]):
+            status = existing_status
+            plugin = existing_plugin
+            if status is not None:
+                # Recheck under the per-home lock so a disconnect cannot be
+                # committed from stale preflight evidence.
+                status = self.openclaw_qr_channel_status(target, channel)
+                if not bool(status.get("healthy")):
+                    status = None
+            if status is not None:
+                plugin = self._openclaw_qr_plugin_status(target, channel)
+                service_result = {
+                    "service_status": "running",
+                    "service_mode": str(info.get("service_mode", "unknown")),
+                }
+                resumed_existing_login = True
+            else:
+                if not interactive:
+                    raise SetupError(
+                        f"{spec['label']} was healthy during preflight but disconnected before "
+                        "ownership could be recovered; rerun setup in an interactive terminal"
+                    )
+                was_running = self._provider_process_live("openclaw", linux_user)
+                login_attempted = False
+                try:
+                    plugin = self._ensure_openclaw_qr_plugin(target, channel, install=install)
+                    login_args = ["channels", "login", "--channel", spec["canonical"]]
+                    if account_id:
+                        login_args.extend(["--account", account_id])
+                    login_attempted = True
+                    self._run_openclaw_qr_command(
+                        target,
+                        channel,
+                        login_args,
+                        purpose=f"logging in to {spec['label']}",
+                        interactive=True,
+                    )
+                except Exception:
+                    if login_attempted:
+                        try:
+                            self._run_managed_provider_service_action(
+                                provider="openclaw",
+                                action="restart" if was_running else "stop",
+                                linux_user=linux_user,
+                                agent_info=info,
+                            )
+                        except Exception:
+                            raise SetupError(
+                                f"{spec['label']} login failed and automatic gateway recovery also "
+                                f"failed; run 'sudo clawie agent service status {target}', then "
+                                f"'sudo clawie agent service {'restart' if was_running else 'stop'} "
+                                f"{target}'"
+                            ) from None
+                    raise
+                service_result = self._run_managed_provider_service_action(
+                    provider="openclaw",
+                    action="restart" if was_running else "start",
+                    linux_user=linux_user,
+                    agent_info=info,
+                )
+                deadline = time.monotonic() + timeout
+                status = None
+                while True:
+                    try:
+                        status = self.openclaw_qr_channel_status(target, channel)
+                    except SetupError:
+                        status = None
+                    if status and bool(status.get("healthy")):
+                        break
+                    if time.monotonic() >= deadline:
+                        detail = str((status or {}).get("last_error", "")).strip()
+                        suffix = f" Last error: {detail}." if detail else ""
+                        raise SetupError(
+                            f"{spec['label']} login completed but live health did not become ready.{suffix} "
+                            f"Credentials were preserved; rerun 'sudo clawie channel {channel} status {target}' "
+                            "before deciding whether to relink. Clawie channel ownership was not changed."
+                        )
+                    time.sleep(1.0)
+                resumed_existing_login = False
+
+            assert plugin is not None
+            assert status is not None
+
+            state = self.store.read_state()
+            agents = state.setdefault("agents", {})
+            persisted = agents.get(target)
+            if not isinstance(persisted, dict):
+                raise AgentNotFoundError(f"agent not found: {target}")
+            channel_name = spec["canonical"]
+            self._assert_channels_unclaimed(
+                agents,
+                target,
+                [{"kind": spec["canonical"], "name": channel_name}],
+            )
+            rows = persisted.setdefault("channels", [])
+            if not isinstance(rows, list):
+                rows = []
+                persisted["channels"] = rows
+            index = self._find_channel(rows, spec["canonical"], channel_name)
+            if index is None:
+                rows.append(
+                    {
+                        "kind": spec["canonical"],
+                        "name": channel_name,
+                        "enabled": True,
+                        "external_id": f"{target}:{spec['canonical']}:{account_id or 'default'}",
+                    }
+                )
+            else:
+                rows[index]["enabled"] = True
+            persisted_info = persisted.setdefault("agent", {})
+            persisted_info["service_status"] = str(service_result.get("service_status", "running"))
+            persisted_info["service_mode"] = str(service_result.get("service_mode", "unknown"))
+            persisted_info["last_sync"] = now_iso()
+            self._event(
+                state,
+                f"channels.{spec['canonical']}_configured",
+                f"Configured {spec['label']} for {target}",
+                {
+                    "agent_id": target,
+                    "provider": "openclaw",
+                    "kind": spec["canonical"],
+                    "name": channel_name,
+                    "account": account_id or "default",
+                    "plugin_version": str(plugin.get("version", "")),
+                },
+            )
+            self.store.write_state(state)
+            return {
+                "agent_id": target,
+                "channel": spec["canonical"],
+                "label": spec["label"],
+                "account": account_id or "default",
+                "plugin": plugin,
+                "status": status,
+                "resumed_existing_login": resumed_existing_login,
+            }
+
+    def list_openclaw_qr_pairings(self, agent_id: str, channel: str) -> dict[str, Any]:
+        spec = self._openclaw_qr_channel_spec(channel)
+        payload = self._run_openclaw_qr_command(
+            agent_id,
+            channel,
+            ["pairing", "list", spec["canonical"], "--json"],
+            purpose=f"listing {spec['label']} pairing requests",
+            expect_json=True,
+        )
+        assert isinstance(payload, dict)
+        requests: list[dict[str, str]] = []
+        for row in payload.get("requests", []):
+            if not isinstance(row, dict):
+                continue
+            requests.append(
+                {
+                    "code": self._safe_telegram_diagnostic(
+                        row.get("code", row.get("pairingCode", "")), limit=128
+                    ),
+                    "sender_id": self._safe_telegram_diagnostic(
+                        row.get("senderId", row.get("userId", row.get("id", ""))), limit=128
+                    ),
+                    "display_name": self._safe_telegram_diagnostic(
+                        row.get("displayName", row.get("name", "")), limit=160
+                    ),
+                    "requested_at": self._safe_telegram_diagnostic(
+                        row.get("requestedAt", row.get("createdAt", "")), limit=80
+                    ),
+                }
+            )
+        return {
+            "agent_id": str(agent_id).strip(),
+            "channel": spec["canonical"],
+            "requests": requests,
+        }
+
+    def approve_openclaw_qr_pairing(
+        self,
+        agent_id: str,
+        channel: str,
+        code: str,
+    ) -> dict[str, Any]:
+        spec = self._openclaw_qr_channel_spec(channel)
+        pairing_code = str(code).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{3,127}", pairing_code):
+            raise ValueError("pairing code must be 4-128 letters, numbers, hyphens, or underscores")
+        self._run_openclaw_qr_command(
+            agent_id,
+            channel,
+            ["pairing", "approve", spec["canonical"], pairing_code],
+            purpose=f"approving a {spec['label']} pairing request",
+        )
+        return {
+            "agent_id": str(agent_id).strip(),
+            "channel": spec["canonical"],
+            "status": "approved",
+        }
 
     def configure_openclaw_telegram(
         self,
@@ -1101,6 +1680,8 @@ class ChannelOpsMixin:
             if not kind or not isinstance(value, dict):
                 continue
             if not bool(value.get("enabled", True)):
+                continue
+            if is_openclaw_channel_placeholder(value):
                 continue
 
             settings = dict(value)
